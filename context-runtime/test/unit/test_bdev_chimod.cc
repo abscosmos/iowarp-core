@@ -13,6 +13,7 @@
 #include <fstream>
 #include <memory>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -196,6 +197,27 @@ public:
   }
 
   /**
+   * Get the number of containers for a pool
+   * @param pool_id Pool identifier
+   * @return Number of containers, or 0 if pool not found
+   */
+  chi::u32 getNumContainers(chi::PoolId pool_id) const {
+    auto *pool_manager = CHI_POOL_MANAGER;
+    if (!pool_manager) {
+      HILOG(kError, "Pool manager not available");
+      return 0;
+    }
+
+    const chi::PoolInfo *pool_info = pool_manager->GetPoolInfo(pool_id);
+    if (!pool_info) {
+      HILOG(kError, "Pool info not found for pool_id: {}", pool_id);
+      return 0;
+    }
+
+    return pool_info->num_containers_;
+  }
+
+  /**
    * Clean up test resources
    */
   void cleanup() {
@@ -261,8 +283,14 @@ TEST_CASE("bdev_block_allocation_4kb", "[bdev][allocate][4kb]") {
                       custom_pool_id, chimaera::bdev::BdevType::kFile);
     REQUIRE(success);
 
+    // Get number of containers for this pool
+    chi::u32 num_containers = fixture.getNumContainers(custom_pool_id);
+    REQUIRE(num_containers > 0);
+    HILOG(kInfo, "Pool has {} containers", num_containers);
+
     // Allocate multiple 4KB blocks using DirectHash for distributed execution
     std::vector<chimaera::bdev::Block> blocks;
+    std::vector<chi::ContainerId> completers;
     for (int i = 0; i < 16; ++i) {
       auto pool_query = chi::PoolQuery::DirectHash(i);
       auto alloc_task = client.AsyncAllocateBlocks(mctx, pool_query, k4KB);
@@ -275,10 +303,28 @@ TEST_CASE("bdev_block_allocation_4kb", "[bdev][allocate][4kb]") {
       REQUIRE(block.block_type_ == 0);    // 4KB category
       REQUIRE(block.offset_ % 4096 == 0); // Aligned
 
+      // Verify that completer_ matches expected container ID based on DirectHash
+      // Formula: expected_container_id = hash_value % num_containers
+      chi::ContainerId expected_completer = static_cast<chi::ContainerId>(i % num_containers);
+      chi::ContainerId actual_completer = alloc_task->GetCompleter();
+
+      REQUIRE(actual_completer == expected_completer);
+      completers.push_back(actual_completer);
+      HILOG(kInfo, "Allocated 4KB block {}: offset={}, size={}, completer={} (expected={})",
+            i, block.offset_, block.size_, actual_completer, expected_completer);
+
       blocks.push_back(block);
       CHI_IPC->DelTask(alloc_task);
-      HILOG(kInfo, "Allocated 4KB block {}: offset={}, size={}", i,
-            block.offset_, block.size_);
+    }
+
+    // Verify that DirectHash distributed tasks across different containers
+    // (at least 2 different containers should have been used if num_containers >= 2)
+    std::set<chi::ContainerId> unique_completers(completers.begin(), completers.end());
+    HILOG(kInfo, "Tasks were distributed across {} unique containers", unique_completers.size());
+    if (num_containers >= 2) {
+      REQUIRE(unique_completers.size() >= 2);
+    } else {
+      REQUIRE(unique_completers.size() == 1);
     }
 
     // Verify blocks don't overlap
@@ -313,9 +359,17 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
                       custom_pool_id, chimaera::bdev::BdevType::kFile);
     REQUIRE(success);
 
+    // Get number of containers for this pool
+    chi::u32 num_containers = fixture.getNumContainers(custom_pool_id);
+    REQUIRE(num_containers > 0);
+    HILOG(kInfo, "Pool has {} containers", num_containers);
+
     // Run write/read operations using DirectHash for distributed execution
     for (int i = 0; i < 16; ++i) {
       auto pool_query = chi::PoolQuery::DirectHash(i);
+
+      // Expected container ID based on DirectHash formula
+      chi::ContainerId expected_completer = static_cast<chi::ContainerId>(i % num_containers);
 
       // Allocate a block
       auto alloc_task = client.AsyncAllocateBlocks(mctx, pool_query, k4KB);
@@ -323,6 +377,11 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
       REQUIRE(alloc_task->return_code_ == 0);
       REQUIRE(alloc_task->blocks_.size() > 0);
       chimaera::bdev::Block block = alloc_task->blocks_[0];
+
+      // Verify allocate task completer
+      REQUIRE(alloc_task->GetCompleter() == expected_completer);
+      HILOG(kInfo, "Iteration {}: Allocate completed by container {} (expected={})",
+            i, alloc_task->GetCompleter(), expected_completer);
       CHI_IPC->DelTask(alloc_task);
 
       // Generate test data
@@ -339,6 +398,11 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
       write_task->Wait();
       REQUIRE(write_task->return_code_ == 0);
       REQUIRE(write_task->bytes_written_ == write_data.size());
+
+      // Verify write task completer
+      REQUIRE(write_task->GetCompleter() == expected_completer);
+      HILOG(kInfo, "Iteration {}: Write completed by container {} (expected={})",
+            i, write_task->GetCompleter(), expected_completer);
       CHI_IPC->DelTask(write_task);
 
       // Read data back - allocate buffer for reading
@@ -350,6 +414,11 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
       read_task->Wait();
       REQUIRE(read_task->return_code_ == 0);
       REQUIRE(read_task->bytes_read_ == write_data.size());
+
+      // Verify read task completer
+      REQUIRE(read_task->GetCompleter() == expected_completer);
+      HILOG(kInfo, "Iteration {}: Read completed by container {} (expected={})",
+            i, read_task->GetCompleter(), expected_completer);
 
       // Convert read data back to vector for verification
       std::vector<hshm::u8> read_data(read_task->bytes_read_);
@@ -646,6 +715,11 @@ TEST_CASE("bdev_ram_allocation_and_io", "[bdev][ram][io]") {
     chimaera::bdev::Block block = alloc_task->blocks_[0];
     REQUIRE(block.size_ == k4KB);
     REQUIRE(block.offset_ < ram_size);
+
+    // Verify that completer_ is set (can be 0, which is a valid container ID)
+    chi::ContainerId completer = alloc_task->GetCompleter();
+    HILOG(kInfo, "Iteration {}: Task completed by container {}", i, completer);
+
     CHI_IPC->DelTask(alloc_task);
 
     // Prepare test data with pattern

@@ -58,6 +58,7 @@ public:
                                    (0=not complete, 1=complete) */
   std::atomic<u32>
       return_code_; /**< Task return code (0=success, non-zero=error) */
+  OUT ContainerId completer_; /**< Container ID that completed this task */
   TaskStat stat_;   /**< Task statistics for I/O and compute tracking */
 
   /**
@@ -85,6 +86,7 @@ public:
     run_ctx_ = nullptr;
     is_complete_.store(0); // Initialize as not complete
     return_code_.store(0); // Initialize as success
+    completer_ = 0; // Initialize as null (0 is invalid container ID)
   }
 
   /**
@@ -108,6 +110,7 @@ public:
     period_ns_ = other.period_ns_;
     run_ctx_ = other.run_ctx_;
     return_code_.store(other.return_code_.load());
+    completer_ = other.completer_;
     stat_ = other.stat_;
     // Explicitly initialize as not complete for copied tasks
     is_complete_.store(0);
@@ -126,6 +129,7 @@ public:
     period_ns_ = other->period_ns_;
     run_ctx_ = other->run_ctx_;
     return_code_.store(other->return_code_.load());
+    completer_ = other->completer_;
     stat_ = other->stat_;
     // Explicitly initialize as not complete for copied tasks
     is_complete_.store(0);
@@ -169,6 +173,7 @@ public:
     run_ctx_ = nullptr;
     is_complete_.store(0); // Initialize as not complete
     return_code_.store(0); // Initialize as success
+    completer_ = 0; // Initialize as null (0 is invalid container ID)
     stat_.io_size_ = 0;
     stat_.compute_ = 0;
   }
@@ -343,9 +348,9 @@ public:
   template <typename Archive> void BaseSerializeOut(Archive &ar) {
     // Only serialize OUT fields - do NOT re-serialize IN fields
     // (pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_ are
-    // all IN) Only return_code_ is an OUT field that needs to be sent back
+    // all IN) Only return_code_ and completer_ are OUT fields that need to be sent back
     u32 return_code_value = return_code_.load();
-    ar(return_code_value);
+    ar(return_code_value, completer_);
     return_code_.store(return_code_value);
   }
 
@@ -390,6 +395,20 @@ public:
    */
   HSHM_CROSS_FUN void SetReturnCode(u32 return_code) {
     return_code_.store(return_code);
+  }
+
+  /**
+   * Get the completer container ID (which container completed this task)
+   * @return Container ID that completed this task
+   */
+  HSHM_CROSS_FUN ContainerId GetCompleter() const { return completer_; }
+
+  /**
+   * Set the completer container ID (which container completed this task)
+   * @param completer Container ID to set
+   */
+  HSHM_CROSS_FUN void SetCompleter(ContainerId completer) {
+    completer_ = completer;
   }
 
   /**
