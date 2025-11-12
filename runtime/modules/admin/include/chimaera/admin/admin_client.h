@@ -129,11 +129,11 @@ class Client : public chi::ContainerClient {
    */
   template <typename TaskType>
   void Send(const hipc::MemContext& mctx,
-            bool srl_mode,
+            chi::MsgType msg_type,
             const hipc::FullPtr<TaskType>& subtask,
             const std::vector<chi::PoolQuery>& pool_queries,
             chi::u32 transfer_flags = 0) {
-    auto task = AsyncSend(mctx, srl_mode, subtask, pool_queries, transfer_flags);
+    auto task = AsyncSend(mctx, msg_type, subtask, pool_queries, transfer_flags);
     task->Wait();
 
     // Check for errors
@@ -151,12 +151,12 @@ class Client : public chi::ContainerClient {
 
   /**
    * Send task to remote nodes (asynchronous)
-   * Can be used for both SerializeIn (sending inputs) and SerializeOut (sending outputs)
+   * Can be used for SerializeIn (sending inputs), SerializeOut (sending outputs), or Heartbeat
    */
   template <typename TaskType>
   hipc::FullPtr<SendTask> AsyncSend(
       const hipc::MemContext& mctx,
-      bool srl_mode,
+      chi::MsgType msg_type,
       const hipc::FullPtr<TaskType>& subtask,
       const std::vector<chi::PoolQuery>& pool_queries,
       chi::u32 transfer_flags = 0) {
@@ -171,7 +171,7 @@ class Client : public chi::ContainerClient {
     // Allocate SendTask
     auto task = ipc_manager->NewTask<SendTask>(
         chi::CreateTaskId(), pool_id_, local_pool_query,
-        srl_mode, base_subtask, pool_queries, transfer_flags);
+        msg_type, base_subtask, pool_queries, transfer_flags);
 
     // Submit to runtime
     ipc_manager->Enqueue(task);

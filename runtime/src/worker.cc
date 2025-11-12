@@ -451,9 +451,9 @@ bool Worker::RouteGlobal(const FullPtr<Task> &task_ptr,
     // Send task using unified Send API with SerializeIn mode
     admin_client.AsyncSend(
         mctx,
-        true,        // srl_mode = true (SerializeIn - sending inputs)
-        task_ptr,    // Task pointer to send
-        pool_queries // Pool queries vector for target nodes
+        chi::MsgType::kSerializeIn, // SerializeIn - sending inputs
+        task_ptr,                   // Task pointer to send
+        pool_queries                // Pool queries vector for target nodes
     );
 
     // Set TASK_ROUTED flag on original task
@@ -946,9 +946,9 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     // Send task outputs using SerializeOut mode
     admin_client.AsyncSend(
         mctx,
-        false,         // srl_mode = false (SerializeOut - sending outputs)
-        task_ptr,      // Task pointer with results
-        return_queries // Send back to return node
+        chi::MsgType::kSerializeOut, // SerializeOut - sending outputs
+        task_ptr,                    // Task pointer with results
+        return_queries               // Send back to return node
     );
 
     HILOG(kDebug, "Worker: Sent remote task outputs back to node {}",

@@ -7,6 +7,7 @@
 #include <cereal/types/vector.hpp>
 #include <memory>
 #include <sstream>
+#include <unistd.h>
 
 #include "lightbeam.h"
 
@@ -24,6 +25,23 @@ void serialize(Archive& ar, hshm::lbm::LbmMeta& meta) {
 }  // namespace cereal
 
 namespace hshm::lbm {
+
+// Lightbeam context flags for Send operations
+constexpr uint32_t LBM_SYNC = 0x1;   /**< Synchronous send (wait for completion) */
+
+/**
+ * Context for lightbeam Send operations
+ * Controls send behavior (sync vs async)
+ */
+struct LbmContext {
+  uint32_t flags;              /**< Combination of LBM_* flags */
+
+  LbmContext() : flags(0) {}
+
+  explicit LbmContext(uint32_t f) : flags(f) {}
+
+  bool IsSync() const { return flags & LBM_SYNC; }
+};
 
 class ZeroMqClient : public Client {
  public:
@@ -73,7 +91,7 @@ class ZeroMqClient : public Client {
   }
 
   template <typename MetaT>
-  int Send(MetaT& meta) {
+  int Send(MetaT& meta, const LbmContext& ctx = LbmContext()) {
     // Serialize metadata (includes both send and recv vectors)
     std::ostringstream oss(std::ios::binary);
     {
@@ -90,8 +108,12 @@ class ZeroMqClient : public Client {
       }
     }
 
+    // Determine send flags based on context
+    // Use ZMQ_DONTWAIT only if LBM_SYNC is not set
+    int base_flags = ctx.IsSync() ? 0 : ZMQ_DONTWAIT;
+
     // Send metadata - use ZMQ_SNDMORE only if there are WRITE bulks to follow
-    int flags = ZMQ_DONTWAIT;
+    int flags = base_flags;
     if (write_bulk_count > 0) {
       flags |= ZMQ_SNDMORE;
     }
@@ -108,7 +130,7 @@ class ZeroMqClient : public Client {
         continue;  // Skip bulks not marked for WRITE
       }
 
-      flags = ZMQ_DONTWAIT;
+      flags = base_flags;
       sent_count++;
       if (sent_count < write_bulk_count) {
         flags |= ZMQ_SNDMORE;
@@ -268,9 +290,9 @@ class ZeroMqServer : public Server {
 // --- Base Class Template Implementations ---
 // These delegate to the derived class implementations
 template <typename MetaT>
-int Client::Send(MetaT& meta) {
-  // This will be resolved through the vtable to the actual implementation
-  return static_cast<ZeroMqClient*>(this)->Send(meta);
+int Client::Send(MetaT& meta, const LbmContext& ctx) {
+  // Forward to ZeroMqClient implementation with provided context
+  return static_cast<ZeroMqClient*>(this)->Send(meta, ctx);
 }
 
 template <typename MetaT>

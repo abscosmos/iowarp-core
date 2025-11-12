@@ -416,9 +416,8 @@ using DestroyTask = DestroyPoolTask;
  * Replaces ClientSendTaskIn and ServerSendTaskOut
  */
 struct SendTask : public chi::Task {
-  // Serialization mode: true = SerializeIn (inputs), false = SerializeOut
-  // (outputs)
-  IN bool srl_mode_;
+  // Message type: kSerializeIn (inputs), kSerializeOut (outputs), or kHeartbeat
+  IN chi::MsgType msg_type_;
 
   // Subtask to serialize and send
   INOUT hipc::FullPtr<chi::Task> origin_task_;
@@ -434,19 +433,19 @@ struct SendTask : public chi::Task {
 
   /** SHM default constructor */
   explicit SendTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), srl_mode_(true),
+      : chi::Task(alloc), msg_type_(chi::MsgType::kSerializeIn),
         origin_task_(hipc::FullPtr<chi::Task>()), pool_queries_(),
         transfer_flags_(0), error_message_(alloc) {}
 
   /** Emplace constructor */
   explicit SendTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
                     const chi::TaskId &task_node, const chi::PoolId &pool_id,
-                    const chi::PoolQuery &pool_query, bool srl_mode,
+                    const chi::PoolQuery &pool_query, chi::MsgType msg_type,
                     hipc::FullPtr<chi::Task> subtask,
                     const std::vector<chi::PoolQuery> &pool_queries,
                     chi::u32 transfer_flags = 0)
       : chi::Task(alloc, task_node, pool_id, pool_query, Method::kSend),
-        srl_mode_(srl_mode), origin_task_(subtask), pool_queries_(pool_queries),
+        msg_type_(msg_type), origin_task_(subtask), pool_queries_(pool_queries),
         transfer_flags_(transfer_flags), error_message_(alloc) {
     // Initialize task
     task_id_ = task_node;
@@ -461,14 +460,14 @@ struct SendTask : public chi::Task {
    * Serialize IN and INOUT parameters for network transfer
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
-    ar(srl_mode_, origin_task_, pool_queries_, transfer_flags_);
+    ar(msg_type_, origin_task_, pool_queries_, transfer_flags_);
   }
 
   /**
    * Serialize OUT and INOUT parameters for network transfer
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
-    ar(srl_mode_, origin_task_, pool_queries_, error_message_);
+    ar(msg_type_, origin_task_, pool_queries_, error_message_);
   }
 
   /**
@@ -478,7 +477,7 @@ struct SendTask : public chi::Task {
   void Copy(const hipc::FullPtr<SendTask> &other) {
     // Copy base Task fields
     // Copy SendTask-specific fields
-    srl_mode_ = other->srl_mode_;
+    msg_type_ = other->msg_type_;
     origin_task_ = other->origin_task_;
     pool_queries_ = other->pool_queries_;
     transfer_flags_ = other->transfer_flags_;

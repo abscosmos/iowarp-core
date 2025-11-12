@@ -17,7 +17,7 @@ RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     cmake --preset release && \
     cmake --build build -j$(nproc) && \
     sudo cmake --install build --prefix /usr/local && \
-    sudo cmake --install build --prefix /iowarp-cte && \
+    sudo cmake --install build --prefix /iowarp-core && \
     sudo rm -rf /workspace
 
 

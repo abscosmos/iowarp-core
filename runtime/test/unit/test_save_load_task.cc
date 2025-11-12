@@ -109,7 +109,7 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
   chi::PoolId orig_new_pool_id = orig_task->new_pool_id_;
 
   // Step 2: SaveIn - serialize IN/INOUT parameters
-  chi::SaveTaskArchive save_in_archive(true); // srl_mode = true for IN
+  chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
   container->SaveTask(chimaera::admin::Method::kCreate, save_in_archive,
                       orig_task.template Cast<chi::Task>());
 
@@ -147,7 +147,7 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
   loaded_in_task->SetReturnCode(42);
 
   // Step 6: SaveOut - serialize OUT/INOUT parameters
-  chi::SaveTaskArchive save_out_archive(false); // srl_mode = false for OUT
+  chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
   container->SaveTask(chimaera::admin::Method::kCreate, save_out_archive,
                       loaded_in_task.template Cast<chi::Task>());
 
@@ -210,7 +210,7 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
   chi::MethodId orig_method = orig_task->method_;
 
   // Step 2: SaveIn - FlushTask has no IN parameters beyond base Task
-  chi::SaveTaskArchive save_in_archive(true);
+  chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
   container->SaveTask(chimaera::admin::Method::kFlush, save_in_archive,
                       orig_task.template Cast<chi::Task>());
 
@@ -235,7 +235,7 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
   loaded_in_task->total_work_done_ = 12345;
 
   // Step 6: SaveOut
-  chi::SaveTaskArchive save_out_archive(false);
+  chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
   container->SaveTask(chimaera::admin::Method::kFlush, save_out_archive,
                       loaded_in_task.template Cast<chi::Task>());
 
@@ -283,7 +283,7 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
   auto orig_task = ipc_manager->NewTask<chimaera::admin::SendTask>(
       chi::TaskId(555, 666, 777, 0, 888), chi::kAdminPoolId,
       chi::PoolQuery::Local(),
-      true, // srl_mode IN parameter
+      chi::MsgType::kSerializeIn, // msg_type IN parameter
       subtask, pool_queries,
       123); // transfer_flags IN parameter
 
@@ -291,12 +291,12 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
 
   // Record original values
   chi::TaskId orig_task_id = orig_task->task_id_;
-  bool orig_srl_mode = orig_task->srl_mode_;
+  chi::MsgType orig_msg_type = orig_task->msg_type_;
   chi::u32 orig_transfer_flags = orig_task->transfer_flags_;
   size_t orig_pool_queries_size = orig_task->pool_queries_.size();
 
   // Step 2: SaveIn
-  chi::SaveTaskArchive save_in_archive(true);
+  chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
   container->SaveTask(chimaera::admin::Method::kSend, save_in_archive,
                       orig_task.template Cast<chi::Task>());
 
@@ -313,7 +313,7 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
   // Step 4: Verify IN parameters
   SECTION("Verify IN parameters after LoadIn") {
     REQUIRE(loaded_in_task->task_id_ == orig_task_id);
-    REQUIRE(loaded_in_task->srl_mode_ == orig_srl_mode);
+    REQUIRE(loaded_in_task->msg_type_ == orig_msg_type);
     REQUIRE(loaded_in_task->transfer_flags_ == orig_transfer_flags);
     REQUIRE(loaded_in_task->pool_queries_.size() == orig_pool_queries_size);
     REQUIRE(!loaded_in_task->origin_task_.IsNull());
@@ -324,7 +324,7 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
       hipc::string(alloc, "send completed successfully");
 
   // Step 6: SaveOut
-  chi::SaveTaskArchive save_out_archive(false);
+  chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
   container->SaveTask(chimaera::admin::Method::kSend, save_out_archive,
                       loaded_in_task.template Cast<chi::Task>());
 
@@ -341,7 +341,7 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
   // Step 8: Verify INOUT and OUT parameters
   SECTION("Verify OUT parameters after LoadOut") {
     // Verify INOUT parameters preserved
-    REQUIRE(loaded_out_task->srl_mode_ == orig_srl_mode);
+    REQUIRE(loaded_out_task->msg_type_ == orig_msg_type);
     REQUIRE(loaded_out_task->pool_queries_.size() == orig_pool_queries_size);
     REQUIRE(!loaded_out_task->origin_task_.IsNull());
 
@@ -384,7 +384,7 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
   chi::u32 orig_destruction_flags = orig_task->destruction_flags_;
 
   // Step 2: SaveIn
-  chi::SaveTaskArchive save_in_archive(true);
+  chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
   container->SaveTask(chimaera::admin::Method::kDestroyPool, save_in_archive,
                       orig_task.template Cast<chi::Task>());
 
@@ -410,7 +410,7 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
   loaded_in_task->error_message_ = hipc::string(alloc, "pool destroyed");
 
   // Step 6: SaveOut
-  chi::SaveTaskArchive save_out_archive(false);
+  chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
   container->SaveTask(chimaera::admin::Method::kDestroyPool, save_out_archive,
                       loaded_in_task.template Cast<chi::Task>());
 

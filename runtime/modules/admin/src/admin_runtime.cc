@@ -374,7 +374,7 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
         target_host->ip_address, hshm::lbm::Transport::kZeroMq, "tcp", port);
 
     // Create SaveTaskArchive with SerializeIn mode and lbm_client
-    chi::SaveTaskArchive archive(true, lbm_client.get());
+    chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn, lbm_client.get());
 
     // Create task copy
     hipc::FullPtr<chi::Task> task_copy;
@@ -411,8 +411,11 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
     chi::u32 elapsed_seconds = 0;
     bool send_succeeded = false;
 
+    // Use synchronous sends for reliability during boot
+    hshm::lbm::LbmContext ctx(hshm::lbm::LBM_SYNC);
+
     while (elapsed_seconds < wait_for_restart_timeout) {
-      rc = lbm_client->Send(archive);
+      rc = lbm_client->Send(archive, ctx);
       if (rc == 0) {
         send_succeeded = true;
         break;
@@ -535,13 +538,15 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
 
     // Create SaveTaskArchive with SerializeOut mode and lbm_client
     // The client will automatically call Expose internally during serialization
-    chi::SaveTaskArchive archive(false, lbm_client.get());
+    chi::SaveTaskArchive archive(chi::MsgType::kSerializeOut, lbm_client.get());
 
     // Serialize the task outputs using container->SaveTask (Expose called
     // automatically)
     container->SaveTask(origin_task->method_, archive, origin_task);
 
-    int rc = lbm_client->Send(archive);
+    // Use non-timed, non-sync context for SendOut
+    hshm::lbm::LbmContext ctx(0);
+    int rc = lbm_client->Send(archive, ctx);
     if (rc != 0) {
       HELOG(kError,
             "[SendOut] Task {} Lightbeam Send FAILED with error code {}",
@@ -563,13 +568,25 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
 }
 
 /**
- * Main Send function - dispatches to SendIn or SendOut
+ * Main Send function - dispatches to SendIn, SendOut, or handles Heartbeat
  */
 void Runtime::Send(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
-  if (task->srl_mode_) {
-    SendIn(task, rctx);
-  } else {
-    SendOut(task);
+  switch (task->msg_type_) {
+    case chi::MsgType::kSerializeIn:
+      SendIn(task, rctx);
+      break;
+    case chi::MsgType::kSerializeOut:
+      SendOut(task);
+      break;
+    case chi::MsgType::kHeartbeat:
+      // Heartbeat message - just log and return success
+      HILOG(kDebug, "Admin: Received heartbeat message");
+      task->SetReturnCode(0);
+      break;
+    default:
+      HELOG(kError, "Admin: Unknown message type in Send");
+      task->SetReturnCode(1);
+      break;
   }
 }
 
@@ -922,14 +939,31 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
     return;
   }
 
-  HILOG(kDebug, "Admin: Received metadata (mode: {})",
-        archive.GetSerializeMode() ? "SerializeIn" : "SerializeOut");
+  // Log message type
+  chi::MsgType msg_type = archive.GetMsgType();
+  const char* msg_type_str =
+    (msg_type == chi::MsgType::kSerializeIn) ? "SerializeIn" :
+    (msg_type == chi::MsgType::kSerializeOut) ? "SerializeOut" :
+    (msg_type == chi::MsgType::kHeartbeat) ? "Heartbeat" : "Unknown";
+  HILOG(kDebug, "Admin: Received metadata (type: {})", msg_type_str);
 
-  // Dispatch based on serialization mode
-  if (archive.GetSerializeMode()) {
-    RecvIn(task, archive, lbm_server);
-  } else {
-    RecvOut(task, archive, lbm_server);
+  // Dispatch based on message type
+  switch (msg_type) {
+    case chi::MsgType::kSerializeIn:
+      RecvIn(task, archive, lbm_server);
+      break;
+    case chi::MsgType::kSerializeOut:
+      RecvOut(task, archive, lbm_server);
+      break;
+    case chi::MsgType::kHeartbeat:
+      // Heartbeat message - just log and return success
+      HILOG(kDebug, "Admin: Received heartbeat message");
+      task->SetReturnCode(0);
+      break;
+    default:
+      HELOG(kError, "Admin: Unknown message type in Recv");
+      task->SetReturnCode(3);
+      break;
   }
 
   (void)rctx;

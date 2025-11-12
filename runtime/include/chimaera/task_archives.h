@@ -456,6 +456,16 @@ public:
 };
 
 /**
+ * Message type enum for task archives
+ * Defines the type of message being sent/received
+ */
+enum class MsgType : uint8_t {
+  kSerializeIn = 0,   /**< Serialize task inputs for remote execution */
+  kSerializeOut = 1,  /**< Serialize task outputs back to origin */
+  kHeartbeat = 2      /**< Heartbeat message (no task data) */
+};
+
+/**
  * Common task information structure used by both SaveTaskArchive and
  * LoadTaskArchive
  */
@@ -480,7 +490,7 @@ private:
 
 public:
   std::vector<TaskInfo> task_infos_;
-  bool srl_mode_; // true = SerializeIn (inputs), false = SerializeOut (outputs)
+  MsgType msg_type_; // Message type: kSerializeIn, kSerializeOut, or kHeartbeat
 
 private:
   std::ostringstream stream_;
@@ -488,17 +498,17 @@ private:
   hshm::lbm::Client *lbm_client_; // Lightbeam client for Expose calls
 
 public:
-  /** Constructor with serialization mode and Lightbeam client */
-  explicit SaveTaskArchive(bool srl_mode,
+  /** Constructor with message type and Lightbeam client */
+  explicit SaveTaskArchive(MsgType msg_type,
                            hshm::lbm::Client *lbm_client = nullptr)
-      : srl_mode_(srl_mode),
+      : msg_type_(msg_type),
         archive_(std::make_unique<cereal::BinaryOutputArchive>(stream_)),
         lbm_client_(lbm_client) {}
 
   /** Move constructor */
   SaveTaskArchive(SaveTaskArchive &&other) noexcept
       : hshm::lbm::LbmMeta(std::move(other)),
-        task_infos_(std::move(other.task_infos_)), srl_mode_(other.srl_mode_),
+        task_infos_(std::move(other.task_infos_)), msg_type_(other.msg_type_),
         stream_(std::move(other.stream_)), archive_(std::move(other.archive_)),
         lbm_client_(other.lbm_client_) {
     other.lbm_client_ = nullptr;
@@ -511,7 +521,7 @@ public:
       stream_ = std::move(other.stream_);
       archive_ = std::move(other.archive_);
       task_infos_ = std::move(other.task_infos_);
-      srl_mode_ = other.srl_mode_;
+      msg_type_ = other.msg_type_;
       lbm_client_ = other.lbm_client_;
       other.lbm_client_ = nullptr;
     }
@@ -530,15 +540,16 @@ public:
       task_infos_.push_back(info);
 
       // Serialize task based on mode
-      if (srl_mode_) {
+      if (msg_type_ == MsgType::kSerializeIn) {
         // SerializeIn mode - serialize input parameters
         value.BaseSerializeIn(*this);
         value.SerializeIn(*this);
-      } else {
+      } else if (msg_type_ == MsgType::kSerializeOut) {
         // SerializeOut mode - serialize output parameters
         value.BaseSerializeOut(*this);
         value.SerializeOut(*this);
       }
+      // kHeartbeat has no task data to serialize
     } else {
       (*archive_)(value);
     }
@@ -585,8 +596,8 @@ public:
   /** Get task information */
   const std::vector<TaskInfo> &GetTaskInfos() const { return task_infos_; }
 
-  /** Get serialization mode */
-  bool GetSerializeMode() const { return srl_mode_; }
+  /** Get message type */
+  MsgType GetMsgType() const { return msg_type_; }
 
   /** Get serialized data as string */
   std::string GetData() const { return stream_.str(); }
@@ -599,7 +610,7 @@ public:
     std::string stream_data = stream_.str();
     // Manually serialize base class members (send, recv) and derived class
     // members
-    ar(send, recv, task_infos_, srl_mode_, stream_data);
+    ar(send, recv, task_infos_, msg_type_, stream_data);
   }
 
   /** Cereal load function - not applicable for output archive */
@@ -620,7 +631,7 @@ private:
 
 public:
   std::vector<TaskInfo> task_infos_;
-  bool srl_mode_; // true = SerializeIn (inputs), false = SerializeOut (outputs)
+  MsgType msg_type_; // Message type: kSerializeIn, kSerializeOut, or kHeartbeat
 
 private:
   std::string data_;
@@ -633,13 +644,13 @@ private:
 public:
   /** Default constructor */
   LoadTaskArchive()
-      : srl_mode_(true), stream_(std::make_unique<std::istringstream>("")),
+      : msg_type_(MsgType::kSerializeIn), stream_(std::make_unique<std::istringstream>("")),
         archive_(std::make_unique<cereal::BinaryInputArchive>(*stream_)),
         current_task_index_(0), current_bulk_index_(0), lbm_server_(nullptr) {}
 
   /** Constructor from serialized data */
   explicit LoadTaskArchive(const std::string &data)
-      : srl_mode_(true), data_(data),
+      : msg_type_(MsgType::kSerializeIn), data_(data),
         stream_(std::make_unique<std::istringstream>(data_)),
         archive_(std::make_unique<cereal::BinaryInputArchive>(*stream_)),
         current_task_index_(0), current_bulk_index_(0), lbm_server_(nullptr) {}
@@ -647,7 +658,7 @@ public:
   /** Move constructor */
   LoadTaskArchive(LoadTaskArchive &&other) noexcept
       : hshm::lbm::LbmMeta(std::move(other)),
-        task_infos_(std::move(other.task_infos_)), srl_mode_(other.srl_mode_),
+        task_infos_(std::move(other.task_infos_)), msg_type_(other.msg_type_),
         data_(std::move(other.data_)), stream_(std::move(other.stream_)),
         archive_(std::move(other.archive_)),
         current_task_index_(other.current_task_index_),
@@ -666,7 +677,7 @@ public:
       task_infos_ = std::move(other.task_infos_);
       current_task_index_ = other.current_task_index_;
       current_bulk_index_ = other.current_bulk_index_;
-      srl_mode_ = other.srl_mode_;
+      msg_type_ = other.msg_type_;
       lbm_server_ = other.lbm_server_;
       other.lbm_server_ = nullptr;
     }
@@ -682,13 +693,14 @@ public:
   template <typename T> LoadTaskArchive &operator>>(T &value) {
     if constexpr (std::is_base_of_v<Task, T>) {
       // Automatically call BaseSerialize* + Serialize* for Task-derived objects
-      if (srl_mode_) {
+      if (msg_type_ == MsgType::kSerializeIn) {
         value.BaseSerializeIn(*this);
         value.SerializeIn(*this);
-      } else {
+      } else if (msg_type_ == MsgType::kSerializeOut) {
         value.BaseSerializeOut(*this);
         value.SerializeOut(*this);
       }
+      // kHeartbeat has no task data to deserialize
     } else {
       (*archive_)(value);
     }
@@ -700,15 +712,16 @@ public:
     if constexpr (std::is_base_of_v<Task, T>) {
       // value must be pre-allocated by caller using CHI_IPC->NewTask
       // Deserialize task based on mode
-      if (srl_mode_) {
+      if (msg_type_ == MsgType::kSerializeIn) {
         // SerializeIn mode - deserialize input parameters
         value->BaseSerializeIn(*this);
         value->SerializeIn(*this);
-      } else {
+      } else if (msg_type_ == MsgType::kSerializeOut) {
         // SerializeOut mode - deserialize output parameters
         value->BaseSerializeOut(*this);
         value->SerializeOut(*this);
       }
+      // kHeartbeat has no task data to deserialize
       current_task_index_++;
     } else {
       (*archive_)(value);
@@ -737,7 +750,7 @@ private:
 public:
   /** Bulk transfer support - handles both input and output modes */
   void bulk(hipc::Pointer &ptr, size_t size, uint32_t flags) {
-    if (srl_mode_) {
+    if (msg_type_ == MsgType::kSerializeIn) {
       // SerializeIn mode (input) - Get pointer from recv vector at current index
       // The task itself doesn't have a valid pointer during deserialization,
       // so we look into the recv vector and use the FullPtr at the current index
@@ -748,7 +761,7 @@ public:
         // Error: not enough bulk transfers in recv vector
         ptr = hipc::Pointer::GetNull();
       }
-    } else {
+    } else if (msg_type_ == MsgType::kSerializeOut) {
       // SerializeOut mode (output) - Expose the existing pointer using lbm_server
       // and append to recv vector
       if (lbm_server_) {
@@ -760,6 +773,7 @@ public:
         ptr = hipc::Pointer::GetNull();
       }
     }
+    // kHeartbeat has no bulk transfers
   }
 
   /** Get task information */
@@ -770,8 +784,8 @@ public:
     return task_infos_[current_task_index_];
   }
 
-  /** Get serialization mode */
-  bool GetSerializeMode() const { return srl_mode_; }
+  /** Get message type */
+  MsgType GetMsgType() const { return msg_type_; }
 
   /** Reset task index for iteration */
   void ResetTaskIndex() { current_task_index_ = 0; }
@@ -797,7 +811,7 @@ public:
     std::string stream_data;
     // Manually deserialize base class members (send, recv) and derived class
     // members
-    ar(send, recv, task_infos_, srl_mode_, stream_data);
+    ar(send, recv, task_infos_, msg_type_, stream_data);
 
     // Reinitialize stream with deserialized data
     data_ = stream_data;

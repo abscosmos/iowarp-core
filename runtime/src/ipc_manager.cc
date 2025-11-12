@@ -35,6 +35,14 @@ bool IpcManager::ClientInit() {
     return true;
   }
 
+  // Wait for local server to become available - critical for client
+  // functionality TestLocalServer sends heartbeat to verify connectivity
+  if (!WaitForLocalServer()) {
+    HELOG(kError, "CRITICAL ERROR: Cannot connect to local server.");
+    HELOG(kError, "Client initialization failed. Exiting.");
+    return false;
+  }
+
   // Initialize memory segments for client
   if (!ClientInitShm()) {
     return false;
@@ -53,14 +61,6 @@ bool IpcManager::ClientInit() {
   } else {
     HELOG(kError, "Warning: Could not access shared header during ClientInit");
     this_host_ = Host(); // Default constructor gives node_id = 0
-  }
-
-  // Wait for local server to become available - critical for client
-  // functionality
-  if (!WaitForLocalServer()) {
-    HELOG(kError, "CRITICAL ERROR: Cannot connect to local server.");
-    HELOG(kError, "Client initialization failed. Exiting.");
-    return false;
   }
 
   // Initialize HSHM TLS key for task counter
@@ -121,9 +121,6 @@ bool IpcManager::ServerInit() {
   // Initialize HSHM TLS key for task counter (needed for CreateTaskId in
   // runtime)
   HSHM_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
-
-  // Start local ZeroMQ server (optional - failure is non-fatal)
-  StartLocalServer();
 
   // Read lane mapping policy from configuration
   auto *config = CHI_CONFIG_MANAGER;
@@ -430,26 +427,49 @@ bool IpcManager::StartLocalServer() {
     local_server_ = hshm::lbm::TransportFactory::GetServer(
         addr, hshm::lbm::Transport::kZeroMq, protocol, port);
 
-    return local_server_ != nullptr;
+    if (local_server_ != nullptr) {
+      HILOG(kInfo, "Successfully started local server at {}:{}", addr, port);
+      return true;
+    }
+
+    HELOG(kError, "Failed to start local server at {}:{}", addr, port);
+    return false;
   } catch (const std::exception &e) {
+    HELOG(kError, "Exception starting local server: {}", e.what());
     return false;
   }
 }
 
 bool IpcManager::TestLocalServer() {
-  ConfigManager *config = CHI_CONFIG_MANAGER;
-
   try {
-    // Create lightbeam client to test connection to local server
+    ConfigManager *config = CHI_CONFIG_MANAGER;
     std::string addr = "127.0.0.1";
     std::string protocol = "tcp";
-    u32 port = config->GetPort() + 1; // Use ZMQ port + 1 to match local server
+    u32 port = config->GetPort() + 1;
 
     auto client = hshm::lbm::TransportFactory::GetClient(
         addr, hshm::lbm::Transport::kZeroMq, protocol, port);
 
-    return client != nullptr;
-  } catch (...) {
+    if (!client) {
+      return false;
+    }
+
+    // Create empty metadata with heartbeat message type
+    chi::SaveTaskArchive archive(chi::MsgType::kHeartbeat, client.get());
+
+    // Use synchronous send (single attempt, no retry)
+    hshm::lbm::LbmContext ctx(hshm::lbm::LBM_SYNC);
+    int rc = client->Send(archive, ctx);
+
+    if (rc == 0) {
+      HILOG(kDebug, "Successfully sent heartbeat to local server");
+      return true;
+    }
+
+    HELOG(kDebug, "Failed to send heartbeat with error code {}", rc);
+    return false;
+  } catch (const std::exception &e) {
+    HELOG(kWarning, "Exception during heartbeat send: {}", e.what());
     return false;
   }
 }

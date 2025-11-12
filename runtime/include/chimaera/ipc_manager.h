@@ -300,6 +300,14 @@ public:
    */
   const Host &GetThisHost() const;
 
+  /**
+   * Start local ZeroMQ server
+   * Uses ZMQ port + 1 for local server operations
+   * Must be called after ServerInit completes to ensure runtime is ready
+   * @return true if successful, false otherwise
+   */
+  bool StartLocalServer();
+
 private:
   /**
    * Map task to lane ID using the configured policy
@@ -353,13 +361,6 @@ private:
    * @return true if successful, false otherwise
    */
   bool ClientInitQueues();
-
-  /**
-   * Start local ZeroMQ server
-   * Uses ZMQ port + 1 for local server operations
-   * @return true if successful, false otherwise
-   */
-  bool StartLocalServer();
 
   /**
    * Test connection to local server

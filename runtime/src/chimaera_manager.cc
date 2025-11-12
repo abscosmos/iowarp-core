@@ -202,6 +202,14 @@ bool Chimaera::ServerInit() {
     HILOG(kInfo, "Compose processing completed successfully");
   }
 
+  // Start local server last - after all other initialization is complete
+  // This ensures clients can connect only when runtime is fully ready
+  if (!ipc_manager->StartLocalServer()) {
+    HELOG(kError, "Failed to start local server - runtime initialization failed");
+    runtime_is_initializing_ = false;
+    return false;
+  }
+
   return true;
 }
 

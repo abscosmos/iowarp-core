@@ -53,7 +53,7 @@ class Client {
                       u32 flags) = 0;
 
   template <typename MetaT>
-  int Send(MetaT& meta);
+  int Send(MetaT& meta, const struct LbmContext& ctx);
 };
 
 class Server {

@@ -551,7 +551,7 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     hipc::FullPtr<chi::Task> task_ptr(original_task.get());
 
     // Test SaveTask with SerializeIn mode (inputs)
-    chi::SaveTaskArchive save_archive(true);  // true = SerializeIn mode
+    chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
     chi::u32 method = task_ptr->method_;
     REQUIRE_NOTHROW(container.SaveTask(method, save_archive, task_ptr));
     std::string serialized_data = save_archive.GetData();
@@ -564,7 +564,7 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     new_task_ptr->method_ =
         original_task->method_; // LoadTask needs method for switch-case
     chi::LoadTaskArchive load_archive(serialized_data);
-    load_archive.srl_mode_ = true;  // SerializeIn mode
+    load_archive.msg_type_ = chi::MsgType::kSerializeIn;  // SerializeIn mode
     REQUIRE_NOTHROW(container.LoadTask(method, load_archive, new_task_ptr));
 
     // Verify data was loaded (though specific verification depends on
@@ -578,7 +578,7 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     hipc::FullPtr<chi::Task> task_ptr(original_task.get());
 
     // Test SaveTask with SerializeOut mode (outputs)
-    chi::SaveTaskArchive save_archive(false);  // false = SerializeOut mode
+    chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
     chi::u32 method = task_ptr->method_;
     REQUIRE_NOTHROW(container.SaveTask(method, save_archive, task_ptr));
     std::string serialized_data = save_archive.GetData();
@@ -591,7 +591,7 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     new_task_ptr->method_ =
         original_task->method_; // LoadTask needs method for switch-case
     chi::LoadTaskArchive load_archive(serialized_data);
-    load_archive.srl_mode_ = false;  // SerializeOut mode
+    load_archive.msg_type_ = chi::MsgType::kSerializeOut;  // SerializeOut mode
     REQUIRE_NOTHROW(container.LoadTask(method, load_archive, new_task_ptr));
   }
 }
