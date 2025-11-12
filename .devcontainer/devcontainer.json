@@ -6,6 +6,9 @@
     },
     "workspaceFolder": "/workspace",
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+    "containerEnv": {
+        "IOWARP_CORE_ROOT": "${localWorkspaceFolder}"
+    },
     "mounts": [
         "source=${localEnv:HOME}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
         "source=${localEnv:HOME}/.claude,target=/tmp/host-claude,type=bind,readonly",
