@@ -24,7 +24,8 @@
                 "twxs.cmake",
                 "KylinIdeTeam.cppdebug",
                 "llvm-vs-code-extensions.vscode-clangd",
-                "ms-vscode.cmake-tools"
+                "ms-vscode.cmake-tools",
+                "ms-azuretools.vscode-docker"
             ],
             "settings": {
                 "cmake.configureOnOpen": false
