@@ -18,9 +18,8 @@ add_compile_definitions(_CRT_SECURE_NO_DEPRECATE)
 # Options
 # ------------------------------------------------------------------------------
 # CMAKE_EXPORT_COMPILE_COMMANDS is set by root CMakeLists.txt
-option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
-option(HSHM_BUILD_TESTS "Build tests" ON)
-option(HSHM_BUILD_BENCHMARKS "Build benchmarks" OFF)
+# BUILD_SHARED_LIBS is set by root CMakeLists.txt
+# HSHM_ENABLE_TESTS and HSHM_ENABLE_BENCHMARKS are set by root CMakeLists.txt
 
 option(HSHM_ENABLE_MPI "Enable MPI support" OFF)
 option(HSHM_ENABLE_ZMQ "Enable ZeroMQ transport" ON)
@@ -274,12 +273,12 @@ endif()
 set(TEST_MAIN ${HSHM_ROOT}/test/unit)
 # enable_testing() is handled by root CMakeLists.txt
 
-if(HSHM_BUILD_TESTS)
+if(HSHM_ENABLE_TESTS)
     message("Building HSHM unit tests")
     add_subdirectory(test)
 endif()
 
-if(HSHM_BUILD_BENCHMARKS)
+if(HSHM_ENABLE_BENCHMARKS)
     message("Building HSHM benchmarks")
     add_subdirectory(benchmark)
 endif()

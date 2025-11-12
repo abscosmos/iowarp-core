@@ -87,4 +87,15 @@ list(APPEND CMAKE_INSTALL_RPATH "${CAE_INSTALL_LIB_DIR}")
 # -----------------------------------------------------------------------------
 # Build ChiMods
 # -----------------------------------------------------------------------------
+# Note: core/CMakeLists.txt handles adding test subdirectory based on BUILD_TESTING
 add_subdirectory(core)
+
+# -----------------------------------------------------------------------------
+# Build Benchmarks
+# -----------------------------------------------------------------------------
+# Add benchmarks if enabled (currently CAE has no benchmark directory)
+# WRP_CAE_ENABLE_BENCHMARKS is set by root CMakeLists.txt
+# if(WRP_CAE_ENABLE_BENCHMARKS)
+#   add_subdirectory(benchmark)
+#   message(STATUS "CAE benchmarks enabled - added benchmark subdirectory")
+# endif()

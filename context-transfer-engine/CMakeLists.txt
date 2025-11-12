@@ -66,14 +66,22 @@ add_subdirectory(adapter)
 # CTest is included by root CMakeLists.txt
 include(CTest)
 
-# Add tests (skip external tests during internal development)
-add_subdirectory(test)
+# Add tests if enabled
+# WRP_CTE_ENABLE_TESTS is set by root CMakeLists.txt
+if(WRP_CTE_ENABLE_TESTS)
+  add_subdirectory(test)
+  message(STATUS "CTE tests enabled - added test subdirectory")
+endif()
 
 # Add wrapper components (includes Python bindings if enabled)
 add_subdirectory(wrapper)
 
-# Add benchmarks
-add_subdirectory(benchmark)
+# Add benchmarks if enabled
+# WRP_CTE_ENABLE_BENCHMARKS is set by root CMakeLists.txt
+if(WRP_CTE_ENABLE_BENCHMARKS)
+  add_subdirectory(benchmark)
+  message(STATUS "CTE benchmarks enabled - added benchmark subdirectory")
+endif()
 
 message(STATUS "CTE Core and Bdev ChiMods configured for compilation")
 

@@ -4,14 +4,34 @@ project(iowarp-core VERSION 1.0.0 LANGUAGES C CXX)
 #------------------------------------------------------------------------------
 # Project Options
 #------------------------------------------------------------------------------
+# Build configuration
+option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
+
+# Component enable/disable
 option(WRP_CORE_ENABLE_RUNTIME "Enable runtime component" ON)
 option(WRP_CORE_ENABLE_CTE "Enable context-transfer-engine component" ON)
 option(WRP_CORE_ENABLE_CAE "Enable context-assimilation-engine component" ON)
 option(WRP_CORE_ENABLE_CEE "Enable context-exploration-engine component" ON)
+
+# Global options
 option(WRP_CORE_ENABLE_TESTS "Enable testing for all components" ON)
 option(WRP_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" ON)
 option(WRP_CORE_ENABLE_PYTHON "Enable Python bindings for all components" OFF)
 option(WRP_CORE_ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
+
+# Component-specific test options (only effective when WRP_CORE_ENABLE_TESTS=ON)
+option(HSHM_ENABLE_TESTS "Enable tests for context-transport-primitives" ON)
+option(CHIMAERA_ENABLE_TESTS "Enable tests for runtime" ON)
+option(WRP_CTE_ENABLE_TESTS "Enable tests for context-transfer-engine" ON)
+option(WRP_CAE_ENABLE_TESTS "Enable tests for context-assimilation-engine" ON)
+option(WRP_CEE_ENABLE_TESTS "Enable tests for context-exploration-engine" ON)
+
+# Component-specific benchmark options
+option(HSHM_ENABLE_BENCHMARKS "Enable benchmarks for context-transport-primitives" OFF)
+option(CHIMAERA_ENABLE_BENCHMARKS "Enable benchmarks for runtime" OFF)
+option(WRP_CTE_ENABLE_BENCHMARKS "Enable benchmarks for context-transfer-engine" OFF)
+option(WRP_CAE_ENABLE_BENCHMARKS "Enable benchmarks for context-assimilation-engine" OFF)
+option(WRP_CEE_ENABLE_BENCHMARKS "Enable benchmarks for context-exploration-engine" OFF)
 
 # Read environment variables from .env.cmake if enabled
 if(WRP_CORE_ENABLE_CMAKE_DOTENV)
@@ -123,6 +143,12 @@ endif()
 # Component Subdirectories
 #------------------------------------------------------------------------------
 
+# Add Catch2 testing framework if tests are enabled
+if(WRP_CORE_ENABLE_TESTS)
+  message(STATUS "Adding Catch2 testing framework")
+  add_subdirectory(external/Catch2)
+endif()
+
 # Context Transport Primitives (formerly cte-hermes-shm) - Required by runtime
 message(STATUS "Building context-transport-primitives component")
 # Enable ELF support for adapter real API functionality
@@ -170,11 +196,30 @@ endif()
 #------------------------------------------------------------------------------
 message(STATUS "")
 message(STATUS "IOWarp Core Configuration Summary:")
-message(STATUS "  Runtime:                      ${WRP_CORE_ENABLE_RUNTIME}")
-message(STATUS "  Context Transfer Engine:      ${WRP_CORE_ENABLE_CTE}")
-message(STATUS "  Context Assimilation Engine:  ${WRP_CORE_ENABLE_CAE}")
-message(STATUS "  Context Exploration Engine:   ${WRP_CORE_ENABLE_CEE}")
-message(STATUS "  Enable Tests:                 ${WRP_CORE_ENABLE_TESTS}")
-message(STATUS "  Python Bindings:              ${WRP_CORE_ENABLE_PYTHON}")
-message(STATUS "  AddressSanitizer:             ${WRP_CORE_ENABLE_ASAN}")
+message(STATUS "  Build Shared Libraries:       ${BUILD_SHARED_LIBS}")
+message(STATUS "  ")
+message(STATUS "  Component Modules:")
+message(STATUS "    Runtime:                    ${WRP_CORE_ENABLE_RUNTIME}")
+message(STATUS "    Context Transfer Engine:    ${WRP_CORE_ENABLE_CTE}")
+message(STATUS "    Context Assimilation:       ${WRP_CORE_ENABLE_CAE}")
+message(STATUS "    Context Exploration:        ${WRP_CORE_ENABLE_CEE}")
+message(STATUS "  ")
+message(STATUS "  Global Options:")
+message(STATUS "    Enable Tests:               ${WRP_CORE_ENABLE_TESTS}")
+message(STATUS "    Python Bindings:            ${WRP_CORE_ENABLE_PYTHON}")
+message(STATUS "    AddressSanitizer:           ${WRP_CORE_ENABLE_ASAN}")
+message(STATUS "  ")
+message(STATUS "  Component Tests (when WRP_CORE_ENABLE_TESTS=ON):")
+message(STATUS "    HSHM Tests:                 ${HSHM_ENABLE_TESTS}")
+message(STATUS "    Chimaera Tests:             ${CHIMAERA_ENABLE_TESTS}")
+message(STATUS "    CTE Tests:                  ${WRP_CTE_ENABLE_TESTS}")
+message(STATUS "    CAE Tests:                  ${WRP_CAE_ENABLE_TESTS}")
+message(STATUS "    CEE Tests:                  ${WRP_CEE_ENABLE_TESTS}")
+message(STATUS "  ")
+message(STATUS "  Component Benchmarks:")
+message(STATUS "    HSHM Benchmarks:            ${HSHM_ENABLE_BENCHMARKS}")
+message(STATUS "    Chimaera Benchmarks:        ${CHIMAERA_ENABLE_BENCHMARKS}")
+message(STATUS "    CTE Benchmarks:             ${WRP_CTE_ENABLE_BENCHMARKS}")
+message(STATUS "    CAE Benchmarks:             ${WRP_CAE_ENABLE_BENCHMARKS}")
+message(STATUS "    CEE Benchmarks:             ${WRP_CEE_ENABLE_BENCHMARKS}")
 message(STATUS "")

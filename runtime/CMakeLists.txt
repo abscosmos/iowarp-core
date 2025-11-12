@@ -55,10 +55,15 @@ add_subdirectory(src)
 # Add modules subdirectory
 add_subdirectory(modules)
 
-# Add benchmark subdirectory
-add_subdirectory(benchmark)
+# Add benchmark subdirectory if benchmarks are enabled
+# CHIMAERA_ENABLE_BENCHMARKS is set by root CMakeLists.txt
+if(CHIMAERA_ENABLE_BENCHMARKS)
+  add_subdirectory(benchmark)
+  message(STATUS "Benchmarks enabled - added benchmark subdirectory")
+endif()
 
 # Add test subdirectory if testing is enabled
+# CHIMAERA_ENABLE_TESTS is set by root CMakeLists.txt
 if(CHIMAERA_ENABLE_TESTS)
   # enable_testing() is handled by root CMakeLists.txt
   add_subdirectory(test)

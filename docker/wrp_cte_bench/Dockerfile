@@ -7,15 +7,15 @@
 #
 # Note: This container uses environment variables only and automatically stops the Chimaera runtime after benchmark completion
 
-FROM iowarp/context-transfer-engine-build:latest
+FROM iowarp/core-build:latest
 
 # Create benchmark directory
 RUN sudo mkdir -p /benchmarks && \
     sudo chown -R iowarp:ubuntu /benchmarks
 
 # Copy the benchmark script and configuration file
-COPY benchmark/wrp_cte_bench.sh /benchmarks/wrp_cte_bench.sh
-COPY benchmark/cte_config_ram.yaml /benchmarks/cte_config.yaml
+COPY context-transfer-engine/benchmark/wrp_cte_bench.sh /benchmarks/wrp_cte_bench.sh
+COPY context-transfer-engine/benchmark/cte_config_ram.yaml /benchmarks/cte_config.yaml
 
 # Make the script executable
 RUN sudo chmod +x /benchmarks/wrp_cte_bench.sh

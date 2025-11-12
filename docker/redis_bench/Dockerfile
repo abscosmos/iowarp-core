@@ -7,7 +7,7 @@
 #   docker run iowarp/cte-redis-bench:latest SetGet 4 1m 10000
 #   docker run iowarp/cte-redis-bench:latest All 4 1m 10000
 
-FROM iowarp/context-transfer-engine-build:latest
+FROM iowarp/core-build:latest
 
 # Install Redis server and tools
 # Using redis from Ubuntu repositories for simplicity and stability
@@ -21,7 +21,7 @@ RUN sudo mkdir -p /benchmarks && \
     sudo chown -R iowarp:ubuntu /benchmarks
 
 # Copy the Redis benchmark script
-COPY benchmark/redis_bench.sh /benchmarks/redis_bench.sh
+COPY context-transfer-engine/benchmark/redis_bench.sh /benchmarks/redis_bench.sh
 
 # Make the script executable
 RUN sudo chmod +x /benchmarks/redis_bench.sh

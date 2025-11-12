@@ -1,3 +1,3 @@
-# Deployment Dockerfile for Content Transfer Engine (CTE)
-# Inherits from the build container and runs launch_cte
-FROM iowarp/context-transfer-engine-build:latest
+# Deployment Dockerfile for IOWarp Core
+# Inherits from the build container
+FROM iowarp/core-build:latest
