@@ -223,43 +223,22 @@ public:
   }
 
   /**
-   * Get the number of nodes from the hostfile
-   * @return Number of nodes/containers in the distributed setup
+   * Get the number of containers from environment variable
+   * @return Number of containers in the distributed setup
    */
-  chi::u32 getNumNodesFromHostfile() const {
-    // Check for hostfile in common locations
-    const char* hostfile_env = std::getenv("CHI_HOSTFILE");
-    std::vector<std::string> hostfile_paths;
-
-    if (hostfile_env) {
-      hostfile_paths.push_back(hostfile_env);
-    }
-    hostfile_paths.push_back("/etc/iowarp/hostfile");
-    hostfile_paths.push_back("./hostfile");
-    hostfile_paths.push_back("../distributed/hostfile");
-
-    for (const auto& path : hostfile_paths) {
-      std::ifstream hostfile(path);
-      if (hostfile.is_open()) {
-        chi::u32 node_count = 0;
-        std::string line;
-        while (std::getline(hostfile, line)) {
-          // Skip empty lines and comments
-          if (!line.empty() && line[0] != '#') {
-            node_count++;
-          }
-        }
-        // If hostfile exists but is empty, default to 1 node
-        if (node_count == 0) {
-          node_count = 1;
-        }
-        HILOG(kInfo, "Found {} nodes in hostfile: {}", node_count, path);
-        return node_count;
+  chi::u32 getNumContainers() const {
+    // First check CHI_NUM_CONTAINERS environment variable
+    const char* num_containers_env = std::getenv("CHI_NUM_CONTAINERS");
+    if (num_containers_env) {
+      chi::u32 num_containers = std::atoi(num_containers_env);
+      if (num_containers > 0) {
+        HILOG(kInfo, "Using CHI_NUM_CONTAINERS={} from environment", num_containers);
+        return num_containers;
       }
     }
 
-    // Default to 1 for local/non-distributed tests (no hostfile found)
-    HILOG(kInfo, "No hostfile found, defaulting to 1 node (local test)");
+    // Default to 1 for local/non-distributed tests
+    HILOG(kInfo, "CHI_NUM_CONTAINERS not set, defaulting to 1 container (local test)");
     return 1;
   }
 
@@ -350,8 +329,9 @@ TEST_CASE("bdev_block_allocation_4kb", "[bdev][allocate][4kb]") {
     REQUIRE(success);
 
     // Allocate multiple 4KB blocks using DirectHash for distributed execution
-    // Get number of containers from hostfile (one container per node)
-    const chi::u32 num_containers = fixture.getNumNodesFromHostfile();
+    // Get number of containers from environment variable
+    const chi::u32 num_containers = fixture.getNumContainers();
+    HILOG(kInfo, "Running test with num_containers={}", num_containers);
     std::vector<chimaera::bdev::Block> blocks;
 
     for (int i = 0; i < 16; ++i) {
@@ -371,6 +351,8 @@ TEST_CASE("bdev_block_allocation_4kb", "[bdev][allocate][4kb]") {
       chi::ContainerId expected_completer = static_cast<chi::ContainerId>(i % num_containers);
       chi::ContainerId actual_completer = alloc_task->GetCompleter();
 
+      HILOG(kInfo, "Iteration {}: DirectHash({}) -> completer={}, expected={} (num_containers={})",
+            i, i, actual_completer, expected_completer, num_containers);
       REQUIRE(actual_completer == expected_completer);
       HILOG(kInfo, "Allocated 4KB block {}: offset={}, size={}, completer={} (expected={})",
             i, block.offset_, block.size_, actual_completer, expected_completer);
@@ -412,8 +394,9 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
     REQUIRE(success);
 
     // Run write/read operations using DirectHash for distributed execution
-    // Get number of containers from hostfile (one container per node)
-    const chi::u32 num_containers = fixture.getNumNodesFromHostfile();
+    // Get number of containers from environment variable
+    const chi::u32 num_containers = fixture.getNumContainers();
+    HILOG(kInfo, "Running test with num_containers={}", num_containers);
 
     for (int i = 0; i < 16; ++i) {
       auto pool_query = chi::PoolQuery::DirectHash(i);
@@ -429,9 +412,9 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
       chimaera::bdev::Block block = alloc_task->blocks_[0];
 
       // Verify allocate task completer
+      HILOG(kInfo, "Iteration {}: DirectHash({}) Allocate -> completer={}, expected={} (num_containers={})",
+            i, i, alloc_task->GetCompleter(), expected_completer, num_containers);
       REQUIRE(alloc_task->GetCompleter() == expected_completer);
-      HILOG(kInfo, "Iteration {}: Allocate completed by container {} (expected={})",
-            i, alloc_task->GetCompleter(), expected_completer);
       CHI_IPC->DelTask(alloc_task);
 
       // Generate test data
