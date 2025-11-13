@@ -112,10 +112,11 @@ class Heap {
   Heap();
 
   /**
-   * Initialize heap with total size
+   * Initialize heap with total size and alignment
    * @param total_size Total size available for allocation
+   * @param alignment Alignment requirement for offsets and sizes (default 4096)
    */
-  void Init(chi::u64 total_size);
+  void Init(chi::u64 total_size, chi::u32 alignment = 4096);
 
   /**
    * Allocate a block from the heap
@@ -126,9 +127,16 @@ class Heap {
    */
   bool Allocate(size_t block_size, int block_type, Block& block);
 
+  /**
+   * Get remaining allocatable space
+   * @return Number of bytes remaining for allocation
+   */
+  chi::u64 GetRemainingSize() const;
+
  private:
   std::atomic<chi::u64> heap_;
   chi::u64 total_size_;
+  chi::u32 alignment_;
 };
 
 /**

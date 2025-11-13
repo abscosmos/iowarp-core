@@ -420,21 +420,22 @@ struct FreeBlocksTask : public chi::Task {
  */
 struct WriteTask : public chi::Task {
   // Task-specific data
-  IN Block block_;             // Block to write to
-  IN hipc::Pointer data_;      // Data to write (pointer-based)
-  IN size_t length_;           // Size of data to write
-  OUT chi::u64 bytes_written_; // Number of bytes actually written
+  IN ArrayVector<Block, 16> blocks_; // Blocks to write to (max 16 blocks)
+  IN hipc::Pointer data_;            // Data to write (pointer-based)
+  IN size_t length_;                 // Size of data to write
+  OUT chi::u64 bytes_written_;       // Number of bytes actually written
 
   /** SHM default constructor */
   explicit WriteTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), length_(0), bytes_written_(0) {}
+      : chi::Task(alloc), blocks_(), length_(0), bytes_written_(0) {}
 
   /** Emplace constructor */
   explicit WriteTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
                      const chi::TaskId &task_node, const chi::PoolId &pool_id,
-                     const chi::PoolQuery &pool_query, const Block &block,
+                     const chi::PoolQuery &pool_query,
+                     const ArrayVector<Block, 16> &blocks,
                      hipc::Pointer data, size_t length)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10), block_(block),
+      : chi::Task(alloc, task_node, pool_id, pool_query, 10), blocks_(blocks),
         data_(data), length_(length), bytes_written_(0) {
     // Initialize task
     task_id_ = task_node;
@@ -456,7 +457,7 @@ struct WriteTask : public chi::Task {
 
   /** Serialize IN and INOUT parameters */
   template <typename Archive> void SerializeIn(Archive &ar) {
-    ar(block_, length_);
+    ar(blocks_, length_);
     // Use bulk transfer for data pointer - BULK_XFER for actual data
     // transmission
     ar.bulk(data_, length_, BULK_XFER);
@@ -477,7 +478,7 @@ struct WriteTask : public chi::Task {
   void Copy(const hipc::FullPtr<WriteTask> &other) {
     // Copy base Task fields
     // Copy WriteTask-specific fields
-    block_ = other->block_;
+    blocks_ = other->blocks_;
     data_ = other->data_;
     length_ = other->length_;
     bytes_written_ = other->bytes_written_;
@@ -489,22 +490,23 @@ struct WriteTask : public chi::Task {
  */
 struct ReadTask : public chi::Task {
   // Task-specific data
-  IN Block block_;         // Block to read from
-  OUT hipc::Pointer data_; // Read data (pointer-based)
+  IN ArrayVector<Block, 16> blocks_; // Blocks to read from (max 16 blocks)
+  OUT hipc::Pointer data_;           // Read data (pointer-based)
   INOUT size_t
       length_; // Size of data buffer (IN: buffer size, OUT: actual size)
   OUT chi::u64 bytes_read_; // Number of bytes actually read
 
   /** SHM default constructor */
   explicit ReadTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), length_(0), bytes_read_(0) {}
+      : chi::Task(alloc), blocks_(), length_(0), bytes_read_(0) {}
 
   /** Emplace constructor */
   explicit ReadTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
                     const chi::TaskId &task_node, const chi::PoolId &pool_id,
-                    const chi::PoolQuery &pool_query, const Block &block,
+                    const chi::PoolQuery &pool_query,
+                    const ArrayVector<Block, 16> &blocks,
                     hipc::Pointer data, size_t length)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10), block_(block),
+      : chi::Task(alloc, task_node, pool_id, pool_query, 10), blocks_(blocks),
         data_(data), length_(length), bytes_read_(0) {
     // Initialize task
     task_id_ = task_node;
@@ -526,7 +528,7 @@ struct ReadTask : public chi::Task {
 
   /** Serialize IN and INOUT parameters */
   template <typename Archive> void SerializeIn(Archive &ar) {
-    ar(block_, length_);
+    ar(blocks_, length_);
     // Use BULK_EXPOSE to indicate metadata only - receiver will allocate buffer
     ar.bulk(data_, length_, BULK_EXPOSE);
   }
@@ -545,7 +547,7 @@ struct ReadTask : public chi::Task {
   void Copy(const hipc::FullPtr<ReadTask> &other) {
     // Copy base Task fields
     // Copy ReadTask-specific fields
-    block_ = other->block_;
+    blocks_ = other->blocks_;
     data_ = other->data_;
     length_ = other->length_;
     bytes_read_ = other->bytes_read_;

@@ -141,7 +141,7 @@ endif()
 # ------------------------------------------------------------------------------
 # External libraries
 # ------------------------------------------------------------------------------
-include(cmake/HermesShmCommonConfig.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/HermesShmCommonConfig.cmake)
 
 # CMAKE_EXPORT_COMPILE_COMMANDS and RPATH settings are set by root CMakeLists.txt
 list(APPEND CMAKE_INSTALL_RPATH "${HSHM_INSTALL_LIB_DIR}")

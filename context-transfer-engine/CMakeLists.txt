@@ -31,7 +31,7 @@ else()
 endif()
 
 # Determine which HermesShm target to use (for both installed and subdirectory modes)
-include(FindHSHMTarget)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindHSHMTarget.cmake)
 
 if(NOT TARGET chimaera::admin_client AND NOT TARGET chimaera_admin_client)
   find_package(chimaera_admin REQUIRED)        # Admin ChiMod (often required for ChiMod operations)

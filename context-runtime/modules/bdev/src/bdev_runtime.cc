@@ -10,13 +10,13 @@
 
 namespace chimaera::bdev {
 
-// Block size constants (in bytes) - 256B, 1KB, 4KB, 64KB, 128KB
+// Block size constants (in bytes) - 4KB, 16KB, 32KB, 64KB, 128KB
 static const size_t kBlockSizes[] = {
-    256,   // 256B
-    1024,  // 1KB
-    4096,  // 4KB
-    65536, // 64KB
-    131072 // 128KB
+    4096,   // 4KB
+    16384,  // 16KB
+    32768,  // 32KB
+    65536,  // 64KB
+    131072  // 128KB
 };
 
 //===========================================================================
@@ -142,28 +142,47 @@ bool GlobalBlockMap::FreeBlock(int worker, Block &block) {
 // Heap Implementation
 //===========================================================================
 
-Heap::Heap() : heap_(0), total_size_(0) {}
+Heap::Heap() : heap_(0), total_size_(0), alignment_(4096) {}
 
-void Heap::Init(chi::u64 total_size) {
+void Heap::Init(chi::u64 total_size, chi::u32 alignment) {
   total_size_ = total_size;
+  alignment_ = (alignment == 0) ? 4096 : alignment;
   heap_.store(0);
 }
 
 bool Heap::Allocate(size_t block_size, int block_type, Block &block) {
-  // Atomic fetch-and-add to allocate from heap
-  chi::u64 old_heap = heap_.fetch_add(block_size);
+  // Align the requested block size to alignment boundary for O_DIRECT I/O
+  // Formula: aligned_size = ((block_size + alignment_ - 1) / alignment_) * alignment_
+  chi::u32 alignment = (alignment_ == 0) ? 4096 : alignment_;
 
-  if (old_heap + block_size > total_size_) {
+  // Align the requested size
+  chi::u64 aligned_size =
+      ((block_size + alignment - 1) / alignment) * alignment;
+  HILOG(kInfo,
+        "Allocating block: block_size = {}, alignment = {}, aligned_size = {}",
+        block_size, alignment, aligned_size);
+
+  // Atomic fetch-and-add to allocate from heap using aligned size
+  chi::u64 old_heap = heap_.fetch_add(aligned_size);
+
+  if (old_heap + aligned_size > total_size_) {
     // Out of space - rollback
-    heap_.fetch_sub(block_size);
     return false;
   }
 
-  // Allocation successful
+  // Allocation successful - both offset and size are aligned
   block.offset_ = old_heap;
-  block.size_ = block_size;
+  block.size_ = aligned_size;
   block.block_type_ = static_cast<chi::u32>(block_type);
   return true;
+}
+
+chi::u64 Heap::GetRemainingSize() const {
+  chi::u64 current_heap = heap_.load();
+  if (current_heap >= total_size_) {
+    return 0;
+  }
+  return total_size_ - current_heap;
 }
 
 Runtime::~Runtime() {
@@ -221,6 +240,8 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
     }
 
     file_size_ = st.st_size;
+    HILOG(kInfo, "File stat: st.st_size={}, params.total_size={}", file_size_, params.total_size_);
+
     if (params.total_size_ > 0 && params.total_size_ < file_size_) {
       file_size_ = params.total_size_;
     }
@@ -229,13 +250,17 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
     if (file_size_ == 0) {
       file_size_ = (params.total_size_ > 0) ? params.total_size_
                                             : (1ULL << 30); // 1GB default
+      HILOG(kInfo, "File is empty, setting file_size_ to {} and calling ftruncate", file_size_);
       if (ftruncate(file_fd_, file_size_) != 0) {
         task->return_code_ = 3;
+        HELOG(kError, "Failed to truncate file: {}, errno: {}, strerror: {}", pool_name, errno, strerror(errno));
         close(file_fd_);
         file_fd_ = -1;
         return;
       }
+      HILOG(kInfo, "ftruncate succeeded, file_size_={}", file_size_);
     }
+    HILOG(kInfo, "Create: Final file_size_={}, initializing allocator", file_size_);
 
     // Initialize async I/O for file backend
     InitializeAsyncIO();
@@ -422,8 +447,10 @@ void Runtime::Read(hipc::FullPtr<ReadTask> task, chi::RunContext &ctx) {
 void Runtime::GetStats(hipc::FullPtr<GetStatsTask> task, chi::RunContext &ctx) {
   // Return the user-provided performance characteristics
   task->metrics_ = perf_metrics_;
-  // Note: remaining_size tracking is now handled by GlobalBlockMap and Heap
-  task->remaining_size_ = 0; // Not tracked in new allocator
+  // Get remaining size from heap allocator
+  chi::u64 remaining = heap_.GetRemainingSize();
+  task->remaining_size_ = remaining;
+  HILOG(kInfo, "GetStats: file_size_={}, remaining={}", file_size_, remaining);
   task->return_code_ = 0;
 }
 
@@ -443,8 +470,8 @@ void Runtime::InitializeAllocator() {
   // Initialize global block map with number of workers
   global_block_map_.Init(kMaxWorkers);
 
-  // Initialize heap with total file size
-  heap_.Init(file_size_);
+  // Initialize heap with total file size and alignment requirement
+  heap_.Init(file_size_, alignment_);
 }
 
 size_t Runtime::GetBlockSize(int block_type) {
@@ -522,6 +549,7 @@ chi::u32 Runtime::PerformAsyncIO(bool is_write, chi::u64 offset, void *buffer,
       break;
     } else if (error_code != EINPROGRESS) {
       // Operation failed
+      HELOG(kError, "Failed to perform async I/O: {}, errno: {}, strerror: {}", error_code, errno, strerror(errno));
       return 3;
     }
     // Operation still in progress, yield the current task
@@ -547,83 +575,127 @@ void Runtime::WriteToFile(hipc::FullPtr<WriteTask> task) {
   // Convert hipc::Pointer to hipc::FullPtr<char> for data access
   hipc::FullPtr<char> data_ptr(task->data_);
 
-  // Align buffer for direct I/O
-  chi::u64 aligned_size = AlignSize(task->length_);
+  chi::u64 total_bytes_written = 0;
+  chi::u64 data_offset = 0;
 
-  // Check if the buffer is already aligned
-  bool is_aligned =
-      (reinterpret_cast<uintptr_t>(data_ptr.ptr_) % alignment_ == 0) &&
-      (task->length_ == aligned_size);
+  // Iterate over all blocks
+  for (size_t i = 0; i < task->blocks_.size(); ++i) {
+    const Block& block = task->blocks_[i];
 
-  void *buffer_to_use;
-  void *aligned_buffer = nullptr;
-  bool needs_free = false;
+    // Calculate how much data to write to this block
+    chi::u64 remaining = task->length_ - total_bytes_written;
+    if (remaining == 0) {
+      break; // All data has been written
+    }
+    chi::u64 block_write_size = std::min(remaining, block.size_);
 
-  if (is_aligned) {
-    // Buffer is already aligned, use it directly
-    buffer_to_use = data_ptr.ptr_;
-  } else {
-    // Allocate aligned buffer
-    if (posix_memalign(&aligned_buffer, alignment_, aligned_size) != 0) {
-      task->return_code_ = 1;
-      task->bytes_written_ = 0;
+    // Get data pointer offset for this block
+    void* block_data = data_ptr.ptr_ + data_offset;
+
+    // Align buffer for direct I/O
+    chi::u64 aligned_size = AlignSize(block_write_size);
+
+    // Check if the buffer is already aligned
+    bool is_aligned =
+        (reinterpret_cast<uintptr_t>(block_data) % alignment_ == 0) &&
+        (block_write_size == aligned_size);
+
+    void* buffer_to_use;
+    void* aligned_buffer = nullptr;
+    bool needs_free = false;
+
+    if (is_aligned) {
+      // Buffer is already aligned, use it directly
+      buffer_to_use = block_data;
+    } else {
+      // Allocate aligned buffer
+      if (posix_memalign(&aligned_buffer, alignment_, aligned_size) != 0) {
+        task->return_code_ = 1;
+        task->bytes_written_ = total_bytes_written;
+        return;
+      }
+      needs_free = true;
+      buffer_to_use = aligned_buffer;
+
+      // Copy data to aligned buffer
+      memcpy(aligned_buffer, block_data, block_write_size);
+      if (aligned_size > block_write_size) {
+        memset(static_cast<char*>(aligned_buffer) + block_write_size, 0,
+               aligned_size - block_write_size);
+      }
+    }
+
+    // Perform async write using POSIX AIO
+    chi::u64 bytes_written;
+    chi::u32 result = PerformAsyncIO(true, block.offset_, buffer_to_use,
+                                      aligned_size, bytes_written,
+                                      task.Cast<chi::Task>());
+
+    if (needs_free) {
+      free(aligned_buffer);
+    }
+
+    if (result != 0) {
+      task->return_code_ = result;
+      task->bytes_written_ = total_bytes_written;
       return;
     }
-    needs_free = true;
-    buffer_to_use = aligned_buffer;
 
-    // Copy data to aligned buffer
-    memcpy(aligned_buffer, data_ptr.ptr_, task->length_);
-    if (aligned_size > task->length_) {
-      memset(static_cast<char *>(aligned_buffer) + task->length_, 0,
-             aligned_size - task->length_);
-    }
+    // Update counters
+    chi::u64 actual_bytes = std::min(bytes_written, block_write_size);
+    total_bytes_written += actual_bytes;
+    data_offset += actual_bytes;
   }
 
-  // Perform async write using POSIX AIO
-  chi::u64 bytes_written;
-  chi::u32 result =
-      PerformAsyncIO(true, task->block_.offset_, buffer_to_use, aligned_size,
-                     bytes_written, task.Cast<chi::Task>());
+  // Update task results
+  task->return_code_ = 0;
+  task->bytes_written_ = total_bytes_written;
 
-  if (needs_free) {
-    free(aligned_buffer);
-  }
-
-  if (result != 0) {
-    task->return_code_ = result;
-    task->bytes_written_ = 0;
-  } else {
-    task->return_code_ = 0;
-    task->bytes_written_ =
-        std::min(bytes_written, static_cast<chi::u64>(task->length_));
-
-    // Update performance metrics
-    total_writes_.fetch_add(1);
-    total_bytes_written_.fetch_add(task->bytes_written_);
-  }
+  // Update performance metrics
+  total_writes_.fetch_add(1);
+  total_bytes_written_.fetch_add(task->bytes_written_);
 }
 
 void Runtime::WriteToRam(hipc::FullPtr<WriteTask> task) {
   // Convert hipc::Pointer to hipc::FullPtr<char> for data access
   hipc::FullPtr<char> data_ptr(task->data_);
 
-  // Check bounds
-  if (task->block_.offset_ + task->length_ > ram_size_) {
-    task->return_code_ = 1; // Write beyond buffer bounds
-    task->bytes_written_ = 0;
-    HELOG(kError,
-          "Write to RAM beyond buffer bounds offset: {}, length: {}, ram_size: "
-          "{}",
-          task->block_.offset_, task->length_, ram_size_);
-    return;
+  chi::u64 total_bytes_written = 0;
+  chi::u64 data_offset = 0;
+
+  // Iterate over all blocks
+  for (size_t i = 0; i < task->blocks_.size(); ++i) {
+    const Block& block = task->blocks_[i];
+
+    // Calculate how much data to write to this block
+    chi::u64 remaining = task->length_ - total_bytes_written;
+    if (remaining == 0) {
+      break; // All data has been written
+    }
+    chi::u64 block_write_size = std::min(remaining, block.size_);
+
+    // Check bounds
+    if (block.offset_ + block_write_size > ram_size_) {
+      task->return_code_ = 1; // Write beyond buffer bounds
+      task->bytes_written_ = total_bytes_written;
+      HELOG(kError,
+            "Write to RAM beyond buffer bounds offset: {}, length: {}, "
+            "ram_size: {}",
+            block.offset_, block_write_size, ram_size_);
+      return;
+    }
+
+    // Simple memory copy
+    memcpy(ram_buffer_ + block.offset_, data_ptr.ptr_ + data_offset,
+           block_write_size);
+
+    // Update counters
+    total_bytes_written += block_write_size;
+    data_offset += block_write_size;
   }
 
-  // Simple memory copy
-  memcpy(ram_buffer_ + task->block_.offset_, data_ptr.ptr_, task->length_);
-
   task->return_code_ = 0;
-  task->bytes_written_ = task->length_;
+  task->bytes_written_ = total_bytes_written;
 
   // Update performance metrics
   total_writes_.fetch_add(1);
@@ -635,87 +707,129 @@ void Runtime::ReadFromFile(hipc::FullPtr<ReadTask> task) {
   // Convert hipc::Pointer to hipc::FullPtr<char> for data access
   hipc::FullPtr<char> data_ptr(task->data_);
 
-  // Align buffer for direct I/O
-  chi::u64 aligned_size = AlignSize(task->block_.size_);
+  chi::u64 total_bytes_read = 0;
+  chi::u64 data_offset = 0;
 
-  // Check if the buffer is already aligned
-  bool is_aligned =
-      (reinterpret_cast<uintptr_t>(data_ptr.ptr_) % alignment_ == 0) &&
-      (task->block_.size_ == aligned_size);
+  // Iterate over all blocks
+  for (size_t i = 0; i < task->blocks_.size(); ++i) {
+    const Block& block = task->blocks_[i];
 
-  void *buffer_to_use;
-  void *aligned_buffer = nullptr;
-  bool needs_free = false;
+    // Calculate how much data to read from this block
+    chi::u64 remaining = task->length_ - total_bytes_read;
+    if (remaining == 0) {
+      break; // All data has been read
+    }
+    chi::u64 block_read_size = std::min(remaining, block.size_);
 
-  if (is_aligned) {
-    // Buffer is already aligned, use it directly
-    buffer_to_use = data_ptr.ptr_;
-  } else {
-    // Allocate aligned buffer
-    if (posix_memalign(&aligned_buffer, alignment_, aligned_size) != 0) {
-      task->return_code_ = 1;
-      task->bytes_read_ = 0;
+    // Get data pointer offset for this block
+    void* block_data = data_ptr.ptr_ + data_offset;
+
+    // Align buffer for direct I/O
+    chi::u64 aligned_size = AlignSize(block_read_size);
+
+    // Check if the buffer is already aligned
+    bool is_aligned =
+        (reinterpret_cast<uintptr_t>(block_data) % alignment_ == 0) &&
+        (block_read_size >= aligned_size);
+
+    void* buffer_to_use;
+    void* aligned_buffer = nullptr;
+    bool needs_free = false;
+
+    if (is_aligned) {
+      // Buffer is already aligned, use it directly
+      buffer_to_use = block_data;
+    } else {
+      // Allocate aligned buffer
+      if (posix_memalign(&aligned_buffer, alignment_, aligned_size) != 0) {
+        task->return_code_ = 1;
+        task->bytes_read_ = total_bytes_read;
+        return;
+      }
+      needs_free = true;
+      buffer_to_use = aligned_buffer;
+    }
+
+    // Perform async read using POSIX AIO
+    chi::u64 bytes_read;
+    chi::u32 result = PerformAsyncIO(false, block.offset_, buffer_to_use,
+                                      aligned_size, bytes_read,
+                                      task.Cast<chi::Task>());
+
+    if (result != 0) {
+      task->return_code_ = result;
+      task->bytes_read_ = total_bytes_read;
+      if (needs_free) {
+        free(aligned_buffer);
+      }
       return;
     }
-    needs_free = true;
-    buffer_to_use = aligned_buffer;
-  }
 
-  // Perform async read using POSIX AIO
-  chi::u64 bytes_read;
-  chi::u32 result =
-      PerformAsyncIO(false, task->block_.offset_, buffer_to_use, aligned_size,
-                     bytes_read, task.Cast<chi::Task>());
+    // Copy data to task output if we used an aligned buffer
+    chi::u64 actual_bytes = std::min(bytes_read, block_read_size);
 
-  if (result != 0) {
-    task->return_code_ = result;
-    task->bytes_read_ = 0;
     if (needs_free) {
+      memcpy(block_data, aligned_buffer, actual_bytes);
       free(aligned_buffer);
     }
-    return;
-  }
 
-  // Copy data to task output if we used an aligned buffer
-  chi::u64 actual_bytes = std::min(bytes_read, task->block_.size_);
-  chi::u64 available_space =
-      std::min(actual_bytes, static_cast<chi::u64>(task->length_));
-
-  if (needs_free) {
-    memcpy(data_ptr.ptr_, aligned_buffer, available_space);
-    free(aligned_buffer);
+    // Update counters
+    total_bytes_read += actual_bytes;
+    data_offset += actual_bytes;
   }
 
   task->return_code_ = 0;
-  task->bytes_read_ = available_space;
+  task->bytes_read_ = total_bytes_read;
 
   // Update performance metrics
   total_reads_.fetch_add(1);
-  total_bytes_read_.fetch_add(available_space);
+  total_bytes_read_.fetch_add(total_bytes_read);
 }
 
 void Runtime::ReadFromRam(hipc::FullPtr<ReadTask> task) {
   // Convert hipc::Pointer to hipc::FullPtr<char> for data access
   hipc::FullPtr<char> data_ptr(task->data_);
 
-  // Check bounds
-  if (task->block_.offset_ + task->block_.size_ > ram_size_) {
-    task->return_code_ = 1; // Read beyond buffer bounds
-    task->bytes_read_ = 0;
-    return;
+  chi::u64 total_bytes_read = 0;
+  chi::u64 data_offset = 0;
+
+  // Iterate over all blocks
+  for (size_t i = 0; i < task->blocks_.size(); ++i) {
+    const Block& block = task->blocks_[i];
+
+    // Calculate how much data to read from this block
+    chi::u64 remaining = task->length_ - total_bytes_read;
+    if (remaining == 0) {
+      break; // All data has been read
+    }
+    chi::u64 block_read_size = std::min(remaining, block.size_);
+
+    // Check bounds
+    if (block.offset_ + block_read_size > ram_size_) {
+      task->return_code_ = 1; // Read beyond buffer bounds
+      task->bytes_read_ = total_bytes_read;
+      HELOG(kError,
+            "Read from RAM beyond buffer bounds offset: {}, length: {}, "
+            "ram_size: {}",
+            block.offset_, block_read_size, ram_size_);
+      return;
+    }
+
+    // Copy data from RAM buffer to task output
+    memcpy(data_ptr.ptr_ + data_offset, ram_buffer_ + block.offset_,
+           block_read_size);
+
+    // Update counters
+    total_bytes_read += block_read_size;
+    data_offset += block_read_size;
   }
 
-  // Copy data from RAM buffer to task output (limit by available buffer space)
-  chi::u64 available_space =
-      std::min(task->block_.size_, static_cast<chi::u64>(task->length_));
-  memcpy(data_ptr.ptr_, ram_buffer_ + task->block_.offset_, available_space);
-
   task->return_code_ = 0;
-  task->bytes_read_ = available_space;
+  task->bytes_read_ = total_bytes_read;
 
   // Update performance metrics
   total_reads_.fetch_add(1);
-  total_bytes_read_.fetch_add(available_space);
+  total_bytes_read_.fetch_add(total_bytes_read);
 }
 
 // VIRTUAL METHOD IMPLEMENTATIONS (now in autogen/bdev_lib_exec.cc)

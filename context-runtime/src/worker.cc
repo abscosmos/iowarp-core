@@ -431,6 +431,9 @@ bool Worker::RouteLocal(const FullPtr<Task> &task_ptr, TaskLane *lane,
     return false;
   }
 
+  // Set the completer_ field to track which container will execute this task
+  task_ptr->SetCompleter(container->container_id_);
+
   // Task is local and should be executed directly
   // Set TASK_ROUTED flag to indicate this task has been routed
   task_ptr->SetFlags(TASK_ROUTED);

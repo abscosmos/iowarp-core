@@ -25,7 +25,7 @@ services:
         chimaera_start_runtime &
         RUNTIME_PID=\$! &&
         echo 'Node 1: Runtime started (PID \$RUNTIME_PID). Running distributed tests...' &&
-        chimaera_bdev_chimod_tests bdev_file_explicit_backend &&
+        chimaera_bdev_chimod_tests &&
         echo 'Node 1: Tests completed.' &&
         kill \$RUNTIME_PID &&
         wait \$RUNTIME_PID

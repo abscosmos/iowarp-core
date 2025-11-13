@@ -149,11 +149,12 @@ class Client : public chi::ContainerClient {
   }
 
   /**
-   * Write data to block - synchronous
+   * Write data to blocks - synchronous
    */
   chi::u64 Write(const hipc::MemContext& mctx, const chi::PoolQuery& pool_query,
-                 const Block& block, hipc::Pointer data, size_t length) {
-    auto task = AsyncWrite(mctx, pool_query, block, data, length);
+                 const ArrayVector<Block, 16>& blocks, hipc::Pointer data,
+                 size_t length) {
+    auto task = AsyncWrite(mctx, pool_query, blocks, data, length);
     task->Wait();
     chi::u64 bytes_written = task->bytes_written_;
     CHI_IPC->DelTask(task);
@@ -161,27 +162,28 @@ class Client : public chi::ContainerClient {
   }
 
   /**
-   * Write data to block - asynchronous
+   * Write data to blocks - asynchronous
    */
   hipc::FullPtr<chimaera::bdev::WriteTask> AsyncWrite(
       const hipc::MemContext& mctx, const chi::PoolQuery& pool_query,
-      const Block& block, hipc::Pointer data, size_t length) {
+      const ArrayVector<Block, 16>& blocks, hipc::Pointer data, size_t length) {
     auto* ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<chimaera::bdev::WriteTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, block, data, length);
+        chi::CreateTaskId(), pool_id_, pool_query, blocks, data, length);
 
     ipc_manager->Enqueue(task);
     return task;
   }
 
   /**
-   * Read data from block - synchronous
+   * Read data from blocks - synchronous
    * Allocates buffer and returns pointer and size via output parameters
    */
   chi::u64 Read(const hipc::MemContext& mctx, const chi::PoolQuery& pool_query,
-                const Block& block, hipc::Pointer& data_out, size_t buffer_size) {
-    auto task = AsyncRead(mctx, pool_query, block, data_out, buffer_size);
+                const ArrayVector<Block, 16>& blocks, hipc::Pointer& data_out,
+                size_t buffer_size) {
+    auto task = AsyncRead(mctx, pool_query, blocks, data_out, buffer_size);
     task->Wait();
     chi::u64 bytes_read = task->bytes_read_;
     CHI_IPC->DelTask(task);
@@ -189,15 +191,16 @@ class Client : public chi::ContainerClient {
   }
 
   /**
-   * Read data from block - asynchronous
+   * Read data from blocks - asynchronous
    */
   hipc::FullPtr<chimaera::bdev::ReadTask> AsyncRead(
       const hipc::MemContext& mctx, const chi::PoolQuery& pool_query,
-      const Block& block, hipc::Pointer data, size_t buffer_size) {
+      const ArrayVector<Block, 16>& blocks, hipc::Pointer data,
+      size_t buffer_size) {
     auto* ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<chimaera::bdev::ReadTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, block, data, buffer_size);
+        chi::CreateTaskId(), pool_id_, pool_query, blocks, data, buffer_size);
 
     ipc_manager->Enqueue(task);
     return task;

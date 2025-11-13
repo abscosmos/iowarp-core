@@ -11,7 +11,7 @@ set(CHIMAERA_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 # SECTION 3: CHIMOD CMAKE UTILITIES AND DEPENDENCIES
 #------------------------------------------------------------------------------
 # Include common utilities and dependencies early so find_package calls are available
-include(cmake/ChimaeraCommon.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ChimaeraCommon.cmake)
 
 #------------------------------------------------------------------------------
 # SECTION 4: DEPENDENCY VERIFICATION

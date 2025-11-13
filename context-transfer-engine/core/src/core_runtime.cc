@@ -1421,10 +1421,14 @@ chi::u32 Runtime::ModifyExistingData(const std::vector<BlobBlock> &blocks,
           block.target_offset_ + write_start_in_block, write_size, 0);
       hipc::Pointer data_ptr = data + data_buffer_offset;
 
+      // Wrap single block in ArrayVector for AsyncWrite
+      chimaera::bdev::ArrayVector<chimaera::bdev::Block, 16> blocks;
+      blocks.push_back(bdev_block);
+
       chimaera::bdev::Client cte_clientcopy = block.bdev_client_;
       auto write_task =
           cte_clientcopy.AsyncWrite(hipc::MemContext(), block.target_query_,
-                                    bdev_block, data_ptr, write_size);
+                                    blocks, data_ptr, write_size);
 
       write_tasks.push_back(write_task);
       expected_write_sizes.push_back(write_size);
@@ -1530,10 +1534,14 @@ chi::u32 Runtime::ReadData(const std::vector<BlobBlock> &blocks,
           block.target_offset_ + read_start_in_block, read_size, 0);
       hipc::Pointer data_ptr = data + data_buffer_offset;
 
+      // Wrap single block in ArrayVector for AsyncRead
+      chimaera::bdev::ArrayVector<chimaera::bdev::Block, 16> blocks;
+      blocks.push_back(bdev_block);
+
       chimaera::bdev::Client cte_clientcopy = block.bdev_client_;
       auto read_task =
           cte_clientcopy.AsyncRead(hipc::MemContext(), block.target_query_,
-                                   bdev_block, data_ptr, read_size);
+                                   blocks, data_ptr, read_size);
 
       read_tasks.push_back(read_task);
       expected_read_sizes.push_back(read_size);
