@@ -61,7 +61,7 @@ class CMakeBuild(build_ext):
         build_dir = source_dir / "build"
 
         # Determine install prefix based on whether we're bundling binaries
-        bundle_binaries = os.environ.get("IOWARP_BUNDLE_BINARIES", "OFF").upper() == "ON"
+        bundle_binaries = os.environ.get("IOWARP_BUNDLE_BINARIES", "ON").upper() == "ON"
         if bundle_binaries:
             # Install to a staging directory that we'll copy into the wheel
             install_prefix = build_temp / "install"
