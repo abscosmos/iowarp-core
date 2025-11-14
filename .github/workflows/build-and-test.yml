@@ -28,7 +28,7 @@ jobs:
         sudo apt-get install -y \
           build-essential cmake pkg-config \
           libboost-context-dev libboost-fiber-dev libboost-system-dev \
-          libelf-dev libzmq3-dev
+          libelf-dev libzmq3-dev libyaml-cpp-dev
 
     - name: Install compression libraries
       run: |
