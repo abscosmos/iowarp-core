@@ -1,5 +1,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/chrono.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -79,7 +80,7 @@ NB_MODULE(wrp_cte_core_ext, m) {
            return self.TagQuery(mctx, tag_regex, max_tags, pool_query);
          },
          "mctx"_a, "tag_regex"_a, "max_tags"_a = 0, "pool_query"_a,
-         "Query tags by regex pattern")
+         "Query tags by regex pattern, returns vector of tag names")
      .def("BlobQuery",
          [](wrp_cte::core::Client &self, const hipc::MemContext &mctx,
             const std::string &tag_regex, const std::string &blob_regex,
@@ -87,7 +88,7 @@ NB_MODULE(wrp_cte_core_ext, m) {
            return self.BlobQuery(mctx, tag_regex, blob_regex, max_blobs, pool_query);
          },
          "mctx"_a, "tag_regex"_a, "blob_regex"_a, "max_blobs"_a = 0, "pool_query"_a,
-         "Query blobs by tag and blob regex patterns");
+         "Query blobs by tag and blob regex patterns, returns vector of (tag_name, blob_name) pairs");
 
   // Module-level convenience functions
   m.def(

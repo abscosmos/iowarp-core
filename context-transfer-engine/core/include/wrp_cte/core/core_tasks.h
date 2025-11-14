@@ -12,6 +12,9 @@
 #include <chimaera/bdev/bdev_client.h>
 #include <yaml-cpp/yaml.h>
 #include <chrono>
+// Include cereal for serialization
+#include <cereal/cereal.hpp>
+#include <cereal/archives/binary.hpp>
 
 namespace wrp_cte::core {
 
@@ -1145,8 +1148,7 @@ struct GetContainedBlobsTask : public chi::Task {
  * New behavior:
  * - Accepts an input maximum number of tags to store (max_tags_). 0 means no
  *   limit.
- * - Returns nested results where each inner vector contains the tag name as
- *   the first element followed by blob names contained in that tag.
+ * - Returns a vector of tag names matching the query.
  * - total_tags_matched_ sums the total number of tags that matched the
  *   pattern across replicas during Aggregate.
  */
@@ -1154,7 +1156,7 @@ struct TagQueryTask : public chi::Task {
   IN hipc::string tag_regex_;
   IN chi::u32 max_tags_;
   OUT chi::u64 total_tags_matched_;
-  OUT hipc::vector<hipc::vector<hipc::string>> results_;
+  OUT hipc::vector<hipc::string> results_;
 
   // SHM constructor
   explicit TagQueryTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
@@ -1210,10 +1212,10 @@ struct TagQueryTask : public chi::Task {
     total_tags_matched_ += other->total_tags_matched_;
 
     // Append results up to max_tags_ (if non-zero)
-    for (const auto &inner_vec : other->results_) {
+    for (const auto &tag_name : other->results_) {
       if (max_tags_ != 0 && results_.size() >= static_cast<size_t>(max_tags_))
         break;
-      results_.emplace_back(inner_vec);
+      results_.emplace_back(tag_name);
     }
   }
 };
@@ -1221,10 +1223,10 @@ struct TagQueryTask : public chi::Task {
 /**
  * BlobQuery task - Query blobs by tag and blob regex patterns
  * New behavior:
- * - Accepts an input maximum number of blobs to store per tag (max_blobs_).
- *   0 means no limit.
- * - Returns nested results where each inner vector contains the tag name as
- *   the first element followed by matching blob names for that tag.
+ * - Accepts an input maximum number of blobs to store (max_blobs_). 0 means no
+ *   limit.
+ * - Returns a vector of pairs where each pair contains (tag_name, blob_name)
+ *   for blobs matching the query.
  * - total_blobs_matched_ sums the total number of blobs that matched across
  *   replicas during Aggregate.
  */
@@ -1233,7 +1235,7 @@ struct BlobQueryTask : public chi::Task {
   IN hipc::string blob_regex_;
   IN chi::u32 max_blobs_;
   OUT chi::u64 total_blobs_matched_;
-  OUT hipc::vector<hipc::vector<hipc::string>> results_;
+  OUT hipc::vector<hipc::pair<hipc::string, hipc::string>> results_;
 
   // SHM constructor
   explicit BlobQueryTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
@@ -1290,29 +1292,25 @@ struct BlobQueryTask : public chi::Task {
     // Sum total matched blobs across replicas
     total_blobs_matched_ += other->total_blobs_matched_;
 
-    // Append nested results respecting max_blobs_ per tag if set
-    for (const auto &inner_vec : other->results_) {
-      if (inner_vec.size() == 0) { continue; }
-      // If max_blobs_ == 0, no per-tag limit applies; otherwise we must trim
-      // copied inner vectors to (1 + max_blobs_) since first element is tag name
-      if (max_blobs_ == 0) {
-        results_.emplace_back(inner_vec);
-      } else {
-        hipc::vector<hipc::string> trimmed(results_.GetAllocator());
-        // Copy tag name
-        trimmed.emplace_back(inner_vec[0]);
-        // Copy up to max_blobs_ blob names
-        size_t copied = 0;
-        for (size_t i = 1; i < inner_vec.size() && copied < max_blobs_; ++i) {
-          trimmed.emplace_back(inner_vec[i]);
-          ++copied;
-        }
-        results_.emplace_back(std::move(trimmed));
-      }
+    // Append results up to max_blobs_ (if non-zero)
+    for (const auto &pair : other->results_) {
+      if (max_blobs_ != 0 && results_.size() >= static_cast<size_t>(max_blobs_))
+        break;
+      results_.emplace_back(pair);
     }
   }
 };
 
 } // namespace wrp_cte::core
+
+// Cereal serialization support for hipc::pair
+namespace cereal {
+
+template <class Archive, typename FirstT, typename SecondT>
+void serialize(Archive &ar, hipc::pair<FirstT, SecondT> &pair) {
+  ar(pair.first_, pair.second_);
+}
+
+} // namespace cereal
 
 #endif // WRPCTE_CORE_TASKS_H_

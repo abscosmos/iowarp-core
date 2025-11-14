@@ -1945,36 +1945,14 @@ void Runtime::TagQuery(hipc::FullPtr<TagQueryTask> task, chi::RunContext &ctx) {
     // Total matched tags (summed across replicas during Aggregate)
     task->total_tags_matched_ = matching_tags.size();
 
-    // Build nested results: for each tag, create inner vector where first
-    // element is the tag name, followed by all blob names contained in that
-    // tag. Respect max_tags_ if non-zero.
+    // Build results: just tag names matching the query. Respect max_tags_ if non-zero.
     task->results_.clear();
     for (const auto &tn : matching_tags) {
       if (task->max_tags_ != 0 && task->results_.size() >= task->max_tags_) {
         break;
       }
       const std::string &tag_name = tn.first;
-      const TagId &tag_id = tn.second;
-
-      hipc::vector<hipc::string> inner(task->results_.GetAllocator());
-      inner.emplace_back(tag_name.c_str());
-
-      // Build prefix for this tag's blobs
-      std::string prefix = std::to_string(tag_id.major_) + "." +
-                           std::to_string(tag_id.minor_) + ".";
-
-      // Iterate through tag_blob_name_to_info_ and add blob names for this tag
-      tag_blob_name_to_info_.for_each(
-          [&prefix, &inner](const std::string &composite_key,
-                            const BlobInfo &blob_info) {
-            (void)blob_info;
-            if (composite_key.rfind(prefix, 0) == 0) {
-              std::string blob_name = composite_key.substr(prefix.length());
-              inner.emplace_back(blob_name.c_str());
-            }
-          });
-
-      task->results_.emplace_back(std::move(inner));
+      task->results_.emplace_back(tag_name.c_str());
     }
 
     // Success
@@ -2014,8 +1992,8 @@ void Runtime::BlobQuery(hipc::FullPtr<BlobQueryTask> task,
           }
         });
 
-    // Build nested results: per-tag inner vector containing tag name then
-    // matching blob names. Also compute total_blobs_matched_.
+    // Build results: pairs of (tag_name, blob_name) for matching blobs.
+    // Also compute total_blobs_matched_.
     task->results_.clear();
     task->total_blobs_matched_ = 0;
 
@@ -2023,17 +2001,13 @@ void Runtime::BlobQuery(hipc::FullPtr<BlobQueryTask> task,
       const std::string &tag_name = tn.first;
       const TagId &tag_id = tn.second;
 
-      hipc::vector<hipc::string> inner(task->results_.GetAllocator());
-      inner.emplace_back(tag_name.c_str());
-
       // Construct prefix for this tag's blobs
       std::string prefix = std::to_string(tag_id.major_) + "." +
                            std::to_string(tag_id.minor_) + ".";
 
       // Iterate and collect matching blobs for this tag
-      size_t per_tag_collected = 0;
       tag_blob_name_to_info_.for_each(
-          [&prefix, &blob_pattern, &inner, &task, &per_tag_collected](
+          [&prefix, &blob_pattern, &tag_name, &task](
               const std::string &composite_key, const BlobInfo &blob_info) {
             (void)blob_info;
             if (composite_key.rfind(prefix, 0) == 0) {
@@ -2041,16 +2015,16 @@ void Runtime::BlobQuery(hipc::FullPtr<BlobQueryTask> task,
               if (std::regex_match(blob_name, blob_pattern)) {
                 // Increase total matched counter (counts all matches)
                 task->total_blobs_matched_++;
-                // Respect per-task max_blobs_ if set
-                if (task->max_blobs_ == 0 || per_tag_collected < task->max_blobs_) {
-                  inner.emplace_back(blob_name.c_str());
-                  ++per_tag_collected;
+                // Respect max_blobs_ if set
+                if (task->max_blobs_ == 0 || 
+                    task->results_.size() < static_cast<size_t>(task->max_blobs_)) {
+                  hipc::pair<hipc::string, hipc::string> pair(
+                      task->results_.GetAllocator(), tag_name.c_str(), blob_name.c_str());
+                  task->results_.emplace_back(std::move(pair));
                 }
               }
             }
           });
-
-      task->results_.emplace_back(std::move(inner));
     }
 
     // Success

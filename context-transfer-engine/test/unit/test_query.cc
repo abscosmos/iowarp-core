@@ -36,6 +36,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <thread>
+#include <chrono>
+#include <unistd.h>
+#include <limits.h>
 
 // Chimaera core includes
 #include <chimaera/admin/admin_tasks.h>
@@ -47,6 +51,13 @@
 #include <wrp_cte/core/core_tasks.h>
 
 namespace fs = std::filesystem;
+using namespace std::chrono_literals;
+
+// Global state tracking for initialization (following pattern from other tests)
+namespace {
+  bool g_runtime_initialized = false;
+  bool g_client_initialized = false;
+}
 
 /**
  * Helper function to check if runtime should be initialized
@@ -100,6 +111,30 @@ public:
   CTEQueryTestFixture() {
     INFO("=== Initializing CTE Query Test Environment ===");
 
+    // Set up library path for ChiMod discovery (following pattern from module_test_guide.md)
+    // Get the build directory by finding the test executable's directory
+    std::string test_exe_path = "/proc/self/exe";
+    char exe_path[1024];
+    ssize_t len = readlink(test_exe_path.c_str(), exe_path, sizeof(exe_path) - 1);
+    if (len != -1) {
+      exe_path[len] = '\0';
+      std::filesystem::path exe_fs_path(exe_path);
+      std::string bin_dir = exe_fs_path.parent_path().string();
+      
+      // Set CHI_REPO_PATH and LD_LIBRARY_PATH to point to bin directory
+      std::string chi_repo_path = bin_dir;
+      std::string ld_library_path = bin_dir;
+      const char* existing_ld_path = std::getenv("LD_LIBRARY_PATH");
+      if (existing_ld_path) {
+        ld_library_path = std::string(bin_dir) + ":" + std::string(existing_ld_path);
+      }
+      
+      setenv("CHI_REPO_PATH", chi_repo_path.c_str(), 1);
+      setenv("LD_LIBRARY_PATH", ld_library_path.c_str(), 1);
+      INFO("Set CHI_REPO_PATH=" << chi_repo_path);
+      INFO("Set LD_LIBRARY_PATH=" << ld_library_path);
+    }
+
     // Initialize test storage path in home directory
     std::string home_dir = hshm::SystemInfo::Getenv("HOME");
     REQUIRE(!home_dir.empty());
@@ -151,34 +186,64 @@ public:
 
 private:
   /**
-   * Initialize both runtime and client
+   * Initialize Chimaera runtime following the module test guide pattern
+   * This sets up the shared memory infrastructure needed for real API calls
+   * Note: The CHIMAERA_RUNTIME_INIT macro has internal state tracking
    */
-  bool initializeBoth() {
-    if (!chi::CHIMAERA_RUNTIME_INIT()) {
+  bool initializeRuntime() {
+    if (g_runtime_initialized) {
+      return true; // Already initialized
+    }
+    
+    INFO("Initializing Chimaera runtime...");
+    bool success = chi::CHIMAERA_RUNTIME_INIT();
+    if (success) {
+      g_runtime_initialized = true;
+      std::this_thread::sleep_for(500ms); // Allow initialization
+
+      // Verify core managers are initialized
+      REQUIRE(CHI_CHIMAERA_MANAGER != nullptr);
+      REQUIRE(CHI_IPC != nullptr);
+      REQUIRE(CHI_POOL_MANAGER != nullptr);
+      REQUIRE(CHI_MODULE_MANAGER != nullptr);
+
+      INFO("Chimaera runtime initialized successfully");
+    } else {
       FAIL("Failed to initialize Chimaera runtime");
-      return false;
     }
-    INFO("Chimaera runtime initialized successfully");
-
-    if (!chi::CHIMAERA_CLIENT_INIT()) {
-      FAIL("Failed to initialize Chimaera client");
-      return false;
-    }
-    INFO("Chimaera client initialized successfully");
-
-    return true;
+    return success;
   }
 
   /**
-   * Initialize only client (runtime already initialized externally)
+   * Initialize Chimaera client following the module test guide pattern
+   * Note: The CHIMAERA_CLIENT_INIT macro has internal state tracking
    */
   bool initializeClient() {
-    if (!chi::CHIMAERA_CLIENT_INIT()) {
-      FAIL("Failed to initialize Chimaera client");
-      return false;
+    if (g_client_initialized) {
+      return true; // Already initialized
     }
-    INFO("Chimaera client initialized successfully");
-    return true;
+    
+    INFO("Initializing Chimaera client...");
+    bool success = chi::CHIMAERA_CLIENT_INIT();
+    if (success) {
+      g_client_initialized = true;
+      std::this_thread::sleep_for(200ms); // Allow connection
+
+      REQUIRE(CHI_IPC != nullptr);
+      REQUIRE(CHI_IPC->IsInitialized());
+
+      INFO("Chimaera client initialized successfully");
+    } else {
+      FAIL("Failed to initialize Chimaera client");
+    }
+    return success;
+  }
+
+  /**
+   * Initialize both runtime and client
+   */
+  bool initializeBoth() {
+    return initializeRuntime() && initializeClient();
   }
 
   /**
@@ -273,12 +338,12 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "TagQuery - Exact Match",
   // Query for exact tag name
   auto results = core_client_->TagQuery(mctx_, "user_data", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " tag rows");
+  INFO("Query returned " << results.size() << " tags");
   REQUIRE(!results.empty());
-  // Each inner vector has tag name as first element
+  // Results are just tag names
   bool found = false;
-  for (const auto &row : results) {
-    if (!row.empty() && row[0] == "user_data") { found = true; break; }
+  for (const auto &tag_name : results) {
+    if (tag_name == "user_data") { found = true; break; }
   }
   CHECK(found);
 }
@@ -293,17 +358,15 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "TagQuery - Wildcard Pattern",
   // Query for all tags starting with "user_"
   auto results = core_client_->TagQuery(mctx_, "user_.*", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " tag rows");
+  INFO("Query returned " << results.size() << " tags");
   REQUIRE(results.size() >= 2); // Should match user_data and user_logs
 
   bool found_user_data = false;
   bool found_user_logs = false;
-  for (const auto& row : results) {
-    if (!row.empty()) {
-      INFO("Found tag: " << row[0]);
-      if (row[0] == "user_data") found_user_data = true;
-      if (row[0] == "user_logs") found_user_logs = true;
-    }
+  for (const auto& tag_name : results) {
+    INFO("Found tag: " << tag_name);
+    if (tag_name == "user_data") found_user_data = true;
+    if (tag_name == "user_logs") found_user_logs = true;
   }
 
   CHECK(found_user_data);
@@ -320,17 +383,15 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "TagQuery - Alternation Pattern",
   // Query for tags matching either "system_config" or "system_cache"
   auto results = core_client_->TagQuery(mctx_, "system_(config|cache)", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " tag rows");
+  INFO("Query returned " << results.size() << " tags");
   REQUIRE(results.size() >= 2);
 
   bool found_config = false;
   bool found_cache = false;
-  for (const auto& row : results) {
-    if (!row.empty()) {
-      INFO("Found tag: " << row[0]);
-      if (row[0] == "system_config") found_config = true;
-      if (row[0] == "system_cache") found_cache = true;
-    }
+  for (const auto& tag_name : results) {
+    INFO("Found tag: " << tag_name);
+    if (tag_name == "system_config") found_config = true;
+    if (tag_name == "system_cache") found_cache = true;
   }
 
   CHECK(found_config);
@@ -347,14 +408,14 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "TagQuery - Match All Pattern",
   // Query for all tags
   auto results = core_client_->TagQuery(mctx_, ".*", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " tag rows");
+  INFO("Query returned " << results.size() << " tags");
   REQUIRE(results.size() >= test_tags_.size());
 
   // Verify all test tags are present
   for (const auto& expected_tag : test_tags_) {
     bool found = false;
-    for (const auto &row : results) {
-      if (!row.empty() && row[0] == expected_tag) { found = true; break; }
+    for (const auto &tag_name : results) {
+      if (tag_name == expected_tag) { found = true; break; }
     }
     CHECK(found);
     if (!found) {
@@ -373,7 +434,7 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "TagQuery - No Matches",
   // Query for non-existent tag pattern
   auto results = core_client_->TagQuery(mctx_, "nonexistent_tag_pattern_xyz", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " tag rows");
+  INFO("Query returned " << results.size() << " tags");
   CHECK(results.empty());
 }
 
@@ -387,20 +448,16 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - Exact Match",
   // Query for specific blob in specific tag
   auto results = core_client_->BlobQuery(mctx_, "user_data", "blob_001\\.dat", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " tag rows");
-  // Sum blobs across rows
-  size_t total_blobs = 0;
-  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
-  INFO("Total blobs matched: " << total_blobs);
-  REQUIRE(total_blobs > 0);
+  INFO("Query returned " << results.size() << " blob pairs");
+  REQUIRE(results.size() > 0);
 
   bool found = false;
-  for (const auto &row : results) {
-    for (size_t i = 1; i < row.size(); ++i) {
-      INFO("Found blob: " << row[i]);
-      if (row[i].find("blob_001.dat") != std::string::npos) { found = true; break; }
+  for (const auto &pair : results) {
+    INFO("Found blob: " << pair.first << "/" << pair.second);
+    if (pair.first == "user_data" && pair.second.find("blob_001.dat") != std::string::npos) {
+      found = true;
+      break;
     }
-    if (found) break;
   }
   CHECK(found);
 }
@@ -415,19 +472,16 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - Wildcard Patterns",
   // Query for all .dat blobs in user_data tag
   auto results = core_client_->BlobQuery(mctx_, "user_data", "blob_.*\\.dat", 0, chi::PoolQuery::Broadcast());
 
-  // Sum blobs across rows
-  size_t total_blobs = 0;
-  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
-  INFO("Total blobs matched: " << total_blobs);
-  REQUIRE(total_blobs >= 2); // Should match blob_001.dat and blob_002.dat
+  INFO("Total blobs matched: " << results.size());
+  REQUIRE(results.size() >= 2); // Should match blob_001.dat and blob_002.dat
 
   int dat_blob_count = 0;
-  for (const auto &row : results) {
-    for (size_t i = 1; i < row.size(); ++i) {
-      INFO("Found blob: " << row[i]);
-      if (row[i].find("blob_") != std::string::npos && row[i].find(".dat") != std::string::npos) {
-        dat_blob_count++;
-      }
+  for (const auto &pair : results) {
+    INFO("Found blob: " << pair.first << "/" << pair.second);
+    if (pair.first == "user_data" && 
+        pair.second.find("blob_") != std::string::npos && 
+        pair.second.find(".dat") != std::string::npos) {
+      dat_blob_count++;
     }
   }
   CHECK(dat_blob_count >= 2);
@@ -443,19 +497,14 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - Multiple Tags",
   // Query for all .txt files in any "user_" tag
   auto results = core_client_->BlobQuery(mctx_, "user_.*", "file_.*\\.txt", 0, chi::PoolQuery::Broadcast());
 
-  // Sum blobs across rows
-  size_t total_blobs = 0;
-  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
-  INFO("Total blobs matched: " << total_blobs);
-  REQUIRE(total_blobs >= 4); // user_data and user_logs each have 2 .txt files
+  INFO("Total blobs matched: " << results.size());
+  REQUIRE(results.size() >= 4); // user_data and user_logs each have 2 .txt files
 
   int txt_file_count = 0;
-  for (const auto &row : results) {
-    for (size_t i = 1; i < row.size(); ++i) {
-      INFO("Found blob: " << row[i]);
-      if (row[i].find("file_") != std::string::npos && row[i].find(".txt") != std::string::npos) {
-        txt_file_count++;
-      }
+  for (const auto &pair : results) {
+    INFO("Found blob: " << pair.first << "/" << pair.second);
+    if (pair.second.find("file_") != std::string::npos && pair.second.find(".txt") != std::string::npos) {
+      txt_file_count++;
     }
   }
   CHECK(txt_file_count >= 4);
@@ -471,11 +520,8 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - Match All",
   // Query for all blobs in all tags
   auto results = core_client_->BlobQuery(mctx_, ".*", ".*", 0, chi::PoolQuery::Broadcast());
 
-  // Sum blobs across rows
-  size_t total_blobs = 0;
-  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
-  INFO("Total blobs matched: " << total_blobs);
-  REQUIRE(total_blobs >= test_blobs_.size());
+  INFO("Total blobs matched: " << results.size());
+  REQUIRE(results.size() >= test_blobs_.size());
 }
 
 /**
@@ -488,11 +534,8 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - No Blob Matches",
   // Query for non-existent blob pattern in existing tag
   auto results = core_client_->BlobQuery(mctx_, "user_data", "nonexistent_blob_xyz", 0, chi::PoolQuery::Broadcast());
 
-  // Sum blobs across rows
-  size_t total_blobs = 0;
-  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
-  INFO("Total blobs matched: " << total_blobs);
-  CHECK(total_blobs == 0);
+  INFO("Total blobs matched: " << results.size());
+  CHECK(results.size() == 0);
 }
 
 /**
@@ -505,7 +548,7 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - No Tag Matches",
   // Query for non-existent tag pattern
   auto results = core_client_->BlobQuery(mctx_, "nonexistent_tag_xyz", ".*", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " tag rows");
+  INFO("Query returned " << results.size() << " blob pairs");
   CHECK(results.empty());
 }
 
@@ -519,21 +562,16 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - File Extension Filter",
   // Query for all .txt files across all tags
   auto results = core_client_->BlobQuery(mctx_, ".*", ".*\\.txt", 0, chi::PoolQuery::Broadcast());
 
-  // Sum blobs across rows
-  size_t total_blobs = 0;
-  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
-  INFO("Total .txt blobs matched: " << total_blobs);
+  INFO("Total .txt blobs matched: " << results.size());
 
   // Each of our 8 test tags has 2 .txt files (file_a.txt, file_b.txt)
   // So we should have at least 16 results
-  REQUIRE(total_blobs >= 16);
+  REQUIRE(results.size() >= 16);
 
   // Verify all results end with .txt
-  for (const auto &row : results) {
-    for (size_t i = 1; i < row.size(); ++i) {
-      INFO("Found blob: " << row[i]);
-      CHECK(row[i].find(".txt") != std::string::npos);
-    }
+  for (const auto &pair : results) {
+    INFO("Found blob: " << pair.first << "/" << pair.second);
+    CHECK(pair.second.find(".txt") != std::string::npos);
   }
 }
 
@@ -547,17 +585,13 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "Query - Local Pool Query",
   // TagQuery with Local should work but only return local results
   auto tag_results = core_client_->TagQuery(mctx_, "user_.*", 0, chi::PoolQuery::Local());
 
-  INFO("TagQuery with Local returned " << tag_results.size() << " tag rows");
+  INFO("TagQuery with Local returned " << tag_results.size() << " tags");
   // Should get results since tags were created locally
   REQUIRE(!tag_results.empty());
 
   // BlobQuery with Local should also work
   auto blob_results = core_client_->BlobQuery(mctx_, "user_.*", "blob_.*", 0, chi::PoolQuery::Local());
 
-  // Sum blobs across rows
-  size_t total_blobs = 0;
-  for (const auto &row : blob_results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
-
-  INFO("BlobQuery with Local returned " << total_blobs << " blobs");
-  REQUIRE(total_blobs > 0);
+  INFO("BlobQuery with Local returned " << blob_results.size() << " blob pairs");
+  REQUIRE(blob_results.size() > 0);
 }

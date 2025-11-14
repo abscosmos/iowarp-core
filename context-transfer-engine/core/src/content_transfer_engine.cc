@@ -52,7 +52,7 @@ bool ContentTransferEngine::ClientInit(const chi::PoolQuery &pool_query) {
   return true;
 }
 
-std::vector<std::vector<std::string>> ContentTransferEngine::TagQuery(
+std::vector<std::string> ContentTransferEngine::TagQuery(
     const std::string &tag_re,
     chi::u32 max_tags,
     const chi::PoolQuery &pool_query) {
@@ -60,7 +60,7 @@ std::vector<std::vector<std::string>> ContentTransferEngine::TagQuery(
   return cte_client->TagQuery(hipc::MemContext(), tag_re, max_tags, pool_query);
 }
 
-std::vector<std::vector<std::string>> ContentTransferEngine::BlobQuery(
+std::vector<std::pair<std::string, std::string>> ContentTransferEngine::BlobQuery(
     const std::string &tag_re,
     const std::string &blob_re,
     chi::u32 max_blobs,
