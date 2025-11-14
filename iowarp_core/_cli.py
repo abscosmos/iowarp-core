@@ -24,7 +24,7 @@ def get_package_paths():
 
 def run_binary(binary_name):
     """
-    Run a bundled binary with the correct library paths.
+    Run a bundled or system-installed binary with the correct library paths.
 
     Args:
         binary_name: Name of the binary to execute
@@ -32,16 +32,29 @@ def run_binary(binary_name):
     lib_dir, bin_dir = get_package_paths()
     binary_path = bin_dir / binary_name
 
+    # Check if binary is bundled in package directory
     if not binary_path.exists():
-        print(f"Error: Binary '{binary_name}' not found at {binary_path}", file=sys.stderr)
-        print(f"Make sure iowarp-core is installed with bundled binaries.", file=sys.stderr)
-        sys.exit(1)
+        # Fall back to system-installed binary (from source distribution)
+        import shutil
+        system_binary = shutil.which(binary_name)
+        if system_binary:
+            binary_path = Path(system_binary)
+        else:
+            print(f"Error: Binary '{binary_name}' not found", file=sys.stderr)
+            print(f"  - Not bundled at: {bin_dir / binary_name}", file=sys.stderr)
+            print(f"  - Not found in PATH", file=sys.stderr)
+            print(f"Make sure iowarp-core is installed correctly.", file=sys.stderr)
+            sys.exit(1)
 
     # Set up environment with library path
     env = os.environ.copy()
 
     # Build library path including conda environment if available
-    lib_paths = [str(lib_dir)]
+    lib_paths = []
+
+    # Add bundled lib directory if it exists (for bundled binary distributions)
+    if lib_dir.exists():
+        lib_paths.append(str(lib_dir))
 
     # Add conda lib directory for dependencies (HDF5, MPI, etc.)
     conda_prefix = env.get("CONDA_PREFIX")
@@ -50,21 +63,22 @@ def run_binary(binary_name):
         if conda_lib.exists():
             lib_paths.append(str(conda_lib))
 
-    # Add lib directory to library path
-    if sys.platform.startswith("linux"):
-        ld_library_path = env.get("LD_LIBRARY_PATH", "")
-        new_paths = ":".join(lib_paths)
-        if ld_library_path:
-            env["LD_LIBRARY_PATH"] = f"{new_paths}:{ld_library_path}"
-        else:
-            env["LD_LIBRARY_PATH"] = new_paths
-    elif sys.platform == "darwin":
-        dyld_library_path = env.get("DYLD_LIBRARY_PATH", "")
-        new_paths = ":".join(lib_paths)
-        if dyld_library_path:
-            env["DYLD_LIBRARY_PATH"] = f"{new_paths}:{dyld_library_path}"
-        else:
-            env["DYLD_LIBRARY_PATH"] = new_paths
+    # Add lib directory to library path (only if we have paths to add)
+    if lib_paths:
+        if sys.platform.startswith("linux"):
+            ld_library_path = env.get("LD_LIBRARY_PATH", "")
+            new_paths = ":".join(lib_paths)
+            if ld_library_path:
+                env["LD_LIBRARY_PATH"] = f"{new_paths}:{ld_library_path}"
+            else:
+                env["LD_LIBRARY_PATH"] = new_paths
+        elif sys.platform == "darwin":
+            dyld_library_path = env.get("DYLD_LIBRARY_PATH", "")
+            new_paths = ":".join(lib_paths)
+            if dyld_library_path:
+                env["DYLD_LIBRARY_PATH"] = f"{new_paths}:{dyld_library_path}"
+            else:
+                env["DYLD_LIBRARY_PATH"] = new_paths
 
     # Execute the binary with arguments passed from command line
     try:
