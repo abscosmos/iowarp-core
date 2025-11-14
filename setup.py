@@ -32,7 +32,6 @@ class CMakeBuild(build_ext):
     def run(self):
         """Build IOWarp core following the quick installation steps."""
         try:
-            subprocess.check_call(['git', 'submodule', 'update', '--init', '--recursive'])
             subprocess.check_output(["cmake", "--version"])
         except OSError:
             raise RuntimeError(
@@ -112,7 +111,7 @@ class CMakeBuild(build_ext):
                 for item in ["CMakeLists.txt", "CMakePresets.json", "context-runtime",
                            "context-transfer-engine", "context-assimilation-engine",
                            "context-transport-primitives", "context-exploration-engine",
-                           "docker", "ai-prompts"]:
+                           "external", "docker", "ai-prompts"]:
                     src_path = package_root / item
                     if src_path.exists():
                         dest_path = source_dir / item
