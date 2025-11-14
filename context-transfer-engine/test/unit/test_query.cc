@@ -271,12 +271,16 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "TagQuery - Exact Match",
   INFO("Testing TagQuery with exact match pattern");
 
   // Query for exact tag name
-  std::vector<std::string> results = core_client_->TagQuery(
-      mctx_, "user_data", chi::PoolQuery::Broadcast());
+  auto results = core_client_->TagQuery(mctx_, "user_data", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
+  INFO("Query returned " << results.size() << " tag rows");
   REQUIRE(!results.empty());
-  CHECK(std::find(results.begin(), results.end(), "user_data") != results.end());
+  // Each inner vector has tag name as first element
+  bool found = false;
+  for (const auto &row : results) {
+    if (!row.empty() && row[0] == "user_data") { found = true; break; }
+  }
+  CHECK(found);
 }
 
 /**
@@ -287,18 +291,19 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "TagQuery - Wildcard Pattern",
   INFO("Testing TagQuery with wildcard pattern");
 
   // Query for all tags starting with "user_"
-  std::vector<std::string> results = core_client_->TagQuery(
-      mctx_, "user_.*", chi::PoolQuery::Broadcast());
+  auto results = core_client_->TagQuery(mctx_, "user_.*", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
+  INFO("Query returned " << results.size() << " tag rows");
   REQUIRE(results.size() >= 2); // Should match user_data and user_logs
 
   bool found_user_data = false;
   bool found_user_logs = false;
-  for (const auto& tag : results) {
-    INFO("Found tag: " << tag);
-    if (tag == "user_data") found_user_data = true;
-    if (tag == "user_logs") found_user_logs = true;
+  for (const auto& row : results) {
+    if (!row.empty()) {
+      INFO("Found tag: " << row[0]);
+      if (row[0] == "user_data") found_user_data = true;
+      if (row[0] == "user_logs") found_user_logs = true;
+    }
   }
 
   CHECK(found_user_data);
@@ -313,18 +318,19 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "TagQuery - Alternation Pattern",
   INFO("Testing TagQuery with alternation pattern");
 
   // Query for tags matching either "system_config" or "system_cache"
-  std::vector<std::string> results = core_client_->TagQuery(
-      mctx_, "system_(config|cache)", chi::PoolQuery::Broadcast());
+  auto results = core_client_->TagQuery(mctx_, "system_(config|cache)", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
+  INFO("Query returned " << results.size() << " tag rows");
   REQUIRE(results.size() >= 2);
 
   bool found_config = false;
   bool found_cache = false;
-  for (const auto& tag : results) {
-    INFO("Found tag: " << tag);
-    if (tag == "system_config") found_config = true;
-    if (tag == "system_cache") found_cache = true;
+  for (const auto& row : results) {
+    if (!row.empty()) {
+      INFO("Found tag: " << row[0]);
+      if (row[0] == "system_config") found_config = true;
+      if (row[0] == "system_cache") found_cache = true;
+    }
   }
 
   CHECK(found_config);
@@ -339,15 +345,17 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "TagQuery - Match All Pattern",
   INFO("Testing TagQuery with match-all pattern");
 
   // Query for all tags
-  std::vector<std::string> results = core_client_->TagQuery(
-      mctx_, ".*", chi::PoolQuery::Broadcast());
+  auto results = core_client_->TagQuery(mctx_, ".*", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
+  INFO("Query returned " << results.size() << " tag rows");
   REQUIRE(results.size() >= test_tags_.size());
 
   // Verify all test tags are present
   for (const auto& expected_tag : test_tags_) {
-    bool found = std::find(results.begin(), results.end(), expected_tag) != results.end();
+    bool found = false;
+    for (const auto &row : results) {
+      if (!row.empty() && row[0] == expected_tag) { found = true; break; }
+    }
     CHECK(found);
     if (!found) {
       INFO("Missing expected tag: " << expected_tag);
@@ -363,10 +371,9 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "TagQuery - No Matches",
   INFO("Testing TagQuery with pattern that matches nothing");
 
   // Query for non-existent tag pattern
-  std::vector<std::string> results = core_client_->TagQuery(
-      mctx_, "nonexistent_tag_pattern_xyz", chi::PoolQuery::Broadcast());
+  auto results = core_client_->TagQuery(mctx_, "nonexistent_tag_pattern_xyz", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
+  INFO("Query returned " << results.size() << " tag rows");
   CHECK(results.empty());
 }
 
@@ -378,20 +385,22 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - Exact Match",
   INFO("Testing BlobQuery with exact match patterns");
 
   // Query for specific blob in specific tag
-  std::vector<std::string> results = core_client_->BlobQuery(
-      mctx_, "user_data", "blob_001\\.dat", chi::PoolQuery::Broadcast());
+  auto results = core_client_->BlobQuery(mctx_, "user_data", "blob_001\\.dat", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
-  REQUIRE(!results.empty());
+  INFO("Query returned " << results.size() << " tag rows");
+  // Sum blobs across rows
+  size_t total_blobs = 0;
+  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
+  INFO("Total blobs matched: " << total_blobs);
+  REQUIRE(total_blobs > 0);
 
-  // Results are in format "major.minor.blob_name"
   bool found = false;
-  for (const auto& result : results) {
-    INFO("Found blob: " << result);
-    if (result.find("blob_001.dat") != std::string::npos) {
-      found = true;
-      break;
+  for (const auto &row : results) {
+    for (size_t i = 1; i < row.size(); ++i) {
+      INFO("Found blob: " << row[i]);
+      if (row[i].find("blob_001.dat") != std::string::npos) { found = true; break; }
     }
+    if (found) break;
   }
   CHECK(found);
 }
@@ -404,18 +413,21 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - Wildcard Patterns",
   INFO("Testing BlobQuery with wildcard patterns");
 
   // Query for all .dat blobs in user_data tag
-  std::vector<std::string> results = core_client_->BlobQuery(
-      mctx_, "user_data", "blob_.*\\.dat", chi::PoolQuery::Broadcast());
+  auto results = core_client_->BlobQuery(mctx_, "user_data", "blob_.*\\.dat", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
-  REQUIRE(results.size() >= 2); // Should match blob_001.dat and blob_002.dat
+  // Sum blobs across rows
+  size_t total_blobs = 0;
+  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
+  INFO("Total blobs matched: " << total_blobs);
+  REQUIRE(total_blobs >= 2); // Should match blob_001.dat and blob_002.dat
 
   int dat_blob_count = 0;
-  for (const auto& result : results) {
-    INFO("Found blob: " << result);
-    if (result.find("blob_") != std::string::npos &&
-        result.find(".dat") != std::string::npos) {
-      dat_blob_count++;
+  for (const auto &row : results) {
+    for (size_t i = 1; i < row.size(); ++i) {
+      INFO("Found blob: " << row[i]);
+      if (row[i].find("blob_") != std::string::npos && row[i].find(".dat") != std::string::npos) {
+        dat_blob_count++;
+      }
     }
   }
   CHECK(dat_blob_count >= 2);
@@ -429,18 +441,21 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - Multiple Tags",
   INFO("Testing BlobQuery with multiple tag matches");
 
   // Query for all .txt files in any "user_" tag
-  std::vector<std::string> results = core_client_->BlobQuery(
-      mctx_, "user_.*", "file_.*\\.txt", chi::PoolQuery::Broadcast());
+  auto results = core_client_->BlobQuery(mctx_, "user_.*", "file_.*\\.txt", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
-  REQUIRE(results.size() >= 4); // user_data and user_logs each have 2 .txt files
+  // Sum blobs across rows
+  size_t total_blobs = 0;
+  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
+  INFO("Total blobs matched: " << total_blobs);
+  REQUIRE(total_blobs >= 4); // user_data and user_logs each have 2 .txt files
 
   int txt_file_count = 0;
-  for (const auto& result : results) {
-    INFO("Found blob: " << result);
-    if (result.find("file_") != std::string::npos &&
-        result.find(".txt") != std::string::npos) {
-      txt_file_count++;
+  for (const auto &row : results) {
+    for (size_t i = 1; i < row.size(); ++i) {
+      INFO("Found blob: " << row[i]);
+      if (row[i].find("file_") != std::string::npos && row[i].find(".txt") != std::string::npos) {
+        txt_file_count++;
+      }
     }
   }
   CHECK(txt_file_count >= 4);
@@ -454,11 +469,13 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - Match All",
   INFO("Testing BlobQuery with match-all patterns");
 
   // Query for all blobs in all tags
-  std::vector<std::string> results = core_client_->BlobQuery(
-      mctx_, ".*", ".*", chi::PoolQuery::Broadcast());
+  auto results = core_client_->BlobQuery(mctx_, ".*", ".*", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
-  REQUIRE(results.size() >= test_blobs_.size());
+  // Sum blobs across rows
+  size_t total_blobs = 0;
+  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
+  INFO("Total blobs matched: " << total_blobs);
+  REQUIRE(total_blobs >= test_blobs_.size());
 }
 
 /**
@@ -469,11 +486,13 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - No Blob Matches",
   INFO("Testing BlobQuery with blob pattern that matches nothing");
 
   // Query for non-existent blob pattern in existing tag
-  std::vector<std::string> results = core_client_->BlobQuery(
-      mctx_, "user_data", "nonexistent_blob_xyz", chi::PoolQuery::Broadcast());
+  auto results = core_client_->BlobQuery(mctx_, "user_data", "nonexistent_blob_xyz", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
-  CHECK(results.empty());
+  // Sum blobs across rows
+  size_t total_blobs = 0;
+  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
+  INFO("Total blobs matched: " << total_blobs);
+  CHECK(total_blobs == 0);
 }
 
 /**
@@ -484,10 +503,9 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - No Tag Matches",
   INFO("Testing BlobQuery with tag pattern that matches nothing");
 
   // Query for non-existent tag pattern
-  std::vector<std::string> results = core_client_->BlobQuery(
-      mctx_, "nonexistent_tag_xyz", ".*", chi::PoolQuery::Broadcast());
+  auto results = core_client_->BlobQuery(mctx_, "nonexistent_tag_xyz", ".*", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
+  INFO("Query returned " << results.size() << " tag rows");
   CHECK(results.empty());
 }
 
@@ -499,19 +517,23 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "BlobQuery - File Extension Filter",
   INFO("Testing BlobQuery with file extension filtering");
 
   // Query for all .txt files across all tags
-  std::vector<std::string> results = core_client_->BlobQuery(
-      mctx_, ".*", ".*\\.txt", chi::PoolQuery::Broadcast());
+  auto results = core_client_->BlobQuery(mctx_, ".*", ".*\\.txt", 0, chi::PoolQuery::Broadcast());
 
-  INFO("Query returned " << results.size() << " results");
+  // Sum blobs across rows
+  size_t total_blobs = 0;
+  for (const auto &row : results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
+  INFO("Total .txt blobs matched: " << total_blobs);
 
   // Each of our 8 test tags has 2 .txt files (file_a.txt, file_b.txt)
   // So we should have at least 16 results
-  REQUIRE(results.size() >= 16);
+  REQUIRE(total_blobs >= 16);
 
   // Verify all results end with .txt
-  for (const auto& result : results) {
-    INFO("Found blob: " << result);
-    CHECK(result.find(".txt") != std::string::npos);
+  for (const auto &row : results) {
+    for (size_t i = 1; i < row.size(); ++i) {
+      INFO("Found blob: " << row[i]);
+      CHECK(row[i].find(".txt") != std::string::npos);
+    }
   }
 }
 
@@ -523,17 +545,19 @@ TEST_CASE_METHOD(CTEQueryTestFixture, "Query - Local Pool Query",
   INFO("Testing query APIs with Local pool query");
 
   // TagQuery with Local should work but only return local results
-  std::vector<std::string> tag_results = core_client_->TagQuery(
-      mctx_, "user_.*", chi::PoolQuery::Local());
+  auto tag_results = core_client_->TagQuery(mctx_, "user_.*", 0, chi::PoolQuery::Local());
 
-  INFO("TagQuery with Local returned " << tag_results.size() << " results");
+  INFO("TagQuery with Local returned " << tag_results.size() << " tag rows");
   // Should get results since tags were created locally
   REQUIRE(!tag_results.empty());
 
   // BlobQuery with Local should also work
-  std::vector<std::string> blob_results = core_client_->BlobQuery(
-      mctx_, "user_.*", "blob_.*", chi::PoolQuery::Local());
+  auto blob_results = core_client_->BlobQuery(mctx_, "user_.*", "blob_.*", 0, chi::PoolQuery::Local());
 
-  INFO("BlobQuery with Local returned " << blob_results.size() << " results");
-  REQUIRE(!blob_results.empty());
+  // Sum blobs across rows
+  size_t total_blobs = 0;
+  for (const auto &row : blob_results) { if (row.size() > 1) total_blobs += (row.size() - 1); }
+
+  INFO("BlobQuery with Local returned " << total_blobs << " blobs");
+  REQUIRE(total_blobs > 0);
 }

@@ -545,15 +545,18 @@ public:
    * @param pool_query Pool query for routing (default: Broadcast)
    * @return Vector of matching tag names
    */
-  std::vector<std::string> TagQuery(const hipc::MemContext &mctx,
+  std::vector<std::vector<std::string>> TagQuery(const hipc::MemContext &mctx,
                                      const std::string &tag_regex,
+                                     chi::u32 max_tags = 0,
                                      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
-    auto task = AsyncTagQuery(mctx, tag_regex, pool_query);
+    auto task = AsyncTagQuery(mctx, tag_regex, max_tags, pool_query);
     task->Wait();
-    std::vector<std::string> result;
+    std::vector<std::vector<std::string>> result;
     if (task->return_code_.load() == 0) {
-      for (const auto &tag_name : task->tag_names_) {
-        result.emplace_back(tag_name.str());
+      for (const auto &inner : task->results_) {
+        std::vector<std::string> row;
+    for (size_t i = 0; i < inner.size(); ++i) { row.emplace_back(inner[i].str()); }
+        result.emplace_back(std::move(row));
       }
     }
     CHI_IPC->DelTask(task);
@@ -570,12 +573,13 @@ public:
   hipc::FullPtr<TagQueryTask>
   AsyncTagQuery(const hipc::MemContext &mctx,
                 const std::string &tag_regex,
+                chi::u32 max_tags = 0,
                 const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
     (void)mctx; // Suppress unused parameter warning
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<TagQueryTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, tag_regex);
+        chi::CreateTaskId(), pool_id_, pool_query, tag_regex, max_tags);
 
     ipc_manager->Enqueue(task);
     return task;
@@ -590,16 +594,19 @@ public:
    * @param pool_query Pool query for routing (default: Broadcast)
    * @return Vector of matching blob names
    */
-  std::vector<std::string> BlobQuery(const hipc::MemContext &mctx,
+  std::vector<std::vector<std::string>> BlobQuery(const hipc::MemContext &mctx,
                                       const std::string &tag_regex,
                                       const std::string &blob_regex,
+                                      chi::u32 max_blobs = 0,
                                       const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
-    auto task = AsyncBlobQuery(mctx, tag_regex, blob_regex, pool_query);
+    auto task = AsyncBlobQuery(mctx, tag_regex, blob_regex, max_blobs, pool_query);
     task->Wait();
-    std::vector<std::string> result;
+    std::vector<std::vector<std::string>> result;
     if (task->return_code_.load() == 0) {
-      for (const auto &blob_name : task->blob_names_) {
-        result.emplace_back(blob_name.str());
+      for (const auto &inner : task->results_) {
+        std::vector<std::string> row;
+    for (size_t i = 0; i < inner.size(); ++i) { row.emplace_back(inner[i].str()); }
+        result.emplace_back(std::move(row));
       }
     }
     CHI_IPC->DelTask(task);
@@ -618,12 +625,13 @@ public:
   AsyncBlobQuery(const hipc::MemContext &mctx,
                  const std::string &tag_regex,
                  const std::string &blob_regex,
+                 chi::u32 max_blobs = 0,
                  const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
     (void)mctx; // Suppress unused parameter warning
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<BlobQueryTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, tag_regex, blob_regex);
+        chi::CreateTaskId(), pool_id_, pool_query, tag_regex, blob_regex, max_blobs);
 
     ipc_manager->Enqueue(task);
     return task;

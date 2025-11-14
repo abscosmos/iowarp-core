@@ -67,7 +67,8 @@ public:
    * @param pool_query Pool query for routing (default: Broadcast)
    * @return Vector of matching tag names
    */
-  std::vector<std::string> TagQuery(const std::string &tag_re,
+  std::vector<std::vector<std::string>> TagQuery(const std::string &tag_re,
+                                     chi::u32 max_tags = 0,
                                      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast());
 
   /**
@@ -77,8 +78,9 @@ public:
    * @param pool_query Pool query for routing (default: Broadcast)
    * @return Vector of matching blob names
    */
-  std::vector<std::string> BlobQuery(const std::string &tag_re,
+  std::vector<std::vector<std::string>> BlobQuery(const std::string &tag_re,
                                       const std::string &blob_re,
+                                      chi::u32 max_blobs = 0,
                                       const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast());
 
 private:
