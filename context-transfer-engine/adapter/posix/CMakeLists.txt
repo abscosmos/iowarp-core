@@ -40,7 +40,7 @@ install(
         FILES
         ${WRP_CTE_HEADERS}
         DESTINATION
-        ${CMAKE_INSTALL_PREFIX}/include/adapter/posix
+        include/adapter/posix
         COMPONENT
         headers
 )
