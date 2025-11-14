@@ -50,35 +50,6 @@ class CMakeBuild(build_ext):
         if os.environ.get("IOWARP_BUNDLE_BINARIES", "OFF").upper() == "ON":
             self.copy_binaries_to_package(build_temp)
 
-    def apply_hdf5_api_fix(self, source_dir):
-        """Apply HDF5 API compatibility fix for HDF5 1.14+."""
-        hdf5_file = source_dir / "context-assimilation-engine" / "core" / "src" / "factory" / "hdf5_file_assimilator.cc"
-
-        if not hdf5_file.exists():
-            print(f"Warning: HDF5 file assimilator not found at {hdf5_file}, skipping fix")
-            return
-
-        print(f"Applying HDF5 API compatibility fix to {hdf5_file.name}...")
-
-        # Read the file
-        content = hdf5_file.read_text()
-
-        # Check if fix is already applied
-        if "H5O_INFO_BASIC" in content:
-            print("  HDF5 API fix already applied")
-            return
-
-        # Apply the fix: Add H5O_INFO_BASIC parameter to H5Oget_info_by_name call
-        old_call = "H5Oget_info_by_name(loc_id, name, &obj_info, H5P_DEFAULT)"
-        new_call = "H5Oget_info_by_name(loc_id, name, &obj_info, H5O_INFO_BASIC, H5P_DEFAULT)"
-
-        if old_call in content:
-            content = content.replace(old_call, new_call)
-            hdf5_file.write_text(content)
-            print(f"  Successfully applied HDF5 API fix")
-        else:
-            print(f"  Warning: HDF5 API call pattern not found, skipping fix")
-
     def build_iowarp_core(self, build_temp):
         """Build IOWarp core using CMake presets from included source or clone."""
         print(f"\n{'='*60}")
@@ -127,9 +98,6 @@ class CMakeBuild(build_ext):
                 subprocess.check_call(["git", "clone", "--recursive", self.REPO_URL, str(source_dir)])
         else:
             print(f"Using existing source at {source_dir}")
-
-        # Apply HDF5 API compatibility fix
-        self.apply_hdf5_api_fix(source_dir)
 
         # Determine build type
         build_type = os.environ.get("IOWARP_BUILD_TYPE", "release").lower()
