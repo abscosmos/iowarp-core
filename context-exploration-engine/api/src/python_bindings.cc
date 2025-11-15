@@ -5,7 +5,6 @@
 #include <wrp_cae/core/factory/assimilation_ctx.h>
 
 namespace nb = nanobind;
-using namespace nb::literals;
 
 NB_MODULE(iowarp_cee_api, m) {
   m.doc() = "IOWarp Context Exploration Engine API - Python Bindings";
@@ -17,9 +16,9 @@ NB_MODULE(iowarp_cee_api, m) {
          "Default constructor")
     .def(nb::init<const std::string&, const std::string&, const std::string&,
                   const std::string&, size_t, size_t, const std::string&, const std::string&>(),
-         "src"_a, "dst"_a, "format"_a,
-         "depends_on"_a = "", "range_off"_a = 0, "range_size"_a = 0,
-         "src_token"_a = "", "dst_token"_a = "",
+         nb::arg("src"), nb::arg("dst"), nb::arg("format"),
+         nb::arg("depends_on") = "", nb::arg("range_off") = 0, nb::arg("range_size") = 0,
+         nb::arg("src_token") = "", nb::arg("dst_token") = "",
          "Full constructor")
     .def_rw("src", &wrp_cae::core::AssimilationCtx::src,
             "Source URL (e.g., file::/path/to/file)")
@@ -49,30 +48,32 @@ NB_MODULE(iowarp_cee_api, m) {
     .def(nb::init<>(),
          "Default constructor - initializes the interface")
     .def("context_bundle", &iowarp::ContextInterface::ContextBundle,
-         "bundle"_a,
+         nb::arg("bundle"),
          "Bundle a group of related objects together and assimilate them\n\n"
          "Parameters:\n"
          "  bundle: List of AssimilationCtx objects to assimilate\n\n"
          "Returns:\n"
          "  0 on success, non-zero error code on failure")
     .def("context_query", &iowarp::ContextInterface::ContextQuery,
-         "tag_re"_a, "blob_re"_a,
+         nb::arg("tag_re"), nb::arg("blob_re"), nb::arg("max_results") = 0,
          "Retrieve the identities of objects matching tag and blob patterns\n\n"
          "Parameters:\n"
          "  tag_re: Tag regex pattern to match\n"
-         "  blob_re: Blob regex pattern to match\n\n"
+         "  blob_re: Blob regex pattern to match\n"
+         "  max_results: Maximum number of results to return (0 = unlimited, default: 0)\n\n"
          "Returns:\n"
          "  List of matching blob names")
     .def("context_retrieve", &iowarp::ContextInterface::ContextRetrieve,
-         "tag_re"_a, "blob_re"_a,
+         nb::arg("tag_re"), nb::arg("blob_re"), nb::arg("max_results") = 0,
          "Retrieve the identities and data of objects (NOT YET IMPLEMENTED)\n\n"
          "Parameters:\n"
          "  tag_re: Tag regex pattern to match\n"
-         "  blob_re: Blob regex pattern to match\n\n"
+         "  blob_re: Blob regex pattern to match\n"
+         "  max_results: Maximum number of results to return (0 = unlimited, default: 0)\n\n"
          "Returns:\n"
          "  List of object identities (currently returns empty list)")
     .def("context_splice", &iowarp::ContextInterface::ContextSplice,
-         "new_ctx"_a, "tag_re"_a, "blob_re"_a,
+         nb::arg("new_ctx"), nb::arg("tag_re"), nb::arg("blob_re"),
          "Split/splice objects into a new context (NOT YET IMPLEMENTED)\n\n"
          "Parameters:\n"
          "  new_ctx: Name of the new context to create\n"
@@ -81,7 +82,7 @@ NB_MODULE(iowarp_cee_api, m) {
          "Returns:\n"
          "  0 on success, non-zero error code on failure")
     .def("context_destroy", &iowarp::ContextInterface::ContextDestroy,
-         "context_names"_a,
+         nb::arg("context_names"),
          "Destroy contexts by name\n\n"
          "Parameters:\n"
          "  context_names: List of context names to destroy\n\n"

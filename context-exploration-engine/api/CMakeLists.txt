@@ -81,17 +81,28 @@ install(DIRECTORY include/
   FILES_MATCHING PATTERN "*.h"
 )
 
-install(EXPORT wrp_cee_api_targets
-  FILE wrp_cee_api_targets.cmake
-  NAMESPACE wrp_cee::
-  DESTINATION lib/cmake/wrp_cee_api
-)
-
-# Create and install package config files
+# Generate package config file with dependencies
 include(CMakePackageConfigHelpers)
 
+# Create the config file content
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/wrp_cee_api-config.cmake.in"
+"@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# Find required dependencies
+find_dependency(chimaera REQUIRED)
+find_dependency(wrp_cte_core REQUIRED)
+find_dependency(wrp_cae_core REQUIRED)
+
+# Include the exported targets
+include(\"\${CMAKE_CURRENT_LIST_DIR}/wrp_cee_api_targets.cmake\")
+
+check_required_components(wrp_cee_api)
+")
+
 configure_package_config_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/wrp_cee_api-config.cmake.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/wrp_cee_api-config.cmake.in"
   "${CMAKE_CURRENT_BINARY_DIR}/wrp_cee_api-config.cmake"
   INSTALL_DESTINATION lib/cmake/wrp_cee_api
 )
@@ -100,6 +111,12 @@ write_basic_package_version_file(
   "${CMAKE_CURRENT_BINARY_DIR}/wrp_cee_api-config-version.cmake"
   VERSION ${PROJECT_VERSION}
   COMPATIBILITY AnyNewerVersion
+)
+
+install(EXPORT wrp_cee_api_targets
+  FILE wrp_cee_api_targets.cmake
+  NAMESPACE wrp_cee::
+  DESTINATION lib/cmake/wrp_cee_api
 )
 
 install(FILES

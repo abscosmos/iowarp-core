@@ -45,10 +45,12 @@ public:
    *
    * @param tag_re Tag regex pattern to match
    * @param blob_re Blob regex pattern to match
+   * @param max_results Maximum number of results to return (0 = unlimited)
    * @return Vector of matching blob names
    */
   std::vector<std::string> ContextQuery(const std::string &tag_re,
-                                         const std::string &blob_re);
+                                         const std::string &blob_re,
+                                         unsigned int max_results = 0);
 
   /**
    * Retrieve the identities and data of objects matching patterns
@@ -57,10 +59,12 @@ public:
    *
    * @param tag_re Tag regex pattern to match
    * @param blob_re Blob regex pattern to match
+   * @param max_results Maximum number of results to return (0 = unlimited)
    * @return Vector of object identities (currently returns empty vector)
    */
   std::vector<std::string> ContextRetrieve(const std::string &tag_re,
-                                            const std::string &blob_re);
+                                            const std::string &blob_re,
+                                            unsigned int max_results = 0);
 
   /**
    * Split/splice objects into a new context

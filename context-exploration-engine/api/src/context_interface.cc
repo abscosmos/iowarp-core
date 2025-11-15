@@ -8,9 +8,9 @@
 namespace iowarp {
 
 ContextInterface::ContextInterface() : is_initialized_(false) {
-  // Initialize Chimaera client if not already initialized
-  if (!chi::CHIMAERA_CLIENT_INIT()) {
-    std::cerr << "Error: Failed to initialize Chimaera client" << std::endl;
+  // Initialize CAE client (which initializes CTE and Chimaera internally)
+  if (!WRP_CAE_CLIENT_INIT()) {
+    std::cerr << "Error: Failed to initialize CAE client" << std::endl;
     return;
   }
 
@@ -66,7 +66,8 @@ int ContextInterface::ContextBundle(
 
 std::vector<std::string> ContextInterface::ContextQuery(
     const std::string &tag_re,
-    const std::string &blob_re) {
+    const std::string &blob_re,
+    unsigned int max_results) {
   if (!is_initialized_) {
     std::cerr << "Error: ContextInterface not initialized" << std::endl;
     return std::vector<std::string>();
@@ -86,7 +87,7 @@ std::vector<std::string> ContextInterface::ContextQuery(
         HSHM_MCTX,
         tag_re,
         blob_re,
-        0,  // max_blobs (0 = unlimited)
+        max_results,  // max_blobs (0 = unlimited)
         chi::PoolQuery::Broadcast());
 
     // Convert pair<string, string> results to just blob names
@@ -105,9 +106,11 @@ std::vector<std::string> ContextInterface::ContextQuery(
 
 std::vector<std::string> ContextInterface::ContextRetrieve(
     const std::string &tag_re,
-    const std::string &blob_re) {
+    const std::string &blob_re,
+    unsigned int max_results) {
   (void)tag_re;   // Suppress unused parameter warning
   (void)blob_re;  // Suppress unused parameter warning
+  (void)max_results;  // Suppress unused parameter warning
 
   // Not yet implemented
   std::cerr << "Warning: ContextRetrieve is not yet implemented" << std::endl;
