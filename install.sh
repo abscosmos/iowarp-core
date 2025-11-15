@@ -209,16 +209,22 @@ echo ">>> Building IOWarp Core..."
 echo "======================================================================"
 echo ""
 
+# Set PKG_CONFIG_PATH for dependency detection (ZeroMQ)
+export PKG_CONFIG_PATH="$INSTALL_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+
 # Create build directory for IOWarp Core
 BUILD_DIR="build/iowarp-core"
 mkdir -p "$BUILD_DIR"
 
 # Configure IOWarp Core with the same prefix
-# Note: Use -S and -B to explicitly specify source and build directories
+# Note: CMAKE_PREFIX_PATH includes multiple paths for different package locations:
+#   - $INSTALL_PREFIX/lib/cmake - Standard location (cereal, boost, ZeroMQ)
+#   - $INSTALL_PREFIX/cmake - Non-standard location (HDF5)
+#   - $INSTALL_PREFIX - General fallback
 cmake -S . -B "$BUILD_DIR" \
     --preset=minimalist \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
-    -DCMAKE_PREFIX_PATH="$INSTALL_PREFIX" \
+    -DCMAKE_PREFIX_PATH="$INSTALL_PREFIX/lib/cmake;$INSTALL_PREFIX/cmake;$INSTALL_PREFIX" \
     -DWRP_CORE_ENABLE_ZMQ=ON \
     -DWRP_CORE_ENABLE_CEREAL=ON \
     -DWRP_CORE_ENABLE_HDF5=${BUILD_HDF5}
