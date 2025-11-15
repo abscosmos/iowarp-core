@@ -4,33 +4,8 @@ project(wrp_cee_api VERSION 1.0.0)
 #------------------------------------------------------------------------------
 # Find Required Packages
 #------------------------------------------------------------------------------
-# Skip find_package if targets already exist (unified build as subdirectory)
-if(NOT TARGET chimaera::cxx AND NOT TARGET chimaera_cxx)
-  find_package(chimaera REQUIRED)
-  list(APPEND CMAKE_MODULE_PATH "${chimaera_DIR}")
-  include(ChimaeraCommon)
-  message(STATUS "Found Chimaera package")
-else()
-  message(STATUS "Using Chimaera as subdirectory")
-  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../context-runtime/cmake")
-  include(ChimaeraCommon)
-endif()
-
-# Find wrp_cte_core package
-if(NOT TARGET wrp_cte::core_client AND NOT TARGET wrp_cte_core_client)
-  find_package(wrp_cte_core REQUIRED)
-  message(STATUS "Found wrp_cte_core package")
-else()
-  message(STATUS "Using wrp_cte_core as subdirectory")
-endif()
-
-# Find wrp_cae_core package
-if(NOT TARGET wrp_cae::core_client AND NOT TARGET wrp_cae_core_client)
-  find_package(wrp_cae_core REQUIRED)
-  message(STATUS "Found wrp_cae_core package")
-else()
-  message(STATUS "Using wrp_cae_core as subdirectory")
-endif()
+# All dependencies are provided by the unified build - no find_package needed
+# chimaera::cxx, wrp_cte_core_client, and wrp_cae_core_client are already available
 
 #------------------------------------------------------------------------------
 # Context Interface Library

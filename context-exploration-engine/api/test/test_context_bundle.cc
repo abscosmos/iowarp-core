@@ -150,7 +150,6 @@ void test_bundle_and_retrieve_workflow() {
   std::cout << "  [STEP 3] Creating CAE pool..." << std::endl;
   wrp_cae::core::Client cae_client;
   wrp_cae::core::CreateParams params;
-  params.worker_count_ = 4;
 
   cae_client.Create(
       HSHM_MCTX,

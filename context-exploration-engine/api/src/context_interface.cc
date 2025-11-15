@@ -82,11 +82,18 @@ std::vector<std::string> ContextInterface::ContextQuery(
 
     // Call BlobQuery with tag and blob regex patterns
     // Use Broadcast to query across all nodes
-    std::vector<std::string> results = cte_client->BlobQuery(
+    auto query_results = cte_client->BlobQuery(
         HSHM_MCTX,
         tag_re,
         blob_re,
+        0,  // max_blobs (0 = unlimited)
         chi::PoolQuery::Broadcast());
+
+    // Convert pair<string, string> results to just blob names
+    std::vector<std::string> results;
+    for (const auto& pair : query_results) {
+      results.push_back(pair.second);  // pair.second is the blob name
+    }
 
     return results;
 
