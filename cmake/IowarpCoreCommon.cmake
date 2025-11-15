@@ -605,8 +605,7 @@ function(add_chimod_runtime)
 
   target_link_libraries(${TARGET_NAME}
     PUBLIC
-      ${RUNTIME_LINK_LIBS}
-    PRIVATE
+      ${RUNTIME_LINK_LIBS} 
       rt  # POSIX real-time library for async I/O
   )
 

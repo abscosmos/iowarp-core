@@ -43,7 +43,6 @@ add_executable(cae_external_test
 target_link_libraries(cae_external_test
     # CAE Core ChiMod libraries (from find_package(wrp_cae_core))
     wrp_cae::core_client                 # CAE Core client library
-    wrp_cae::core_runtime                # CAE Core runtime library (if needed)
 
     # Core Chimaera framework (automatically included by ChiMod libraries)
     # chimaera::cxx                      # NOT needed - automatically included
