@@ -15,9 +15,9 @@ sys.path.insert(0, os.getcwd())
 
 try:
     # Import the CEE API module (built by nanobind)
-    import iowarp_cee_api as cee
+    import wrp_cee as cee
 except ImportError as e:
-    print(f"❌ Failed to import iowarp_cee_api module: {e}")
+    print(f"❌ Failed to import wrp_cee module: {e}")
     print("   Make sure WRP_CORE_ENABLE_PYTHON=ON and nanobind is installed")
     sys.exit(1)
 

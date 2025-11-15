@@ -47,7 +47,7 @@ add_cee_api_unit_test(test_context_destroy test_context_destroy.cc)
 #------------------------------------------------------------------------------
 # Python Tests (if Python bindings are enabled)
 #------------------------------------------------------------------------------
-if(TARGET iowarp_cee_api)
+if(TARGET wrp_cee)
   # Copy Python test to build directory
   configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/test_context_interface.py

@@ -6,7 +6,7 @@
 
 namespace nb = nanobind;
 
-NB_MODULE(iowarp_cee_api, m) {
+NB_MODULE(wrp_cee, m) {
   m.doc() = "IOWarp Context Exploration Engine API - Python Bindings";
 
   // Bind AssimilationCtx struct
