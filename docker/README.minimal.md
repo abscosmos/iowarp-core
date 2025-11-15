@@ -1,16 +1,16 @@
 # IOWarp Core - Minimal Docker Build
 
-This directory contains the minimal Docker configuration for testing the IOWarp Core minimalistic build.
+This directory contains the minimal Docker configuration for pip-based installation testing of IOWarp Core.
 
 ## Overview
 
 The `minimal.Dockerfile` provides a containerized build environment that:
 
-- Uses only essential build dependencies (cmake, gcc, make, git)
-- Builds with the **minimalist** CMake preset (Release mode)
-- Uses **only submodule dependencies** (no system libraries except build tools)
-- Disables tests, benchmarks, and optional features
-- Validates that the project can be built with minimal external dependencies
+- Uses only essential build dependencies (cmake, gcc, make, git, python3)
+- Installs IOWarp Core via **pip install** (using setup.py → install.sh workflow)
+- Builds dependencies from submodules (Boost, ZeroMQ, cereal, yaml-cpp)
+- Installs directly to the Python virtual environment (`/opt/venv`)
+- Validates the complete pip-based installation workflow
 
 ## Dependencies
 
@@ -49,33 +49,55 @@ WRP_CORE_ENABLE_HDF5=ON
 WRP_CORE_ENABLE_CEREAL=ON
 ```
 
-## Building the Docker Image
+## Quick Start - Automated Installation
+
+The easiest way to test the pip-based installation is using the provided script:
+
+```bash
+cd docker
+./install_docker.sh
+```
+
+This script will:
+1. Build the minimal Docker image with source code and initialized submodules
+2. Run `pip install` inside the container
+3. Install IOWarp Core to `/opt/venv` (the container's virtual environment)
+4. Verify the installation by checking for libraries and CMake configs
+
+Expected output:
+```
+Successfully installed iowarp-core-0.0.post98
+
+Checking installed libraries in /opt/venv/lib:
+-rw-r--r-- 1 root root 2.0M libchimaera_cxx.so.1.0.0
+-rw-r--r-- 1 root root 803K libwrp_cte_core_runtime.so
+...
+
+Checking CMake config files:
+/opt/venv/lib/cmake/chimaera/
+/opt/venv/lib/cmake/wrp_cte_core/
+/opt/venv/lib/cmake/iowarp-core/
+...
+
+✓ Installation test complete!
+```
+
+## Manual Build Steps
+
+If you want to build manually without the script:
+
+### 1. Build the Docker Image
 
 From the repository root:
 
 ```bash
-docker build -f docker/minimal.Dockerfile -t iowarp-minimal .
+docker build -f docker/minimal.Dockerfile -t iowarp/minimal:latest .
 ```
 
-## Running the Container
-
-To see build information:
+### 2. Run pip install in the Container
 
 ```bash
-docker run --rm iowarp-minimal
-```
-
-Expected output:
-```
-IOWarp Core - Minimalist Build Container
-Build configuration: Release mode, no tests/benchmarks
-Dependencies: Boost, ZeroMQ, HDF5, cereal (from submodules)
-
-Built libraries:
-[List of shared libraries]
-
-Built executables:
-[List of executables]
+docker run --rm iowarp/minimal:latest /bin/bash -c "pip install -v ."
 ```
 
 ## Size Optimization
@@ -86,13 +108,29 @@ The minimal build significantly reduces:
 - **Binary size**: Release mode with optimization
 - **Attack surface**: Minimal feature set reduces potential vulnerabilities
 
+## Installation Approach
+
+IOWarp Core uses **direct installation to sys.prefix** (not wheel bundling):
+
+- **Libraries** → `{sys.prefix}/lib/` (e.g., `/opt/venv/lib/`)
+- **Headers** → `{sys.prefix}/include/`
+- **Binaries** → `{sys.prefix}/bin/` (automatically in PATH)
+- **CMake configs** → `{sys.prefix}/lib/cmake/`
+
+This approach is standard for C++ libraries with Python bindings and ensures:
+- ✅ CMake can find packages with `find_package(IowarpCore)`
+- ✅ Binaries are automatically in PATH
+- ✅ Works like system package managers (apt, yum, conda)
+
+To change this behavior, set `IOWARP_BUNDLE_BINARIES=ON` to bundle into the wheel instead.
+
 ## Use Cases
 
 This minimal configuration is ideal for:
-- **Production deployments** - Minimal dependencies and attack surface
-- **CI/CD validation** - Quick smoke test that build works without system libraries
+- **pip-based installation testing** - Validates the setup.py → install.sh workflow
+- **CI/CD validation** - Tests that dependencies build correctly from submodules
+- **Virtual environment installation** - Standard Python package installation
 - **Dependency auditing** - Clear view of what's actually required
-- **Embedded systems** - Minimal footprint for resource-constrained environments
 
 ## Differences from Full Build
 
@@ -129,8 +167,12 @@ docker images | grep iowarp-minimal
 
 ## Related Files
 
-- `minimal.Dockerfile` - Dockerfile for minimal build
-- `.dockerignore` - Excludes build artifacts from Docker context
+- `install_docker.sh` - Automated script for building and installing in Docker
+- `minimal.Dockerfile` - Dockerfile for minimal build environment
+- `/.dockerignore` - Excludes build artifacts from Docker context
+- `/setup.py` - Python packaging that calls install.sh
+- `/install.sh` - Unified installer for dependencies and IOWarp Core
+- `/cmake/detect/` - CMake dependency detection system
 - `/CMakePresets.json` - Contains the `minimalist` preset definition
 - `/CMakeLists.txt` - Root build configuration with all options
 

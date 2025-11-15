@@ -243,19 +243,11 @@ if(NOT TARGET cereal AND NOT TARGET cereal::cereal)
     endif()
 endif()
 
-# MPICH (always find to ensure target exists, but only required if enabled)
+# MPICH (only find when explicitly enabled)
 if(WRP_CORE_ENABLE_MPI)
     find_package(MPI REQUIRED COMPONENTS C CXX)
     set(MPI_LIBS MPI::MPI_CXX)
     message(STATUS "found mpi.h at ${MPI_CXX_INCLUDE_DIRS}")
-else()
-    # Try to find MPI quietly - if not found, create a dummy target
-    find_package(MPI QUIET COMPONENTS C CXX)
-    if(NOT MPI_FOUND)
-        # Create dummy MPI targets for compatibility with code that unconditionally links MPI
-        add_library(MPI::MPI_CXX INTERFACE IMPORTED)
-        message(STATUS "MPI not enabled - created dummy MPI::MPI_CXX target")
-    endif()
 endif()
 
 # ROCm (conditional)
