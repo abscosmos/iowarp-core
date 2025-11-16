@@ -96,6 +96,9 @@ if [ -f build/detect/dependency_status.txt ]; then
     echo "  NEED_BOOST:    $NEED_BOOST"
     echo "  NEED_ZEROMQ:   $NEED_ZEROMQ"
     echo "  NEED_HDF5:     $NEED_HDF5"
+    echo "  NEED_YAML_CPP: $NEED_YAML_CPP"
+    echo "  NEED_CEREAL:   $NEED_CEREAL"
+    echo "  NEED_CATCH2:   $NEED_CATCH2"
     echo ""
 else
     echo "Warning: Could not find dependency detection results"
@@ -103,6 +106,9 @@ else
     NEED_BOOST=1
     NEED_ZEROMQ=1
     NEED_HDF5=1
+    NEED_YAML_CPP=1
+    NEED_CEREAL=1
+    NEED_CATCH2=1
 fi
 
 #------------------------------------------------------------------------------
@@ -253,6 +259,92 @@ if [ "$NEED_HDF5" = "1" ] || [ "$NEED_HDF5" = "TRUE" ]; then
     echo "✓ HDF5 installed to $INSTALL_PREFIX"
 else
     echo "✓ HDF5 already available, skipping"
+fi
+echo ""
+
+#------------------------------------------------------------------------------
+# YAML-CPP - Build from submodule
+#------------------------------------------------------------------------------
+if [ "$NEED_YAML_CPP" = "1" ] || [ "$NEED_YAML_CPP" = "TRUE" ]; then
+    echo ">>> Building yaml-cpp from submodule..."
+
+    cd external/yaml-cpp
+    mkdir -p build
+    cd build
+
+    cmake .. \
+        -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DYAML_CPP_BUILD_TESTS=OFF \
+        -DYAML_CPP_BUILD_TOOLS=OFF \
+        -DYAML_CPP_BUILD_CONTRIB=OFF \
+        -DYAML_BUILD_SHARED_LIBS=OFF
+
+    cmake --build . -j${BUILD_JOBS}
+    cmake --install .
+
+    cd "$SCRIPT_DIR"
+    echo "✓ yaml-cpp installed to $INSTALL_PREFIX"
+else
+    echo "✓ yaml-cpp already available, skipping"
+fi
+echo ""
+
+#------------------------------------------------------------------------------
+# Cereal - Build from submodule (header-only, just install)
+#------------------------------------------------------------------------------
+if [ "$NEED_CEREAL" = "1" ] || [ "$NEED_CEREAL" = "TRUE" ]; then
+    echo ">>> Installing cereal from submodule..."
+
+    cd external/cereal
+    mkdir -p build
+    cd build
+
+    cmake .. \
+        -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
+        -DJUST_INSTALL_CEREAL=ON \
+        -DBUILD_DOC=OFF \
+        -DBUILD_SANDBOX=OFF \
+        -DSKIP_PERFORMANCE_COMPARISON=ON
+
+    cmake --build . -j${BUILD_JOBS}
+    cmake --install .
+
+    cd "$SCRIPT_DIR"
+    echo "✓ cereal installed to $INSTALL_PREFIX"
+else
+    echo "✓ cereal already available, skipping"
+fi
+echo ""
+
+#------------------------------------------------------------------------------
+# Catch2 - Build from submodule
+#------------------------------------------------------------------------------
+if [ "$NEED_CATCH2" = "1" ] || [ "$NEED_CATCH2" = "TRUE" ]; then
+    echo ">>> Building Catch2 from submodule..."
+
+    cd external/Catch2
+    mkdir -p build
+    cd build
+
+    cmake .. \
+        -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCATCH_BUILD_TESTING=OFF \
+        -DCATCH_INSTALL_DOCS=OFF \
+        -DCATCH_INSTALL_EXTRAS=ON
+
+    cmake --build . -j${BUILD_JOBS}
+    cmake --install .
+
+    cd "$SCRIPT_DIR"
+    echo "✓ Catch2 installed to $INSTALL_PREFIX"
+else
+    echo "✓ Catch2 already available, skipping"
 fi
 echo ""
 

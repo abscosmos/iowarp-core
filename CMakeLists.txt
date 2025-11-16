@@ -198,16 +198,15 @@ if(WRP_CORE_ENABLE_DOXYGEN)
     message(STATUS "found doxygen at ${DOXYGEN_EXECUTABLE}")
 endif()
 
-# Catch2 - handled later in component subdirectories section
-
-# YAML-CPP - always use submodule (built later)
-
-if (${YAML_CPP_LIBRARIES})
-    set(YAML_CPP_LIBS ${YAML_CPP_LIBRARIES})
-elseif(TARGET yaml-cpp::yaml-cpp)
-    set(YAML_CPP_LIBS yaml-cpp::yaml-cpp)
-else()
-    set(YAML_CPP_LIBS yaml-cpp)
+# YAML-CPP - find from system or install.sh installation
+find_package(yaml-cpp REQUIRED)
+if(yaml-cpp_FOUND)
+    message(STATUS "found yaml-cpp at ${yaml-cpp_DIR}")
+    if(TARGET yaml-cpp::yaml-cpp)
+        set(YAML_CPP_LIBS yaml-cpp::yaml-cpp)
+    else()
+        set(YAML_CPP_LIBS yaml-cpp)
+    endif()
 endif()
 
 # Boost components - find from system or install.sh installation
@@ -216,19 +215,10 @@ if(Boost_FOUND)
     message(STATUS "found boost at ${Boost_INCLUDE_DIRS}")
 endif()
 
-# Cereal - Try system first, fall back to submodule
-if(NOT TARGET cereal AND NOT TARGET cereal::cereal)
-    find_package(cereal QUIET)
-    if(cereal_FOUND)
-        message(STATUS "Found cereal from system at ${cereal_DIR}")
-    else()
-        message(STATUS "System cereal not found, using submodule")
-        set(JUST_INSTALL_CEREAL ON CACHE BOOL "Just install cereal headers" FORCE)
-        set(BUILD_DOC OFF CACHE BOOL "Disable cereal documentation" FORCE)
-        set(BUILD_SANDBOX OFF CACHE BOOL "Disable cereal sandbox" FORCE)
-        set(SKIP_PERFORMANCE_COMPARISON ON CACHE BOOL "Skip cereal performance comparison" FORCE)
-        add_subdirectory(external/cereal)
-    endif()
+# Cereal - find from system or install.sh installation
+find_package(cereal REQUIRED)
+if(cereal_FOUND)
+    message(STATUS "found cereal at ${cereal_DIR}")
 endif()
 
 # MPICH (only find when explicitly enabled)
@@ -520,31 +510,21 @@ endif()
 # Component Subdirectories
 #------------------------------------------------------------------------------
 
-# Catch2 testing framework - Try system first, fall back to submodule
+# Catch2 testing framework - find from system or install.sh installation
 if(WRP_CORE_ENABLE_TESTS)
   message(STATUS "Finding Catch2 testing framework")
-  find_package(Catch2 3 QUIET)
+  find_package(Catch2 3 REQUIRED)
   if(Catch2_FOUND)
-    message(STATUS "Found Catch2 from system at ${Catch2_DIR}")
-  else()
-    message(STATUS "System Catch2 not found, using submodule")
-    add_subdirectory(external/Catch2)
+    message(STATUS "found Catch2 at ${Catch2_DIR}")
   endif()
 endif()
 
 
-# yaml-cpp - Try system first, fall back to submodule
+# yaml-cpp is already found by IowarpCoreCommon (line 202)
 if(NOT TARGET yaml-cpp AND NOT TARGET yaml-cpp::yaml-cpp)
-  find_package(yaml-cpp QUIET)
-  if(yaml-cpp_FOUND)
-    message(STATUS "Found yaml-cpp from system")
-  else()
-    message(STATUS "System yaml-cpp not found, using submodule")
-    add_subdirectory(external/yaml-cpp)
-  endif()
-else()
-  message(STATUS "yaml-cpp already found by IowarpCoreCommon")
+  message(FATAL_ERROR "yaml-cpp was not found. Please run install.sh to install dependencies.")
 endif()
+message(STATUS "yaml-cpp already found by IowarpCoreCommon")
 
 # Context Transport Primitives (formerly cte-hermes-shm) - Required by runtime
 message(STATUS "Building context-transport-primitives component")

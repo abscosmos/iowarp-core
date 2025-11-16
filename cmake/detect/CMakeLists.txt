@@ -22,6 +22,9 @@ find_package(PkgConfig QUIET)
 set(NEED_BOOST TRUE)
 set(NEED_ZEROMQ TRUE)
 set(NEED_HDF5 TRUE)
+set(NEED_YAML_CPP TRUE)
+set(NEED_CEREAL TRUE)
+set(NEED_CATCH2 TRUE)
 
 # Output file for dependency detection results
 set(DETECTION_OUTPUT "${CMAKE_BINARY_DIR}/dependency_status.txt")
@@ -82,6 +85,39 @@ else()
 endif()
 
 #------------------------------------------------------------------------------
+# YAML-CPP Detection
+#------------------------------------------------------------------------------
+find_package(yaml-cpp QUIET)
+if(yaml-cpp_FOUND)
+    set(NEED_YAML_CPP FALSE)
+    message(STATUS "✓ yaml-cpp found at ${yaml-cpp_DIR}")
+else()
+    message(STATUS "✗ yaml-cpp NOT found - will build from submodule")
+endif()
+
+#------------------------------------------------------------------------------
+# Cereal Detection
+#------------------------------------------------------------------------------
+find_package(cereal QUIET)
+if(cereal_FOUND)
+    set(NEED_CEREAL FALSE)
+    message(STATUS "✓ cereal found at ${cereal_DIR}")
+else()
+    message(STATUS "✗ cereal NOT found - will build from submodule")
+endif()
+
+#------------------------------------------------------------------------------
+# Catch2 Detection
+#------------------------------------------------------------------------------
+find_package(Catch2 3 QUIET)
+if(Catch2_FOUND)
+    set(NEED_CATCH2 FALSE)
+    message(STATUS "✓ Catch2 found at ${Catch2_DIR}")
+else()
+    message(STATUS "✗ Catch2 NOT found - will build from submodule")
+endif()
+
+#------------------------------------------------------------------------------
 # Write Detection Results to File
 #------------------------------------------------------------------------------
 file(WRITE ${DETECTION_OUTPUT} "# Dependency Detection Results\n")
@@ -90,6 +126,9 @@ file(APPEND ${DETECTION_OUTPUT} "# Generated: ${CMAKE_CURRENT_LIST_FILE}\n\n")
 file(APPEND ${DETECTION_OUTPUT} "NEED_BOOST=${NEED_BOOST}\n")
 file(APPEND ${DETECTION_OUTPUT} "NEED_ZEROMQ=${NEED_ZEROMQ}\n")
 file(APPEND ${DETECTION_OUTPUT} "NEED_HDF5=${NEED_HDF5}\n")
+file(APPEND ${DETECTION_OUTPUT} "NEED_YAML_CPP=${NEED_YAML_CPP}\n")
+file(APPEND ${DETECTION_OUTPUT} "NEED_CEREAL=${NEED_CEREAL}\n")
+file(APPEND ${DETECTION_OUTPUT} "NEED_CATCH2=${NEED_CATCH2}\n")
 
 message(STATUS "")
 message(STATUS "Dependency detection results written to: ${DETECTION_OUTPUT}")
@@ -104,6 +143,9 @@ message(STATUS "================================================================
 message(STATUS "  Boost:       ${NEED_BOOST}")
 message(STATUS "  ZeroMQ:      ${NEED_ZEROMQ}")
 message(STATUS "  HDF5:        ${NEED_HDF5}")
+message(STATUS "  yaml-cpp:    ${NEED_YAML_CPP}")
+message(STATUS "  cereal:      ${NEED_CEREAL}")
+message(STATUS "  Catch2:      ${NEED_CATCH2}")
 message(STATUS "=================================================================")
 message(STATUS "")
 
