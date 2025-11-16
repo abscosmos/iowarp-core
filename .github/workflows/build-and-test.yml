@@ -141,61 +141,61 @@ jobs:
         echo "=== CMake Config Files ==="
         find /usr/local -name "*Config.cmake" -o -name "*-config.cmake" | grep -E "(iowarp|chimaera|hshm)" | head -20
 
-    # - name: Test external project linking (CTE)
-    #   run: |
-    #     echo "=== Testing CTE external integration ==="
-    #     cd context-transfer-engine/test/unit/external
-    #     mkdir -p build && cd build
-    #     cmake ..
-    #     cmake --build .
-    #     echo "✓ CTE external test built successfully"
-    #   continue-on-error: false
-    #   env:
-    #     CMAKE_PREFIX_PATH: /usr/local
-    #     PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
-    #     LD_LIBRARY_PATH: /usr/local/lib
+    - name: Test external project linking (CTE)
+      run: |
+        echo "=== Testing CTE external integration ==="
+        cd context-transfer-engine/test/unit/external
+        mkdir -p build && cd build
+        cmake ..
+        cmake --build .
+        echo "✓ CTE external test built successfully"
+      continue-on-error: false
+      env:
+        CMAKE_PREFIX_PATH: /usr/local
+        PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+        LD_LIBRARY_PATH: /usr/local/lib
 
-    # - name: Test external project linking (Runtime)
-    #   run: |
-    #     echo "=== Testing Runtime external integration ==="
-    #     cd context-runtime/test/unit/external
-    #     mkdir -p build && cd build
-    #     cmake ..
-    #     cmake --build .
-    #     echo "✓ Runtime external test built successfully"
-    #   continue-on-error: false
-    #   env:
-    #     CMAKE_PREFIX_PATH: /usr/local
-    #     PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
-    #     LD_LIBRARY_PATH: /usr/local/lib
+    - name: Test external project linking (Runtime)
+      run: |
+        echo "=== Testing Runtime external integration ==="
+        cd context-runtime/test/unit/external
+        mkdir -p build && cd build
+        cmake ..
+        cmake --build .
+        echo "✓ Runtime external test built successfully"
+      continue-on-error: false
+      env:
+        CMAKE_PREFIX_PATH: /usr/local
+        PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+        LD_LIBRARY_PATH: /usr/local/lib
 
-    # - name: Test external project linking (Transport Primitives)
-    #   run: |
-    #     echo "=== Testing Transport Primitives external integration ==="
-    #     cd context-transport-primitives/test/unit/external
-    #     mkdir -p build && cd build
-    #     cmake ..
-    #     cmake --build .
-    #     echo "✓ Transport Primitives external test built successfully"
-    #   continue-on-error: false
-    #   env:
-    #     CMAKE_PREFIX_PATH: /usr/local
-    #     PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
-    #     LD_LIBRARY_PATH: /usr/local/lib
+    - name: Test external project linking (Transport Primitives)
+      run: |
+        echo "=== Testing Transport Primitives external integration ==="
+        cd context-transport-primitives/test/unit/external
+        mkdir -p build && cd build
+        cmake ..
+        cmake --build .
+        echo "✓ Transport Primitives external test built successfully"
+      continue-on-error: false
+      env:
+        CMAKE_PREFIX_PATH: /usr/local
+        PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+        LD_LIBRARY_PATH: /usr/local/lib
 
-    # - name: Test external project linking (CAE)
-    #   run: |
-    #     echo "=== Testing CAE external integration ==="
-    #     cd context-assimilation-engine/test/unit/external
-    #     mkdir -p build && cd build
-    #     cmake ..
-    #     cmake --build .
-    #     echo "✓ CAE external test built successfully"
-    #   continue-on-error: false
-    #   env:
-    #     CMAKE_PREFIX_PATH: /usr/local
-    #     PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
-    #     LD_LIBRARY_PATH: /usr/local/lib
+    - name: Test external project linking (CAE)
+      run: |
+        echo "=== Testing CAE external integration ==="
+        cd context-assimilation-engine/test/unit/external
+        mkdir -p build && cd build
+        cmake ..
+        cmake --build .
+        echo "✓ CAE external test built successfully"
+      continue-on-error: false
+      env:
+        CMAKE_PREFIX_PATH: /usr/local
+        PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+        LD_LIBRARY_PATH: /usr/local/lib
 
     - name: Create package with CPack
       run: |
