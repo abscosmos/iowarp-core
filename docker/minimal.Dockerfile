@@ -72,7 +72,7 @@ COPY . /iowarp-core/
 # Configure git to trust the directory and initialize submodules
 # Note: We use --init without --recursive because install.sh will handle
 # recursive initialization of nested submodules (like nanobind's robin_map)
-RUN git config --global --add safe.directory /iowarp-core 
+RUN rm -rf build && git config --global --add safe.directory /iowarp-core 
 
 #------------------------------------------------------------------------------
 # Default Command
