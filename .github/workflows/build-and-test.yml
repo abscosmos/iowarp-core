@@ -16,6 +16,9 @@ jobs:
       matrix:
         os: ['ubuntu-24.04', 'ubuntu-24.04-arm']
 
+    env:
+      INSTALL_PREFIX: ${{ github.workspace }}/install
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -45,7 +48,7 @@ jobs:
     - name: Build and install dependencies using install.sh
       run: |
         chmod +x install.sh
-        sudo DEPS_ONLY=TRUE INSTALL_PREFIX=/usr/local ./install.sh
+        sudo DEPS_ONLY=TRUE INSTALL_PREFIX=$INSTALL_PREFIX ./install.sh
         # Fix ownership of build directory created by install.sh
         sudo chown -R $USER:$USER build/ || true
       env:
@@ -119,69 +122,82 @@ jobs:
 
     - name: Install to temporary prefix
       run: |
-        cmake --install build --prefix ${{ github.workspace }}/install
+        cmake --install build --prefix ${{ env.INSTALL_PREFIX }}
         echo ""
         echo "=== Installation Summary ==="
-        echo "Install prefix: ${{ github.workspace }}/install"
-        echo "Total installed files: $(find ${{ github.workspace }}/install -type f | wc -l)"
+        echo "Install prefix: ${{ env.INSTALL_PREFIX }}"
+        echo "Total installed files: $(find ${{ env.INSTALL_PREFIX }} -type f | wc -l)"
         echo ""
 
     - name: Verify installation structure
       run: |
         echo "=== Installed Libraries ==="
-        find ${{ github.workspace }}/install -name "*.so*" -o -name "*.a" | sort
+        find ${{ env.INSTALL_PREFIX }} -name "*.so*" -o -name "*.a" | sort
         echo ""
         echo "=== Installed Headers ==="
-        find ${{ github.workspace }}/install -name "*.h" -o -name "*.hpp" | head -30
+        find ${{ env.INSTALL_PREFIX }} -name "*.h" -o -name "*.hpp" | head -30
         echo ""
         echo "=== Installed Binaries ==="
-        find ${{ github.workspace }}/install -type f -executable -name "*" | head -20
+        find ${{ env.INSTALL_PREFIX }} -type f -executable -name "*" | head -20
         echo ""
         echo "=== CMake Config Files ==="
-        find ${{ github.workspace }}/install -name "*Config.cmake" -o -name "*-config.cmake" | head -20
+        find ${{ env.INSTALL_PREFIX }} -name "*Config.cmake" -o -name "*-config.cmake" | head -20
 
     - name: Test external project linking (CTE)
       run: |
         echo "=== Testing CTE external integration ==="
         cd context-transfer-engine/test/unit/external
         mkdir -p build && cd build
-        echo "CMAKE_PREFIX_PATH: ${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install"
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" \
-              --debug-find \
-              ..
+        cmake ..
         cmake --build .
         echo "✓ CTE external test built successfully"
       continue-on-error: false
+      env:
+        CMAKE_PREFIX_PATH: ${{ env.INSTALL_PREFIX }}:/usr/local
+        PKG_CONFIG_PATH: ${{ env.INSTALL_PREFIX }}/lib/pkgconfig:/usr/local/lib/pkgconfig
+        LD_LIBRARY_PATH: ${{ env.INSTALL_PREFIX }}/lib:/usr/local/lib
 
     - name: Test external project linking (Runtime)
       run: |
         echo "=== Testing Runtime external integration ==="
         cd context-runtime/test/unit/external
         mkdir -p build && cd build
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
+        cmake ..
         cmake --build .
         echo "✓ Runtime external test built successfully"
       continue-on-error: false
+      env:
+        CMAKE_PREFIX_PATH: ${{ env.INSTALL_PREFIX }}:/usr/local
+        PKG_CONFIG_PATH: ${{ env.INSTALL_PREFIX }}/lib/pkgconfig:/usr/local/lib/pkgconfig
+        LD_LIBRARY_PATH: ${{ env.INSTALL_PREFIX }}/lib:/usr/local/lib
 
     - name: Test external project linking (Transport Primitives)
       run: |
         echo "=== Testing Transport Primitives external integration ==="
         cd context-transport-primitives/test/unit/external
         mkdir -p build && cd build
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
+        cmake ..
         cmake --build .
         echo "✓ Transport Primitives external test built successfully"
       continue-on-error: false
+      env:
+        CMAKE_PREFIX_PATH: ${{ env.INSTALL_PREFIX }}:/usr/local
+        PKG_CONFIG_PATH: ${{ env.INSTALL_PREFIX }}/lib/pkgconfig:/usr/local/lib/pkgconfig
+        LD_LIBRARY_PATH: ${{ env.INSTALL_PREFIX }}/lib:/usr/local/lib
 
     - name: Test external project linking (CAE)
       run: |
         echo "=== Testing CAE external integration ==="
         cd context-assimilation-engine/test/unit/external
         mkdir -p build && cd build
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
+        cmake ..
         cmake --build .
         echo "✓ CAE external test built successfully"
       continue-on-error: false
+      env:
+        CMAKE_PREFIX_PATH: ${{ env.INSTALL_PREFIX }}:/usr/local
+        PKG_CONFIG_PATH: ${{ env.INSTALL_PREFIX }}/lib/pkgconfig:/usr/local/lib/pkgconfig
+        LD_LIBRARY_PATH: ${{ env.INSTALL_PREFIX }}/lib:/usr/local/lib
 
     - name: Create package with CPack
       run: |
@@ -211,7 +227,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: install-${{ matrix.os }}
-        path: ${{ github.workspace }}/install/
+        path: ${{ env.INSTALL_PREFIX }}/
         retention-days: 7
 
     - name: Upload packages
