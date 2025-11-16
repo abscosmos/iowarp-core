@@ -33,6 +33,8 @@ RUN apt-get update && \
     gcc \
     # Version control (for git submodules)
     git \
+    # Download tool (for install.sh)
+    curl \
     # Python and venv
     python3 \
     python3-pip \
@@ -68,9 +70,9 @@ COPY . /iowarp-core/
 # Initialize Git Submodules
 #------------------------------------------------------------------------------
 # Configure git to trust the directory and initialize submodules
-RUN git config --global --add safe.directory /iowarp-core && \
-    git submodule update --init --recursive && \
-    echo "Git submodules initialized successfully"
+# Note: We use --init without --recursive because install.sh will handle
+# recursive initialization of nested submodules (like nanobind's robin_map)
+RUN git config --global --add safe.directory /iowarp-core 
 
 #------------------------------------------------------------------------------
 # Default Command

@@ -8,10 +8,15 @@ set -e  # Exit on error
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Initialize and update git submodules recursively
-echo ">>> Initializing git submodules..."
-git submodule update --init --recursive
-echo ""
+# Initialize and update git submodules recursively (if in a git repository)
+if [ -d ".git" ]; then
+    echo ">>> Initializing git submodules..."
+    git submodule update --init --recursive
+    echo ""
+else
+    echo ">>> Not a git repository, skipping submodule initialization"
+    echo ""
+fi
 
 # Default install prefix
 : ${INSTALL_PREFIX:=/usr/local}
@@ -281,8 +286,22 @@ echo ""
 export PKG_CONFIG_PATH="$INSTALL_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
 
 # Create build directory for IOWarp Core
-BUILD_DIR="build/iowarp-core"
+BUILD_DIR="build"
 mkdir -p "$BUILD_DIR"
+
+# Collect environment variables with specific prefixes to forward to cmake
+CMAKE_EXTRA_ARGS=()
+for var in $(compgen -e); do
+    if [[ "$var" =~ ^(WRP_CORE_ENABLE_|WRP_CTE_ENABLE_|WRP_CAE_ENABLE_|WRP_CEE_ENABLE_|HSHM_ENABLE_|WRP_CTP_ENABLE_|WRP_RUNTIME_ENABLE_|CHIMAERA_ENABLE_) ]]; then
+        CMAKE_EXTRA_ARGS+=("-D${var}=${!var}")
+    fi
+done
+
+echo "Forwarding environment variables to cmake:"
+for arg in "${CMAKE_EXTRA_ARGS[@]}"; do
+    echo "  $arg"
+done
+echo ""
 
 # Configure IOWarp Core with the same prefix
 # Note: CMAKE_PREFIX_PATH includes multiple paths for different package locations:
@@ -293,12 +312,7 @@ cmake -S . -B "$BUILD_DIR" \
     --preset=minimalist \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
     -DCMAKE_PREFIX_PATH="$INSTALL_PREFIX/lib/cmake;$INSTALL_PREFIX/cmake;$INSTALL_PREFIX" \
-    -DWRP_CORE_ENABLE_ZMQ=ON \
-    -DWRP_CORE_ENABLE_CEREAL=ON \
-    -DWRP_CORE_ENABLE_HDF5=ON \
-    -DWRP_CORE_ENABLE_TESTS="$WRP_CORE_ENABLE_TESTS" \
-    -DWRP_CORE_ENABLE_BENCHMARKS="$WRP_CORE_ENABLE_BENCHMARKS" \
-    -DWRP_CORE_ENABLE_MPI="$WRP_CORE_ENABLE_MPI"
+    "${CMAKE_EXTRA_ARGS[@]}"
 
 # Build IOWarp Core
 cmake --build "$BUILD_DIR" -j${BUILD_JOBS}
