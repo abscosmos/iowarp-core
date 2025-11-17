@@ -23,25 +23,36 @@ target_include_directories(wrp_cte_core_ext PRIVATE
 target_compile_features(wrp_cte_core_ext PRIVATE cxx_std_17)
 
 # Configure RPATH for Python module
-# Uses $ORIGIN for relocatable installation
+# Python extension needs to find libraries in {venv}/lib
+# Path from site-packages to lib: lib/python3.x/site-packages -> ../../../lib
+# Order matters: Check same directory first, then ../../../lib for installed libraries
 if(WRP_CORE_ENABLE_RPATH)
     if(APPLE)
+        # From site-packages to lib: ../../../lib
         set_target_properties(wrp_cte_core_ext PROPERTIES
-            INSTALL_RPATH "@loader_path"
+            BUILD_RPATH "@loader_path:@loader_path/../../../lib"
+            INSTALL_RPATH "@loader_path:@loader_path/../../../lib"
+            BUILD_WITH_INSTALL_RPATH FALSE
+            SKIP_BUILD_RPATH FALSE
         )
     elseif(UNIX)
+        # From site-packages to lib: ../../../lib
         set_target_properties(wrp_cte_core_ext PROPERTIES
-            INSTALL_RPATH "$ORIGIN"
+            BUILD_RPATH "$ORIGIN:$ORIGIN/../../../lib"
+            INSTALL_RPATH "$ORIGIN:$ORIGIN/../../../lib"
+            BUILD_WITH_INSTALL_RPATH FALSE
+            SKIP_BUILD_RPATH FALSE
         )
     endif()
 endif()
 
-# Install Python module to CMAKE_INSTALL_PREFIX
+# Install Python module to site-packages
+# For pip install: Python_SITEARCH = {venv}/lib/python3.x/site-packages
 install(
     TARGETS wrp_cte_core_ext
-    LIBRARY DESTINATION .
+    LIBRARY DESTINATION "${Python_SITEARCH}"
 )
-message(STATUS "CTE Python wrapper will be installed to: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "CTE Python wrapper will be installed to: ${Python_SITEARCH}")
 
 # Generate stub file for type hints
 # Note: Stub generation is disabled because the module requires runtime initialization

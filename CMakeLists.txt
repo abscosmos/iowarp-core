@@ -32,6 +32,9 @@ option(WRP_CORE_ENABLE_RPATH "Enable RPATH for installed libraries" ON)
 option(WRP_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
 
+# Note: For pip install, CMAKE_INSTALL_PREFIX should be set to the venv root (e.g., /path/to/venv)
+# Python bindings will install to site-packages via nanobind's install() commands
+
 #------------------------------------------------------------------------------
 # Transport and Network Features
 #------------------------------------------------------------------------------
@@ -79,7 +82,6 @@ option(CHIMAERA_ENABLE_BENCHMARKS "Enable benchmarks for Chimaera runtime" ON)
 option(WRP_CTE_ENABLE_TESTS "Enable tests for CTE" ON)
 option(WRP_CTE_ENABLE_BENCHMARKS "Enable benchmarks for CTE" ON)
 option(WRP_CTE_ENABLE_PYTHON "Enable Python bindings for CTE (requires WRP_CORE_ENABLE_PYTHON=ON)" ON)
-option(WRP_CORE_INSTALL_TO_VENV "Install Python wrappers to Python site-packages instead of lib/" ON)
 
 # CTE Adapter Options (require WRP_CORE_ENABLE_ELF=ON)
 option(WRP_CTE_ENABLE_POSIX_ADAPTER "Enable POSIX adapter" ON)
@@ -418,19 +420,18 @@ if(WRP_CORE_ENABLE_PYTHON)
   # Add nanobind as subdirectory (git submodule)
   add_subdirectory(external/nanobind)
 
-  # Override CMAKE_INSTALL_PREFIX if installing to venv
-  # This makes the entire installation go to site-packages, creating a self-contained Python package
-  if(WRP_CORE_INSTALL_TO_VENV)
-    # Only override if not already set to site-packages
-    if(NOT CMAKE_INSTALL_PREFIX STREQUAL "${Python_SITEARCH}")
-      set(ORIGINAL_CMAKE_INSTALL_PREFIX "${CMAKE_INSTALL_PREFIX}")
-      set(CMAKE_INSTALL_PREFIX "${Python_SITEARCH}" CACHE PATH "Install path prefix (overridden by WRP_CORE_INSTALL_TO_VENV)" FORCE)
-      message(STATUS "WRP_CORE_INSTALL_TO_VENV=ON: Overriding CMAKE_INSTALL_PREFIX")
-      message(STATUS "  Original: ${ORIGINAL_CMAKE_INSTALL_PREFIX}")
-      message(STATUS "  New:      ${CMAKE_INSTALL_PREFIX}")
-      message(STATUS "  All IOWarp components will be installed to Python site-packages")
-    endif()
-  endif()
+  # For pip install: CMAKE_INSTALL_PREFIX is set to the venv root by setup.py
+  # Standard layout for pip install:
+  #   - Binaries:         {venv}/bin/
+  #   - Libraries:        {venv}/lib/
+  #   - Python bindings:  {venv}/lib/python3.x/site-packages/ (handled per-module)
+  #   - Headers:          {venv}/include/
+  #   - CMake configs:    {venv}/lib/cmake/
+  message(STATUS "Python package installation layout:")
+  message(STATUS "  Install prefix:     ${CMAKE_INSTALL_PREFIX}")
+  message(STATUS "  Binaries:           ${CMAKE_INSTALL_PREFIX}/bin")
+  message(STATUS "  Libraries:          ${CMAKE_INSTALL_PREFIX}/lib")
+  message(STATUS "  Python site-arch:   ${Python_SITEARCH}")
 else()
   message(STATUS "Python bindings disabled")
 endif()
@@ -457,15 +458,16 @@ if(WRP_CORE_ENABLE_RPATH)
 
     # Platform-specific RPATH configuration using relative paths
     # This allows the installation to be relocated to any directory
+    # Order matters: Check same directory first, then ../lib for binaries
     if(APPLE)
         set(CMAKE_MACOSX_RPATH TRUE)
         # Use @loader_path for macOS - relative to the loading binary/library
-        set(CMAKE_INSTALL_RPATH "@loader_path/../lib:@loader_path")
-        set(CMAKE_BUILD_RPATH "@loader_path/../lib:@loader_path")
+        set(CMAKE_INSTALL_RPATH "@loader_path:@loader_path/../lib")
+        set(CMAKE_BUILD_RPATH "@loader_path:@loader_path/../lib")
     elseif(UNIX)
         # Use $ORIGIN for Linux - relative to the loading binary/library
-        set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN")
-        set(CMAKE_BUILD_RPATH "$ORIGIN/../lib:$ORIGIN")
+        set(CMAKE_INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib")
+        set(CMAKE_BUILD_RPATH "$ORIGIN:$ORIGIN/../lib")
     endif()
 else()
     message(STATUS "RPATH disabled - libraries will not have embedded runtime paths")

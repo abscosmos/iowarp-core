@@ -62,25 +62,35 @@ if(WRP_CORE_ENABLE_PYTHON)
     )
 
     # Configure RPATH for Python module
-    # Uses $ORIGIN for relocatable installation
-    # When installed to site-packages, libraries are in site-packages/lib/
+    # Python extension needs to find libraries in {venv}/lib
+    # Path from site-packages to lib: lib/python3.x/site-packages -> ../../../lib
+    # Order matters: Check same directory first, then ../../../lib for installed libraries
     if(WRP_CORE_ENABLE_RPATH)
       if(APPLE)
+        # From site-packages to lib: ../../../lib
         set_target_properties(wrp_cee PROPERTIES
-          INSTALL_RPATH "@loader_path/lib:@loader_path/../lib:@loader_path"
+          BUILD_RPATH "@loader_path:@loader_path/../../../lib"
+          INSTALL_RPATH "@loader_path:@loader_path/../../../lib"
+          BUILD_WITH_INSTALL_RPATH FALSE
+          SKIP_BUILD_RPATH FALSE
         )
       elseif(UNIX)
+        # From site-packages to lib: ../../../lib
         set_target_properties(wrp_cee PROPERTIES
-          INSTALL_RPATH "$ORIGIN/lib:$ORIGIN/../lib:$ORIGIN"
+          BUILD_RPATH "$ORIGIN:$ORIGIN/../../../lib"
+          INSTALL_RPATH "$ORIGIN:$ORIGIN/../../../lib"
+          BUILD_WITH_INSTALL_RPATH FALSE
+          SKIP_BUILD_RPATH FALSE
         )
       endif()
     endif()
 
-    # Install Python module to CMAKE_INSTALL_PREFIX
+    # Install Python module to site-packages
+    # For pip install: Python_SITEARCH = {venv}/lib/python3.x/site-packages
     install(TARGETS wrp_cee
-      LIBRARY DESTINATION .
+      LIBRARY DESTINATION "${Python_SITEARCH}"
     )
-    message(STATUS "CEE Python wrapper will be installed to: ${CMAKE_INSTALL_PREFIX}")
+    message(STATUS "CEE Python wrapper will be installed to: ${Python_SITEARCH}")
   endif()
 else()
   message(STATUS "Python bindings disabled - set WRP_CORE_ENABLE_PYTHON=ON to enable")

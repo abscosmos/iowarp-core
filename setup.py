@@ -92,10 +92,6 @@ class CMakeBuild(build_ext):
         # Build the unified core
         self.build_iowarp_core(build_temp)
 
-        # If bundling binaries, copy them to the package directory
-        if os.environ.get("IOWARP_BUNDLE_BINARIES", "OFF").upper() == "ON":
-            self.copy_binaries_to_package(build_temp)
-
     def build_iowarp_core(self, build_temp):
         """Build IOWarp core using install.sh script."""
         print(f"\n{'='*60}")
@@ -134,6 +130,13 @@ class CMakeBuild(build_ext):
         # Prepare environment for install.sh
         env = os.environ.copy()
         env["INSTALL_PREFIX"] = str(install_prefix)
+        # INSTALL_PREFIX points to venv root, e.g., /path/to/venv
+        # This ensures standard layout:
+        #   - Binaries:    {venv}/bin/
+        #   - Libraries:   {venv}/lib/
+        #   - Headers:     {venv}/include/
+        #   - CMake:       {venv}/lib/cmake/
+        # Python bindings install to site-packages via nanobind
 
         # Determine number of parallel jobs
         if hasattr(self, "parallel") and self.parallel:
@@ -166,244 +169,6 @@ class CMakeBuild(build_ext):
             sys.exit(result.returncode)
 
         print(f"\nIOWarp core built and installed successfully!\n")
-
-    def copy_binaries_to_package(self, build_temp):
-        """Copy built binaries and headers into the Python package for wheel bundling."""
-        print("\n" + "="*60)
-        print("Copying binaries to package directory")
-        print("="*60 + "\n")
-
-        install_prefix = build_temp / "install"
-        package_dir = Path(self.build_lib) / "iowarp_core"
-
-        # Create directories in the package
-        lib_dir = package_dir / "lib"
-        include_dir = package_dir / "include"
-        bin_dir = package_dir / "bin"
-
-        lib_dir.mkdir(parents=True, exist_ok=True)
-        include_dir.mkdir(parents=True, exist_ok=True)
-        bin_dir.mkdir(parents=True, exist_ok=True)
-
-        # Copy libraries
-        src_lib_dir = install_prefix / "lib"
-        if src_lib_dir.exists():
-            print(f"Copying libraries from {src_lib_dir} to {lib_dir}")
-            for lib_file in src_lib_dir.rglob("*"):
-                if lib_file.is_file() or lib_file.is_symlink():
-                    # Copy .so, .a, and .dylib files
-                    if lib_file.suffix in [".so", ".a", ".dylib"] or ".so." in lib_file.name:
-                        rel_path = lib_file.relative_to(src_lib_dir)
-                        dest = lib_dir / rel_path
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        # Remove existing file/symlink to avoid conflicts
-                        if dest.exists() or dest.is_symlink():
-                            dest.unlink()
-                        # Copy file or symlink
-                        if lib_file.is_symlink():
-                            os.symlink(os.readlink(lib_file), dest)
-                        else:
-                            shutil.copy2(lib_file, dest)
-                        print(f"  Copied: {rel_path}")
-
-        # Copy lib64 if it exists (some systems use lib64)
-        src_lib64_dir = install_prefix / "lib64"
-        if src_lib64_dir.exists():
-            print(f"Copying libraries from {src_lib64_dir} to {lib_dir}")
-            for lib_file in src_lib64_dir.rglob("*"):
-                if lib_file.is_file() or lib_file.is_symlink():
-                    if lib_file.suffix in [".so", ".a", ".dylib"] or ".so." in lib_file.name:
-                        rel_path = lib_file.relative_to(src_lib64_dir)
-                        dest = lib_dir / rel_path
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        # Remove existing file/symlink to avoid conflicts
-                        if dest.exists() or dest.is_symlink():
-                            dest.unlink()
-                        # Copy file or symlink
-                        if lib_file.is_symlink():
-                            os.symlink(os.readlink(lib_file), dest)
-                        else:
-                            shutil.copy2(lib_file, dest)
-                        print(f"  Copied: {rel_path}")
-
-        # Copy headers
-        src_include_dir = install_prefix / "include"
-        if src_include_dir.exists():
-            print(f"Copying headers from {src_include_dir} to {include_dir}")
-            for header_file in src_include_dir.rglob("*"):
-                if header_file.is_file():
-                    rel_path = header_file.relative_to(src_include_dir)
-                    dest = include_dir / rel_path
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(header_file, dest)
-
-        # Copy binaries/executables
-        src_bin_dir = install_prefix / "bin"
-        if src_bin_dir.exists():
-            print(f"Copying binaries from {src_bin_dir} to {bin_dir}")
-            # Binaries to exclude from distribution (test executables)
-            exclude_binaries = {
-                "test_binary_assim",
-                "test_error_handling",
-                "test_hdf5_assim",
-                "test_range_assim",
-            }
-            for bin_file in src_bin_dir.rglob("*"):
-                if bin_file.is_file():
-                    # Skip test binaries
-                    if bin_file.name in exclude_binaries:
-                        print(f"  Skipped test binary: {bin_file.name}")
-                        continue
-
-                    rel_path = bin_file.relative_to(src_bin_dir)
-                    dest = bin_dir / rel_path
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(bin_file, dest)
-                    # Make executable
-                    dest.chmod(dest.stat().st_mode | 0o111)
-                    print(f"  Copied: {rel_path}")
-
-        # Copy conda dependencies
-        conda_prefix = os.environ.get("CONDA_PREFIX")
-        if conda_prefix:
-            print(f"\n" + "="*60)
-            print("Copying conda dependencies")
-            print("="*60 + "\n")
-
-            conda_lib_dir = Path(conda_prefix) / "lib"
-            if conda_lib_dir.exists():
-                # List of library patterns to copy (dependencies needed by IOWarp)
-                lib_patterns = [
-                    "libboost_*.so*",
-                    "libhdf5*.so*",
-                    "libmpi*.so*",
-                    "libzmq*.so*",
-                    "libsodium.so*",  # Required by ZeroMQ
-                    "libyaml*.so*",  # Note: libyaml-cpp is built from source (see skip_libs below)
-                    "libz.so*",
-                    "libsz.so*",
-                    "libaec.so*",
-                    "libcurl.so*",
-                    "libssh2.so*",  # Required by libcurl
-                    "libnghttp2.so*",  # Required by libcurl
-                    "libssl.so*",  # OpenSSL SSL library
-                    "libcrypto.so*",  # OpenSSL crypto library
-                    "libopen-*.so*",  # OpenMPI libraries
-                    "libpmix*.so*",  # PMIx for OpenMPI
-                    "libhwloc*.so*",  # Hardware locality for MPI
-                    "libevent*.so*",  # Event notification library
-                    "libfabric*.so*",  # Networking for MPI
-                    "libefa.so*",  # Elastic Fabric Adapter (if available)
-                    "libpsm*.so*",  # Intel PSM/PSM2 (if available)
-                    "libucx*.so*",  # Unified Communication X
-                    "libucp*.so*",  # UCX Protocol layer
-                    "libucc*.so*",  # Unified Collective Communication
-                    "libucs*.so*",  # UCX Services layer
-                    "libuct*.so*",  # UCX Transport layer
-                    "libucm*.so*",  # UCX Memory layer
-                    "libicu*.so*",  # ICU (International Components for Unicode)
-                    "libnuma*.so*",  # NUMA support
-                    "librdmacm.so*",  # RDMA connection manager
-                    "libibverbs.so*",  # InfiniBand verbs
-                    "libstdc++.so*",
-                    "libgcc_s.so*",
-                    "libgfortran.so*",
-                    "libquadmath.so*",
-                ]
-
-                copied_libs = set()
-                # Libraries we build from source and should not copy from conda
-                skip_libs = {
-                    "libyaml-cpp.so",
-                    "libyaml-cpp.so.0.8",
-                    "libyaml-cpp.so.0.8.0",
-                }
-
-                for pattern in lib_patterns:
-                    for lib_file in conda_lib_dir.glob(pattern):
-                        lib_name = lib_file.name
-
-                        # Skip libraries we build from source
-                        if lib_name in skip_libs:
-                            print(f"  Skipping conda {lib_name} (using built-from-source version)")
-                            continue
-
-                        if lib_file.is_file() and not lib_file.is_symlink():
-                            if lib_name not in copied_libs:
-                                dest = lib_dir / lib_name
-                                shutil.copy2(lib_file, dest)
-                                copied_libs.add(lib_name)
-                                print(f"  Copied conda dependency: {lib_name}")
-                        elif lib_file.is_symlink():
-                            # Copy symlinks as well
-                            if lib_name not in copied_libs:
-                                dest = lib_dir / lib_name
-                                # Remove existing file/symlink to avoid conflicts
-                                if dest.exists() or dest.is_symlink():
-                                    dest.unlink()
-                                target = lib_file.readlink()
-                                # If target is relative, keep it relative
-                                if not target.is_absolute():
-                                    dest.symlink_to(target)
-                                else:
-                                    # If absolute, just copy the file it points to
-                                    shutil.copy2(lib_file, dest)
-                                copied_libs.add(lib_name)
-                                print(f"  Copied conda dependency (symlink): {lib_name}")
-
-                print(f"\nTotal conda dependencies copied: {len(copied_libs)}")
-
-        # Fix RPATH in all bundled libraries to prefer bundled dependencies
-        print(f"\n" + "="*60)
-        print("Fixing RPATH in bundled libraries")
-        print("="*60 + "\n")
-
-        # Check if patchelf is available
-        patchelf_available = True
-        try:
-            subprocess.run(["patchelf", "--version"],
-                         capture_output=True, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print("  Warning: patchelf not found, skipping RPATH fixes")
-            print("  Libraries may fail to find bundled dependencies")
-            patchelf_available = False
-
-        if patchelf_available:
-            # Fix RPATH for all .so files in lib directory
-            for lib_file in lib_dir.rglob("*.so*"):
-                if lib_file.is_file() and not lib_file.is_symlink():
-                    try:
-                        # Set RPATH to look in same directory first
-                        # $ORIGIN means the directory containing the library
-                        subprocess.run([
-                            "patchelf",
-                            "--set-rpath", "$ORIGIN:$ORIGIN/..:$ORIGIN/../lib",
-                            "--force-rpath",
-                            str(lib_file)
-                        ], capture_output=True, check=True)
-                        print(f"  Fixed RPATH: {lib_file.name}")
-                    except subprocess.CalledProcessError as e:
-                        # Some files may not be ELF files or may not have RPATH
-                        # This is fine, just skip them
-                        pass
-
-            # Fix RPATH for binaries
-            for bin_file in bin_dir.rglob("*"):
-                if bin_file.is_file() and not bin_file.is_symlink():
-                    try:
-                        # Set RPATH to look in ../lib
-                        subprocess.run([
-                            "patchelf",
-                            "--set-rpath", "$ORIGIN/../lib",
-                            "--force-rpath",
-                            str(bin_file)
-                        ], capture_output=True, check=True)
-                        print(f"  Fixed RPATH: bin/{bin_file.name}")
-                    except subprocess.CalledProcessError:
-                        pass
-
-        print("\nBinary copying complete!\n")
-
 
 # Create extensions list
 # Always include the CMake build extension so that source distributions work correctly.
