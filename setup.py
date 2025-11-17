@@ -7,12 +7,10 @@ Builds and installs C++ components using CMake in the correct order.
 import os
 import sys
 import subprocess
-import shutil
 from pathlib import Path
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 from setuptools.command.sdist import sdist
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 
 class CMakeExtension(Extension):
@@ -169,6 +167,7 @@ class CMakeBuild(build_ext):
             sys.exit(result.returncode)
 
         print(f"\nIOWarp core built and installed successfully!\n")
+
 
 # Create extensions list
 # Always include the CMake build extension so that source distributions work correctly.
