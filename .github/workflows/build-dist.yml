@@ -47,15 +47,11 @@ jobs:
         path: dist/*.tar.gz
         retention-days: 7
 
-  build:
-    # Binary wheel distribution for multiple Python versions and architectures
-    # Using ubuntu-20.04 for better manylinux compatibility (GLIBC 2.31 -> manylinux_2_31)
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      matrix:
-        os: ['ubuntu-20.04', 'ubuntu-24.04-arm']
-        python-version: ['3.10', '3.11', '3.12', '3.13']
+  build-wheels:
+    # Build binary wheels using cibuildwheel for manylinux_2_28 compatibility
+    # manylinux_2_28 provides 90-95% Linux compatibility (Ubuntu 20.04+, RHEL 8+, Debian 10+)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
 
     steps:
     - name: Checkout repository
@@ -63,74 +59,78 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Set up Miniconda
-      uses: conda-incubator/setup-miniconda@v3
+    - name: Set up Python
+      uses: actions/setup-python@v5
       with:
-        auto-update-conda: true
-        python-version: ${{ matrix.python-version }}
-        channels: conda-forge,defaults
-        channel-priority: strict
+        python-version: '3.10'
 
-    - name: Install conda dependencies
-      shell: bash -l {0}
+    - name: Set up QEMU for multi-arch builds
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+
+    - name: Build wheels with cibuildwheel
+      uses: pypa/cibuildwheel@v2.21
+      env:
+        # Build for Python 3.10, 3.11, 3.12, 3.13
+        CIBW_BUILD: cp310-* cp311-* cp312-* cp313-*
+
+        # Build for x86_64 and aarch64 architectures
+        CIBW_ARCHS_LINUX: x86_64 aarch64
+
+        # Use manylinux_2_28 images (AlmaLinux 8 based, GLIBC 2.28)
+        CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+        CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+
+        # Install C++ dependencies before building
+        # Using dnf (AlmaLinux 8 package manager) instead of conda
+        CIBW_BEFORE_ALL_LINUX: |
+          dnf install -y \
+            boost-devel \
+            zeromq-devel \
+            hdf5-devel \
+            openmpi-devel \
+            yaml-cpp-devel \
+            cmake \
+            gcc-c++ \
+            make \
+            git \
+            openssl-devel \
+            zlib-devel \
+            elfutils-devel
+
+        # Set environment variables for the build
+        CIBW_ENVIRONMENT: >
+          IOWARP_BUNDLE_BINARIES=ON
+
+        # Test the wheel after building
+        CIBW_TEST_COMMAND: >
+          python -c "import iowarp_core; print('Installed version:', iowarp_core.get_version())"
+
+        # Skip tests for cross-compiled ARM builds (can't run on x86_64 runner)
+        CIBW_TEST_SKIP: "*-musllinux* *-manylinux_aarch64"
+
+    - name: List built wheels
       run: |
-        conda install -y \
-          cereal \
-          catch2 \
-          cmake \
-          boost \
-          yaml-cpp \
-          zeromq \
-          cxx-compiler \
-          pkg-config \
-          openmpi \
-          elfutils \
-          zlib \
-          h5py
+        ls -lh wheelhouse/
+        echo ""
+        echo "=== Wheel details ==="
+        for wheel in wheelhouse/*.whl; do
+          echo "File: $(basename $wheel)"
+          echo "Size: $(du -h $wheel | cut -f1)"
+          echo ""
+        done
 
-    - name: Set up MPI environment
-      shell: bash -l {0}
-      run: |
-        echo "MPI_HOME=$CONDA_PREFIX" >> $GITHUB_ENV
-        echo "MPI_C_COMPILER=$CONDA_PREFIX/bin/mpicc" >> $GITHUB_ENV
-        echo "MPI_CXX_COMPILER=$CONDA_PREFIX/bin/mpic++" >> $GITHUB_ENV
-
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          build-essential \
-          git \
-          libssl-dev
-
-    - name: Install build dependencies
-      shell: bash -l {0}
-      run: |
-        python -m pip install --upgrade pip
-        pip install build twine check-wheel-contents nanobind setuptools-scm
-
-    - name: Build wheel
-      shell: bash -l {0}
-      run: |
-        IOWARP_BUNDLE_BINARIES=ON python -m build --wheel
-      timeout-minutes: 45
-
-    - name: Check distribution
-      shell: bash -l {0}
-      run: |
-        twine check dist/*
-        ls -lh dist/
-
-    - name: Upload artifacts
+    - name: Upload wheel artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: distributions-${{ matrix.os }}-py${{ matrix.python-version }}
-        path: dist/
+        name: wheels
+        path: wheelhouse/*.whl
         retention-days: 7
 
   test-sdist:
     needs: build-sdist
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
 
     steps:
@@ -191,132 +191,10 @@ jobs:
       run: |
         python -c "import iowarp_core; print('Installed version:', iowarp_core.get_version())"
 
-  test-wheel-py313:
-    needs: build
-    runs-on: ubuntu-20.04
-    timeout-minutes: 60
-
-    steps:
-    - name: Download Python 3.13 wheel artifact
-      uses: actions/download-artifact@v4
-      with:
-        name: distributions-ubuntu-20.04-py3.13
-        path: dist/
-
-    - name: Set up Miniconda
-      uses: conda-incubator/setup-miniconda@v3
-      with:
-        auto-update-conda: true
-        python-version: '3.13'
-        channels: conda-forge,defaults
-        channel-priority: strict
-
-    - name: Install conda dependencies
-      shell: bash -l {0}
-      run: |
-        conda install -y \
-          cereal \
-          catch2 \
-          cmake \
-          boost \
-          yaml-cpp \
-          zeromq \
-          cxx-compiler \
-          pkg-config \
-          openmpi \
-          elfutils \
-          zlib \
-          h5py
-
-    - name: Set up MPI environment
-      shell: bash -l {0}
-      run: |
-        echo "MPI_HOME=$CONDA_PREFIX" >> $GITHUB_ENV
-        echo "MPI_C_COMPILER=$CONDA_PREFIX/bin/mpicc" >> $GITHUB_ENV
-        echo "MPI_CXX_COMPILER=$CONDA_PREFIX/bin/mpic++" >> $GITHUB_ENV
-
-    - name: Install wheel checking tools
-      shell: bash -l {0}
-      run: |
-        pip install check-wheel-contents auditwheel
-
-    - name: Check wheel contents
-      shell: bash -l {0}
-      run: |
-        echo "=== Wheel contents check ==="
-        check-wheel-contents dist/*.whl || true
-        echo ""
-        echo "=== Wheel file info ==="
-        ls -lh dist/
-        echo ""
-        echo "=== Unzip wheel to inspect structure ==="
-        unzip -l dist/*.whl | head -50
-
-    - name: Repair wheel with auditwheel (create manylinux-compliant wheel)
-      shell: bash -l {0}
-      run: |
-        echo "=== Repairing wheel with auditwheel ==="
-
-        # Let auditwheel auto-detect the best manylinux tag based on system GLIBC
-        # ubuntu-20.04 (GLIBC 2.31) -> manylinux_2_31
-        # ubuntu-24.04-arm (GLIBC varies) -> auto-detected
-        echo "System GLIBC version:"
-        ldd --version | head -1
-
-        # Repair wheel to bundle all dependencies and create manylinux-compliant wheel
-        # auditwheel will automatically select the appropriate manylinux tag
-        auditwheel repair dist/*.whl -w dist/repaired/
-
-        # Replace original wheel with repaired version
-        rm dist/*.whl
-        mv dist/repaired/*.whl dist/
-        rm -rf dist/repaired/
-
-        # Verify repaired wheel
-        echo ""
-        echo "=== Verifying repaired wheel ==="
-        auditwheel show dist/*.whl
-        echo ""
-        echo "=== Repaired wheel file ==="
-        ls -lh dist/
-
-    - name: Test wheel on clean system (without conda)
-      shell: bash
-      run: |
-        echo "=== Testing repaired wheel on clean system ==="
-        echo "This test verifies the wheel works without conda dependencies"
-
-        # Use system Python (not conda) to create a clean environment
-        /usr/bin/python3 -m venv /tmp/clean_wheel_test
-        source /tmp/clean_wheel_test/bin/activate
-
-        # Install wheel in clean environment
-        pip install dist/*.whl
-
-        # Test import
-        python -c "import iowarp_core; print('✓ Import successful on clean system')"
-        python -c "import iowarp_core; print('✓ Version:', iowarp_core.get_version())"
-        python -c "import sys; print('✓ Python version:', sys.version)"
-
-        deactivate
-        echo "✓ Clean system test passed - wheel is properly bundled!"
-
-    - name: Install from wheel
-      shell: bash -l {0}
-      run: |
-        pip install dist/*.whl
-
-    - name: Test installation
-      shell: bash -l {0}
-      run: |
-        python -c "import iowarp_core; print('Installed version:', iowarp_core.get_version())"
-        python -c "import sys; print('Python version:', sys.version)"
-        python -c "import iowarp_core; print('Module location:', iowarp_core.__file__)"
-
   publish:
     name: Publish to PyPI
     # Publishes both source distributions and binary wheels
-    needs: [build-sdist, test-sdist, build, test-wheel-py313]
+    needs: [build-sdist, test-sdist, build-wheels]
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     environment:
@@ -332,18 +210,11 @@ jobs:
         name: source-distribution
         path: dist/
 
-    - name: Download all wheel artifacts
+    - name: Download wheel artifacts
       uses: actions/download-artifact@v4
       with:
-        pattern: distributions-*
-        path: wheels/
-        merge-multiple: true
-
-    - name: Move wheels to dist directory
-      run: |
-        mkdir -p dist/
-        find wheels/ -name "*.whl" -exec mv {} dist/ \;
-        rm -rf wheels/
+        name: wheels
+        path: dist/
 
     - name: Verify distributions
       run: |
@@ -363,7 +234,7 @@ jobs:
 
   github-release:
     name: Create GitHub Release
-    needs: [build-sdist, test-sdist, build, test-wheel-py313]  # Don't depend on publish - create release even if PyPI rejects
+    needs: [build-sdist, test-sdist, build-wheels]  # Don't depend on publish - create release even if PyPI rejects
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -376,18 +247,11 @@ jobs:
         name: source-distribution
         path: dist/
 
-    - name: Download all wheel artifacts
+    - name: Download wheel artifacts
       uses: actions/download-artifact@v4
       with:
-        pattern: distributions-*
-        path: wheels/
-        merge-multiple: true
-
-    - name: Move wheels to dist directory
-      run: |
-        mkdir -p dist/
-        find wheels/ -name "*.whl" -exec mv {} dist/ \;
-        rm -rf wheels/
+        name: wheels
+        path: dist/
 
     - name: List distribution files
       run: |
