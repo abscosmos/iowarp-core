@@ -33,9 +33,10 @@ option(WRP_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
 
 # Installation Prefix Configuration
-# - Conda: CMAKE_INSTALL_PREFIX is automatically set to $CONDA_PREFIX during conda build
-# - Pip: CMAKE_INSTALL_PREFIX should be set to the venv root (e.g., /path/to/venv)
-# Python bindings will install to site-packages via nanobind's install() commands
+# - Conda (primary): CMAKE_INSTALL_PREFIX is automatically set to $CONDA_PREFIX during conda build
+# - Custom installs: Set CMAKE_INSTALL_PREFIX to desired root directory
+# Libraries install to ${CMAKE_INSTALL_PREFIX}/lib
+# Python bindings install to ${CMAKE_INSTALL_PREFIX}/lib/pythonX.Y/site-packages
 
 #------------------------------------------------------------------------------
 # Build System Detection and Configuration
@@ -480,18 +481,10 @@ if(WRP_CORE_ENABLE_PYTHON)
   # Add nanobind as subdirectory (git submodule)
   add_subdirectory(external/nanobind)
 
-  # For pip install: CMAKE_INSTALL_PREFIX is set to the venv root by setup.py
-  # Standard layout for pip install:
-  #   - Binaries:         {venv}/bin/
-  #   - Libraries:        {venv}/lib/
-  #   - Python bindings:  {venv}/lib/python3.x/site-packages/ (handled per-module)
-  #   - Headers:          {venv}/include/
-  #   - CMake configs:    {venv}/lib/cmake/
-  message(STATUS "Python package installation layout:")
+  message(STATUS "Python bindings enabled:")
   message(STATUS "  Install prefix:     ${CMAKE_INSTALL_PREFIX}")
-  message(STATUS "  Binaries:           ${CMAKE_INSTALL_PREFIX}/bin")
-  message(STATUS "  Libraries:          ${CMAKE_INSTALL_PREFIX}/lib")
-  message(STATUS "  Python site-arch:   ${Python_SITEARCH}")
+  message(STATUS "  Python bindings:    ${CMAKE_INSTALL_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
+  message(STATUS "  Python_SITEARCH:    ${Python_SITEARCH} (for reference only)")
 else()
   message(STATUS "Python bindings disabled")
 endif()

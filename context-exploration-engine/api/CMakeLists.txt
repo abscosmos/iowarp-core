@@ -61,36 +61,13 @@ if(WRP_CORE_ENABLE_PYTHON)
         wrp_cee_api
     )
 
-    # Configure RPATH for Python module
-    # Python extension needs to find libraries in {venv}/lib
-    # Path from site-packages to lib: lib/python3.x/site-packages -> ../../../lib
-    # Order matters: Check same directory first, then ../../../lib for installed libraries
-    if(WRP_CORE_ENABLE_RPATH)
-      if(APPLE)
-        # From site-packages to lib: ../../../lib
-        set_target_properties(wrp_cee PROPERTIES
-          BUILD_RPATH "@loader_path:@loader_path/../../../lib"
-          INSTALL_RPATH "@loader_path:@loader_path/../../../lib"
-          BUILD_WITH_INSTALL_RPATH FALSE
-          SKIP_BUILD_RPATH FALSE
-        )
-      elseif(UNIX)
-        # From site-packages to lib: ../../../lib
-        set_target_properties(wrp_cee PROPERTIES
-          BUILD_RPATH "$ORIGIN:$ORIGIN/../../../lib"
-          INSTALL_RPATH "$ORIGIN:$ORIGIN/../../../lib"
-          BUILD_WITH_INSTALL_RPATH FALSE
-          SKIP_BUILD_RPATH FALSE
-        )
-      endif()
-    endif()
-
-    # Install Python module to site-packages
-    # For pip install: Python_SITEARCH = {venv}/lib/python3.x/site-packages
+    # Install Python module to site-packages within CMAKE_INSTALL_PREFIX
+    # For conda: This will be ${CMAKE_INSTALL_PREFIX}/lib/pythonX.Y/site-packages
+    set(PYTHON_SITE_PACKAGES "lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
     install(TARGETS wrp_cee
-      LIBRARY DESTINATION "${Python_SITEARCH}"
+      LIBRARY DESTINATION "${PYTHON_SITE_PACKAGES}"
     )
-    message(STATUS "CEE Python wrapper will be installed to: ${Python_SITEARCH}")
+    message(STATUS "CEE Python wrapper will be installed to: ${CMAKE_INSTALL_PREFIX}/${PYTHON_SITE_PACKAGES}")
   endif()
 else()
   message(STATUS "Python bindings disabled - set WRP_CORE_ENABLE_PYTHON=ON to enable")
