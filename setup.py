@@ -362,56 +362,12 @@ class CMakeBuild(build_ext):
 
                 print(f"\nTotal conda dependencies copied: {len(copied_libs)}")
 
-        # Fix RPATH in all bundled libraries to prefer bundled dependencies
-        print(f"\n" + "="*60)
-        print("Fixing RPATH in bundled libraries")
-        print("="*60 + "\n")
-
-        # Check if patchelf is available
-        patchelf_available = True
-        try:
-            subprocess.run(["patchelf", "--version"],
-                         capture_output=True, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            print("  Warning: patchelf not found, skipping RPATH fixes")
-            print("  Libraries may fail to find bundled dependencies")
-            patchelf_available = False
-
-        if patchelf_available:
-            # Fix RPATH for all .so files in lib directory
-            for lib_file in lib_dir.rglob("*.so*"):
-                if lib_file.is_file() and not lib_file.is_symlink():
-                    try:
-                        # Set RPATH to look in same directory first
-                        # $ORIGIN means the directory containing the library
-                        subprocess.run([
-                            "patchelf",
-                            "--set-rpath", "$ORIGIN:$ORIGIN/..:$ORIGIN/../lib",
-                            "--force-rpath",
-                            str(lib_file)
-                        ], capture_output=True, check=True)
-                        print(f"  Fixed RPATH: {lib_file.name}")
-                    except subprocess.CalledProcessError:
-                        # Some files may not be ELF files or may not have RPATH
-                        # This is fine, just skip them
-                        pass
-
-            # Fix RPATH for binaries
-            for bin_file in bin_dir.rglob("*"):
-                if bin_file.is_file() and not bin_file.is_symlink():
-                    try:
-                        # Set RPATH to look in ../lib
-                        subprocess.run([
-                            "patchelf",
-                            "--set-rpath", "$ORIGIN/../lib",
-                            "--force-rpath",
-                            str(bin_file)
-                        ], capture_output=True, check=True)
-                        print(f"  Fixed RPATH: bin/{bin_file.name}")
-                    except subprocess.CalledProcessError:
-                        pass
-
-        print("\nBinary copying complete!\n")
+        # Note: RPATH fixing is not needed because:
+        # - CMake already sets correct relative RPATH ($ORIGIN) at build time
+        # - All IOWarp libraries and binaries are already relocatable
+        # - Bundled libraries retain their CMake-configured RPATH when copied
+        print("\nBinary copying complete!")
+        print("Note: Libraries already have correct RPATH set by CMake build system\n")
 
 
 class BinaryDistribution(Distribution):
