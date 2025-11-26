@@ -3,6 +3,7 @@ project(hermes_shm)
 set(TEST_MAIN ${CMAKE_CURRENT_SOURCE_DIR})
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+add_subdirectory(allocator)
 add_subdirectory(backend)
 # Following test directories disabled - depend on deleted code:
 # add_subdirectory(types)

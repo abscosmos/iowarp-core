@@ -20,7 +20,7 @@
 
 #include "hermes_shm/constants/macros.h"
 // #include "hermes_shm/data_structures/ipc/chararr.h"  // Deleted during hard refactoring
-#include "hermes_shm/memory/memory.h"
+#include "hermes_shm/memory/allocator/allocator.h"
 
 namespace hshm::ipc {
 
@@ -72,50 +72,39 @@ class MemoryBackendId {
 typedef MemoryBackendId memory_backend_id_t;
 
 struct MemoryBackendHeader {
-  union {
-    size_t data_size_;  // For CPU-only backends
-    size_t md_size_;    // For CPU+GPU backends
-  };
+  size_t md_size_;         // Metadata size for process connection
   MemoryBackendId id_;
   bitfield64_t flags_;
-  size_t accel_data_size_;
+  size_t accel_data_size_; // Actual data buffer size for allocators
   int accel_id_;
 
   HSHM_CROSS_FUN void Print() const {
-    printf("(%s) MemoryBackendHeader: id: %d, data_size: %lu\n",
-           kCurrentDevice, id_.id_, (long unsigned)data_size_);
+    printf("(%s) MemoryBackendHeader: id: %d, md_size: %lu, accel_data_size: %lu\n",
+           kCurrentDevice, id_.id_, (long unsigned)md_size_, (long unsigned)accel_data_size_);
   }
 };
 
 #define MEMORY_BACKEND_INITIALIZED BIT_OPT(u64, 0)
 #define MEMORY_BACKEND_OWNED BIT_OPT(u64, 1)
-#define MEMORY_BACKEND_COPY_GPU BIT_OPT(u64, 2)
-#define MEMORY_BACKEND_MIRROR_GPU BIT_OPT(u64, 3)
-#define MEMORY_BACKEND_HAS_ALLOC BIT_OPT(u64, 4)
-#define MEMORY_BACKEND_HAS_GPU_ALLOC BIT_OPT(u64, 5)
-#define MEMORY_BACKEND_IS_SCANNED BIT_OPT(u64, 6)
+#define MEMORY_BACKEND_HAS_ALLOC BIT_OPT(u64, 2)
+#define MEMORY_BACKEND_HAS_GPU_ALLOC BIT_OPT(u64, 3)
+#define MEMORY_BACKEND_IS_SCANNED BIT_OPT(u64, 4)
 
 class UrlMemoryBackend {};
 
 class MemoryBackend {
  public:
   MemoryBackendHeader *header_;
-  union {
-    char *data_; /** For CPU-only backends */
-    char *md_;   /** For CPU+GPU backends */
-  };
-  union {
-    size_t data_size_; /** For CPU-only backends */
-    size_t md_size_;   /** For CPU+GPU backends */
-  };
+  char *md_;              // Metadata for how processes (on CPU) connect to this backend. Not required for allocators.
+  size_t md_size_;        // Metadata size. Not required for allocators.
   bitfield64_t flags_;
-  char *accel_data_;
-  size_t accel_data_size_;
+  char *accel_data_;      // Buffer for allocators (equivalent to buffer_ in class Allocator)
+  size_t accel_data_size_;// Buffer size for allocators (equivalent to buffer_size_ in class Allocator)
   int accel_id_;
 
  public:
   HSHM_CROSS_FUN
-  MemoryBackend() : header_(nullptr), data_(nullptr) {}
+  MemoryBackend() : header_(nullptr), md_(nullptr), md_size_(0), accel_data_(nullptr), accel_data_size_(0), accel_id_(-1) {}
 
   ~MemoryBackend() = default;
 
@@ -144,29 +133,6 @@ class MemoryBackend {
   HSHM_CROSS_FUN
   void UnsetInitialized() { flags_.UnsetBits(MEMORY_BACKEND_INITIALIZED); }
 
-  /** Mark data for GPU copy */
-  HSHM_CROSS_FUN
-  void SetCopyGpu() { flags_.SetBits(MEMORY_BACKEND_COPY_GPU); }
-
-  /** Check if data is marked for GPU copy */
-  HSHM_CROSS_FUN
-  bool IsCopyGpu() { return flags_.Any(MEMORY_BACKEND_COPY_GPU); }
-
-  /** Unmark data for GPU copy */
-  HSHM_CROSS_FUN
-  void UnsetCopyGpu() { flags_.UnsetBits(MEMORY_BACKEND_COPY_GPU); }
-
-  /** Mark data for GPU mirror */
-  HSHM_CROSS_FUN
-  void SetMirrorGpu() { flags_.SetBits(MEMORY_BACKEND_MIRROR_GPU); }
-
-  /** Check if data is marked for GPU mirror */
-  HSHM_CROSS_FUN
-  bool IsMirrorGpu() { return flags_.Any(MEMORY_BACKEND_MIRROR_GPU); }
-
-  /** Unmark data for GPU mirror */
-  HSHM_CROSS_FUN
-  void UnsetMirrorGpu() { flags_.UnsetBits(MEMORY_BACKEND_MIRROR_GPU); }
 
   /** Mark data as having an allocation */
   HSHM_CROSS_FUN
@@ -233,13 +199,13 @@ class MemoryBackend {
   HSHM_CROSS_FUN
   void Print() const {
     header_->Print();
-    printf("(%s) MemoryBackend: data: %p, data_size: %lu\n", kCurrentDevice,
-           data_, (long unsigned)data_size_);
+    printf("(%s) MemoryBackend: md: %p, md_size: %lu, accel_data: %p, accel_data_size: %lu\n",
+           kCurrentDevice, md_, (long unsigned)md_size_, accel_data_, (long unsigned)accel_data_size_);
   }
 
   /// Each allocator must define its own shm_init.
   // virtual bool shm_init(size_t size, ...) = 0;
-  // virtual bool shm_deserialize(const hshm::chararr &url) = 0;
+  // virtual bool shm_attach(const hshm::chararr &url) = 0;
   // virtual void shm_detach() = 0;
   // virtual void shm_destroy() = 0;
 };

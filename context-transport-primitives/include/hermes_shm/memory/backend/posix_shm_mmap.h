@@ -29,13 +29,10 @@
 namespace hshm::ipc {
 
 class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
- public:
-  CLS_CONST MemoryBackendType EnumType = MemoryBackendType::kPosixShmMmap;
-
  protected:
   File fd_;
-  hshm::chararr url_;
-  CLS_CONST int hdr_size_ = KILOBYTES(16);
+  std::string url_;
+  size_t total_size_;
 
  public:
   /** Constructor */
@@ -56,40 +53,100 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
   /** Initialize backend */
   bool shm_init(const MemoryBackendId &backend_id, size_t size,
-                const hshm::chararr &url) {
+                const std::string &url) {
+    // Enforce minimum backend size of 1MB
+    constexpr size_t kMinBackendSize = 1024 * 1024;  // 1MB
+    if (size < kMinBackendSize) {
+      size = kMinBackendSize;
+    }
+
+    // Initialize flags before calling methods that use it
+    flags_.Clear();
     SetInitialized();
     Own();
-    std::string url_s = url.str();
-    SystemInfo::DestroySharedMemory(url_s);
-    if (!SystemInfo::CreateNewSharedMemory(fd_, url_s, size + hdr_size_)) {
+
+    // Calculate sizes: header + md section + alignment + data section
+    constexpr size_t kAlignment = 4096;  // 4KB alignment
+    size_t header_size = sizeof(MemoryBackendHeader);
+    size_t md_size = header_size;  // md section stores the header
+    size_t aligned_md_size = ((md_size + kAlignment - 1) / kAlignment) * kAlignment;
+    total_size_ = aligned_md_size + size;
+
+    // Create shared memory
+    SystemInfo::DestroySharedMemory(url);
+    if (!SystemInfo::CreateNewSharedMemory(fd_, url, total_size_)) {
       char *err_buf = strerror(errno);
       HILOG(kError, "shm_open failed: {}", err_buf);
       return false;
     }
     url_ = url;
-    header_ = (MemoryBackendHeader *)_ShmMap(hdr_size_, 0);
+
+    // Map the entire shared memory region as one contiguous block
+    char *ptr = _ShmMap(total_size_, 0);
+    if (!ptr) {
+      return false;
+    }
+
+    // Layout: [MemoryBackendHeader | padding to 4KB] [accel_data]
+    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
     new (header_) MemoryBackendHeader();
-    header_->type_ = MemoryBackendType::kPosixShmMmap;
     header_->id_ = backend_id;
-    header_->data_size_ = size;
-    data_size_ = size;
-    data_ = _ShmMap(size, hdr_size_);
+    header_->md_size_ = md_size;
+    header_->accel_data_size_ = size;
+    header_->accel_id_ = -1;
+    header_->flags_.Clear();
+
+    // md_ points to the header itself (metadata for process connection)
+    md_ = ptr;
+    md_size_ = md_size;
+
+    // accel_data_ starts at 4KB aligned boundary after md section
+    accel_data_ = ptr + aligned_md_size;
+    accel_data_size_ = size;
+    accel_id_ = -1;
+
     return true;
   }
 
   /** Deserialize the backend */
-  bool shm_deserialize(const hshm::chararr &url) {
+  bool shm_attach(const std::string &url) {
+    flags_.Clear();
     SetInitialized();
     Disown();
-    std::string url_s = url.str();
-    if (!SystemInfo::OpenSharedMemory(fd_, url_s)) {
+
+    if (!SystemInfo::OpenSharedMemory(fd_, url)) {
       const char *err_buf = strerror(errno);
       HILOG(kError, "shm_open failed: {}", err_buf);
       return false;
     }
-    header_ = (MemoryBackendHeader *)_ShmMap(hdr_size_, 0);
-    data_size_ = header_->data_size_;
-    data_ = _ShmMap(data_size_, hdr_size_);
+    url_ = url;
+
+    // First, map just the header to get the size information
+    constexpr size_t kAlignment = 4096;
+    header_ = (MemoryBackendHeader *)_ShmMap(kAlignment, 0);
+
+    // Calculate total size based on header information
+    size_t md_size = header_->md_size_;
+    size_t aligned_md_size = ((md_size + kAlignment - 1) / kAlignment) * kAlignment;
+    total_size_ = aligned_md_size + header_->accel_data_size_;
+
+    // Unmap the header
+    SystemInfo::UnmapMemory(header_, kAlignment);
+
+    // Map the entire region
+    char *ptr = _ShmMap(total_size_, 0);
+    if (!ptr) {
+      return false;
+    }
+
+    // Set up pointers
+    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
+    md_ = ptr;
+    md_size_ = header_->md_size_;
+    accel_data_ = ptr + aligned_md_size;
+    accel_data_size_ = header_->accel_data_size_;
+    accel_id_ = header_->accel_id_;
+
     return true;
   }
 
@@ -115,9 +172,8 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     if (!IsInitialized()) {
       return;
     }
-    SystemInfo::UnmapMemory(reinterpret_cast<void *>(header_),
-                            HSHM_SYSTEM_INFO->page_size_);
-    SystemInfo::UnmapMemory(data_, data_size_);
+    // Unmap the entire contiguous region
+    SystemInfo::UnmapMemory(reinterpret_cast<void *>(header_), total_size_);
     SystemInfo::CloseSharedMemory(fd_);
     UnsetInitialized();
   }
@@ -128,7 +184,7 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
       return;
     }
     _Detach();
-    SystemInfo::DestroySharedMemory(url_.c_str());
+    SystemInfo::DestroySharedMemory(url_);
     UnsetInitialized();
   }
 };

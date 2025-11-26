@@ -34,15 +34,11 @@ struct _MallocAllocatorHeader : public AllocatorHeader {
 
   HSHM_CROSS_FUN
   void Configure(AllocatorId alloc_id, size_t custom_header_size) {
-    AllocatorHeader::Configure(alloc_id, AllocatorType::kStackAllocator,
-                               custom_header_size);
+    AllocatorHeader::Configure(alloc_id, custom_header_size);
   }
 };
 
 class _MallocAllocator : public Allocator {
- public:
-  HSHM_ALLOCATOR(_MallocAllocator);
-
  private:
   _MallocAllocatorHeader *header_;
 
@@ -59,7 +55,6 @@ class _MallocAllocator : public Allocator {
   HSHM_CROSS_FUN
   void shm_init(AllocatorId id, size_t custom_header_size,
                 MemoryBackend backend) {
-    type_ = AllocatorType::kMallocAllocator;
     id_ = id;
     buffer_ = nullptr;
     buffer_size_ = std::numeric_limits<size_t>::max();
@@ -73,8 +68,8 @@ class _MallocAllocator : public Allocator {
    * Attach an existing allocator from shared memory
    * */
   HSHM_CROSS_FUN
-  void shm_deserialize(MemoryBackend backend) {
-    HSHM_THROW_ERROR(NOT_IMPLEMENTED, "_MallocAllocator::shm_deserialize");
+  void shm_attach(MemoryBackend backend) {
+    HSHM_THROW_ERROR(NOT_IMPLEMENTED, "_MallocAllocator::shm_attach");
   }
 
   /**

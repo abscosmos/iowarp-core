@@ -24,6 +24,7 @@
 #include "types/argpack.h"
 #include "types/atomic.h"
 #include "types/bitfield.h"
+#include "types/hash.h"
 #include "types/numbers.h"
 #include "types/qtok.h"
 #include "types/real_number.h"

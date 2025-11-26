@@ -7,16 +7,21 @@ set(HSHM_LIBS "")
 
 # BUILD HSHM FOR HOST ONLY
 set(SRC_FILES
-    # system_info.cc   # NOTE(llogan): Commented out because ROCm is annoying and buggy
+    system_info.cc
     # memory_manager.cc  # NOTE: Deleted during hard refactoring
 )
 
-# Create empty library with just headers since all source files are commented out
-add_library(hermes_shm_host INTERFACE)
-target_link_libraries(hermes_shm_host INTERFACE
+# Create library with system_info.cc
+add_library(hermes_shm_host ${SRC_FILES})
+target_link_libraries(hermes_shm_host PUBLIC
     ${REAL_TIME_FLAGS}
     configure
     thread_all
+)
+target_include_directories(hermes_shm_host PUBLIC
+    $<BUILD_INTERFACE:${HSHM_ROOT}/include>
+    $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+    $<INSTALL_INTERFACE:include>
 )
 hshm_target_compile_definitions(hermes_shm_host)
 list(APPEND HSHM_LIBS hermes_shm_host)

@@ -27,13 +27,14 @@
 #include "hermes_shm/util/gpu_api.h"
 #include "hermes_shm/util/logging.h"
 #include "memory_backend.h"
-#include "posix_shm_mmap.h"
 
 namespace hshm::ipc {
 
-class GpuShmMmap : public PosixShmMmap {
- public:
-  CLS_CONST MemoryBackendType EnumType = MemoryBackendType::kGpuShmMmap;
+class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
+ protected:
+  File fd_;
+  std::string url_;
+  size_t total_size_;
 
  public:
   /** Constructor */
@@ -54,35 +55,116 @@ class GpuShmMmap : public PosixShmMmap {
 
   /** Initialize shared memory */
   bool shm_init(const MemoryBackendId& backend_id, size_t size,
-                const hshm::chararr& url, int gpu_id = 0) {
-    bool ret = PosixShmMmap::shm_init(backend_id, size, url);
-    if (!ret) {
+                const std::string& url, int gpu_id = 0) {
+    // Enforce minimum backend size of 1MB
+    constexpr size_t kMinBackendSize = 1024 * 1024;  // 1MB
+    if (size < kMinBackendSize) {
+      size = kMinBackendSize;
+    }
+
+    // Initialize flags before calling methods that use it
+    flags_.Clear();
+    SetInitialized();
+    Own();
+
+    // Calculate sizes: header + md section + alignment + data section
+    constexpr size_t kAlignment = 4096;  // 4KB alignment
+    size_t header_size = sizeof(MemoryBackendHeader);
+    size_t md_size = header_size;  // md section stores the header
+    size_t aligned_md_size = ((md_size + kAlignment - 1) / kAlignment) * kAlignment;
+    total_size_ = aligned_md_size + size;
+
+    // Create shared memory
+    SystemInfo::DestroySharedMemory(url);
+    if (!SystemInfo::CreateNewSharedMemory(fd_, url, total_size_)) {
+      char *err_buf = strerror(errno);
+      HILOG(kError, "shm_open failed: {}", err_buf);
       return false;
     }
-    SetCopyGpu();
-    SetMirrorGpu();
-    Register(header_, HSHM_SYSTEM_INFO->page_size_);
-    Register(data_, size);
-    header_->accel_data_size_ = data_size_;
+    url_ = url;
+
+    // Map the entire shared memory region as one contiguous block
+    char *ptr = reinterpret_cast<char *>(
+        SystemInfo::MapSharedMemory(fd_, total_size_, 0));
+    if (!ptr) {
+      HSHM_THROW_ERROR(SHMEM_CREATE_FAILED);
+    }
+
+    // Layout: [MemoryBackendHeader | padding to 4KB] [accel_data]
+    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
+    new (header_) MemoryBackendHeader();
+    header_->id_ = backend_id;
+    header_->md_size_ = md_size;
+    header_->accel_data_size_ = size;
     header_->accel_id_ = gpu_id;
-    accel_data_ = data_;
-    accel_data_size_ = data_size_;
-    accel_id_ = header_->accel_id_;
-    header_->type_ = MemoryBackendType::kGpuShmMmap;
+    header_->flags_.Clear();
+
+    // md_ points to the header itself (metadata for process connection)
+    md_ = ptr;
+    md_size_ = md_size;
+
+    // accel_data_ starts at 4KB aligned boundary after md section
+    accel_data_ = ptr + aligned_md_size;
+    accel_data_size_ = size;
+    accel_id_ = gpu_id;
+
+    // Register both metadata and data sections with GPU
+    Register(md_, aligned_md_size);
+    Register(accel_data_, size);
+
     return true;
   }
 
   /** SHM deserialize */
-  bool shm_deserialize(const hshm::chararr& url) {
-    SetCopyGpu();
-    SetMirrorGpu();
-    bool ret = PosixShmMmap::shm_deserialize(url);
-    Register(header_, HSHM_SYSTEM_INFO->page_size_);
-    Register(data_, data_size_);
-    accel_data_ = data_;
-    accel_data_size_ = data_size_;
+  bool shm_attach(const std::string& url) {
+    flags_.Clear();
+    SetInitialized();
+    Disown();
+
+    if (!SystemInfo::OpenSharedMemory(fd_, url)) {
+      const char *err_buf = strerror(errno);
+      HILOG(kError, "shm_open failed: {}", err_buf);
+      return false;
+    }
+    url_ = url;
+
+    // First, map just the header to get the size information
+    constexpr size_t kAlignment = 4096;
+    char *ptr = reinterpret_cast<char *>(
+        SystemInfo::MapSharedMemory(fd_, kAlignment, 0));
+    if (!ptr) {
+      return false;
+    }
+
+    // Calculate total size based on header information
+    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
+    size_t md_size = header_->md_size_;
+    size_t aligned_md_size = ((md_size + kAlignment - 1) / kAlignment) * kAlignment;
+    total_size_ = aligned_md_size + header_->accel_data_size_;
+
+    // Unmap the header
+    SystemInfo::UnmapMemory(ptr, kAlignment);
+
+    // Map the entire region
+    ptr = reinterpret_cast<char *>(
+        SystemInfo::MapSharedMemory(fd_, total_size_, 0));
+    if (!ptr) {
+      return false;
+    }
+
+    // Set up pointers
+    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
+    md_ = ptr;
+    md_size_ = header_->md_size_;
+    accel_data_ = ptr + aligned_md_size;
+    accel_data_size_ = header_->accel_data_size_;
     accel_id_ = header_->accel_id_;
-    return ret;
+
+    // Register both metadata and data sections with GPU
+    Register(md_, aligned_md_size);
+    Register(accel_data_, accel_data_size_);
+
+    return true;
   }
 
   /** Map shared memory */
@@ -93,9 +175,32 @@ class GpuShmMmap : public PosixShmMmap {
 
   /** Detach shared memory */
   void _Detach() {
-    GpuApi::UnregisterHostMemory(header_);
-    GpuApi::UnregisterHostMemory(data_);
-    PosixShmMmap::_Detach();
+    if (!IsInitialized()) {
+      return;
+    }
+    // Unregister GPU memory
+    if (md_) {
+      GpuApi::UnregisterHostMemory(md_);
+    }
+    if (accel_data_ && accel_data_ != md_) {
+      GpuApi::UnregisterHostMemory(accel_data_);
+    }
+    // Unmap the entire contiguous region
+    if (header_) {
+      SystemInfo::UnmapMemory(reinterpret_cast<void *>(header_), total_size_);
+    }
+    SystemInfo::CloseSharedMemory(fd_);
+    UnsetInitialized();
+  }
+
+  /** Destroy shared memory */
+  void _Destroy() {
+    if (!IsInitialized()) {
+      return;
+    }
+    _Detach();
+    SystemInfo::DestroySharedMemory(url_);
+    UnsetInitialized();
   }
 };
 

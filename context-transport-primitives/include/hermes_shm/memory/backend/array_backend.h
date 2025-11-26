@@ -54,7 +54,7 @@ class ArrayBackend : public MemoryBackend {
     return true;
   }
 
-  bool shm_deserialize(const hshm::chararr &url) {
+  bool shm_attach(const hshm::chararr &url) {
     (void)url;
     HSHM_THROW_ERROR(SHMEM_NOT_SUPPORTED);
     return false;

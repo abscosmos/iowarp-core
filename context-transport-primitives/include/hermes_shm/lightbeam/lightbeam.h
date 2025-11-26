@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include "hermes_shm/memory/memory.h"
+#include "hermes_shm/memory/allocator/allocator.h"
 #include "hermes_shm/types/bitfield.h"
 
 namespace hshm::lbm {
