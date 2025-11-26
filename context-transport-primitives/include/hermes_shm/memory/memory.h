@@ -17,7 +17,7 @@
 #include <type_traits>
 
 #include "hermes_shm/constants/macros.h"
-#include "hermes_shm/data_structures/ipc/hash.h"
+// #include "hermes_shm/data_structures/ipc/hash.h"  // Deleted during hard refactoring
 #include "hermes_shm/introspect/system_info.h"
 #include "hermes_shm/types/atomic.h"
 #include "hermes_shm/types/bitfield.h"
@@ -735,7 +735,7 @@ namespace std {
 template <>
 struct hash<hshm::ipc::AllocatorId> {
   std::size_t operator()(const hshm::ipc::AllocatorId &key) const {
-    return hshm::hash<uint64_t>{}(key.int_);
+    return std::hash<uint64_t>{}(key.int_);
   }
 };
 

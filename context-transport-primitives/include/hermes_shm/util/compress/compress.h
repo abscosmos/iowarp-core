@@ -13,7 +13,7 @@
 #ifndef HSHM_SHM_INCLUDE_HSHM_SHM_COMPRESS_COMPRESS_H_
 #define HSHM_SHM_INCLUDE_HSHM_SHM_COMPRESS_COMPRESS_H_
 
-#include "hermes_shm/data_structures/all.h"
+// #include "hermes_shm/data_structures/all.h"  // Deleted during hard refactoring
 
 namespace hshm {
 

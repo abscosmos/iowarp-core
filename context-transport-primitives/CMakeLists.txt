@@ -329,11 +329,6 @@ if(HSHM_ENABLE_TESTS)
     add_subdirectory(test)
 endif()
 
-if(HSHM_ENABLE_BENCHMARKS)
-    message("Building HSHM benchmarks")
-    add_subdirectory(benchmark)
-endif()
-
 # add_subdirectory(example)
 
 # ------------------------------------------------------------------------------

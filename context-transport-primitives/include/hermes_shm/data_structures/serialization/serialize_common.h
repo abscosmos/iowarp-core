@@ -19,7 +19,7 @@
 #include <cereal/archives/binary.hpp>
 #endif
 
-#include "hermes_shm/data_structures/ipc/hash.h"
+// #include "hermes_shm/data_structures/ipc/hash.h"  // Deleted during hard refactoring
 
 namespace hshm::ipc {
 

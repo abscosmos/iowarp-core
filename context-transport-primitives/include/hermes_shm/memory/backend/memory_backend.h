@@ -19,19 +19,10 @@
 #include <vector>
 
 #include "hermes_shm/constants/macros.h"
-#include "hermes_shm/data_structures/ipc/chararr.h"
+// #include "hermes_shm/data_structures/ipc/chararr.h"  // Deleted during hard refactoring
 #include "hermes_shm/memory/memory.h"
 
 namespace hshm::ipc {
-
-enum class MemoryBackendType {
-  kPosixShmMmap,
-  kMallocBackend,
-  kArrayBackend,
-  kPosixMmap,
-  kGpuMalloc,
-  kGpuShmMmap,
-};
 
 /** ID for memory backend */
 class MemoryBackendId {
@@ -85,16 +76,14 @@ struct MemoryBackendHeader {
     size_t data_size_;  // For CPU-only backends
     size_t md_size_;    // For CPU+GPU backends
   };
-  MemoryBackendType type_;
   MemoryBackendId id_;
   bitfield64_t flags_;
   size_t accel_data_size_;
   int accel_id_;
 
   HSHM_CROSS_FUN void Print() const {
-    printf("(%s) MemoryBackendHeader: type: %d, id: %d, data_size: %lu\n",
-           kCurrentDevice, static_cast<int>(type_), id_.id_,
-           (long unsigned)data_size_);
+    printf("(%s) MemoryBackendHeader: id: %d, data_size: %lu\n",
+           kCurrentDevice, id_.id_, (long unsigned)data_size_);
   }
 };
 

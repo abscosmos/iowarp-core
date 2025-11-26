@@ -9,8 +9,7 @@ if (HSHM_ENABLE_MPI)
             ${TEST_MAIN}/main_mpi.cc
             test_init.cc
             backend.cc
-            memory_slots.cc
-            memory_manager.cc)
+            memory_slots.cc)
     add_dependencies(test_backend_exec hermes_shm_host)
     target_link_libraries(test_backend_exec
             hermes_shm_host Catch2::Catch2 hshm::mpi)
@@ -23,8 +22,6 @@ if (HSHM_ENABLE_MPI)
             mpirun -n 2 ${CMAKE_BINARY_DIR}/bin/test_backend_exec "MemorySlot")
     add_test(NAME ctp_reserve COMMAND
             ${CMAKE_BINARY_DIR}/bin/test_backend_exec "BackendReserve")
-    add_test(NAME ctp_memory_manager COMMAND
-            mpirun -n 2 ${CMAKE_BINARY_DIR}/bin/test_backend_exec "MemoryManager")
 
     #------------------------------------------------------------------------------
     # Install Targets
