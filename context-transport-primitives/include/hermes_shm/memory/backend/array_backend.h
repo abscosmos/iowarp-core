@@ -29,32 +29,45 @@ namespace hshm::ipc {
 
 class ArrayBackend : public MemoryBackend {
  public:
-  CLS_CONST MemoryBackendType EnumType = MemoryBackendType::kArrayBackend;
-  MemoryBackendHeader local_hdr_;
-
- public:
   HSHM_CROSS_FUN
   ArrayBackend() = default;
 
-  ~ArrayBackend() {}
+  ~ArrayBackend() {
+    if (IsOwned() && header_ != nullptr) {
+      header_->~MemoryBackendHeader();
+      free(header_);
+      header_ = nullptr;
+    }
+  }
 
   HSHM_CROSS_FUN
-  bool shm_init(const MemoryBackendId &backend_id, size_t size, char *region) {
-    if (size < sizeof(MemoryBackendHeader)) {
-      HSHM_THROW_ERROR(SHMEM_CREATE_FAILED);
-    }
+  bool shm_init(const MemoryBackendId &backend_id, size_t size, char *region, u64 offset = 0) {
     SetInitialized();
     Own();
-    header_ = &local_hdr_;
-    local_hdr_.type_ = MemoryBackendType::kArrayBackend;
-    local_hdr_.id_ = backend_id;
-    local_hdr_.data_size_ = size;
-    data_size_ = local_hdr_.data_size_;
+
+    // Allocate metadata using malloc and construct with placement new
+    void *header_mem = malloc(sizeof(MemoryBackendHeader));
+    header_ = new (header_mem) MemoryBackendHeader();
+    md_ = reinterpret_cast<char*>(header_);
+    md_size_ = sizeof(MemoryBackendHeader);
+
+    // Initialize header
+    header_->id_ = backend_id;
+    header_->md_size_ = md_size_;
+    header_->data_size_ = size;
+    header_->data_id_ = -1;
+    header_->flags_.Clear();
+
+    // Data segment from region
+    data_size_ = size;
     data_ = region;
+    data_id_ = -1;
+    root_offset_ = offset;
+
     return true;
   }
 
-  bool shm_attach(const hshm::chararr &url) {
+  bool shm_attach(const std::string &url) {
     (void)url;
     HSHM_THROW_ERROR(SHMEM_NOT_SUPPORTED);
     return false;

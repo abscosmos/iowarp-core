@@ -46,7 +46,8 @@ struct AllocatorId {
 };
 ```
 
-Expose the following method in the BaseAllocator class:
+Expose the following method in the BaseAllocator class. Assume the AllocT has things like backend. 
+CoreAllocT will inherit from Allocator always:
 ```
 template<typename AllocT, typename ...Args>
 AllocT *CreateSubAllocator(u64 sub_id, size_t size, Args&& ...args) {
@@ -89,6 +90,8 @@ class Heap {
 
 # ArenaAllocator
 
+Add to context-transport-primitives/include/hermes_shm/memory/allocator/arena_allocator.h
+
 Just grows upwards. FreeOffset, CreateTls, FreeTls, AlignedAllocate is unimplemented (but not erronous if it gets called).
 
 Templated, takes as input ATOMIC. The arena may or may not be atomic.
@@ -100,10 +103,3 @@ template<bool ATOMIC>
 class ArenaAllocator {}
 ```
 
-# ThreadLocalAllocator
-
-I want to create an allocator that levearages thread-local storage for most operations.
-
-### 
-
-### Coalescing

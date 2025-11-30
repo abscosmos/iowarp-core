@@ -56,8 +56,10 @@ class _MallocAllocator : public Allocator {
   void shm_init(AllocatorId id, size_t custom_header_size,
                 MemoryBackend backend) {
     id_ = id;
-    buffer_ = nullptr;
-    buffer_size_ = std::numeric_limits<size_t>::max();
+    backend_ = backend;
+    data_ = nullptr;
+    data_size_ = std::numeric_limits<size_t>::max();
+    accel_id_ = -1;
     header_ = ConstructHeader<_MallocAllocatorHeader>(
         malloc(sizeof(_MallocAllocatorHeader) + custom_header_size));
     custom_header_ = reinterpret_cast<char *>(header_ + 1);
@@ -73,31 +75,21 @@ class _MallocAllocator : public Allocator {
   }
 
   /**
-   * Allocate a memory of \a size size. The page allocator cannot allocate
-   * memory larger than the page size.
+   * Allocate a memory of \a size size with optional alignment.
    * */
   HSHM_CROSS_FUN
-  OffsetPointer AllocateOffset(const hipc::MemContext &ctx, size_t size) {
-    auto page =
-        reinterpret_cast<MallocPage *>(malloc(sizeof(MallocPage) + size));
+  OffsetPointer AllocateOffset(const hipc::MemContext &ctx, size_t size, size_t alignment = 0) {
+#if HSHM_IS_HOST
+    void *mem;
+    if (alignment > 0) {
+      mem = SystemInfo::AlignedAlloc(alignment, sizeof(MallocPage) + size);
+    } else {
+      mem = malloc(sizeof(MallocPage) + size);
+    }
+    auto page = reinterpret_cast<MallocPage *>(mem);
     page->page_size_ = size;
     header_->AddSize(size);
     return OffsetPointer((size_t)(page + 1));
-  }
-
-  /**
-   * Allocate a memory of \a size size, which is aligned to \a
-   * alignment.
-   * */
-  HSHM_CROSS_FUN
-  OffsetPointer AlignedAllocateOffset(const hipc::MemContext &ctx, size_t size,
-                                      size_t alignment) {
-#if HSHM_IS_HOST
-    auto page = reinterpret_cast<MallocPage *>(
-        SystemInfo::AlignedAlloc(alignment, sizeof(MallocPage) + size));
-    page->page_size_ = size;
-    header_->AddSize(size);
-    return OffsetPointer(size_t(page + 1));
 #else
     return OffsetPointer(0);
 #endif

@@ -81,13 +81,16 @@ class ZeroMqClient : public Client {
 
   // Expose from raw pointer - calls base implementation
   Bulk Expose(const char* data, size_t data_size, u32 flags) override {
-    hipc::FullPtr<char> ptr(data);
+    hipc::FullPtr<char> ptr(const_cast<char*>(data), hipc::Pointer());
     return Expose(ptr, data_size, flags);
   }
 
   // Expose from hipc::Pointer - calls base implementation
-  Bulk Expose(const hipc::Pointer& ptr, size_t data_size, u32 flags) override {
-    return Expose(hipc::FullPtr<char>(ptr), data_size, flags);
+  Bulk Expose(const hipc::Pointer& shm_ptr, size_t data_size, u32 flags) override {
+    // For hipc::Pointer, we don't have the raw pointer, so we can't create a valid FullPtr
+    // This case needs to be handled differently - the pointer needs to be resolved first
+    hipc::FullPtr<char> ptr(nullptr, shm_ptr);
+    return Expose(ptr, data_size, flags);
   }
 
   template <typename MetaT>
@@ -191,13 +194,16 @@ class ZeroMqServer : public Server {
 
   // Expose from raw pointer - calls base implementation
   Bulk Expose(char* data, size_t data_size, u32 flags) override {
-    hipc::FullPtr<char> ptr(data);
+    hipc::FullPtr<char> ptr(data, hipc::Pointer());
     return Expose(ptr, data_size, flags);
   }
 
   // Expose from hipc::Pointer - calls base implementation
-  Bulk Expose(const hipc::Pointer& ptr, size_t data_size, u32 flags) override {
-    return Expose(hipc::FullPtr<char>(ptr), data_size, flags);
+  Bulk Expose(const hipc::Pointer& shm_ptr, size_t data_size, u32 flags) override {
+    // For hipc::Pointer, we don't have the raw pointer, so we can't create a valid FullPtr
+    // This case needs to be handled differently - the pointer needs to be resolved first
+    hipc::FullPtr<char> ptr(nullptr, shm_ptr);
+    return Expose(ptr, data_size, flags);
   }
 
   template <typename MetaT>

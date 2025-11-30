@@ -93,6 +93,14 @@ struct nonatomic {
     return x;
   }
 
+  /** Atomic store wrapper */
+  template <typename U>
+  HSHM_INLINE_CROSS_FUN void
+  store(U val, std::memory_order order = std::memory_order_seq_cst) {
+    (void)order;
+    x = (T)val;
+  }
+
   /** Get reference to x */
   HSHM_INLINE_CROSS_FUN T &ref() { return x; }
 
@@ -112,10 +120,14 @@ struct nonatomic {
   HSHM_INLINE_CROSS_FUN bool compare_exchange_weak(
       T &expected, U desired,
       std::memory_order order = std::memory_order_seq_cst) {
-    (void)expected;
     (void)order;
-    x = desired;
-    return true;
+    if (x == expected) {
+      x = (T)desired;
+      return true;
+    } else {
+      expected = x;
+      return false;
+    }
   }
 
   /** Atomic compare exchange strong wrapper */
@@ -123,10 +135,14 @@ struct nonatomic {
   HSHM_INLINE_CROSS_FUN bool compare_exchange_strong(
       T &expected, U desired,
       std::memory_order order = std::memory_order_seq_cst) {
-    (void)expected;
     (void)order;
-    x = desired;
-    return true;
+    if (x == expected) {
+      x = (T)desired;
+      return true;
+    } else {
+      expected = x;
+      return false;
+    }
   }
 
   /** Atomic pre-increment operator */

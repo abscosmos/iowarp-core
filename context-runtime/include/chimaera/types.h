@@ -269,9 +269,9 @@ constexpr PoolId kAdminPoolId =
     UniqueId(1, 0); // Admin ChiMod pool ID (reserved)
 
 // Allocator type aliases using HSHM conventions
-#define CHI_MAIN_ALLOC_T hipc::ThreadLocalAllocator
-#define CHI_CDATA_ALLOC_T hipc::ThreadLocalAllocator
-#define CHI_RDATA_ALLOC_T hipc::ThreadLocalAllocator
+#define CHI_MAIN_ALLOC_T hipc::MallocAllocator
+#define CHI_CDATA_ALLOC_T hipc::MallocAllocator
+#define CHI_RDATA_ALLOC_T hipc::MallocAllocator
 
 // Memory segment identifiers
 enum MemorySegment {
@@ -318,7 +318,8 @@ template <typename T> using FullPtr = hipc::FullPtr<T>;
 } // namespace chi
 
 // Create HSHM data structures template for chi namespace
-HSHM_DATA_STRUCTURES_TEMPLATE(chi, CHI_MAIN_ALLOC_T);
+// TODO: HSHM_DATA_STRUCTURES_TEMPLATE macro has been removed
+// HSHM_DATA_STRUCTURES_TEMPLATE(chi, CHI_MAIN_ALLOC_T);
 
 // Hash function specializations for std::unordered_map
 namespace std {

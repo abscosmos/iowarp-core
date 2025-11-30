@@ -24,7 +24,7 @@ using hshm::testing::AllocatorTest;
 hipc::MallocAllocator* CreateMallocAllocator(hipc::MallocBackend &backend) {
   // Initialize backend with 128 MB
   size_t backend_size = 128 * 1024 * 1024;
-  backend.shm_init(hipc::MemoryBackendId(0), backend_size);
+  backend.shm_init(hipc::MemoryBackendId(0, 0), backend_size);
 
   // Create allocator on top of backend
   hipc::MallocAllocator *alloc = new hipc::MallocAllocator();

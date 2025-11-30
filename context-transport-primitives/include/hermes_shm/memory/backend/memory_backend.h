@@ -27,60 +27,63 @@ namespace hshm::ipc {
 /** ID for memory backend */
 class MemoryBackendId {
  public:
-  u32 id_;
+  u32 major_;  // Major ID (e.g., PID)
+  u32 minor_;  // Minor ID (relative to major)
 
   HSHM_CROSS_FUN
-  MemoryBackendId() = default;
+  MemoryBackendId() : major_(0), minor_(0) {}
 
   HSHM_CROSS_FUN
-  MemoryBackendId(u32 id) : id_(id) {}
+  MemoryBackendId(u32 major, u32 minor) : major_(major), minor_(minor) {}
 
   HSHM_CROSS_FUN
-  MemoryBackendId(const MemoryBackendId &other) : id_(other.id_) {}
+  MemoryBackendId(const MemoryBackendId &other) : major_(other.major_), minor_(other.minor_) {}
 
   HSHM_CROSS_FUN
-  MemoryBackendId(MemoryBackendId &&other) noexcept : id_(other.id_) {}
+  MemoryBackendId(MemoryBackendId &&other) noexcept : major_(other.major_), minor_(other.minor_) {}
 
   HSHM_CROSS_FUN
   MemoryBackendId &operator=(const MemoryBackendId &other) {
-    id_ = other.id_;
+    major_ = other.major_;
+    minor_ = other.minor_;
     return *this;
   }
 
   HSHM_CROSS_FUN
   MemoryBackendId &operator=(MemoryBackendId &&other) noexcept {
-    id_ = other.id_;
+    major_ = other.major_;
+    minor_ = other.minor_;
     return *this;
   }
 
   HSHM_CROSS_FUN
-  static MemoryBackendId GetRoot() { return {0}; }
+  static MemoryBackendId GetRoot() { return {0, 0}; }
 
   HSHM_CROSS_FUN
-  static MemoryBackendId Get(u32 id) { return {id + 1}; }
+  static MemoryBackendId Get(u32 major, u32 minor) { return {major, minor}; }
 
   HSHM_CROSS_FUN
   bool operator==(const MemoryBackendId &other) const {
-    return id_ == other.id_;
+    return major_ == other.major_ && minor_ == other.minor_;
   }
 
   HSHM_CROSS_FUN
   bool operator!=(const MemoryBackendId &other) const {
-    return id_ != other.id_;
+    return major_ != other.major_ || minor_ != other.minor_;
   }
 };
 typedef MemoryBackendId memory_backend_id_t;
 
 struct MemoryBackendHeader {
-  size_t md_size_;         // Metadata size for process connection
+  size_t md_size_;    // Metadata size for process connection
   MemoryBackendId id_;
   bitfield64_t flags_;
-  size_t accel_data_size_; // Actual data buffer size for allocators
-  int accel_id_;
+  size_t data_size_;  // Actual data buffer size for allocators
+  int data_id_;       // Device ID for the data buffer (GPU ID, etc.)
 
   HSHM_CROSS_FUN void Print() const {
-    printf("(%s) MemoryBackendHeader: id: %d, md_size: %lu, accel_data_size: %lu\n",
-           kCurrentDevice, id_.id_, (long unsigned)md_size_, (long unsigned)accel_data_size_);
+    printf("(%s) MemoryBackendHeader: id: (%u, %u), md_size: %lu, data_size: %lu\n",
+           kCurrentDevice, id_.major_, id_.minor_, (long unsigned)md_size_, (long unsigned)data_size_);
   }
 };
 
@@ -95,31 +98,19 @@ class UrlMemoryBackend {};
 class MemoryBackend {
  public:
   MemoryBackendHeader *header_;
-  char *md_;              // Metadata for how processes (on CPU) connect to this backend. Not required for allocators.
-  size_t md_size_;        // Metadata size. Not required for allocators.
+  char *md_;       // Metadata for how processes (on CPU) connect to this backend. Not required for allocators.
+  size_t md_size_; // Metadata size. Not required for allocators.
   bitfield64_t flags_;
-  char *accel_data_;      // Buffer for allocators (equivalent to buffer_ in class Allocator)
-  size_t accel_data_size_;// Buffer size for allocators (equivalent to buffer_size_ in class Allocator)
-  int accel_id_;
+  char *data_;      // Data buffer for allocators
+  size_t data_size_;// Data buffer size for allocators
+  int data_id_;     // Device ID for the data buffer (GPU ID, etc.)
+  u64 root_offset_; // Offset from root backend (0 if this is root, non-zero for sub-allocators)
 
  public:
   HSHM_CROSS_FUN
-  MemoryBackend() : header_(nullptr), md_(nullptr), md_size_(0), accel_data_(nullptr), accel_data_size_(0), accel_id_(-1) {}
+  MemoryBackend() : header_(nullptr), md_(nullptr), md_size_(0), data_(nullptr), data_size_(0), data_id_(-1), root_offset_(0) {}
 
   ~MemoryBackend() = default;
-
-  HSHM_CROSS_FUN
-  MemoryBackend Shift(size_t offset) {
-    MemoryBackend backend;
-    backend.header_ = header_;
-    backend.md_ = md_ + offset;
-    backend.md_size_ = md_size_ - offset;
-    backend.accel_data_ = accel_data_;
-    backend.accel_data_size_ = accel_data_size_;
-    backend.Disown();
-    backend.SetInitialized();
-    return backend;
-  }
 
   /** Mark data as valid */
   HSHM_CROSS_FUN
@@ -146,36 +137,6 @@ class MemoryBackend {
   HSHM_CROSS_FUN
   void UnsetHasAlloc() { header_->flags_.UnsetBits(MEMORY_BACKEND_HAS_ALLOC); }
 
-  /** Mark data as having a GPU allocation */
-  HSHM_CROSS_FUN
-  void SetHasGpuAlloc() {
-    header_->flags_.SetBits(MEMORY_BACKEND_HAS_GPU_ALLOC);
-  }
-
-  /** Check if data has a GPU allocation */
-  HSHM_CROSS_FUN
-  bool IsHasGpuAlloc() {
-    return header_->flags_.Any(MEMORY_BACKEND_HAS_GPU_ALLOC);
-  }
-
-  /** Unmark data as having a GPU allocation */
-  HSHM_CROSS_FUN
-  void UnsetHasGpuAlloc() {
-    header_->flags_.UnsetBits(MEMORY_BACKEND_HAS_GPU_ALLOC);
-  }
-
-  /** Mark data as scanned */
-  HSHM_CROSS_FUN
-  void SetScanned() { flags_.SetBits(MEMORY_BACKEND_IS_SCANNED); }
-
-  /** Check if data is scanned */
-  HSHM_CROSS_FUN
-  bool IsScanned() { return flags_.Any(MEMORY_BACKEND_IS_SCANNED); }
-
-  /** Unmark data as scanned */
-  HSHM_CROSS_FUN
-  void UnsetScanned() { flags_.UnsetBits(MEMORY_BACKEND_IS_SCANNED); }
-
   /** This is the process which destroys the backend */
   HSHM_CROSS_FUN
   void Own() { flags_.SetBits(MEMORY_BACKEND_OWNED); }
@@ -199,8 +160,8 @@ class MemoryBackend {
   HSHM_CROSS_FUN
   void Print() const {
     header_->Print();
-    printf("(%s) MemoryBackend: md: %p, md_size: %lu, accel_data: %p, accel_data_size: %lu\n",
-           kCurrentDevice, md_, (long unsigned)md_size_, accel_data_, (long unsigned)accel_data_size_);
+    printf("(%s) MemoryBackend: md: %p, md_size: %lu, data: %p, data_size: %lu, root_offset: %lu\n",
+           kCurrentDevice, md_, (long unsigned)md_size_, data_, (long unsigned)data_size_, (long unsigned)root_offset_);
   }
 
   /// Each allocator must define its own shm_init.

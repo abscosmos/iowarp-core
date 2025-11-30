@@ -74,7 +74,7 @@ void load(Ar &ar, std::unordered_map<KeyT, T> &data) {
 }
 
 /** A class for serializing simple objects into private memory */
-template <typename DataT = hshm::charwrap>
+template <typename DataT = std::vector<char>>
 class LocalSerialize {
  public:
   DataT &data_;
@@ -134,7 +134,7 @@ class LocalSerialize {
 };
 
 /** A class for serializing simple objects into private memory */
-template <typename DataT = hshm::charwrap>
+template <typename DataT = std::vector<char>>
 class LocalDeserialize {
  public:
   const DataT &data_;

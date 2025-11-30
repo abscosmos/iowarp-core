@@ -62,22 +62,23 @@ class MallocBackend : public MemoryBackend {
       return false;
     }
 
-    // Layout: [MemoryBackendHeader | padding to 4KB] [accel_data]
+    // Layout: [MemoryBackendHeader | padding to 4KB] [data]
     header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
     header_->id_ = backend_id;
     header_->md_size_ = md_size;
-    header_->accel_data_size_ = size;
-    header_->accel_id_ = -1;
+    header_->data_size_ = size;
+    header_->data_id_ = -1;
     header_->flags_.Clear();
 
     // md_ points to the header itself (metadata for process connection)
     md_ = ptr;
     md_size_ = md_size;
 
-    // accel_data_ starts at 4KB aligned boundary after md section
-    accel_data_ = ptr + aligned_md_size;
-    accel_data_size_ = size;
-    accel_id_ = -1;
+    // data_ starts at 4KB aligned boundary after md section
+    data_ = ptr + aligned_md_size;
+    data_size_ = size;
+    data_id_ = -1;
+    root_offset_ = 0;
 
     return true;
   }
