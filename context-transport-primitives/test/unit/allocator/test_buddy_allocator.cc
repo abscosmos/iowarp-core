@@ -24,7 +24,7 @@ TEST_CASE("BuddyAllocator - Initialization", "[buddy_allocator]") {
   backend.shm_init(MemoryBackendId(0, 0), heap_size);
 
   BuddyAllocator allocator;
-  bool success = allocator.shm_init(backend.data_, heap_size);
+  bool success = allocator.shm_init(backend);
 
   REQUIRE(success);
 
@@ -37,26 +37,47 @@ TEST_CASE("BuddyAllocator - Small Allocations", "[buddy_allocator]") {
   backend.shm_init(MemoryBackendId(0, 0), heap_size);
 
   BuddyAllocator allocator;
-  allocator.shm_init(backend.data_, heap_size);
+  allocator.shm_init(backend);
 
   SECTION("Single small allocation") {
     auto offset = allocator.AllocateOffset(64);
     REQUIRE_FALSE(offset.IsNull());
     REQUIRE(offset.load() > 0);
+
+    // Verify data can be written and read
+    FullPtr<char> full_ptr(&allocator, offset);
+    REQUIRE(full_ptr.ptr_ != nullptr);
+    memset(full_ptr.ptr_, 0xAA, 64);
+    for (size_t i = 0; i < 64; ++i) {
+      REQUIRE(full_ptr.ptr_[i] == static_cast<char>(0xAA));
+    }
   }
 
   SECTION("Multiple small allocations") {
     std::vector<OffsetPtr> allocations;
 
-    // Allocate 10 small blocks
+    // Allocate 10 small blocks and verify data writes
     for (int i = 0; i < 10; ++i) {
       auto offset = allocator.AllocateOffset(64);
       REQUIRE_FALSE(offset.IsNull());
+
+      // Write unique pattern to each allocation
+      FullPtr<unsigned char> full_ptr(&allocator, offset);
+      REQUIRE(full_ptr.ptr_ != nullptr);
+      unsigned char pattern = static_cast<unsigned char>(i);
+      memset(full_ptr.ptr_, pattern, 64);
+
       allocations.push_back(offset);
     }
 
-    // Verify all allocations are unique
+    // Verify all allocations are unique and contain correct data
     for (size_t i = 0; i < allocations.size(); ++i) {
+      FullPtr<unsigned char> full_ptr(&allocator, allocations[i]);
+      unsigned char pattern = static_cast<unsigned char>(i);
+      for (size_t j = 0; j < 64; ++j) {
+        REQUIRE(full_ptr.ptr_[j] == pattern);
+      }
+
       for (size_t j = i + 1; j < allocations.size(); ++j) {
         REQUIRE(allocations[i].load() != allocations[j].load());
       }
@@ -69,12 +90,27 @@ TEST_CASE("BuddyAllocator - Small Allocations", "[buddy_allocator]") {
     for (size_t size : sizes) {
       auto offset = allocator.AllocateOffset(size);
       REQUIRE_FALSE(offset.IsNull());
+
+      // Verify data writes for each size
+      FullPtr<unsigned char> full_ptr(&allocator, offset);
+      REQUIRE(full_ptr.ptr_ != nullptr);
+      unsigned char pattern = static_cast<unsigned char>(size & 0xFF);
+      memset(full_ptr.ptr_, pattern, size);
+      // Spot check first and last bytes
+      REQUIRE(full_ptr.ptr_[0] == pattern);
+      REQUIRE(full_ptr.ptr_[size - 1] == pattern);
     }
   }
 
   SECTION("Minimum size allocation") {
     auto offset = allocator.AllocateOffset(1);
     REQUIRE_FALSE(offset.IsNull());
+
+    // Verify data write
+    FullPtr<char> full_ptr(&allocator, offset);
+    REQUIRE(full_ptr.ptr_ != nullptr);
+    full_ptr.ptr_[0] = 'X';
+    REQUIRE(full_ptr.ptr_[0] == 'X');
   }
 
   backend.shm_destroy();
@@ -86,25 +122,54 @@ TEST_CASE("BuddyAllocator - Large Allocations", "[buddy_allocator]") {
   backend.shm_init(MemoryBackendId(0, 0), heap_size);
 
   BuddyAllocator allocator;
-  allocator.shm_init(backend.data_, heap_size);
+  allocator.shm_init(backend);
 
   SECTION("Single large allocation") {
     auto offset = allocator.AllocateOffset(32 * 1024);  // 32KB
     REQUIRE_FALSE(offset.IsNull());
+
+    // Verify data can be written and read
+    FullPtr<char> full_ptr(&allocator, offset);
+    REQUIRE(full_ptr.ptr_ != nullptr);
+    memset(full_ptr.ptr_, 0xBB, 32 * 1024);
+    // Spot check first page and last page
+    for (size_t i = 0; i < 4096; ++i) {
+      REQUIRE(full_ptr.ptr_[i] == static_cast<char>(0xBB));
+    }
+    for (size_t i = 32 * 1024 - 4096; i < 32 * 1024; ++i) {
+      REQUIRE(full_ptr.ptr_[i] == static_cast<char>(0xBB));
+    }
   }
 
   SECTION("Multiple large allocations") {
     std::vector<OffsetPtr> allocations;
 
-    // Allocate 5 large blocks
+    // Allocate 5 large blocks and verify data writes
     for (int i = 0; i < 5; ++i) {
       auto offset = allocator.AllocateOffset(64 * 1024);  // 64KB each
       REQUIRE_FALSE(offset.IsNull());
+
+      // Write unique pattern to each allocation
+      FullPtr<unsigned char> full_ptr(&allocator, offset);
+      REQUIRE(full_ptr.ptr_ != nullptr);
+      unsigned char pattern = static_cast<unsigned char>(i + 10);
+      memset(full_ptr.ptr_, pattern, 64 * 1024);
+
       allocations.push_back(offset);
     }
 
-    // Verify all allocations are unique
+    // Verify all allocations are unique and contain correct data
     for (size_t i = 0; i < allocations.size(); ++i) {
+      FullPtr<unsigned char> full_ptr(&allocator, allocations[i]);
+      unsigned char pattern = static_cast<unsigned char>(i + 10);
+      // Check first and last 4KB pages
+      for (size_t j = 0; j < 4096; ++j) {
+        REQUIRE(full_ptr.ptr_[j] == pattern);
+      }
+      for (size_t j = 64 * 1024 - 4096; j < 64 * 1024; ++j) {
+        REQUIRE(full_ptr.ptr_[j] == pattern);
+      }
+
       for (size_t j = i + 1; j < allocations.size(); ++j) {
         REQUIRE(allocations[i].load() != allocations[j].load());
       }
@@ -136,7 +201,7 @@ TEST_CASE("BuddyAllocator - Free and Reallocation", "[buddy_allocator]") {
   backend.shm_init(MemoryBackendId(0, 0), heap_size);
 
   BuddyAllocator allocator;
-  allocator.shm_init(backend.data_, heap_size);
+  allocator.shm_init(backend);
 
   SECTION("Free and reallocate small") {
     auto offset1 = allocator.AllocateOffset(128);
@@ -191,7 +256,7 @@ TEST_CASE("BuddyAllocator - Coalescing", "[buddy_allocator]") {
   backend.shm_init(MemoryBackendId(0, 0), heap_size);
 
   BuddyAllocator allocator;
-  allocator.shm_init(backend.data_, heap_size);
+  allocator.shm_init(backend);
 
   SECTION("Coalesce adjacent small blocks") {
     // Allocate several small blocks
@@ -252,7 +317,7 @@ TEST_CASE("BuddyAllocator - Mixed Small and Large", "[buddy_allocator]") {
   backend.shm_init(MemoryBackendId(0, 0), heap_size);
 
   BuddyAllocator allocator;
-  allocator.shm_init(backend.data_, heap_size);
+  allocator.shm_init(backend);
 
   SECTION("Interleaved small and large allocations") {
     std::vector<OffsetPtr> allocations;
@@ -285,7 +350,7 @@ TEST_CASE("BuddyAllocator - Stress Test", "[buddy_allocator]") {
   backend.shm_init(MemoryBackendId(0, 0), heap_size);
 
   BuddyAllocator allocator;
-  allocator.shm_init(backend.data_, heap_size);
+  allocator.shm_init(backend);
 
   SECTION("Many allocations and frees") {
     std::vector<OffsetPtr> active;
@@ -334,7 +399,7 @@ TEST_CASE("BuddyAllocator - Out of Memory", "[buddy_allocator]") {
   backend.shm_init(MemoryBackendId(0, 0), heap_size);
 
   BuddyAllocator allocator;
-  allocator.shm_init(backend.data_, heap_size);
+  allocator.shm_init(backend);
 
   SECTION("Exhaust heap") {
     std::vector<OffsetPtr> allocations;
@@ -367,7 +432,7 @@ TEST_CASE("BuddyAllocator - ReallocateOffset", "[buddy_allocator]") {
   backend.shm_init(MemoryBackendId(0, 0), heap_size);
 
   BuddyAllocator allocator;
-  allocator.shm_init(backend.data_, heap_size);
+  allocator.shm_init(backend);
 
   SECTION("Reallocate to smaller size - no reallocation") {
     auto offset = allocator.AllocateOffset(1024);

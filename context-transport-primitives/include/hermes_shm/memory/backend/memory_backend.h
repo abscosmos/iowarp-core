@@ -158,14 +158,14 @@ class MemoryBackend {
   const MemoryBackendId &GetId() const { return header_->id_; }
 
   /**
-   * Shift the data pointer by an offset amount
-   * Updates both data_size_ and data_offset_ fields
+   * Shift the data offset by an amount
+   * Updates data_size_ and data_offset_ fields
+   * DOES NOT modify data_ pointer - all sub-allocators share the same root data_ pointer
    *
-   * @param offset The amount to shift the data pointer
+   * @param offset The amount to shift the data offset
    */
   HSHM_CROSS_FUN
   void Shift(size_t offset) {
-    data_ += offset;
     data_size_ -= offset;
     data_offset_ += offset;
   }
