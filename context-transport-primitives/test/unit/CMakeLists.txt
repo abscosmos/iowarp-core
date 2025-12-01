@@ -4,6 +4,7 @@ set(TEST_MAIN ${CMAKE_CURRENT_SOURCE_DIR})
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 add_subdirectory(allocator)
+add_subdirectory(allocators)
 add_subdirectory(backend)
 add_subdirectory(data_structures)
 # Following test directories disabled - depend on deleted code:
