@@ -80,7 +80,7 @@ TEST_CASE("BuddyAllocator - Random Allocation", "[BuddyAllocator]") {
 
   SECTION("16 iterations of random allocations"){
     try {
-      tester.TestRandomAllocation(16);
+      tester.TestRandomAllocation(256);
     }
     catch (const std::exception &e) {
       std::cout << ("TestRandomAllocation(16) failed: " + std::string(e.what()));

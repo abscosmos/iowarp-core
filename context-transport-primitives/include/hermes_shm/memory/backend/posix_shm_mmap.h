@@ -236,24 +236,20 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
   /** Unmap shared memory */
   void _Detach() {
-    if (!IsInitialized()) {
+    if (header_ == nullptr) {
       return;
     }
     // Unmap the entire contiguous region (starts 2*kBackendHeaderSize bytes before header_)
     char *mapping_start = reinterpret_cast<char*>(header_) - 2 * kBackendHeaderSize;
     SystemInfo::UnmapMemory(mapping_start, total_size_);
     SystemInfo::CloseSharedMemory(fd_);
-    UnsetInitialized();
+    header_ = nullptr;
   }
 
   /** Destroy shared memory */
   void _Destroy() {
-    if (!IsInitialized()) {
-      return;
-    }
     _Detach();
     SystemInfo::DestroySharedMemory(url_);
-    UnsetInitialized();
   }
 };
 
