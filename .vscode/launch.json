@@ -173,7 +173,9 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/bin/test_mp_allocator_exec",
-            "args": [],
+            "args": [
+                "MultiProcessAllocator - Random Allocation"
+            ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build",
             "environment": [],

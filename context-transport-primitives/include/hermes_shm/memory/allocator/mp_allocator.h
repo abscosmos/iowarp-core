@@ -52,15 +52,14 @@ class ThreadBlock : public pre::slist_node {
   ThreadBlock() : tid_(-1) {}
 
   /**
-   * Initialize the thread block with a memory region
+   * Initialize the thread block
    *
    * @param backend Memory backend from the allocator
-   * @param region FullPtr to the memory region for this thread
    * @param region_size Size of the memory region in bytes
    * @param tid Thread ID for this block
    * @return true on success, false on failure
    */
-  bool shm_init(const MemoryBackend &backend, FullPtr<void> region, size_t region_size, int tid) {
+  bool shm_init(const MemoryBackend &backend, size_t region_size, int tid) {
     tid_ = tid;
 
     // Create shifted backend positioned at the allocator object address
@@ -122,15 +121,14 @@ class ProcessBlock : public pre::slist_node {
   }
 
   /**
-   * Initialize the process block with a memory region
+   * Initialize the process block
    *
    * @param backend Memory backend from the allocator
-   * @param region FullPtr to the memory region for this process
    * @param region_size Size of the memory region in bytes
    * @param pid Process ID
    * @return true on success, false on failure
    */
-  bool shm_init(const MemoryBackend &backend, FullPtr<void> region, size_t region_size, int pid) {
+  bool shm_init(const MemoryBackend &backend, size_t region_size, int pid) {
     pid_ = pid;
     tid_count_ = 0;
     lock_.Init();
@@ -358,13 +356,9 @@ class _MultiProcessAllocator : public Allocator {
       return nullptr;
     }
 
-    // Create managed_region starting AFTER the ThreadBlock object
-    OffsetPtr<> shifted_off(tblock_ptr.shm_.off_.load() + sizeof(ThreadBlock));
-    FullPtr<void> managed_region(this, shifted_off);
-
     printf("[EnsureTls] Initializing ThreadBlock\n");
-    // Initialize ThreadBlock with the managed_region and store in TLS
-    tblock_ptr.ptr_->shm_init(GetBackend(), managed_region, thread_unit_, pblock->tid_count_++);
+    // Initialize ThreadBlock with the region size and store in TLS
+    tblock_ptr.ptr_->shm_init(GetBackend(), thread_unit_, pblock->tid_count_++);
     HSHM_THREAD_MODEL->SetTls<void>(pblock->tblock_key_, reinterpret_cast<void*>(tblock_ptr.ptr_));
     printf("[EnsureTls] ThreadBlock initialized and stored in TLS\n");
     return tblock_ptr.ptr_;
@@ -474,12 +468,8 @@ class _MultiProcessAllocator : public Allocator {
         return FullPtr<ProcessBlock>::GetNull();
       }
 
-      // Step 3c: Create managed_region starting AFTER the ProcessBlock object
-      OffsetPtr<> shifted_off(pblock_ptr.shm_.off_.load() + sizeof(ProcessBlock));
-      FullPtr<void> managed_region(this, shifted_off);
-
-      // Step 3d: Call shm_init on the ProcessBlock with the managed_region
-      if (!pblock_ptr.ptr_->shm_init(GetBackend(), managed_region, process_unit_, pid)) {
+      // Step 3d: Call shm_init on the ProcessBlock with the region size
+      if (!pblock_ptr.ptr_->shm_init(GetBackend(), process_unit_, pid)) {
         alloc_.Free(pblock_ptr);  // Free the SINGLE allocation on error
         return FullPtr<ProcessBlock>::GetNull();
       }
