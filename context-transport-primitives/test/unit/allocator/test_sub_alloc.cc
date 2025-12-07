@@ -27,12 +27,8 @@ hipc::ArenaAllocator<false>* CreateArenaAllocator(hipc::MallocBackend &backend) 
   size_t alloc_size = sizeof(hipc::ArenaAllocator<false>);
   backend.shm_init(hipc::MemoryBackendId(0, 0), alloc_size + heap_size);
 
-  // Construct allocator at beginning of backend
-  auto *alloc = backend.Cast<hipc::ArenaAllocator<false>>();
-  new (alloc) hipc::ArenaAllocator<false>();
-
-  // Initialize allocator with backend and region_size
-  alloc->shm_init(backend, heap_size);
+  // Construct and initialize allocator using MakeAlloc
+  auto *alloc = backend.MakeAlloc<hipc::ArenaAllocator<false>>(heap_size);
 
   return alloc;
 }
