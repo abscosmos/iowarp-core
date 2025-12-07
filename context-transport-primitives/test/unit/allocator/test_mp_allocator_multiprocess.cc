@@ -91,13 +91,13 @@ int main(int argc, char **argv) {
   if (duration_sec > 0) {
     std::cout << "Rank " << rank << ": Starting timed workload test with " << nthreads
               << " threads for " << duration_sec << " seconds" << std::endl;
-    std::cout << "Rank " << rank << ": Testing SMALL allocations only (1 byte to 16KB)" << std::endl;
 
     // Create allocator tester and run timed workload with SMALL allocations only
     AllocatorTest<MultiProcessAllocator> tester(allocator);
-    constexpr size_t kSmallMin = 1;           // 1 byte
-    constexpr size_t kSmallMax = 16 * 1024;   // 16 KB
-    tester.TestTimedMultiThreadedWorkload(nthreads, duration_sec, kSmallMin, kSmallMax);
+    constexpr size_t kAllocMin = 1;           // 1 byte
+    constexpr size_t kAllocMax = 16 * 1024;   // 16 Mb
+    tester.TestTimedMultiThreadedWorkload(nthreads, duration_sec, kAllocMin,
+                                          kAllocMax);
     std::cout << "Rank " << rank << ": TEST PASSED" << std::endl;
   } else {
     std::cout << "Rank " << rank << ": Initialization complete, exiting" << std::endl;

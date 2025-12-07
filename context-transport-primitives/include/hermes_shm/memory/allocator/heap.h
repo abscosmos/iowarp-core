@@ -144,6 +144,7 @@ class Heap {
     return (current < max_offset_) ? (max_offset_ - current) : 0;
   }
 
+
  private:
   /**
    * Align a size to the specified alignment

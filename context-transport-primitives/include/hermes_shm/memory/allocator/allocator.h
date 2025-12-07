@@ -785,6 +785,14 @@ struct FullPtr : public ShmPointer {
     }
   }
 
+  /** Alloc + offset constructor */
+  template <typename AllocT>
+  HSHM_CROSS_FUN explicit FullPtr(AllocT *alloc, size_t offset) {
+    shm_.off_ = offset;
+    shm_.alloc_id_ = alloc->GetId();
+    ptr_ = reinterpret_cast<T*>(alloc->GetBackendData() + offset);
+  }
+
   /** Shared half + alloc constructor for ShmPtr */
   template <
       typename AllocT, bool ATOMIC,

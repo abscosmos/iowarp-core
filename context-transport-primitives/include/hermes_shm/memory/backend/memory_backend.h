@@ -168,11 +168,11 @@ class MemoryBackend : public MemoryBackendHeader {
 
   /** Get the ID of this backend */
   HSHM_CROSS_FUN
-  MemoryBackendId &GetId() { return header_->id_; }
+  MemoryBackendId &GetId() { return id_; }
 
   /** Get the ID of this backend */
   HSHM_CROSS_FUN
-  const MemoryBackendId &GetId() const { return header_->id_; }
+  const MemoryBackendId &GetId() const { return id_; }
 
 
   /**
@@ -444,9 +444,8 @@ class MemoryBackend : public MemoryBackendHeader {
 
   HSHM_CROSS_FUN
   void Print() const {
-    header_->Print();
     printf("(%s) MemoryBackend: region: %p, data: %p, data_capacity: %lu\n",
-           kCurrentDevice, region_, data_, (long unsigned)header_->data_capacity_);
+           kCurrentDevice, region_, data_, (long unsigned)data_capacity_);
   }
 
   /// Each allocator must define its own shm_init.

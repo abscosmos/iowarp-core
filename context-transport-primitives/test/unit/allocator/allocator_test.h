@@ -184,7 +184,10 @@ class AllocatorTest {
         }
 
         // Verify allocator correctness by writing to all allocated memory
-        std::memset(ptr.ptr_, static_cast<unsigned char>((iter + ptrs.size()) & 0xFF), alloc_size);
+        std::memset(ptr.ptr_,
+                    static_cast<unsigned char>((iter + ptrs.size()) & 0xFF),
+                    alloc_size);
+        
         ptrs.push_back({ptr, alloc_size});
         total_allocated += alloc_size;
       }

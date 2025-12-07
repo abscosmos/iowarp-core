@@ -304,3 +304,22 @@ Expand will update the big_heap_.
 # MultProcess Allocator
 
 Use Expand instead of Free when expanding.
+
+
+@CLAUDE.md
+
+Let's make another unit test that stresses the ability to make allocators at weird offsets in the backend.
+
+This will be for BuddyAllocator. 
+
+You will create a backend using PosixMmap.
+
+You will then create ptr = MemoryBackend.data_ ptr + 256KB.
+
+You will then cast that to BuddyAllocator. 
+
+You will call new (BuddyAllocator) (ptr) and then shm_init.
+
+You will then execute the random unit test.
+
+Add this to the existing buddy allocator unit tests (context-transport-primitives/test/unit/allocator/test_buddy_allocator.cc).

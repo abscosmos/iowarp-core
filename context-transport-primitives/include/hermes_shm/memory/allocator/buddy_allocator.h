@@ -161,24 +161,38 @@ class _BuddyAllocator : public Allocator {
   }
 
   /**
+   * Attach to an existing buddy allocator
+   *
+   * BuddyAllocator does not require any process-specific initialization,
+   * so this is a no-op. The allocator state is fully shared.
+   *
+   * @param backend Memory backend (unused)
+   * @return true (always succeeds)
+   */
+  bool shm_attach(const MemoryBackend &backend) {
+    (void)backend;  // Unused - no process-specific initialization needed
+    return true;
+  }
+
+  /**
    * Allocate memory of specified size
    *
-   * @param size Size in bytes to allocate (excluding BuddyPage header)
-   * @param alignment Alignment requirement (ignored - buddy allocator uses power-of-2 sizes)
+   * @param requested_size Size in bytes to allocate (excluding BuddyPage header)
+   * @param alignment_requirement Alignment requirement (ignored - buddy allocator uses power-of-2 sizes)
    * @return Offset pointer to allocated memory (after BuddyPage header)
    */
-  OffsetPtr<> AllocateOffset(size_t size, size_t alignment = 1) {
-    (void)alignment;  // Buddy allocator uses power-of-2 sizes, alignment is implicit
+  OffsetPtr<> AllocateOffset(size_t requested_size, size_t alignment_requirement = 1) {
+    (void)alignment_requirement;  // Buddy allocator uses power-of-2 sizes, alignment is implicit
 
-    if (size < kMinSize) {
-      size = kMinSize;
+    if (requested_size < kMinSize) {
+      requested_size = kMinSize;
     }
 
     OffsetPtr<> ptr;
-    if (size <= kSmallThreshold) {
-      ptr = AllocateSmall(size);
+    if (requested_size <= kSmallThreshold) {
+      ptr = AllocateSmall(requested_size);
     } else {
-      ptr = AllocateLarge(size);
+      ptr = AllocateLarge(requested_size);
     }
 
     return ptr;
@@ -263,8 +277,7 @@ class _BuddyAllocator : public Allocator {
       free_page.ptr_->size_ = data_size + sizeof(BuddyPage);
 
       // Add to free list
-      ShmPtr<pre::slist_node> shm_ptr(GetId(), page_offset);
-      FullPtr<pre::slist_node> node_ptr(this, shm_ptr);
+      FullPtr<pre::slist_node> node_ptr(this, page_offset);
       small_pages_[list_idx].emplace(this, node_ptr);
     } else {
       // Large page - add to large_pages_ list
@@ -276,8 +289,7 @@ class _BuddyAllocator : public Allocator {
       free_page.ptr_->size_ = data_size + sizeof(BuddyPage);
 
       // Add to free list
-      ShmPtr<pre::slist_node> shm_ptr(GetId(), page_offset);
-      FullPtr<pre::slist_node> node_ptr(this, shm_ptr);
+      FullPtr<pre::slist_node> node_ptr(this, page_offset);
       large_pages_[list_idx].emplace(this, node_ptr);
     }
   }
@@ -296,8 +308,13 @@ class _BuddyAllocator : public Allocator {
       return;
     }
     // Expand the big_heap_ max_offset to include the new region
-    size_t region_end = region.load() + region_size; 
-    big_heap_.Init(region.load(), region_end); 
+    // The new region should be contiguous with the current heap (at its max boundary)
+    size_t region_start = region.load();
+    size_t region_end = region_start + region_size;
+    size_t current_max = big_heap_.GetMaxOffset();
+
+    // Extend the heap's max boundary without resetting the allocation pointer
+    big_heap_.Init(region.load(), region_end);
   }
 
  private:
@@ -401,7 +418,6 @@ class _BuddyAllocator : public Allocator {
     }
 
     // Iterate through all entries in the list using the iterator
-    int i = 0;
     for (auto it = large_pages_[list_idx].begin(this);
          it != large_pages_[list_idx].end(); ++it) {
       hipc::FullPtr<FreeLargeBuddyPage> free_page(
@@ -415,7 +431,6 @@ class _BuddyAllocator : public Allocator {
         (void)large_pages_[list_idx].PopAt(this, it);
         return offset;
       }
-      ++i;
     }
 
     return 0;  // No fit found
@@ -485,8 +500,7 @@ class _BuddyAllocator : public Allocator {
         free_page.ptr_->size_ = page_total_size;
 
         // Add to free list
-        ShmPtr<pre::slist_node> shm_ptr(GetId(), remaining_offset);
-        FullPtr<pre::slist_node> node_ptr(this, shm_ptr);
+        FullPtr<pre::slist_node> node_ptr(this, remaining_offset);
         small_pages_[i].emplace(this, node_ptr);
 
         remaining_offset += page_total_size;
@@ -503,33 +517,31 @@ class _BuddyAllocator : public Allocator {
   /**
    * Add a remainder page back to the appropriate free list
    *
-   * @param remainder_offset Offset to the remainder page
-   * @param remainder_total_size Total size of remainder (including BuddyPage header)
+   * @param page_offset Offset to the remainder page
+   * @param total_size Total size of remainder (including BuddyPage header)
    */
-  void AddRemainderToFreeList(size_t remainder_offset, size_t remainder_total_size) {
-    size_t remainder_data_size = remainder_total_size - sizeof(BuddyPage);
+  void AddRemainderToFreeList(size_t page_offset, size_t total_size) {
+    size_t data_size = total_size - sizeof(BuddyPage);
 
-    if (remainder_data_size <= kSmallThreshold) {
+    if (data_size <= kSmallThreshold) {
       // Small remainder - use exact size match (round down)
-      size_t rem_list_idx = GetSmallPageListIndexForFree(remainder_data_size);
+      size_t rem_list_idx = GetSmallPageListIndexForFree(data_size);
 
-      hipc::FullPtr<FreeSmallBuddyPage> remainder(this, OffsetPtr<FreeSmallBuddyPage>(remainder_offset));
+      hipc::FullPtr<FreeSmallBuddyPage> remainder(this, OffsetPtr<FreeSmallBuddyPage>(page_offset));
       remainder.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node base
-      remainder.ptr_->size_ = remainder_total_size;
+      remainder.ptr_->size_ = total_size;
 
-      ShmPtr<pre::slist_node> rem_shm(GetId(), remainder_offset);
-      FullPtr<pre::slist_node> rem_node(this, rem_shm);
+      FullPtr<pre::slist_node> rem_node(this, page_offset);
       small_pages_[rem_list_idx].emplace(this, rem_node);
     } else {
       // Large remainder - use exact size match
-      size_t rem_list_idx = GetLargePageListIndexForFree(remainder_data_size);
+      size_t rem_list_idx = GetLargePageListIndexForFree(data_size);
 
-      hipc::FullPtr<FreeLargeBuddyPage> remainder(this, OffsetPtr<FreeLargeBuddyPage>(remainder_offset));
+      hipc::FullPtr<FreeLargeBuddyPage> remainder(this, OffsetPtr<FreeLargeBuddyPage>(page_offset));
       remainder.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node base
-      remainder.ptr_->size_ = remainder_total_size;
+      remainder.ptr_->size_ = total_size;
 
-      ShmPtr<pre::slist_node> rem_shm(GetId(), remainder_offset);
-      FullPtr<pre::slist_node> rem_node(this, rem_shm);
+      FullPtr<pre::slist_node> rem_node(this, page_offset);
       large_pages_[rem_list_idx].emplace(this, rem_node);
     }
   }
@@ -538,15 +550,15 @@ class _BuddyAllocator : public Allocator {
    * Finalize allocation by setting page header and returning user offset
    *
    * @param page_offset Offset to the page (including BuddyPage header)
-   * @param data_size Size of the data portion (excluding BuddyPage header)
+   * @param user_size Size of the data portion (excluding BuddyPage header)
    * @return Offset pointer to usable memory (after BuddyPage header)
    */
-  OffsetPtr<> FinalizeAllocation(size_t page_offset, size_t data_size) {
+  OffsetPtr<> FinalizeAllocation(size_t page_offset, size_t user_size) {
     hipc::FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(page_offset));
-    page.ptr_->size_ = data_size;  // Store size without header
+    page.ptr_->size_ = user_size;  // Store size without header
 
     // Sanity check
-    // if (page_offset > GetBackendDataCapacity() - data_size) {
+    // if (page_offset > GetBackendDataCapacity() - user_size) {
     //   throw std::runtime_error("Allocation failed: Out of memory");
     // }
 
@@ -556,43 +568,49 @@ class _BuddyAllocator : public Allocator {
   /**
    * Get free list index for small allocations when allocating (round up to next largest)
    *
-   * @param size Reference to size - will be modified to the rounded-up power-of-2 size
+   * @param alloc_size Reference to size - will be modified to the rounded-up power-of-2 size
    * @return Index into the small_pages_ array
    */
-  size_t GetSmallPageListIndexForAlloc(size_t &size) {
-    if (size <= kMinSize) {
-      size = kMinSize;
+  static size_t GetSmallPageListIndexForAlloc(size_t &alloc_size) {
+    if (alloc_size <= kMinSize) {
+      alloc_size = kMinSize;
       return 0;
     }
 
     // Round up to next power of 2
-    size_t log2 = static_cast<size_t>(std::ceil(std::log2(static_cast<double>(size))));
+    size_t log2 = static_cast<size_t>(std::ceil(std::log2(static_cast<double>(alloc_size))));
 
     if (log2 < kMinLog2) {
-      size = kMinSize;
+      alloc_size = kMinSize;
       return 0;
     }
     if (log2 > kSmallLog2) {
-      size = kSmallThreshold;
+      alloc_size = kSmallThreshold;
       return kMaxSmallPages - 1;
     }
 
     // Calculate the rounded-up size
-    size = static_cast<size_t>(1) << log2;  // 2^log2
+    alloc_size = static_cast<size_t>(1) << log2;  // 2^log2
     return log2 - kMinLog2;
   }
 
   /**
    * Get free list index for small pages when freeing (round down to exact or next smallest)
    */
-  size_t GetSmallPageListIndexForFree(size_t size) {
-    if (size <= kMinSize) return 0;
+  static size_t GetSmallPageListIndexForFree(size_t size) {
+    if (size <= kMinSize) {
+      return 0;
+    }
 
     // Round down to exact power of 2
     size_t log2 = static_cast<size_t>(std::floor(std::log2(static_cast<double>(size))));
 
-    if (log2 < kMinLog2) return 0;
-    if (log2 > kSmallLog2) return kMaxSmallPages - 1;
+    if (log2 < kMinLog2) {
+      return 0;
+    }
+    if (log2 > kSmallLog2) {
+      return kMaxSmallPages - 1;
+    }
 
     return log2 - kMinLog2;
   }
@@ -600,14 +618,20 @@ class _BuddyAllocator : public Allocator {
   /**
    * Get free list index for large allocations when allocating (round down)
    */
-  size_t GetLargePageListIndexForAlloc(size_t size) {
-    if (size <= kSmallThreshold) return 0;
+  static size_t GetLargePageListIndexForAlloc(size_t size) {
+    if (size <= kSmallThreshold) {
+      return 0;
+    }
 
     // Round down to previous power of 2
     size_t log2 = static_cast<size_t>(std::floor(std::log2(static_cast<double>(size))));
 
-    if (log2 <= kSmallLog2) return 0;
-    if (log2 > kMaxLog2) return kMaxLargePages - 1;
+    if (log2 <= kSmallLog2) {
+      return 0;
+    }
+    if (log2 > kMaxLog2) {
+      return kMaxLargePages - 1;
+    }
 
     return log2 - kSmallLog2 - 1;
   }

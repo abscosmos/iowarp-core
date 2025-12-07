@@ -90,7 +90,7 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     // Shared portion: backend_size - 4KB (shared header + data)
     // Offset into file: 0 (maps entire file starting from offset 0)
     region_ = reinterpret_cast<char *>(
-        SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_size, 0));
+        SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_size,  0));
     if (!region_) {
       HILOG(kError, "Failed to create mixed mapping");
       SystemInfo::CloseSharedMemory(fd_);
@@ -152,8 +152,8 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     // Private portion: 4KB (private header)
     // Shared portion: backend_size - 4KB (shared header + data)
     // Offset into file: 0 (maps entire file starting from offset 0)
-    region_ = reinterpret_cast<char *>(
-        SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_size, 0));
+    region_ = reinterpret_cast<char *>(SystemInfo::MapMixedMemory(
+        fd_, kBackendHeaderSize, shared_size, 0));
     if (!region_) {
       HILOG(kError, "Failed to create mixed mapping during attach");
       SystemInfo::CloseSharedMemory(fd_);

@@ -34,6 +34,12 @@ add_dependencies(test_mp_allocator_multiprocess_exec hermes_shm_host)
 target_link_libraries(test_mp_allocator_multiprocess_exec
         hermes_shm_host)
 
+add_executable(test_buddy_allocator_singlethread_exec
+        test_buddy_allocator_singlethread.cc)
+add_dependencies(test_buddy_allocator_singlethread_exec hermes_shm_host)
+target_link_libraries(test_buddy_allocator_singlethread_exec
+        hermes_shm_host)
+
 #------------------------------------------------------------------------------
 # Test Cases
 #------------------------------------------------------------------------------
@@ -58,6 +64,9 @@ add_test(NAME ctp_mp_allocator_multiprocess
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_mp_allocator_multiprocess_test.sh
                 ${CMAKE_BINARY_DIR}/bin/test_mp_allocator_multiprocess_exec)
 
+add_test(NAME ctp_buddy_allocator_singlethread COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_buddy_allocator_singlethread_exec 0 5)
+
 #------------------------------------------------------------------------------
 # Install Targets
 #------------------------------------------------------------------------------
@@ -67,6 +76,7 @@ install(TARGETS
         test_buddy_allocator_exec
         test_mp_allocator_exec
         test_mp_allocator_multiprocess_exec
+        test_buddy_allocator_singlethread_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
@@ -80,4 +90,5 @@ if(HSHM_ENABLE_COVERAGE)
     set_coverage_flags(test_buddy_allocator_exec)
     set_coverage_flags(test_mp_allocator_exec)
     set_coverage_flags(test_mp_allocator_multiprocess_exec)
+    set_coverage_flags(test_buddy_allocator_singlethread_exec)
 endif()

@@ -240,6 +240,23 @@ class _MultiProcessAllocator : public Allocator {
     return nullptr;
   }
 
+  /**
+   * Validate that a pointer is not within an allocated region
+   *
+   * Checks if the given pointer falls within the range [region_start, region_start + region_size).
+   * This is important to catch ThreadBlock or ProcessBlock corruption.
+   *
+   * @param ptr Pointer to check
+   * @param region_offset Start offset of the allocated region
+   * @param region_size Size of the allocated region
+   * @return true if pointer is outside the region, false if inside
+   */
+  bool IsPointerOutsideRegion(void *ptr, size_t region_offset, size_t region_size) {
+    char *region_start = GetBackendData() + region_offset;
+    char *region_end = region_start + region_size;
+    char *ptr_addr = reinterpret_cast<char*>(ptr);
+    return (ptr_addr < region_start || ptr_addr >= region_end);
+  }
 
   /**
    * Initialize the allocator with a new memory region
@@ -475,16 +492,29 @@ class _MultiProcessAllocator : public Allocator {
    * @return Offset pointer to allocated memory, or null on failure
    */
   OffsetPtr<> AllocateOffset(size_t size) {
+    ThreadBlock *tblock = EnsureTls();
     OffsetPtr<> ptr = AllocateOffsetFromTblock(size);
     if (!ptr.IsNull()) {
+      // Verify that ThreadBlock is not within the allocated region
+      if (tblock != nullptr && !IsPointerOutsideRegion(tblock, ptr.load(), size)) {
+        throw std::runtime_error("ThreadBlock corrupted: allocated region overlaps ThreadBlock");
+      }
       return ptr;
     }
     ptr = AllocateOffsetFromPblock(size);
     if (!ptr.IsNull()) {
+      // Verify that ThreadBlock is not within the allocated region
+      if (tblock != nullptr && !IsPointerOutsideRegion(tblock, ptr.load(), size)) {
+        throw std::runtime_error("ThreadBlock corrupted: allocated region overlaps ThreadBlock");
+      }
       return ptr;
     }
     ptr = AllocateOffsetFromGlobal(size);
     if (!ptr.IsNull()) {
+      // Verify that ThreadBlock is not within the allocated region
+      if (tblock != nullptr && !IsPointerOutsideRegion(tblock, ptr.load(), size)) {
+        throw std::runtime_error("ThreadBlock corrupted: allocated region overlaps ThreadBlock");
+      }
       return ptr;
     }
     return ptr;
