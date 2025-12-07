@@ -107,20 +107,16 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
     // Note: header_ is a separate mapping, so we need to update our view
     // The shared header in the mixed region also contains the backend header data
-    md_ = shared_header_ptr;
-    md_size_ = kBackendHeaderSize;
+    id_ = backend_id;
+    backend_size_ = backend_size;
     data_capacity_ = backend_size - 2 * kBackendHeaderSize;
     data_id_ = -1;
+    priv_header_off_ = static_cast<size_t>(data_ - region_);
+    flags_.Clear();
 
-    // Initialize the header
+    // Copy all header fields to shared header
     new (header_) MemoryBackendHeader();
-    header_->id_ = backend_id;
-    header_->md_size_ = kBackendHeaderSize;
-    header_->backend_size_ = backend_size;
-    header_->data_size_ = data_capacity_;
-    header_->data_id_ = -1;
-    header_->priv_header_off_ = static_cast<size_t>(data_ - region_);
-    header_->flags_.Clear();
+    (*header_) = (const MemoryBackendHeader&)*this;
 
     return true;
   }
@@ -167,11 +163,6 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     // Set up pointers (same layout as shm_init)
     char *shared_header_ptr = region_ + kBackendHeaderSize;
     data_ = shared_header_ptr + kBackendHeaderSize;
-
-    md_ = shared_header_ptr;
-    md_size_ = kBackendHeaderSize;
-    data_capacity_ = header_->data_size_;
-    data_id_ = header_->data_id_;
 
     return true;
   }

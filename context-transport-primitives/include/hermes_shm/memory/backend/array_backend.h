@@ -52,26 +52,25 @@ class ArrayBackend : public MemoryBackend {
   bool shm_init(const MemoryBackendId &backend_id, size_t size, char *region, u64 offset = 0) {
     // Headers are at the beginning of the region
     region_ = region;
-    char *shared_header_ptr = region + kBackendHeaderSize;
+    char *priv_header_ptr = region + kBackendHeaderSize;
+    char *shared_header_ptr = priv_header_ptr + kBackendHeaderSize;
 
     // Store backend metadata header
-    header_ = reinterpret_cast<MemoryBackendHeader*>(shared_header_ptr);
-    md_ = shared_header_ptr;
-    md_size_ = kBackendHeaderSize;
-
-    // Initialize header
-    header_->id_ = backend_id;
-    header_->md_size_ = kBackendHeaderSize;
-    header_->backend_size_ = size;
-    header_->data_size_ = size - 2 * kBackendHeaderSize;
-    header_->data_id_ = -1;
-    header_->priv_header_off_ = static_cast<size_t>(shared_header_ptr + kBackendHeaderSize - region);
-    header_->flags_.Clear();
+    header_ = reinterpret_cast<MemoryBackendHeader *>(shared_header_ptr +
+                                                      kBackendHeaderSize);
+    data_capacity_ = size - 3 * kBackendHeaderSize;
+    id_ = backend_id;
+    backend_size_ = size;
+    data_id_ = -1;
+    priv_header_off_ = static_cast<size_t>(priv_header_ptr - region);
+    flags_.Clear();
 
     // data_ points to start of data region (after shared header)
     data_ = shared_header_ptr + kBackendHeaderSize;
-    data_capacity_ = size - 2 * kBackendHeaderSize;
-    data_id_ = -1;
+
+    // Copy all header fields to shared header
+    new (header_) MemoryBackendHeader();
+    (*header_) = (const MemoryBackendHeader&)*this;
 
     return true;
   }

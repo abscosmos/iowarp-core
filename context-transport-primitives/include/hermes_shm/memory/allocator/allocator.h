@@ -110,6 +110,14 @@ class Allocator {
    * Get backend data pointer (reconstructs from allocator position)
    */
   HSHM_INLINE_CROSS_FUN
+  char *GetBackendData() {
+    return reinterpret_cast<char *>(this) - this_;
+  }
+
+  /**
+   * Get backend data pointer (reconstructs from allocator position)
+   */
+  HSHM_INLINE_CROSS_FUN
   char* GetBackendData() const {
     return reinterpret_cast<char*>(const_cast<Allocator*>(this)) - this_;
   }
@@ -121,8 +129,20 @@ class Allocator {
    * @return Pointer to private header of type HEADER_T
    */
   template <typename HEADER_T>
-  HSHM_INLINE_CROSS_FUN HEADER_T* GetPrivateHeader() const {
-    return GetBackend().GetPrivateHeader<HEADER_T>(GetBackendData());
+  HSHM_INLINE_CROSS_FUN HEADER_T* GetPrivateHeader() {
+    return const_cast<HEADER_T*>(
+        static_cast<const Allocator*>(this)->GetPrivateHeader<HEADER_T>());
+  }
+
+  /**
+   * Get typed private header (process-local storage) - const version
+   * This region is kBackendHeaderSize bytes and is NOT shared between processes
+   * Uses GetBackend() to access the proper priv_header_off_ for correct calculation
+   * @return Const pointer to private header of type HEADER_T
+   */
+  template <typename HEADER_T>
+  HSHM_INLINE_CROSS_FUN const HEADER_T* GetPrivateHeader() const {
+    return backend_.GetPrivateHeader<HEADER_T>(GetBackendData());
   }
 
   /**
@@ -145,7 +165,7 @@ class Allocator {
    */
   template <typename HEADER_T>
   HSHM_INLINE_CROSS_FUN HEADER_T *GetSharedHeader() {
-    return GetBackend().GetSharedHeader<HEADER_T>(GetBackendData());
+    return backend_.GetSharedHeader<HEADER_T>(GetBackendData());
   }
 
   /**
@@ -156,19 +176,10 @@ class Allocator {
    */
   template <typename HEADER_T>
   HSHM_INLINE_CROSS_FUN const HEADER_T *GetSharedHeader() const {
-    return GetBackend().GetSharedHeader<HEADER_T>(GetBackendData());
+    return backend_.GetSharedHeader<HEADER_T>(GetBackendData());
   }
 
-
-  /**
-   * Get the size of the backend data region
-   * This is the total size available to the allocator
-   *
-   * @return Size of backend data region in bytes
-   */
-  HSHM_INLINE_CROSS_FUN
-  size_t GetBackendDataSize() const { return backend_.data_capacity_; }
-
+  
   /**
    * Get the size of the backend data capacity
    * This is the total size available to the allocator

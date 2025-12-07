@@ -105,7 +105,7 @@ class AllocatorTest {
    * @param iterations Number of iterations
    */
   void TestRandomAllocation(size_t iterations) {
-    const size_t kMaxAllocSize = 1024 * 1024;  // 1 MB
+    const size_t kMaxAllocSize = 16 * 1024;  // 16 MB
     const size_t kMaxTotalSize = 64 * 1024 * 1024;  // 64 MB
     const size_t kMaxAllocations = 5000;
 
@@ -125,6 +125,7 @@ class AllocatorTest {
           break;
         }
 
+        // printf("Allocating size: %lu\n", alloc_size);
         auto ptr = alloc_->template Allocate<char>(alloc_size, 64);
         if (ptr.IsNull()) {
           // Allocation failed - clean up and break

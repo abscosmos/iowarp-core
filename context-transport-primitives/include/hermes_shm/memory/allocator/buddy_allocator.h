@@ -153,7 +153,7 @@ class _BuddyAllocator : public Allocator {
 
     // Big heap gets all available space initially
     big_heap_.Init(heap_begin, heap_max_offset);
-
+    
     // Small arena is initially empty - will be populated on first small allocation
     small_arena_.Init(0, 0);
 
@@ -282,6 +282,24 @@ class _BuddyAllocator : public Allocator {
     }
   }
 
+  /**
+   * Expand the allocator with new memory region
+   *
+   * This method expands the big_heap_ to include a new memory region,
+   * making it available for allocation and arena repopulation.
+   *
+   * @param region Offset pointer to the new region
+   * @param region_size Size of the new region in bytes
+   */
+  void Expand(OffsetPtr<> region, size_t region_size) {
+    if (region.IsNull() || region_size == 0) {
+      return;
+    }
+    // Expand the big_heap_ max_offset to include the new region
+    size_t region_end = region.load() + region_size; 
+    big_heap_.Init(region.load(), region_end); 
+  }
+
  private:
   /**
    * Allocate small memory (<16KB) using round-up sizing
@@ -383,7 +401,9 @@ class _BuddyAllocator : public Allocator {
     }
 
     // Iterate through all entries in the list using the iterator
-    for (auto it = large_pages_[list_idx].begin(this); it != large_pages_[list_idx].end(); ++it) {
+    int i = 0;
+    for (auto it = large_pages_[list_idx].begin(this);
+         it != large_pages_[list_idx].end(); ++it) {
       hipc::FullPtr<FreeLargeBuddyPage> free_page(
           this, OffsetPtr<FreeLargeBuddyPage>(it.GetCurrent().load()));
 
@@ -395,6 +415,7 @@ class _BuddyAllocator : public Allocator {
         (void)large_pages_[list_idx].PopAt(this, it);
         return offset;
       }
+      ++i;
     }
 
     return 0;  // No fit found
@@ -407,7 +428,22 @@ class _BuddyAllocator : public Allocator {
   bool RepopulateSmallArena() {
     size_t arena_size = kSmallArenaSize + kSmallArenaPages * sizeof(BuddyPage);
 
-    // Step 4.2.1: Search all large_pages_ lists for space
+    // Set arena bounds for DivideArenaIntoPages to use
+    DivideArenaIntoPages();
+
+    // Step 4.2.1: Try allocating from big_heap_ first
+    size_t heap_offset = big_heap_.Allocate(arena_size);
+    if (heap_offset != 0) {
+      // Step 4.1: Divide into pages using greedy algorithm
+      small_arena_.Init(heap_offset, heap_offset + arena_size);
+
+      // Step 4.3: Arena is now fully divided into free list pages
+      // No need to reset - arena remains empty as all space is in free lists
+
+      return true;
+    }
+
+    // Step 4.2.2: If heap fails, search all large_pages_ lists for space
     {
       for (size_t list_idx = 0; list_idx < kMaxLargePages; ++list_idx) {
         size_t offset = FindFirstFit(list_idx, arena_size);
@@ -416,20 +452,6 @@ class _BuddyAllocator : public Allocator {
           return true;
         }
       }
-    }
-
-    // Step 4.2.3: Try allocating from big_heap_
-    size_t heap_offset = big_heap_.Allocate(arena_size);
-    if (heap_offset != 0) {
-      // Step 4.1: Divide into pages using greedy algorithm
-      // Set arena bounds for DivideArenaIntoPages to use
-      DivideArenaIntoPages();
-      small_arena_.Init(heap_offset, heap_offset + arena_size);
-
-      // Step 4.3: Arena is now fully divided into free list pages
-      // No need to reset - arena remains empty as all space is in free lists
-
-      return true;
     }
 
     return false;  // Could not repopulate

@@ -267,3 +267,40 @@ shm_attach(url):
 2. Get backend_size_ from the header
 3. region_: Use MapMixed for backend_size_.
 4. Partition the region_ as described. Each 
+
+# PosixMmap
+
+region: [memory backend header] [private header] [shared header] [data]
+
+shm_init
+1. region: Use Map to map the entire backend
+2. First 4KB are the memory backend header
+3. Next 4KB are the private header
+4. Next 4KB are the shared header
+5. Remainder is data
+
+shm_attach: Not implemented
+
+# ArrayBackend
+
+region: [memory backend header] [private header] [shared header] [data]
+
+shm_init
+1. region: The input array
+2. First 4KB are the memory backend header
+3. Next 4KB are the private header
+4. Next 4KB are the shared header
+5. Remainder is data
+
+shm_attach: not implemented.
+
+
+@CLAUDE.md
+
+# Expand(OffsetPtr region, size_t region_size)
+Update BuddyAllocator to have this method.
+Expand will update the big_heap_. 
+
+# MultProcess Allocator
+
+Use Expand instead of Free when expanding.

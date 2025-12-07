@@ -79,8 +79,8 @@ TEST_CASE("MultiProcessAllocator - Random Allocation", "[MultiProcessAllocator]"
 
   AllocatorTest<hipc::MultiProcessAllocator> tester(alloc);
 
-  SECTION("16 iterations of random allocations") {
-    REQUIRE_NOTHROW(tester.TestRandomAllocation(16));
+  SECTION("256 iterations of random allocations") {
+    REQUIRE_NOTHROW(tester.TestRandomAllocation(256));
   }
 
   SECTION("32 iterations of random allocations") {
@@ -101,11 +101,11 @@ TEST_CASE("MultiProcessAllocator - Multi-threaded Random", "[MultiProcessAllocat
 
   AllocatorTest<hipc::MultiProcessAllocator> tester(alloc);
 
-  SECTION("8 threads, 2 iterations each") {
-    REQUIRE_NOTHROW(tester.TestMultiThreadedRandom(8, 2));
+  SECTION("8 threads, 16 iterations each") {
+    REQUIRE_NOTHROW(tester.TestMultiThreadedRandom(8, 16));
   }
 
-  SECTION("4 threads, 4 iterations each") {
+  SECTION("4 threads, 256 iterations each") {
     REQUIRE_NOTHROW(tester.TestMultiThreadedRandom(4, 256));
   }
 

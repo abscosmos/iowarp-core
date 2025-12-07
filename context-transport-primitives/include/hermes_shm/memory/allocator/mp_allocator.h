@@ -70,14 +70,17 @@ class ThreadBlock : public pre::slist_node {
   }
 
   /**
-   * Expand this ThreadBlock by freeing a region back to it
+   * Expand this ThreadBlock with a new memory region
    *
-   * This is called when memory is returned to the ThreadBlock allocator,
-   * typically when a ThreadBlock is freed or when coalescing occurs.
+   * This is called when memory is allocated from the ProcessBlock allocator
+   * to expand the ThreadBlock's available memory for allocation.
    *
-   * @param ptr Offset pointer to memory region to return
+   * @param region Offset pointer to new memory region
+   * @param region_size Size of the new region in bytes
    */
-  void Expand(OffsetPtr<> ptr) { alloc_.FreeOffset(ptr); }
+  void Expand(OffsetPtr<> region, size_t region_size) {
+    alloc_.Expand(region, region_size);
+  }
 };
 
 /**
@@ -145,15 +148,16 @@ class ProcessBlock : public pre::slist_node {
   }
 
   /**
-   * Expand this ProcessBlock by freeing a region back to it
+   * Expand this ProcessBlock with a new memory region
    *
-   * This is called when memory is returned to the ProcessBlock allocator,
-   * typically when a ThreadBlock is freed or when coalescing occurs.
+   * This is called when memory is allocated from the global allocator
+   * to expand the ProcessBlock's available memory for allocation.
    *
-   * @param ptr Offset pointer to memory region to return
+   * @param region Offset pointer to new memory region
+   * @param region_size Size of the new region in bytes
    */
-  void Expand(OffsetPtr<> ptr) {
-    alloc_.FreeOffset(ptr);
+  void Expand(OffsetPtr<> region, size_t region_size) {
+    alloc_.Expand(region, region_size);
   }
 };
 
@@ -268,16 +272,9 @@ class _MultiProcessAllocator : public Allocator {
     size_t available_size = region_size - sizeof(_MultiProcessAllocator);
     alloc_.shm_init(backend, available_size);
 
-    // Set default sizes based on available memory
-    // For testing with smaller memory regions, use smaller defaults
-    if (available_size < 1ULL * 1024 * 1024 * 1024) {
-      // For regions < 1GB, use smaller units
-      process_unit_ = available_size / 4;        // Use 1/4 of available space
-      thread_unit_ = 4ULL * 1024 * 1024;         // 4MB
-    } else {
-      process_unit_ = 1ULL * 1024 * 1024 * 1024;  // 1GB
-      thread_unit_ = 16ULL * 1024 * 1024;         // 16MB
-    }
+    // Default process and thread units
+    process_unit_ = 16ULL * 1024 * 1024;  // 16MB
+    thread_unit_ = 1024 * 1024;         // 1MB
 
     // Allocate first ProcessBlock using AllocateProcessBlock()
     FullPtr<ProcessBlock> pblock_ptr = AllocateProcessBlock();
@@ -331,11 +328,9 @@ class _MultiProcessAllocator : public Allocator {
    * @return Pointer to the thread's ThreadBlock, or nullptr on failure
    */
   ThreadBlock* EnsureTls() {
-    printf("[EnsureTls] Start\n");
     // Get ProcessBlock (should already exist from shm_init or shm_attach)
     ProcessBlock *pblock = GetProcessBlock();
     if (pblock == nullptr) {
-      printf("[EnsureTls] No ProcessBlock\n");
       return nullptr;
     }
 
@@ -345,20 +340,16 @@ class _MultiProcessAllocator : public Allocator {
       return reinterpret_cast<ThreadBlock*>(tblock_data);
     }
 
-    printf("[EnsureTls] Allocating new ThreadBlock with SINGLE allocation\n");
     // Allocate SINGLE region for both ThreadBlock object and managed region
     FullPtr<ThreadBlock> tblock_ptr = AllocateFromProcessOrGlobal<ThreadBlock>(
         sizeof(ThreadBlock) + thread_unit_);
     if (tblock_ptr.IsNull()) {
-      printf("[EnsureTls] Failed to allocate ThreadBlock region\n");
       return nullptr;
     }
 
-    printf("[EnsureTls] Initializing ThreadBlock\n");
     // Initialize ThreadBlock with the region size and store in TLS
     tblock_ptr.ptr_->shm_init(GetBackend(), thread_unit_, pblock->tid_count_++);
     HSHM_THREAD_MODEL->SetTls<void>(pblock->tblock_key_, reinterpret_cast<void*>(tblock_ptr.ptr_));
-    printf("[EnsureTls] ThreadBlock initialized and stored in TLS\n");
     return tblock_ptr.ptr_;
   }
 
@@ -383,38 +374,28 @@ class _MultiProcessAllocator : public Allocator {
 
     // Tier 1: Try allocating from ProcessBlock (requires lock)
     {
-      printf("[AllocFromProcOrGlobal] Acquiring pblock lock (Tier 1)\n");
       ScopedMutex scoped_lock(pblock->lock_, 0);
-      printf("[AllocFromProcOrGlobal] Acquired pblock lock (Tier 1)\n");
       FullPtr<T> ptr = pblock->alloc_.Allocate<T>(size);
       if (!ptr.IsNull()) {
-        printf("[AllocFromProcOrGlobal] Success (Tier 1), releasing pblock lock\n");
         return ptr;
       }
-      printf("[AllocFromProcOrGlobal] Failed (Tier 1), releasing pblock lock\n");
     }
 
     // Tier 2: Expand ProcessBlock from global allocator and retry
     {
       // First acquire global lock to allocate expansion memory
-      printf("[AllocFromProcOrGlobal] Acquiring global lock (Tier 2)\n");
       ScopedMutex global_lock(lock_, 0);
-      printf("[AllocFromProcOrGlobal] Acquired global lock (Tier 2)\n");
       OffsetPtr<> expand_ptr = alloc_.AllocateOffset(process_unit_);
       if (expand_ptr.IsNull()) {
-        printf("[AllocFromProcOrGlobal] Expand failed, releasing global lock\n");
         return FullPtr<T>::GetNull();
       }
 
       // Now acquire ProcessBlock lock to expand and retry allocation
-      printf("[AllocFromProcOrGlobal] Acquiring pblock lock (Tier 2)\n");
       ScopedMutex pblock_lock(pblock->lock_, 0);
-      printf("[AllocFromProcOrGlobal] Acquired pblock lock (Tier 2)\n");
-      pblock->Expand(expand_ptr);
+      pblock->Expand(expand_ptr, process_unit_);
 
       // Retry allocation from expanded ProcessBlock
       FullPtr<T> ptr = pblock->alloc_.Allocate<T>(size);
-      printf("[AllocFromProcOrGlobal] Tier 2 complete, releasing locks\n");
       return ptr;  // May still be null if expansion wasn't enough
     }
   }
@@ -439,9 +420,7 @@ class _MultiProcessAllocator : public Allocator {
    */
   FullPtr<ProcessBlock> AllocateProcessBlock() {
     // Lock the global process list
-    printf("[AllocateProcessBlock] Acquiring global lock\n");
     ScopedMutex scoped_lock(lock_, 0);
-    printf("[AllocateProcessBlock] Acquired global lock\n");
 
     FullPtr<ProcessBlock> pblock_ptr = FullPtr<ProcessBlock>::GetNull();
     int pid;
@@ -625,20 +604,13 @@ class _MultiProcessAllocator : public Allocator {
       return OffsetPtr<>::GetNull();
     }
 
-    printf("[AllocOffsetFromPblock] Acquiring pblock lock\n");
     ScopedMutex scoped_lock(pblock->lock_, 0);
-    printf("[AllocOffsetFromPblock] Acquired pblock lock\n");
     OffsetPtr<> expand_offset = pblock->alloc_.AllocateOffset(thread_unit_);
     if (!expand_offset.IsNull()) {
       // Expand the thread block and try reallocating
-      tblock->Expand(expand_offset);
-      OffsetPtr<> ptr = tblock->alloc_.AllocateOffset(size);
-      if (!ptr.IsNull()) {
-        printf("[AllocOffsetFromPblock] Success, releasing pblock lock\n");
-        return ptr;
-      }
+      tblock->Expand(expand_offset, thread_unit_);
+      return AllocateOffsetFromTblock(size);
     }
-    printf("[AllocOffsetFromPblock] Failed, releasing pblock lock\n");
     return OffsetPtr<>::GetNull();
   }
 
@@ -663,28 +635,20 @@ class _MultiProcessAllocator : public Allocator {
     // Acquire global lock to allocate expansion memory
     OffsetPtr<> expand_ptr;
     {
-      printf("[AllocOffsetFromGlobal] Acquiring global lock\n");
       ScopedMutex global_lock(lock_, 0);
-      printf("[AllocOffsetFromGlobal] Acquired global lock\n");
       expand_ptr = alloc_.AllocateOffset(process_unit_);
       if (expand_ptr.IsNull()) {
-        printf("[AllocOffsetFromGlobal] Expand failed, releasing global lock\n");
         return OffsetPtr<>::GetNull();
       }
-      printf("[AllocOffsetFromGlobal] Releasing global lock\n");
     }
 
     // Acquire ProcessBlock lock to expand
     {
-      printf("[AllocOffsetFromGlobal] Acquiring pblock lock\n");
       ScopedMutex pblock_lock(pblock->lock_, 0);
-      printf("[AllocOffsetFromGlobal] Acquired pblock lock\n");
-      pblock->Expand(expand_ptr);
-      printf("[AllocOffsetFromGlobal] Releasing pblock lock\n");
+      pblock->Expand(expand_ptr, process_unit_);
     }
 
     // Retry through ProcessBlock tier (which will expand ThreadBlock if needed)
-    printf("[AllocOffsetFromGlobal] Calling AllocateOffsetFromPblock\n");
     return AllocateOffsetFromPblock(size);
   }
 

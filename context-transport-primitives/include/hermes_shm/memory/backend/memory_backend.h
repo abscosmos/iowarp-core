@@ -119,17 +119,16 @@ class MemoryBackendId {
 typedef MemoryBackendId memory_backend_id_t;
 
 struct MemoryBackendHeader {
-  size_t md_size_;           // Aligned metadata size (4KB aligned)
   MemoryBackendId id_;
   bitfield64_t flags_;
   size_t backend_size_;      // Total size of region_
-  size_t data_size_;         // Remaining size of data_
+  size_t data_capacity_;     // Capacity available for data allocation
   int data_id_;              // Device ID for the data buffer (GPU ID, etc.)
   size_t priv_header_off_;   // Offset from data_ back to start of private header
 
   HSHM_CROSS_FUN void Print() const {
-    printf("(%s) MemoryBackendHeader: id: (%u, %u), md_size: %lu, backend_size: %lu, data_size: %lu, priv_header_off: %lu\n",
-           kCurrentDevice, id_.major_, id_.minor_, (long unsigned)md_size_, (long unsigned)backend_size_, (long unsigned)data_size_, (long unsigned)priv_header_off_);
+    printf("(%s) MemoryBackendHeader: id: (%u, %u), backend_size: %lu, data_capacity: %lu, priv_header_off: %lu\n",
+           kCurrentDevice, id_.major_, id_.minor_, (long unsigned)backend_size_, (long unsigned)data_capacity_, (long unsigned)priv_header_off_);
   }
 };
 
@@ -147,19 +146,23 @@ class UrlMemoryBackend {};
  */
 static constexpr size_t kBackendHeaderSize = 4 * 1024;  // 4KB per header (shared + private = 8KB total)
 
-class MemoryBackend {
+class MemoryBackend : public MemoryBackendHeader {
  public:
-  MemoryBackendHeader *header_;
-  char *region_;    // The entire region: [private header] [shared header] [custom header] [data]
-  char *md_;        // Metadata for how processes (on CPU) connect to this backend. Not required for allocators.
-  size_t md_size_;  // Metadata size. Not required for allocators.
+  MemoryBackendHeader *header_;  // Pointer to the MemoryBackendHeader in shared/mapped memory
+  char *region_;    // The entire region: [private header] [shared header] [data]
   char *data_;      // Data buffer for allocators (points to start of data section)
-  size_t data_capacity_; // Full size of backend (total capacity available)
-  int data_id_;     // Device ID for the data buffer (GPU ID, etc.)
 
  public:
   HSHM_CROSS_FUN
-  MemoryBackend() : header_(nullptr), region_(nullptr), md_(nullptr), md_size_(0), data_(nullptr), data_capacity_(0), data_id_(-1) {}
+  MemoryBackend() : header_(nullptr), region_(nullptr), data_(nullptr) {
+    // Initialize inherited MemoryBackendHeader fields
+    id_ = MemoryBackendId();
+    flags_.Clear();
+    backend_size_ = 0;
+    data_capacity_ = 0;
+    data_id_ = -1;
+    priv_header_off_ = 0;
+  }
 
   ~MemoryBackend() = default;
 
@@ -186,7 +189,7 @@ class MemoryBackend {
     if (data == nullptr) {
       return nullptr;
     }
-    return reinterpret_cast<T*>(data - header_->priv_header_off_);
+    return reinterpret_cast<T*>(data - priv_header_off_);
   }
 
   /**
@@ -202,7 +205,7 @@ class MemoryBackend {
     if (data == nullptr) {
       return nullptr;
     }
-    return reinterpret_cast<const T*>(data - header_->priv_header_off_);
+    return reinterpret_cast<const T*>(data - priv_header_off_);
   }
 
   /**
@@ -442,8 +445,8 @@ class MemoryBackend {
   HSHM_CROSS_FUN
   void Print() const {
     header_->Print();
-    printf("(%s) MemoryBackend: region: %p, md: %p, md_size: %lu, data: %p, data_capacity: %lu\n",
-           kCurrentDevice, region_, md_, (long unsigned)md_size_, data_, (long unsigned)data_capacity_);
+    printf("(%s) MemoryBackend: region: %p, data: %p, data_capacity: %lu\n",
+           kCurrentDevice, region_, data_, (long unsigned)header_->data_capacity_);
   }
 
   /// Each allocator must define its own shm_init.

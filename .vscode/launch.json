@@ -174,7 +174,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/build/bin/test_mp_allocator_exec",
             "args": [
-                "MultiProcessAllocator - Random Allocation"
+                "MultiProcessAllocator - Multi-threaded Random"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build",
@@ -206,7 +206,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/build/bin/test_buddy_allocator_exec",
             "args": [
-                "BuddyAllocator - Batch Allocate and Free"
+                "BuddyAllocator - Random Allocation"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build",

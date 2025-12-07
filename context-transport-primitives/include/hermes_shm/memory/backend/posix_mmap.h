@@ -36,10 +36,6 @@
 namespace hshm::ipc {
 
 class PosixMmap : public MemoryBackend {
- private:
-  size_t total_size_;
-  void *map_ptr_;  // Actual mapping start (includes private region)
-
  public:
   /** Constructor */
   HSHM_CROSS_FUN
@@ -56,38 +52,35 @@ class PosixMmap : public MemoryBackend {
       backend_size = kMinBackendSize;
     }
 
-    // Total layout: [2*kBackendHeaderSize headers] [data]
-    total_size_ = backend_size;
+    // Total layout: [backend header] [private header] [shared header] [data]
 
     // Map memory
-    char *ptr = _Map(total_size_);
+    char *ptr = _Map(backend_size);
     if (!ptr) {
       return false;
     }
-    map_ptr_ = ptr;  // Save mapping start for cleanup
 
     region_ = ptr;
-    char *shared_header_ptr = ptr + kBackendHeaderSize;
+    char *priv_header_ptr = ptr + kBackendHeaderSize;
+    char *shared_header_ptr = priv_header_ptr + kBackendHeaderSize;
 
     // Initialize header at shared header location
-    header_ = reinterpret_cast<MemoryBackendHeader *>(shared_header_ptr);
-    new (header_) MemoryBackendHeader();
-    header_->id_ = backend_id;
-    header_->md_size_ = kBackendHeaderSize;
-    header_->backend_size_ = backend_size;
-    header_->data_size_ = backend_size - 2 * kBackendHeaderSize;
-    header_->data_id_ = -1;
-    header_->priv_header_off_ = static_cast<size_t>(shared_header_ptr + kBackendHeaderSize - ptr);
-    header_->flags_.Clear();
+    header_ = reinterpret_cast<MemoryBackendHeader *>(shared_header_ptr +
+                                                      kBackendHeaderSize);
 
-    // md_ points to the shared header
-    md_ = shared_header_ptr;
-    md_size_ = kBackendHeaderSize;
+    id_ = backend_id;
+    backend_size_ = backend_size;
+    data_capacity_ = backend_size - 3 * kBackendHeaderSize;
+    data_id_ = -1;
+    priv_header_off_ = static_cast<size_t>(priv_header_ptr - ptr);
+    flags_.Clear();
 
     // data_ starts after shared header
     data_ = shared_header_ptr + kBackendHeaderSize;
-    data_capacity_ = header_->data_size_;
-    data_id_ = -1;
+
+    // Copy all header fields to shared header
+    new (header_) MemoryBackendHeader();
+    (*header_) = (const MemoryBackendHeader&)*this;
 
     return true;
   }
@@ -119,9 +112,9 @@ class PosixMmap : public MemoryBackend {
 
   /** Unmap shared memory */
   void _Detach() {
-    if (map_ptr_) {
-      SystemInfo::UnmapMemory(map_ptr_, total_size_);  // Unmap from mapping start (includes private region)
-      map_ptr_ = nullptr;
+    if (region_) {
+      SystemInfo::UnmapMemory(region_, backend_size_);
+      region_ = nullptr;
     }
   }
 

@@ -96,3 +96,7 @@ Check to see if the new size is less than or equal to the new size. If it is, th
 Otherwise, we will need to AllocateOffset, get the FullPtr from the offset, and then copy from the old offset into the new one. Call FreeOffset afterwards.
 Ensure that the size stored in the BuddyPage is the size of the page without the BuddyPage metadata header. Verify that in AllocateOffset.
 
+## Expand(OffsetPtr region, size_t region_size)
+
+Expand will update the big_heap_. 
+

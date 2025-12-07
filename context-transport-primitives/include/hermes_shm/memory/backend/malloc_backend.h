@@ -56,27 +56,26 @@ class MallocBackend : public MemoryBackend {
     alloc_ptr_ = ptr;  // Save allocation start for cleanup
 
     region_ = ptr;
-    char *shared_header_ptr = ptr + kBackendHeaderSize;
+    char *priv_header_ptr = ptr + kBackendHeaderSize;
+    char *shared_header_ptr = priv_header_ptr + kBackendHeaderSize;
 
     // Initialize header at shared header location
-    header_ = reinterpret_cast<MemoryBackendHeader *>(shared_header_ptr);
-    new (header_) MemoryBackendHeader();
-    header_->id_ = backend_id;
-    header_->md_size_ = kBackendHeaderSize;
-    header_->backend_size_ = backend_size;
-    header_->data_size_ = backend_size - 2 * kBackendHeaderSize;
-    header_->data_id_ = -1;
-    header_->priv_header_off_ = static_cast<size_t>(shared_header_ptr + kBackendHeaderSize - ptr);
-    header_->flags_.Clear();
+    header_ = reinterpret_cast<MemoryBackendHeader *>(shared_header_ptr +
+                                                      kBackendHeaderSize);
 
-    // md_ points to the shared header
-    md_ = shared_header_ptr;
-    md_size_ = kBackendHeaderSize;
+    id_ = backend_id;
+    backend_size_ = backend_size;
+    data_capacity_ = backend_size - 3 * kBackendHeaderSize;
+    data_id_ = -1;
+    priv_header_off_ = static_cast<size_t>(priv_header_ptr - ptr);
+    flags_.Clear();
 
     // data_ starts after shared header
     data_ = shared_header_ptr + kBackendHeaderSize;
-    data_capacity_ = header_->data_size_;
-    data_id_ = -1;
+
+    // Copy all header fields to shared header
+    new (header_) MemoryBackendHeader();
+    (*header_) = (const MemoryBackendHeader&)*this;
 
     return true;
   }
