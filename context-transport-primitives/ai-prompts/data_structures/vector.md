@@ -1,5 +1,7 @@
 @CLAUDE.md
 
+Add a todo list. 
+
 # ShmContainer
 Implement a base class called ShmContainer
 
@@ -24,9 +26,13 @@ class ShmContainer {
 
 # Vector
 
-Implement a shared-memory vector and iterators for it.
+Implement a shared-memory vector and iterators for it in context-transport-primitives/include/hermes_shm/data_structures/ipc/vector.h.
 It should implement similar methods to std::vector along with similar iterators.
 Handle piece-of-data (POD) types differently from classes. 
+POD types should support using memcpy and memset for initialization.
+Implement the various types of constructors, operators, and methods based on:
+https://en.cppreference.com/w/cpp/container/vector.html
+https://en.cppreference.com/w/cpp/container/vector/vector.html
 
 ```
 namespace hshm::ipc {
