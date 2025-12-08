@@ -25,7 +25,7 @@ class ShmContainer {
 # Vector
 
 Implement a shared-memory vector and iterators for it.
-It should implement most methods the same as you would expect.
+It should implement similar methods to std::vector along with similar iterators.
 Handle piece-of-data (POD) types differently from classes. 
 
 ```
