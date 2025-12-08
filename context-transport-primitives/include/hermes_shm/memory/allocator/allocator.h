@@ -243,7 +243,9 @@ class Allocator {
   HSHM_INLINE_CROSS_FUN bool ContainsPtr(const OffsetPtrBase<T, ATOMIC> &ptr) const {
     size_t off = ptr.off_.load();
     // DEBUG
-    // printf("ContainsPtr(OffsetPtr): off=%zu, data_capacity=%zu, result=%d\n", off, backend_.data_capacity_, (int)(off < backend_.data_capacity_));
+    printf("ContainsPtr(OffsetPtr): this=%p, off=%zu, &backend_=%p, data_capacity=%zu\n",
+           (void*)this, off, (void*)&backend_, backend_.data_capacity_);
+    fflush(stdout);
     return off < backend_.data_capacity_;
   }
 
@@ -778,11 +780,17 @@ struct FullPtr : public ShmPointer {
       typename = typename std::enable_if<!std::is_same<T, AllocT>::value>::type>
   HSHM_CROSS_FUN explicit FullPtr(AllocT *alloc,
                                   const OffsetPtrBase<T, ATOMIC> &shm) {
-    if (alloc->ContainsPtr(shm)) {
+    if (alloc && alloc->ContainsPtr(shm)) {
       shm_.off_ = shm.load();
       shm_.alloc_id_ = alloc->GetId();
-      ptr_ = reinterpret_cast<T*>(alloc->GetBackendData() + shm.load());
+      char *backend_data = alloc->GetBackendData();
+      printf("[FullPtr] alloc=%p, backend_data=%p, offset=%zu, result_ptr=%p\n",
+             (void*)alloc, (void*)backend_data, shm.load(),
+             (void*)(backend_data + shm.load()));
+      ptr_ = reinterpret_cast<T*>(backend_data + shm.load());
     } else {
+      printf("[FullPtr] alloc=%p, ContainsPtr=%d, setting null\n",
+             (void*)alloc, alloc ? (int)alloc->ContainsPtr(shm) : -1);
       SetNull();
     }
   }
