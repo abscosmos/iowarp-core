@@ -869,4 +869,54 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
   }
 }
 
+template <typename T>
+hipc::FullPtr<T> IpcManager::ToFullPtr(const hipc::ShmPtr<T> &shm_ptr) {
+  if (shm_ptr.IsNull()) {
+    return hipc::FullPtr<T>();
+  }
+
+  // Check main allocator
+  if (shm_ptr.shm_.alloc_id_ == main_allocator_id_) {
+    return hipc::FullPtr<T>(main_allocator_, shm_ptr);
+  }
+
+  // Check client data allocator
+  if (shm_ptr.shm_.alloc_id_ == client_data_allocator_id_) {
+    return hipc::FullPtr<T>(client_data_allocator_, shm_ptr);
+  }
+
+  // Check runtime data allocator
+  if (shm_ptr.shm_.alloc_id_ == runtime_data_allocator_id_) {
+    return hipc::FullPtr<T>(runtime_data_allocator_, shm_ptr);
+  }
+
+  // No matching allocator found
+  return hipc::FullPtr<T>();
+}
+
+template <typename T>
+hipc::FullPtr<T> IpcManager::ToFullPtr(T *ptr) {
+  if (!ptr) {
+    return hipc::FullPtr<T>();
+  }
+
+  // Check main allocator
+  if (main_allocator_ && main_allocator_->ContainsPtr(ptr)) {
+    return hipc::FullPtr<T>(main_allocator_, ptr);
+  }
+
+  // Check client data allocator
+  if (client_data_allocator_ && client_data_allocator_->ContainsPtr(ptr)) {
+    return hipc::FullPtr<T>(client_data_allocator_, ptr);
+  }
+
+  // Check runtime data allocator
+  if (runtime_data_allocator_ && runtime_data_allocator_->ContainsPtr(ptr)) {
+    return hipc::FullPtr<T>(runtime_data_allocator_, ptr);
+  }
+
+  // No matching allocator found
+  return hipc::FullPtr<T>();
+}
+
 } // namespace chi

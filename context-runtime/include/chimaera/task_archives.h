@@ -35,8 +35,6 @@ struct DataTransfer {
   DataTransfer() : size(0), flags(0) {}
   DataTransfer(const hipc::FullPtr<char> &d, size_t s, uint32_t f)
       : data(d), size(s), flags(f) {}
-  DataTransfer(hipc::ShmPtr<> ptr, size_t s, uint32_t f)
-      : data(hipc::FullPtr<char>(CHI_IPC->GetMainAllocator(), ptr)), size(s), flags(f) {}
 
   // Serialization support for cereal
   template <class Archive> void serialize(Archive &ar) {
@@ -138,7 +136,7 @@ public:
     // The actual buffer allocation will be done by the caller after
     // LoadFromMessage using CHI_IPC->AllocateBuffer(size) and the
     // DataTransfer info
-    data_transfers_.emplace_back(ptr, size, flags);
+    data_transfers_.emplace_back(CHI_IPC->ToFullPtr(ptr), size, flags);
   }
 
   /** Get data transfer information */
@@ -233,7 +231,7 @@ public:
   /** Bulk transfer support */
   void bulk(hipc::ShmPtr<> ptr, size_t size, uint32_t flags) {
     // Create DataTransfer object and append to data_transfers_ vector
-    DataTransfer transfer(ptr, size, flags);
+    DataTransfer transfer(CHI_IPC->ToFullPtr(ptr), size, flags);
     data_transfers_.push_back(transfer);
 
     // Serialize the DataTransfer object

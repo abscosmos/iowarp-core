@@ -325,6 +325,24 @@ public:
    */
   bool StartLocalServer();
 
+  /**
+   * Convert ShmPtr to FullPtr by checking allocator IDs
+   * Matches the ShmPtr's allocator ID against main, data, and rdata allocators
+   * @param shm_ptr The ShmPtr to convert
+   * @return FullPtr with matching allocator and pointer, or null FullPtr if no match
+   */
+  template <typename T>
+  hipc::FullPtr<T> ToFullPtr(const hipc::ShmPtr<T> &shm_ptr);
+
+  /**
+   * Convert raw pointer to FullPtr by checking allocators
+   * Uses ContainsPtr() on each allocator to find the matching one
+   * @param ptr The raw pointer to convert
+   * @return FullPtr with matching allocator and pointer, or null FullPtr if no match
+   */
+  template <typename T>
+  hipc::FullPtr<T> ToFullPtr(T *ptr);
+
 private:
   /**
    * Map task to lane ID using the configured policy
