@@ -267,43 +267,7 @@ class MemoryBackend : public MemoryBackendHeader {
     const char *priv = GetPrivateHeader<char>(data);
     return reinterpret_cast<const T*>(priv + kBackendHeaderSize);
   }
-
-  /**
-   * Get pointer to the custom header given a data pointer.
-   * Custom header is located kBackendHeaderSize bytes after the shared header.
-   *
-   * @tparam T Type to cast the custom header to (default: char)
-   * @param data The data pointer to calculate offset from
-   * @return Pointer to the custom header, or nullptr if data is null
-   */
-  template<typename T = char>
-  HSHM_CROSS_FUN
-  T *GetCustomHeader(char *data) {
-    if (data == nullptr) {
-      return nullptr;
-    }
-    char *shared = GetSharedHeader<char>(data);
-    return reinterpret_cast<T*>(shared + kBackendHeaderSize);
-  }
-
-  /**
-   * Get pointer to the custom header given a data pointer (const version).
-   * Custom header is located kBackendHeaderSize bytes after the shared header.
-   *
-   * @tparam T Type to cast the custom header to (default: char)
-   * @param data The data pointer to calculate offset from
-   * @return Const pointer to the custom header, or nullptr if data is null
-   */
-  template<typename T = char>
-  HSHM_CROSS_FUN
-  const T *GetCustomHeader(const char *data) const {
-    if (data == nullptr) {
-      return nullptr;
-    }
-    const char *shared = GetSharedHeader<char>(data);
-    return reinterpret_cast<const T*>(shared + kBackendHeaderSize);
-  }
-
+  
   /**
    * Get pointer to the shared header (4KB before data_, at data_ - kBackendHeaderSize)
    *
@@ -359,30 +323,6 @@ class MemoryBackend : public MemoryBackendHeader {
   HSHM_CROSS_FUN
   const T *GetPrivateHeader() const {
     return GetPrivateHeader<T>(data_);
-  }
-
-  /**
-   * Get pointer to the custom header
-   *
-   * @tparam T Type to cast the custom header to (default: char)
-   * @return Pointer to the custom header, or nullptr if data_ is null
-   */
-  template<typename T = char>
-  HSHM_CROSS_FUN
-  T *GetCustomHeader() {
-    return GetCustomHeader<T>(data_);
-  }
-
-  /**
-   * Get pointer to the custom header (const version)
-   *
-   * @tparam T Type to cast the custom header to (default: char)
-   * @return Const pointer to the custom header, or nullptr if data_ is null
-   */
-  template<typename T = char>
-  HSHM_CROSS_FUN
-  const T *GetCustomHeader() const {
-    return GetCustomHeader<T>(data_);
   }
 
   /**

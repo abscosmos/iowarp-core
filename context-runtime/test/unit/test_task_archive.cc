@@ -41,7 +41,7 @@ constexpr chi::u32 kTestExposeFlag = 0x2; // BULK_EXPOSE
 
 // Helper allocator for tests - returns main allocator for task construction
 Task::AllocT* GetTestAllocator() {
-  return CHI_IPC->GetMainAllocator();
+  return CHI_IPC->GetMainAlloc();
 }
 
 // Helper to create test task with sample data

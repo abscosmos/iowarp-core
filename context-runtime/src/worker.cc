@@ -160,7 +160,7 @@ u32 Worker::ProcessNewTasks() {
     if (assigned_lane_ && ::chi::TaskQueue_PopTask(assigned_lane_, task_typed_ptr)) {
       tasks_processed++;
       // Convert TypedPointer to FullPtr for consistent API usage
-      hipc::FullPtr<Task> task_full_ptr(CHI_IPC->GetMainAllocator(), task_typed_ptr);
+      hipc::FullPtr<Task> task_full_ptr(CHI_IPC->GetMainAlloc(), task_typed_ptr);
 
       if (!task_full_ptr.IsNull()) {
         // Get container for routing

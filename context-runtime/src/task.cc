@@ -47,7 +47,7 @@ void Task::Wait(double block_time_us, bool from_yield) {
     // This ensures AreSubtasksCompleted() properly tracks this subtask
     // Skip if called from yield to avoid double tracking
     if (!from_yield) {
-      auto alloc = CHI_IPC->GetMainAllocator();
+      auto alloc = CHI_IPC->GetMainAlloc();
       hipc::FullPtr<Task> this_task_ptr(alloc, this);
       run_ctx->waiting_for_tasks.push_back(this_task_ptr);
     }

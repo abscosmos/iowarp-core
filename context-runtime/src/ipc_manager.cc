@@ -171,51 +171,9 @@ void IpcManager::ServerFinalize() {
 // Template methods (NewTask, DelTask, AllocateBuffer, Enqueue) are implemented
 // inline in the header
 
-TaskQueue *IpcManager::GetTaskQueue() { return external_queue_.ptr_; }
+TaskQueue *IpcManager::GetTaskQueue() { return worker_queues_.ptr_; }
 
 bool IpcManager::IsInitialized() const { return is_initialized_; }
-
-bool IpcManager::InitializeWorkerQueues(u32 num_workers) {
-  if (!main_allocator_ || !shared_header_) {
-    return false;
-  }
-
-  try {
-    // Initialize worker queues vector in shared header
-    // Construct the vector with the allocator
-    new (&shared_header_->worker_queues) chi::ipc::vector<WorkQueue>(main_allocator_);
-
-    // Resize to num_workers (default-initializes each WorkQueue)
-    shared_header_->worker_queues.resize(num_workers);
-
-    // Store worker count
-    shared_header_->num_workers = num_workers;
-
-    return true;
-  } catch (const std::exception &e) {
-    return false;
-  }
-}
-
-hipc::FullPtr<WorkQueue> IpcManager::GetWorkerQueue(u32 worker_id) {
-  if (!shared_header_) {
-    return hipc::FullPtr<WorkQueue>::GetNull();
-  }
-
-  if (worker_id >= shared_header_->num_workers) {
-    return hipc::FullPtr<WorkQueue>::GetNull();
-  }
-
-  // Get the vector of worker queues
-  auto &worker_queues_vector = shared_header_->worker_queues;
-
-  if (worker_id >= worker_queues_vector.size()) {
-    return hipc::FullPtr<WorkQueue>::GetNull();
-  }
-
-  // Return FullPtr reference to the specific worker's queue in the vector
-  return ToFullPtr<WorkQueue>(&worker_queues_vector[worker_id]);
-}
 
 u32 IpcManager::GetWorkerCount() {
   if (!shared_header_) {
@@ -269,17 +227,17 @@ bool IpcManager::ServerInitShm() {
     }
 
     // Create allocators using backend's MakeAlloc method
-    main_allocator_ = main_backend_.MakeAlloc<CHI_MAIN_ALLOC_T>(custom_header_size);
+    main_allocator_ = main_backend_.MakeAlloc<CHI_MAIN_ALLOC_T>();
     if (!main_allocator_) {
       return false;
     }
 
-    client_data_allocator_ = client_data_backend_.MakeAlloc<CHI_CDATA_ALLOC_T>(0);
+    client_data_allocator_ = client_data_backend_.MakeAlloc<CHI_CDATA_ALLOC_T>();
     if (!client_data_allocator_) {
       return false;
     }
 
-    runtime_data_allocator_ = runtime_data_backend_.MakeAlloc<CHI_RDATA_ALLOC_T>(0);
+    runtime_data_allocator_ = runtime_data_backend_.MakeAlloc<CHI_RDATA_ALLOC_T>();
     if (!runtime_data_allocator_) {
       return false;
     }
@@ -350,33 +308,41 @@ bool IpcManager::ServerInitQueues() {
   try {
     // Get the custom header from the backend
     shared_header_ =
-        main_backend_.template GetCustomHeader<IpcSharedHeader>();
+        main_backend_.template GetSharedHeader<IpcSharedHeader>();
 
     if (!shared_header_) {
       return false;
     }
 
     // Initialize shared header
-    shared_header_->num_workers = 0;
     shared_header_->node_id = 0; // Will be set after host identification
 
-    // Get number of sched workers from ConfigManager
-    // Number of lanes equals number of sched workers for optimal distribution
+    // Get worker counts from ConfigManager
     ConfigManager *config = CHI_CONFIG_MANAGER;
-    u32 num_lanes = config->GetWorkerThreadCount(kSchedWorker);
+    u32 sched_count = config->GetSchedulerWorkerCount();
+    u32 slow_count = config->GetSlowWorkerCount();
+    u32 total_workers = sched_count + slow_count;
+
+    // Number of scheduling queues equals number of sched workers
+    u32 num_sched_queues = sched_count;
+
+    // Store worker count and scheduling queue count
+    shared_header_->num_workers = total_workers;
+    shared_header_->num_sched_queues = num_sched_queues;
 
     // Initialize TaskQueue in shared header
-    new (&shared_header_->external_queue) TaskQueue(
+    // Number of lanes equals number of sched workers for optimal distribution
+    new (&shared_header_->worker_queues) TaskQueue(
         main_allocator_,
-        num_lanes, // num_lanes equals sched worker count
-        2,         // num_priorities (2 priorities: 0=normal, 1=resumed tasks)
-        1024);     // depth_per_queue
+        total_workers,  // num_lanes equals total worker count
+        2,      // num_priorities (2 priorities: 0=normal, 1=resumed tasks)
+        1024);  // depth_per_queue
 
     // Create FullPtr reference to the shared TaskQueue
-    external_queue_ = hipc::FullPtr<TaskQueue>(main_allocator_,
-                                               &shared_header_->external_queue);
+    worker_queues_ = hipc::FullPtr<TaskQueue>(main_allocator_,
+                                              &shared_header_->worker_queues);
 
-    return !external_queue_.IsNull();
+    return !worker_queues_.IsNull();
   } catch (const std::exception &e) {
     return false;
   }
@@ -390,7 +356,7 @@ bool IpcManager::ClientInitQueues() {
   try {
     // Get the custom header from the backend
     shared_header_ =
-        main_backend_.template GetCustomHeader<IpcSharedHeader>();
+        main_backend_.template GetSharedHeader<IpcSharedHeader>();
 
     if (!shared_header_) {
       return false;
@@ -398,10 +364,10 @@ bool IpcManager::ClientInitQueues() {
 
     // Client accesses the server's shared TaskQueue
     // Create FullPtr reference to the shared TaskQueue
-    external_queue_ = hipc::FullPtr<TaskQueue>(main_allocator_,
-                                               &shared_header_->external_queue);
+    worker_queues_ = hipc::FullPtr<TaskQueue>(main_allocator_,
+                                              &shared_header_->worker_queues);
 
-    return !external_queue_.IsNull();
+    return !worker_queues_.IsNull();
   } catch (const std::exception &e) {
     return false;
   }

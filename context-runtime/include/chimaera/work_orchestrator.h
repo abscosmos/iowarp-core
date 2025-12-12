@@ -161,7 +161,6 @@ class WorkOrchestrator {
 
   // Worker containers organized by type
   std::vector<std::unique_ptr<Worker>> sched_workers_;
-  std::vector<std::unique_ptr<Worker>> process_reaper_workers_;
 
   // All workers for easy access
   std::vector<Worker*> all_workers_;

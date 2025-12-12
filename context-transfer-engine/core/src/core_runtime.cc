@@ -86,7 +86,7 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
 
   // Get main allocator from IPC manager
   auto *ipc_manager = CHI_IPC;
-  auto *main_allocator = ipc_manager->GetMainAllocator();
+  auto *main_allocator = ipc_manager->GetMainAlloc();
 
   // Initialize telemetry ring buffer
   telemetry_log_ = hipc::circular_mpsc_ring_buffer<CteTelemetry>(main_allocator,
@@ -281,7 +281,7 @@ void Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
 
     // Create target info with bdev client and performance stats
     auto *ipc_manager = CHI_IPC;
-    auto *main_allocator = ipc_manager->GetMainAllocator();
+    auto *main_allocator = ipc_manager->GetMainAlloc();
     TargetInfo target_info(main_allocator);
     target_info.target_name_ = target_name;
     target_info.bdev_pool_name_ = bdev_pool_name;
@@ -1150,7 +1150,7 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
 
   // Create tag info
   auto *ipc_manager = CHI_IPC;
-  auto *main_allocator = ipc_manager->GetMainAllocator();
+  auto *main_allocator = ipc_manager->GetMainAlloc();
   TagInfo tag_info(main_allocator);
   tag_info.tag_name_ = tag_name;
   tag_info.tag_id_ = tag_id;
@@ -1237,7 +1237,7 @@ BlobInfo *Runtime::CreateNewBlob(const std::string &blob_name,
 
   // Prepare blob info structure BEFORE acquiring lock
   auto *ipc_manager = CHI_IPC;
-  auto *main_allocator = ipc_manager->GetMainAllocator();
+  auto *main_allocator = ipc_manager->GetMainAlloc();
   BlobInfo new_blob_info(main_allocator);
   new_blob_info.blob_name_ = blob_name;
   new_blob_info.score_ = blob_score;
@@ -1575,7 +1575,7 @@ chi::u32 Runtime::ReadData(const std::vector<BlobBlock> &blocks,
       hipc::ShmPtr<> read_data_ptr =
           data + (task_idx > 0 ? expected_read_sizes[task_idx - 1] : 0);
       char *read_data =
-          CHI_IPC->GetMainAllocator()->Convert<char>(read_data_ptr);
+          CHI_IPC->GetMainAlloc()->Convert<char>(read_data_ptr);
       std::string data_preview = "data=[";
       for (size_t i = 0; i < std::min(static_cast<size_t>(task->bytes_read_),
                                       static_cast<size_t>(16));

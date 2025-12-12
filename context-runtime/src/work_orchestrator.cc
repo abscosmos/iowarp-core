@@ -157,22 +157,9 @@ bool WorkOrchestrator::Init() {
     return false; // Configuration manager not initialized
   }
 
-  // Initialize worker queues in shared memory first
-  IpcManager *ipc = CHI_IPC;
-  if (!ipc) {
-    return false; // IPC manager not initialized
-  }
-
-  // Calculate total worker count from configuration
-  // Calculate total workers: scheduler + slow + process reaper
+  // Get worker counts from configuration
   u32 sched_count = config->GetSchedulerWorkerCount();
   u32 slow_count = config->GetSlowWorkerCount();
-  u32 total_workers =
-      sched_count + slow_count + config->GetWorkerThreadCount(kProcessReaper);
-
-  if (!ipc->InitializeWorkerQueues(total_workers)) {
-    return false;
-  }
 
   // Create scheduler workers (fast tasks)
   for (u32 i = 0; i < sched_count; ++i) {
@@ -187,12 +174,6 @@ bool WorkOrchestrator::Init() {
       return false;
     }
   }
-
-  // Create process reaper workers
-  // if (!CreateWorkers(kProcessReaper,
-  //                    config->GetWorkerThreadCount(kProcessReaper))) {
-  //   return false;
-  // }
 
   is_initialized_ = true;
   return true;
@@ -218,7 +199,6 @@ void WorkOrchestrator::Finalize() {
   // Clear worker containers
   all_workers_.clear();
   sched_workers_.clear();
-  process_reaper_workers_.clear();
 
   is_initialized_ = false;
 }
@@ -314,28 +294,28 @@ bool WorkOrchestrator::AreWorkersRunning() const { return workers_running_; }
 bool WorkOrchestrator::IsStackDownward() const { return stack_is_downward_; }
 
 bool WorkOrchestrator::SpawnWorkerThreads() {
-  // Get IPC Manager to access external queue
+  // Get IPC Manager to access worker queues
   IpcManager *ipc = CHI_IPC;
   if (!ipc) {
     return false;
   }
 
-  // Get the external queue (task queue)
-  TaskQueue *external_queue = ipc->GetTaskQueue();
-  if (!external_queue) {
+  // Get the worker queues (task queue)
+  TaskQueue *worker_queues = ipc->GetTaskQueue();
+  if (!worker_queues) {
     HELOG(kError,
-          "WorkOrchestrator: External queue not available for lane mapping");
+          "WorkOrchestrator: Worker queues not available for lane mapping");
     return false;
   }
 
-  u32 num_lanes = external_queue->GetNumLanes();
+  u32 num_lanes = worker_queues->GetNumLanes();
   if (num_lanes == 0) {
-    HELOG(kError, "WorkOrchestrator: External queue has no lanes");
+    HELOG(kError, "WorkOrchestrator: Worker queues have no lanes");
     return false;
   }
 
-  // Map lanes to sched workers (only sched workers process tasks from external
-  // queue)
+  // Map lanes to sched workers (only sched workers process tasks from worker
+  // queues)
   u32 num_sched_workers = static_cast<u32>(sched_workers_.size());
   if (num_sched_workers == 0) {
     HELOG(kError,
@@ -350,7 +330,7 @@ bool WorkOrchestrator::SpawnWorkerThreads() {
     if (worker) {
       // Direct 1:1 mapping: worker i gets lane i
       u32 lane_id = worker_idx;
-      TaskLane *lane = &external_queue->GetLane(lane_id, 0);
+      TaskLane *lane = &worker_queues->GetLane(lane_id, 0);
 
       // Set the worker's assigned lane
       worker->SetLane(lane);
@@ -359,7 +339,7 @@ bool WorkOrchestrator::SpawnWorkerThreads() {
       lane->SetAssignedWorkerId(worker->GetId());
 
       HILOG(kDebug,
-            "WorkOrchestrator: Mapped sched worker {} (ID {}) to external "
+            "WorkOrchestrator: Mapped sched worker {} (ID {}) to worker "
             "queue lane {}",
             worker_idx, worker->GetId(), lane_id);
     }
@@ -407,9 +387,9 @@ bool WorkOrchestrator::CreateWorker(ThreadType thread_type) {
     sched_workers_.push_back(std::move(worker));
     slow_workers_.push_back(worker_ptr);
     break;
-  case kProcessReaper:
-    process_reaper_workers_.push_back(std::move(worker));
-    break;
+  default:
+    // Unknown worker type
+    return false;
   }
 
   return true;

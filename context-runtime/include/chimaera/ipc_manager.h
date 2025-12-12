@@ -27,11 +27,10 @@ using WorkQueue = chi::ipc::mpsc_ring_buffer<hipc::ShmPtr<TaskLane>>;
  * Contains shared data structures
  */
 struct IpcSharedHeader {
-  TaskQueue external_queue; // External/Process TaskQueue in shared memory
-  chi::ipc::vector<WorkQueue>
-      worker_queues; // Vector of worker active queues
-  u32 num_workers;   // Number of workers for which queues are allocated
-  u64 node_id;       // 64-bit hash of the hostname for node identification
+  TaskQueue worker_queues;  // Multi-lane worker task queue in shared memory
+  u32 num_workers;          // Number of workers for which queues are allocated
+  u32 num_sched_queues;     // Number of scheduling queues for task distribution
+  u64 node_id;              // 64-bit hash of the hostname for node identification
 };
 
 /**
@@ -160,11 +159,11 @@ public:
    * @param task_ptr Task to enqueue
    */
   template <typename TaskT> void Enqueue(FullPtr<TaskT> &task_ptr) {
-    if (!external_queue_.IsNull() && external_queue_.ptr_) {
+    if (!worker_queues_.IsNull() && worker_queues_.ptr_ && shared_header_) {
       // Create ShmPtr from the task FullPtr
       hipc::ShmPtr<Task> typed_ptr(task_ptr.shm_);
 
-      u32 num_lanes = external_queue_->GetNumLanes();
+      u32 num_lanes = shared_header_->num_sched_queues;
       if (num_lanes == 0)
         return; // Avoid division by zero
 
@@ -173,7 +172,7 @@ public:
 
       // Get lane as FullPtr and use TaskQueue's EmplaceTask method
       // Priority 0 for normal task submission
-      auto &lane_ref = external_queue_->GetLane(lane_id, 0);
+      auto &lane_ref = worker_queues_->GetLane(lane_id, 0);
       lane_ref.Push(task_ptr.template Cast<Task>().shm_);
     }
   }
@@ -191,13 +190,7 @@ public:
   bool IsInitialized() const;
 
   /**
-   * Get main allocator for creating worker queues
-   * @return Pointer to main allocator or nullptr if not available
-   */
-  CHI_MAIN_ALLOC_T *GetMainAllocator() { return main_allocator_; }
-
-  /**
-   * Get main allocator (alias for GetMainAllocator)
+   * Get main allocator (alias for GetMainAlloc)
    * @return Pointer to main allocator or nullptr if not available
    */
   CHI_MAIN_ALLOC_T *GetMainAlloc() { return main_allocator_; }
@@ -213,20 +206,6 @@ public:
    * @return Pointer to runtime data allocator or nullptr if not available
    */
   CHI_RDATA_ALLOC_T *GetRdataAlloc() { return runtime_data_allocator_; }
-
-  /**
-   * Initialize worker queues in shared memory
-   * @param num_workers Number of worker queues to create
-   * @return true if initialization successful, false otherwise
-   */
-  bool InitializeWorkerQueues(u32 num_workers);
-
-  /**
-   * Get worker active queue by worker ID
-   * @param worker_id Worker identifier (0-based)
-   * @return FullPtr to worker's active queue or null if invalid
-   */
-  hipc::FullPtr<WorkQueue> GetWorkerQueue(u32 worker_id);
 
   /**
    * Get number of workers from shared memory header
@@ -478,8 +457,8 @@ private:
   // Pointer to shared header containing the task queue pointer
   IpcSharedHeader *shared_header_ = nullptr;
 
-  // The actual external TaskQueue instance
-  hipc::FullPtr<TaskQueue> external_queue_;
+  // The worker task queues (multi-lane queue)
+  hipc::FullPtr<TaskQueue> worker_queues_;
 
   // Local ZeroMQ server (using lightbeam)
   std::unique_ptr<hshm::lbm::Server> local_server_;
