@@ -108,7 +108,7 @@
                 "WRP_CORE_ENABLE_RUNTIME": "ON",
                 "WRP_CORE_ENABLE_CTE": "ON",
                 "WRP_CORE_ENABLE_CAE": "ON",
-                "WRP_CORE_ENABLE_CEE": "ON",
+                "WRP_CORE_ENABLE_CEE": "OFF",
                 "WRP_CORE_ENABLE_TESTS": "ON",
                 "WRP_CORE_ENABLE_BENCHMARKS": "ON",
                 "WRP_CORE_ENABLE_ELF": "ON",
