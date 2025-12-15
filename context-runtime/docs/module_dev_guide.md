@@ -3506,7 +3506,7 @@ Your repository's root `CMakeLists.txt` must find and link to the installed Chim
 cmake_minimum_required(VERSION 3.20)
 project(my_external_chimod)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find required Chimaera packages

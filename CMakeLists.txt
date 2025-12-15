@@ -477,7 +477,7 @@ endif()
 # Global Settings
 #------------------------------------------------------------------------------
 # C++ Standard - Applied to all subdirectories
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Export compile commands for IDE integration - Applied to all subdirectories
