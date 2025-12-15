@@ -68,21 +68,40 @@ exec "$@"' > /usr/local/bin/docker-entrypoint.sh \
 RUN echo "iowarp ALL=(ALL) NOPASSWD: /bin/chmod 666 /var/run/docker.sock" >> /etc/sudoers.d/docker-socket \
     && chmod 0440 /etc/sudoers.d/docker-socket
 
+# Install NVIDIA Container Toolkit repository
+RUN curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+    && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+        tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
 # Install CUDA from NVIDIA's official repository
-# Using CUDA 12.6 (latest stable version)
-# Note: We only install the toolkit, not drivers (drivers come from the host via --gpus flag)
+# This installs the complete CUDA toolkit + runtime libraries for actual GPU execution
 RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb \
     && dpkg -i cuda-keyring_1.1-1_all.deb \
     && rm cuda-keyring_1.1-1_all.deb \
     && apt-get update \
-    && apt-get install -y \
+    && apt-get install -y --no-install-recommends \
         cuda-toolkit-12-6 \
+        cuda-cudart-12-6 \
+        cuda-libraries-12-6 \
+        cuda-nvrtc-12-6 \
+        cuda-nvml-dev-12-6 \
+        libcublas-12-6 \
+        libcufft-12-6 \
+        libcurand-12-6 \
+        libcusolver-12-6 \
+        libcusparse-12-6 \
+        libnpp-12-6 \
+        libnvidia-container-tools \
+        libnvidia-container1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set CUDA environment variables
+# Set CUDA environment variables for runtime execution
 ENV CUDA_HOME=/usr/local/cuda-12.6
 ENV PATH=${CUDA_HOME}/bin:${PATH}
-ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${CUDA_HOME}/lib64/stubs:/usr/lib/x86_64-linux-gnu
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # Switch to iowarp user for conda and venv setup
 USER iowarp
@@ -137,10 +156,12 @@ RUN python3 -m venv /home/iowarp/venv \
 # Add conda activation and CUDA paths to bashrc
 # Conda base environment is auto-activated to ensure all conda dependencies are available
 RUN echo '' >> /home/iowarp/.bashrc \
-    && echo '# CUDA environment variables' >> /home/iowarp/.bashrc \
+    && echo '# CUDA environment variables for GPU execution' >> /home/iowarp/.bashrc \
     && echo 'export CUDA_HOME=/usr/local/cuda-12.6' >> /home/iowarp/.bashrc \
     && echo 'export PATH=/usr/local/cuda-12.6/bin:$PATH' >> /home/iowarp/.bashrc \
-    && echo 'export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH' >> /home/iowarp/.bashrc \
+    && echo 'export LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:/usr/local/cuda-12.6/lib64/stubs:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> /home/iowarp/.bashrc \
+    && echo 'export NVIDIA_VISIBLE_DEVICES=all' >> /home/iowarp/.bashrc \
+    && echo 'export NVIDIA_DRIVER_CAPABILITIES=compute,utility' >> /home/iowarp/.bashrc \
     && echo '' >> /home/iowarp/.bashrc \
     && echo '# >>> conda initialize >>>' >> /home/iowarp/.bashrc \
     && echo '# Conda base environment is auto-activated with all dev dependencies' >> /home/iowarp/.bashrc \

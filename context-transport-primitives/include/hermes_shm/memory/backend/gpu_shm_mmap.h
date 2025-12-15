@@ -31,9 +31,12 @@
 namespace hshm::ipc {
 
 /**
- * GPU-accessible shared memory backend using POSIX shared memory with CUDA/ROCm IPC
+ * GPU-accessible shared memory backend using POSIX shared memory with GPU registration
  *
- * Similar to PosixShmMmap but registers memory with GPU for IPC access.
+ * Similar to PosixShmMmap but registers memory with GPU for unified memory access.
+ * The POSIX shared memory is inherently shareable across processes, and GPU registration
+ * makes it accessible from GPU kernels without requiring IPC handles or explicit copies.
+ *
  * Memory layout in file:
  *   [4KB backend header] [4KB shared header] [data]
  *
@@ -44,7 +47,6 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
  protected:
   File fd_;
   std::string url_;
-  GpuIpcMemHandle ipc_handle_;  // IPC handle for GPU memory sharing
 
  public:
   /** Constructor */
@@ -126,18 +128,13 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
     priv_header_off_ = static_cast<size_t>(data_ - region_);
     flags_.Clear();
 
-    // Set GPU-only flag since this backend requires GPU IPC
-    SetGpuOnly();
-
     // Copy all header fields to shared header
     new (header_) MemoryBackendHeader();
     (*header_) = (const MemoryBackendHeader&)*this;
 
-    // Register memory with GPU for IPC
+    // Register memory with GPU for unified memory access
+    // This allows both CPU and GPU to access the same memory
     _RegisterWithGpu(region_, backend_size);
-
-    // Get IPC handle for this memory region
-    GpuApi::GetIpcMemHandle(ipc_handle_, (void *)data_);
 
     // Mark this process as the owner
     SetOwner();

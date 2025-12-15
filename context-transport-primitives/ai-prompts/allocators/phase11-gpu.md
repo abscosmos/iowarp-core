@@ -46,6 +46,6 @@ The data should be allocated with cudaMalloc.
 
 # GpuMalloc Test
 1. Create a GpuMalloc backend.
-Then do the same as GpuShmMmap test.
+Then do 2- 6 from the GpuShmMmap test
 
 Place both unit tests under a directory called test/unit/gpu

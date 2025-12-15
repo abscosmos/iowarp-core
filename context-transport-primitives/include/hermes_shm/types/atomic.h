@@ -301,14 +301,22 @@ struct rocm_atomic {
   template <typename U>
   HSHM_INLINE_CROSS_FUN T
   fetch_add(U count, std::memory_order order = std::memory_order_seq_cst) {
-    return atomicAdd(&x, count);
+    if constexpr (sizeof(T) == 8) {
+      return atomicAdd(reinterpret_cast<unsigned long long*>(&x), static_cast<unsigned long long>(count));
+    } else {
+      return atomicAdd(&x, count);
+    }
   }
 
   /** Atomic fetch_sub wrapper*/
   template <typename U>
   HSHM_INLINE_CROSS_FUN T
   fetch_sub(U count, std::memory_order order = std::memory_order_seq_cst) {
-    return atomicAdd(&x, -count);
+    if constexpr (sizeof(T) == 8) {
+      return atomicAdd(reinterpret_cast<unsigned long long*>(&x), static_cast<unsigned long long>(-count));
+    } else {
+      return atomicAdd(&x, -count);
+    }
   }
 
   /** Atomic load wrapper */

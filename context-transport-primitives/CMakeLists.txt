@@ -294,8 +294,16 @@ function(hshm_target_compile_definitions target)
         HSHM_ENABLE_DLL_EXPORT=$<BOOL:${BUILD_SHARED_LIBS}>
     )
 
-    # Only add CUDA/ROCM definitions for GPU targets, not host targets
-    if(NOT target STREQUAL "hermes_shm_host" AND NOT target STREQUAL "cxx")
+    # Add CUDA/ROCM definitions for all targets
+    # Host targets get 0, GPU targets get 1 (set explicitly in their target definitions)
+    if(target STREQUAL "hermes_shm_host" OR target STREQUAL "cxx")
+        # Host-only targets: explicitly disable GPU support
+        list(APPEND common_definitions
+            HSHM_ENABLE_CUDA=0
+            HSHM_ENABLE_ROCM=0
+        )
+    else()
+        # GPU and other targets: use CMake variable values
         list(APPEND common_definitions
             HSHM_ENABLE_CUDA=$<BOOL:${HSHM_ENABLE_CUDA}>
             HSHM_ENABLE_ROCM=$<BOOL:${HSHM_ENABLE_ROCM}>

@@ -10,7 +10,10 @@
         "IOWARP_CORE_ROOT": "${localWorkspaceFolder}",
         "CONDA_DEFAULT_ENV": "base",
         "CONDA_AUTO_ACTIVATE_BASE": "true",
-        "CUDA_HOME": "/usr/local/cuda-12.6"
+        "CUDA_HOME": "/usr/local/cuda-12.6",
+        "NVIDIA_VISIBLE_DEVICES": "all",
+        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+        "ASAN_OPTIONS": "protect_shadow_gap=0"
     },
     "mounts": [
         "source=${localEnv:HOME}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
@@ -20,11 +23,14 @@
     ],
     "runArgs": [
         "--privileged",
-        "--shm-size=2gb"
+        "--shm-size=2gb",
+        "--gpus=all"
     ],
-    "hostRequirements": {
-        "gpu": "optional"
-    },
+    // NOTE: If container fails to start with GPU error, run on host:
+    //   sudo apt-get install -y nvidia-container-toolkit
+    //   sudo nvidia-ctk runtime configure --runtime=docker
+    //   sudo systemctl restart docker
+    // Then rebuild the devcontainer.
     "customizations": {
         "vscode": {
             "extensions": [

@@ -123,9 +123,6 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
     data_id_ = gpu_id;
     priv_header_off_ = kBackendHeaderSize;
 
-    // Set GPU-only flag
-    SetGpuOnly();
-
     // Mark this process as the owner of the backend
     SetOwner();
 

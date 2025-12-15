@@ -21,14 +21,76 @@ using hshm::ipc::GpuMalloc;
 using hshm::ipc::MemoryBackendId;
 using hshm::ipc::mpsc_ring_buffer;
 using hshm::ipc::ArenaAllocator;
+using hshm::ipc::MemoryBackend;
+
+/**
+ * GPU kernel to create and initialize an allocator
+ *
+ * @tparam AllocT The allocator type to create
+ * @param backend Pointer to the memory backend (must be in GPU-accessible memory)
+ * @param result Output pointer to store the created allocator pointer
+ */
+template<typename AllocT>
+__global__ void MakeAllocKernel(MemoryBackend *backend, AllocT **result) {
+  // Use MakeAlloc to create and initialize the allocator
+  *result = backend->MakeAlloc<AllocT>();
+}
+
+/**
+ * GPU kernel to allocate and construct a ring buffer from the allocator
+ *
+ * @tparam AllocT The allocator type
+ * @tparam T The ring buffer element type
+ * @param alloc Pointer to the allocator
+ * @param depth Depth (capacity + 1) of the ring buffer
+ * @param result Output pointer to store the allocated ring buffer pointer
+ */
+template<typename AllocT, typename T>
+__global__ void AllocateRingBufferKernel(AllocT *alloc, size_t capacity, mpsc_ring_buffer<T, AllocT> **result) {
+  // Use NewObj to allocate and construct the ring buffer
+  auto ring_ptr = alloc->template NewObj<mpsc_ring_buffer<T, AllocT>>(alloc, capacity);
+
+  // Return the ring buffer pointer
+  *result = ring_ptr.ptr_;
+}
 
 /**
  * GPU kernel to push elements onto ring buffer
+ *
+ * @tparam T The element type
+ * @tparam AllocT The allocator type
+ * @param ring Pointer to the ring buffer
+ * @param values Array of values to push
+ * @param count Number of elements to push
  */
-template<typename T>
-__global__ void PushElementsKernel(mpsc_ring_buffer<T> *ring, T *values, size_t count) {
+template<typename T, typename AllocT>
+__global__ void PushElementsKernel(mpsc_ring_buffer<T, AllocT> *ring, T *values, size_t count) {
   for (size_t i = 0; i < count; ++i) {
-    ring->emplace(values[i]);
+    ring->Emplace(values[i]);
+  }
+}
+
+/**
+ * GPU kernel to pop elements from ring buffer and verify values
+ *
+ * @tparam T The element type
+ * @tparam AllocT The allocator type
+ * @param ring Pointer to the ring buffer
+ * @param output Array to store popped values
+ * @param count Number of elements to pop
+ * @param success Output flag - set to 1 if all pops succeeded, 0 otherwise
+ */
+template<typename T, typename AllocT>
+__global__ void PopElementsKernel(mpsc_ring_buffer<T, AllocT> *ring, T *output, size_t count, int *success) {
+  *success = 1;  // Assume success
+  for (size_t i = 0; i < count; ++i) {
+    T value;
+    bool popped = ring->Pop(value);
+    if (!popped) {
+      *success = 0;  // Pop failed
+      return;
+    }
+    output[i] = value;
   }
 }
 
@@ -55,17 +117,85 @@ TEST_CASE("GpuMalloc", "[gpu][backend]") {
     MemoryBackendId backend_id(0, 1);
     bool init_success = backend.shm_init(backend_id, kDataSize, kUrl, kGpuId);
     REQUIRE(init_success);
-    REQUIRE(backend.IsGpuOnly());
-    REQUIRE(backend.DoAccelPath());  // Should be true on host
 
-    // Step 2: Create an allocator on that backend
-    auto *alloc = backend.MakeAlloc<hipc::ArenaAllocator<false>>();
-    REQUIRE(alloc != nullptr);
+    // Step 2: Create an allocator on that backend (using GPU kernel)
+    using AllocT = hipc::ArenaAllocator<false>;
+    AllocT **alloc_result_dev;
+    cudaMalloc(&alloc_result_dev, sizeof(AllocT*));
 
-    // Step 3: For now, skip ring_buffer testing as the API needs investigation
-    // TODO: Implement ring_buffer allocation and GPU kernel test
+    MemoryBackend *backend_dev;
+    cudaMalloc(&backend_dev, sizeof(GpuMalloc));
+    cudaMemcpy(backend_dev, &backend, sizeof(GpuMalloc), cudaMemcpyHostToDevice);
 
-    // Cleanup
-    backend.shm_destroy();
+    MakeAllocKernel<AllocT><<<1, 1>>>(backend_dev, alloc_result_dev);
+    cudaDeviceSynchronize();
+
+    AllocT *alloc_ptr;
+    cudaMemcpy(&alloc_ptr, alloc_result_dev, sizeof(AllocT*), cudaMemcpyDeviceToHost);
+    REQUIRE(alloc_ptr != nullptr);
+
+    // Step 3: Allocate a ring_buffer on that backend (using GPU kernel)
+    using RingBuffer = mpsc_ring_buffer<int, AllocT>;
+    RingBuffer **ring_result_dev;
+    cudaMalloc(&ring_result_dev, sizeof(RingBuffer*));
+
+    AllocateRingBufferKernel<AllocT, int><<<1, 1>>>(alloc_ptr, kNumElements, ring_result_dev);
+    cudaDeviceSynchronize();
+
+    RingBuffer *ring_ptr;
+    cudaMemcpy(&ring_ptr, ring_result_dev, sizeof(RingBuffer*), cudaMemcpyDeviceToHost);
+    REQUIRE(ring_ptr != nullptr);
+
+    // Step 4 & 5: Pass the ring_buffer to the kernel and push 10 elements
+    // Prepare values to push on the host
+    int host_values[kNumElements];
+    for (size_t i = 0; i < kNumElements; ++i) {
+      host_values[i] = static_cast<int>(i);
+    }
+
+    // Copy values to GPU
+    int *dev_values;
+    cudaMalloc(&dev_values, kNumElements * sizeof(int));
+    cudaMemcpy(dev_values, host_values, kNumElements * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Launch kernel to push elements
+    PushElementsKernel<int, AllocT><<<1, 1>>>(ring_ptr, dev_values, kNumElements);
+    cudaDeviceSynchronize();
+
+    // Step 6: Verify the runtime can pop the 10 elements
+    // Allocate device memory for output values and success flag
+    int *dev_output;
+    cudaMalloc(&dev_output, kNumElements * sizeof(int));
+
+    int *dev_success;
+    cudaMalloc(&dev_success, sizeof(int));
+
+    // Launch kernel to pop elements from ring buffer
+    PopElementsKernel<int, AllocT><<<1, 1>>>(ring_ptr, dev_output, kNumElements, dev_success);
+    cudaDeviceSynchronize();
+
+    // Copy results back to host
+    int host_output[kNumElements];
+    int success_flag;
+    cudaMemcpy(host_output, dev_output, kNumElements * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&success_flag, dev_success, sizeof(int), cudaMemcpyDeviceToHost);
+
+    // Verify all pops succeeded
+    REQUIRE(success_flag == 1);
+
+    // Verify the popped values match what we pushed
+    for (size_t i = 0; i < kNumElements; ++i) {
+      REQUIRE(host_output[i] == host_values[i]);
+    }
+
+    // Cleanup GPU temporary allocations
+    cudaFree(dev_success);
+    cudaFree(dev_output);
+    cudaFree(dev_values);
+    cudaFree(ring_result_dev);
+    cudaFree(alloc_result_dev);
+    cudaFree(backend_dev);
+
+    // Backend cleanup handled automatically by destructor
   }
 }

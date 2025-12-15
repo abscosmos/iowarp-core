@@ -330,6 +330,18 @@ HSHM (HermesShm/context-transport-primitives) provides modular INTERFACE library
   - Provides: Data encryption support
   - Compile definitions: `HSHM_ENABLE_ENCRYPT`
 
+- **`hshm::cuda_cxx`** - CUDA GPU support
+  - Provides: CUDA-enabled HSHM library for GPU code
+  - Use for: CUDA kernel code and GPU device functions
+  - Compile definitions: `HSHM_ENABLE_CUDA=1`, `HSHM_ENABLE_ROCM=0`
+  - Note: Only available when `HSHM_ENABLE_CUDA=ON` at build time
+
+- **`hshm::rocm_cxx`** - ROCm GPU support
+  - Provides: ROCm-enabled HSHM library for GPU code
+  - Use for: HIP kernel code and GPU device functions
+  - Compile definitions: `HSHM_ENABLE_ROCM=1`, `HSHM_ENABLE_CUDA=0`
+  - Note: Only available when `HSHM_ENABLE_ROCM=ON` at build time
+
 **Linking Guidelines:**
 
 1. **Never link to yaml-cpp directly** - Use `hshm::configure` instead (except within hshm::configure itself)
@@ -338,6 +350,7 @@ HSHM (HermesShm/context-transport-primitives) provides modular INTERFACE library
 4. **ChiMod clients** - Should only link to `hshm::cxx` (automatically included)
 5. **ChiMod runtimes** - May link to additional modular targets as needed
 6. **Tests** - Link only to the specific modular targets they test
+7. **GPU code** - Use `hshm::cuda_cxx` or `hshm::rocm_cxx` for GPU kernel code; use `hshm::cxx` for host code
 
 **Example Usage:**
 ```cmake
@@ -358,6 +371,11 @@ target_link_libraries(my_adapter
 target_link_libraries(my_test
   hshm::cxx
   hshm::mpi                 # Only link MPI where needed
+)
+
+# GPU application using CUDA
+target_link_libraries(my_cuda_kernel
+  hshm::cuda_cxx            # For GPU kernel code
 )
 ```
 
