@@ -109,10 +109,7 @@ public:
     TaskT* ptr = new TaskT(std::forward<Args>(args)...);
     // Create a FullPtr with null allocator ID and zero offset (private memory)
     // Use explicit initialization to avoid template constructor overload issues
-    hipc::FullPtr<TaskT> result;
-    result.ptr_ = ptr;
-    result.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
-    result.shm_.off_ = 0;
+    hipc::FullPtr<TaskT> result(result.ptr_);
     return result;
   }
 
