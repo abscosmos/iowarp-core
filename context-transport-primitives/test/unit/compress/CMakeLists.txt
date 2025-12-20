@@ -9,9 +9,22 @@ add_executable(test_compress_exec
         ${TEST_MAIN}/main.cc
         test_init.cc
         test_compress.cc)
+
+add_executable(benchmark_compress_exec
+        ${TEST_MAIN}/main.cc
+        test_init.cc
+        test_compress_benchmark.cc)
 add_dependencies(test_compress_exec hermes_shm_host)
 target_link_libraries(test_compress_exec
-        hermes_shm_host Catch2::Catch2)
+        hermes_shm_host hshm::compress Catch2::Catch2)
+target_compile_definitions(test_compress_exec
+        PRIVATE HSHM_ENABLE_COMPRESS=1)
+
+add_dependencies(benchmark_compress_exec hermes_shm_host)
+target_link_libraries(benchmark_compress_exec
+        hermes_shm_host hshm::compress Catch2::Catch2)
+target_compile_definitions(benchmark_compress_exec
+        PRIVATE HSHM_ENABLE_COMPRESS=1)
 
 add_test(NAME ctp_compress COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_compress_exec "~[error=FatalError]")
