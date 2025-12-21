@@ -91,8 +91,26 @@ struct ParseOmniTask : public chi::Task {
     serialized_ctx_ = chi::priv::string(CHI_IPC->GetMainAlloc(), ss.str());
   }
 
+  /**
+   * Serialize IN and INOUT parameters
+   */
+  template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(serialized_ctx_);
+  }
+
+  /**
+   * Serialize OUT and INOUT parameters
+   */
+  template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_tasks_scheduled_, result_code_, error_message_);
+  }
+
   // Copy method for distributed execution (optional)
   void Copy(const hipc::FullPtr<ParseOmniTask> &other) {
+    // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     serialized_ctx_ = other->serialized_ctx_;
     num_tasks_scheduled_ = other->num_tasks_scheduled_;
     result_code_ = other->result_code_;

@@ -85,13 +85,12 @@ public:
       task_infos_.push_back(info);
 
       // Serialize task based on mode
+      // Task::SerializeIn/SerializeOut will handle base class fields
       if (msg_type_ == LocalMsgType::kSerializeIn) {
         // SerializeIn mode - serialize input parameters
-        value.BaseSerializeIn(*this);
         value.SerializeIn(*this);
       } else if (msg_type_ == LocalMsgType::kSerializeOut) {
         // SerializeOut mode - serialize output parameters
-        value.BaseSerializeOut(*this);
         value.SerializeOut(*this);
       }
     } else {
@@ -248,12 +247,11 @@ public:
    */
   template <typename T> LocalLoadTaskArchive &operator>>(T &value) {
     if constexpr (std::is_base_of_v<Task, T>) {
-      // Automatically call BaseSerialize* + Serialize* for Task-derived objects
+      // Call Serialize* for Task-derived objects
+      // Task::SerializeIn/SerializeOut will handle base class fields
       if (msg_type_ == LocalMsgType::kSerializeIn) {
-        value.BaseSerializeIn(*this);
         value.SerializeIn(*this);
       } else if (msg_type_ == LocalMsgType::kSerializeOut) {
-        value.BaseSerializeOut(*this);
         value.SerializeOut(*this);
       }
     } else {
@@ -273,13 +271,12 @@ public:
     if constexpr (std::is_base_of_v<Task, T>) {
       // value must be pre-allocated by caller using CHI_IPC->NewTask
       // Deserialize task based on mode
+      // Task::SerializeIn/SerializeOut will handle base class fields
       if (msg_type_ == LocalMsgType::kSerializeIn) {
         // SerializeIn mode - deserialize input parameters
-        value->BaseSerializeIn(*this);
         value->SerializeIn(*this);
       } else if (msg_type_ == LocalMsgType::kSerializeOut) {
         // SerializeOut mode - deserialize output parameters
-        value->BaseSerializeOut(*this);
         value->SerializeOut(*this);
       }
       current_task_index_++;

@@ -453,134 +453,115 @@ hipc::FullPtr<chi::Task> Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadT
   switch (method) {
     case Method::kCreate: {
       auto task_ptr = ipc_manager->NewTask<CreateTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kDestroy: {
       auto task_ptr = ipc_manager->NewTask<DestroyTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kRegisterTarget: {
       auto task_ptr = ipc_manager->NewTask<RegisterTargetTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kUnregisterTarget: {
       auto task_ptr = ipc_manager->NewTask<UnregisterTargetTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kListTargets: {
       auto task_ptr = ipc_manager->NewTask<ListTargetsTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kStatTargets: {
       auto task_ptr = ipc_manager->NewTask<StatTargetsTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kGetOrCreateTag: {
       auto task_ptr = ipc_manager->NewTask<core::GetOrCreateTagTask<core::CreateParams>>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kPutBlob: {
       auto task_ptr = ipc_manager->NewTask<PutBlobTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kGetBlob: {
       auto task_ptr = ipc_manager->NewTask<GetBlobTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kReorganizeBlob: {
       auto task_ptr = ipc_manager->NewTask<ReorganizeBlobTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kDelBlob: {
       auto task_ptr = ipc_manager->NewTask<DelBlobTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kDelTag: {
       auto task_ptr = ipc_manager->NewTask<DelTagTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kGetTagSize: {
       auto task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kPollTelemetryLog: {
       auto task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kGetBlobScore: {
       auto task_ptr = ipc_manager->NewTask<GetBlobScoreTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kGetBlobSize: {
       auto task_ptr = ipc_manager->NewTask<GetBlobSizeTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kGetContainedBlobs: {
       auto task_ptr = ipc_manager->NewTask<GetContainedBlobsTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kTagQuery: {
       auto task_ptr = ipc_manager->NewTask<TagQueryTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kBlobQuery: {
       auto task_ptr = ipc_manager->NewTask<BlobQueryTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
@@ -596,134 +577,115 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive,
   switch (method) {
     case Method::kCreate: {
       auto typed_task = task_ptr.template Cast<CreateTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kDestroy: {
       auto typed_task = task_ptr.template Cast<DestroyTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kRegisterTarget: {
       auto typed_task = task_ptr.template Cast<RegisterTargetTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kUnregisterTarget: {
       auto typed_task = task_ptr.template Cast<UnregisterTargetTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kListTargets: {
       auto typed_task = task_ptr.template Cast<ListTargetsTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kStatTargets: {
       auto typed_task = task_ptr.template Cast<StatTargetsTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kGetOrCreateTag: {
       auto typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kPutBlob: {
       auto typed_task = task_ptr.template Cast<PutBlobTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kGetBlob: {
       auto typed_task = task_ptr.template Cast<GetBlobTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kReorganizeBlob: {
       auto typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kDelBlob: {
       auto typed_task = task_ptr.template Cast<DelBlobTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kDelTag: {
       auto typed_task = task_ptr.template Cast<DelTagTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kGetTagSize: {
       auto typed_task = task_ptr.template Cast<GetTagSizeTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kPollTelemetryLog: {
       auto typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kGetBlobScore: {
       auto typed_task = task_ptr.template Cast<GetBlobScoreTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kGetBlobSize: {
       auto typed_task = task_ptr.template Cast<GetBlobSizeTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kGetContainedBlobs: {
       auto typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kTagQuery: {
       auto typed_task = task_ptr.template Cast<TagQueryTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kBlobQuery: {
       auto typed_task = task_ptr.template Cast<BlobQueryTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }

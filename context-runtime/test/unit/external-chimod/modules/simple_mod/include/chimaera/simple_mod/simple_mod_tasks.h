@@ -83,6 +83,7 @@ struct FlushTask : public chi::Task {
    */
   template <typename Archive>
   void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     // No parameters to serialize for flush
     (void)ar;
   }
@@ -93,7 +94,17 @@ struct FlushTask : public chi::Task {
    */
   template <typename Archive>
   void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(total_work_done_);
+  }
+
+  /**
+   * Copy from another FlushTask
+   */
+  void Copy(const hipc::FullPtr<FlushTask> &other) {
+    // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
+    total_work_done_ = other->total_work_done_;
   }
 };
 

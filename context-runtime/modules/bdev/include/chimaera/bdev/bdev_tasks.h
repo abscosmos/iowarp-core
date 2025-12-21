@@ -343,10 +343,16 @@ struct AllocateBlocksTask : public chi::Task {
   }
 
   /** Serialize IN and INOUT parameters */
-  template <typename Archive> void SerializeIn(Archive &ar) { ar(size_); }
+  template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(size_);
+  }
 
   /** Serialize OUT and INOUT parameters */
-  template <typename Archive> void SerializeOut(Archive &ar) { ar(blocks_); }
+  template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(blocks_);
+  }
 
   /**
    * Copy from another AllocateBlocksTask (assumes this task is already
@@ -355,6 +361,7 @@ struct AllocateBlocksTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<AllocateBlocksTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy AllocateBlocksTask-specific fields
     size_ = other->size_;
     blocks_ = other->blocks_;
@@ -395,11 +402,15 @@ struct FreeBlocksTask : public chi::Task {
   }
 
   /** Serialize IN and INOUT parameters */
-  template <typename Archive> void SerializeIn(Archive &ar) { ar(blocks_); }
+  template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(blocks_);
+  }
 
   /** Serialize OUT and INOUT parameters */
   template <typename Archive> void SerializeOut(Archive &ar) {
-    // No output parameters
+    Task::SerializeOut(ar);
+    // No additional output parameters
   }
 
   /**
@@ -408,6 +419,7 @@ struct FreeBlocksTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<FreeBlocksTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy FreeBlocksTask-specific fields
     blocks_ = other->blocks_;
   }
@@ -457,6 +469,7 @@ struct WriteTask : public chi::Task {
 
   /** Serialize IN and INOUT parameters */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(blocks_, length_);
     // Use bulk transfer for data pointer - BULK_XFER for actual data
     // transmission
@@ -465,11 +478,15 @@ struct WriteTask : public chi::Task {
 
   /** Serialize OUT and INOUT parameters */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(bytes_written_);
   }
 
   /** Aggregate */
-  void Aggregate(const hipc::FullPtr<WriteTask> &other) { Copy(other); }
+  void Aggregate(const hipc::FullPtr<WriteTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
 
   /**
    * Copy from another WriteTask (assumes this task is already constructed)
@@ -477,6 +494,7 @@ struct WriteTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<WriteTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy WriteTask-specific fields
     blocks_ = other->blocks_;
     data_ = other->data_;
@@ -530,6 +548,7 @@ struct ReadTask : public chi::Task {
 
   /** Serialize IN and INOUT parameters */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(blocks_, length_);
     // Use BULK_EXPOSE to indicate metadata only - receiver will allocate buffer
     ar.bulk(data_, length_, BULK_EXPOSE);
@@ -537,6 +556,7 @@ struct ReadTask : public chi::Task {
 
   /** Serialize OUT and INOUT parameters */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(length_, bytes_read_);
     // Use BULK_XFER to actually transfer the read data back
     ar.bulk(data_, length_, BULK_XFER);
@@ -548,6 +568,7 @@ struct ReadTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<ReadTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy ReadTask-specific fields
     blocks_ = other->blocks_;
     data_ = other->data_;
@@ -584,11 +605,13 @@ struct GetStatsTask : public chi::Task {
 
   /** Serialize IN and INOUT parameters */
   template <typename Archive> void SerializeIn(Archive &ar) {
-    // No input parameters
+    Task::SerializeIn(ar);
+    // No additional input parameters
   }
 
   /** Serialize OUT and INOUT parameters */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(metrics_, remaining_size_);
   }
 
@@ -598,6 +621,7 @@ struct GetStatsTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<GetStatsTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy GetStatsTask-specific fields
     metrics_ = other->metrics_;
     remaining_size_ = other->remaining_size_;

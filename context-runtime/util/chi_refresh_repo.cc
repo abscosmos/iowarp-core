@@ -353,8 +353,7 @@ class ChiModGenerator {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
       oss << "      auto task_ptr = ipc_manager->NewTask<" << task_type << ">();\n";
-      oss << "      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive\n";
-      oss << "      task_ptr.ptr_->BaseSerializeIn(archive);\n";
+      oss << "      // Call SerializeIn - task will call Task::SerializeIn for base fields\n";
       oss << "      task_ptr.ptr_->SerializeIn(archive);\n";
       oss << "      return task_ptr.template Cast<chi::Task>();\n";
       oss << "    }\n";
@@ -376,8 +375,7 @@ class ChiModGenerator {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
       oss << "      auto typed_task = task_ptr.template Cast<" << task_type << ">();\n";
-      oss << "      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive\n";
-      oss << "      typed_task.ptr_->BaseSerializeOut(archive);\n";
+      oss << "      // Call SerializeOut - task will call Task::SerializeOut for base fields\n";
       oss << "      typed_task.ptr_->SerializeOut(archive);\n";
       oss << "      break;\n";
       oss << "    }\n";

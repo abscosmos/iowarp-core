@@ -166,6 +166,7 @@ struct BaseCreateTask : public chi::Task {
    * This includes: chimod_name_, pool_name_, chimod_params_, new_pool_id_
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(chimod_name_, pool_name_, chimod_params_, new_pool_id_);
   }
 
@@ -174,6 +175,7 @@ struct BaseCreateTask : public chi::Task {
    * This includes: chimod_name_, chimod_params_, new_pool_id_, error_message_
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(chimod_name_, chimod_params_, new_pool_id_, error_message_);
   }
 
@@ -183,6 +185,7 @@ struct BaseCreateTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<BaseCreateTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy BaseCreateTask-specific fields
     chimod_name_ = other->chimod_name_;
     pool_name_ = other->pool_name_;
@@ -258,6 +261,7 @@ struct DestroyPoolTask : public chi::Task {
    * This includes: target_pool_id_, destruction_flags_
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(target_pool_id_, destruction_flags_);
   }
 
@@ -266,6 +270,7 @@ struct DestroyPoolTask : public chi::Task {
    * This includes: error_message_
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(error_message_);
   }
 
@@ -276,6 +281,7 @@ struct DestroyPoolTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<DestroyPoolTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy DestroyPoolTask-specific fields
     target_pool_id_ = other->target_pool_id_;
     destruction_flags_ = other->destruction_flags_;
@@ -321,6 +327,7 @@ struct StopRuntimeTask : public chi::Task {
    * This includes: shutdown_flags_, grace_period_ms_
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(shutdown_flags_, grace_period_ms_);
   }
 
@@ -329,6 +336,7 @@ struct StopRuntimeTask : public chi::Task {
    * This includes: error_message_
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(error_message_);
   }
 
@@ -339,6 +347,7 @@ struct StopRuntimeTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<StopRuntimeTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy StopRuntimeTask-specific fields
     shutdown_flags_ = other->shutdown_flags_;
     grace_period_ms_ = other->grace_period_ms_;
@@ -377,8 +386,8 @@ struct FlushTask : public chi::Task {
    * No additional parameters for FlushTask
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
-    // No parameters to serialize for flush
-    (void)ar;
+    Task::SerializeIn(ar);
+    // No additional parameters to serialize for flush
   }
 
   /**
@@ -386,6 +395,7 @@ struct FlushTask : public chi::Task {
    * This includes: total_work_done_
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(total_work_done_);
   }
 
@@ -395,6 +405,7 @@ struct FlushTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<FlushTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy FlushTask-specific fields
     total_work_done_ = other->total_work_done_;
   }
@@ -454,6 +465,7 @@ struct SendTask : public chi::Task {
    * Serialize IN and INOUT parameters for network transfer
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(msg_type_, origin_task_, pool_queries_, transfer_flags_);
   }
 
@@ -461,6 +473,7 @@ struct SendTask : public chi::Task {
    * Serialize OUT and INOUT parameters for network transfer
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(msg_type_, origin_task_, pool_queries_, error_message_);
   }
 
@@ -470,6 +483,7 @@ struct SendTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<SendTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy SendTask-specific fields
     msg_type_ = other->msg_type_;
     origin_task_ = other->origin_task_;
@@ -514,6 +528,7 @@ struct RecvTask : public chi::Task {
    * Serialize IN and INOUT parameters for network transfer
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(transfer_flags_);
   }
 
@@ -521,6 +536,7 @@ struct RecvTask : public chi::Task {
    * Serialize OUT and INOUT parameters for network transfer
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(error_message_);
   }
 
@@ -530,6 +546,7 @@ struct RecvTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<RecvTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy RecvTask-specific fields
     transfer_flags_ = other->transfer_flags_;
     error_message_ = other->error_message_;

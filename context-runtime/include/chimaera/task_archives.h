@@ -113,9 +113,8 @@ public:
   /** Deserialize operator for input archives */
   template <typename T> TaskLoadInArchive &operator>>(T &value) {
     if constexpr (std::is_base_of_v<Task, T>) {
-      // Automatically call BaseSerializeIn + SerializeIn for Task-derived
-      // objects
-      value.BaseSerializeIn(*this);
+      // Call SerializeIn for Task-derived objects
+      // Task::SerializeIn will handle base class fields
       value.SerializeIn(*this);
     } else {
       (*archive_)(value);
@@ -205,9 +204,8 @@ public:
   /** Serialize operator for output archives */
   template <typename T> TaskSaveInArchive &operator<<(const T &value) {
     if constexpr (std::is_base_of_v<Task, T>) {
-      // Automatically call BaseSerializeIn + SerializeIn for Task-derived
-      // objects
-      const_cast<T &>(value).BaseSerializeIn(*this);
+      // Call SerializeIn for Task-derived objects
+      // Task::SerializeIn will handle base class fields
       const_cast<T &>(value).SerializeIn(*this);
     } else {
       (*archive_)(value);
@@ -315,9 +313,8 @@ public:
   /** Deserialize operator for input archives */
   template <typename T> TaskLoadOutArchive &operator>>(T &value) {
     if constexpr (std::is_base_of_v<Task, T>) {
-      // Automatically call BaseSerializeOut + SerializeOut for Task-derived
-      // objects
-      value.BaseSerializeOut(*this);
+      // Call SerializeOut for Task-derived objects
+      // Task::SerializeOut will handle base class fields
       value.SerializeOut(*this);
     } else {
       (*archive_)(value);
@@ -397,9 +394,8 @@ public:
   /** Serialize operator for output archives */
   template <typename T> TaskSaveOutArchive &operator<<(const T &value) {
     if constexpr (std::is_base_of_v<Task, T>) {
-      // Automatically call BaseSerializeOut + SerializeOut for Task-derived
-      // objects
-      const_cast<T &>(value).BaseSerializeOut(*this);
+      // Call SerializeOut for Task-derived objects
+      // Task::SerializeOut will handle base class fields
       const_cast<T &>(value).SerializeOut(*this);
     } else {
       (*archive_)(value);
@@ -525,11 +521,11 @@ public:
       // Serialize task based on mode
       if (msg_type_ == MsgType::kSerializeIn) {
         // SerializeIn mode - serialize input parameters
-        value.BaseSerializeIn(*this);
+        // Task::SerializeIn will handle base class fields
         value.SerializeIn(*this);
       } else if (msg_type_ == MsgType::kSerializeOut) {
         // SerializeOut mode - serialize output parameters
-        value.BaseSerializeOut(*this);
+        // Task::SerializeOut will handle base class fields
         value.SerializeOut(*this);
       }
       // kHeartbeat has no task data to serialize
@@ -661,12 +657,11 @@ public:
   /** Deserialize regular (non-pointer) types using underlying cereal archive */
   template <typename T> LoadTaskArchive &operator>>(T &value) {
     if constexpr (std::is_base_of_v<Task, T>) {
-      // Automatically call BaseSerialize* + Serialize* for Task-derived objects
+      // Call Serialize* for Task-derived objects
+      // Task::SerializeIn/SerializeOut will handle base class fields
       if (msg_type_ == MsgType::kSerializeIn) {
-        value.BaseSerializeIn(*this);
         value.SerializeIn(*this);
       } else if (msg_type_ == MsgType::kSerializeOut) {
-        value.BaseSerializeOut(*this);
         value.SerializeOut(*this);
       }
       // kHeartbeat has no task data to deserialize
@@ -681,13 +676,12 @@ public:
     if constexpr (std::is_base_of_v<Task, T>) {
       // value must be pre-allocated by caller using CHI_IPC->NewTask
       // Deserialize task based on mode
+      // Task::SerializeIn/SerializeOut will handle base class fields
       if (msg_type_ == MsgType::kSerializeIn) {
         // SerializeIn mode - deserialize input parameters
-        value->BaseSerializeIn(*this);
         value->SerializeIn(*this);
       } else if (msg_type_ == MsgType::kSerializeOut) {
         // SerializeOut mode - deserialize output parameters
-        value->BaseSerializeOut(*this);
         value->SerializeOut(*this);
       }
       // kHeartbeat has no task data to deserialize

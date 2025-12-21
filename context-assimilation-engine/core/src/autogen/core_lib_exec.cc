@@ -133,22 +133,19 @@ hipc::FullPtr<chi::Task> Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadT
   switch (method) {
     case Method::kCreate: {
       auto task_ptr = ipc_manager->NewTask<CreateTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kDestroy: {
       auto task_ptr = ipc_manager->NewTask<DestroyTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kParseOmni: {
       auto task_ptr = ipc_manager->NewTask<ParseOmniTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
@@ -164,22 +161,19 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive,
   switch (method) {
     case Method::kCreate: {
       auto typed_task = task_ptr.template Cast<CreateTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kDestroy: {
       auto typed_task = task_ptr.template Cast<DestroyTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kParseOmni: {
       auto typed_task = task_ptr.template Cast<ParseOmniTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }

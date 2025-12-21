@@ -92,6 +92,10 @@ class Task {
 
   /**
    * Copy from another task (assumes this task is already constructed)
+   *
+   * IMPORTANT: Derived classes that override Copy MUST call Task::Copy(other)
+   * first before copying their own fields.
+   *
    * @param other Pointer to the source task to copy from
    */
   HSHM_CROSS_FUN void Copy(const hipc::FullPtr<Task> &other) {
@@ -231,13 +235,17 @@ class Task {
   }
 
   /**
-   * Serialize base task fields for incoming network transfer (IN and INOUT
-   * parameters) This method serializes the common task fields that are shared
-   * across all task types. Called automatically by archives when they detect
-   * Task inheritance.
+   * Serialize task for incoming network transfer (IN and INOUT parameters)
+   * This method serializes the base Task fields first, then should be overridden
+   * by derived classes to serialize their specific fields.
+   *
+   * IMPORTANT: Derived classes MUST call Task::SerializeIn(ar) first before
+   * serializing their own fields.
+   *
    * @param ar Archive to serialize to
    */
-  template <typename Archive> void BaseSerializeIn(Archive &ar) {
+  template <typename Archive> void SerializeIn(Archive &ar) {
+    // Serialize base Task fields (IN and INOUT parameters)
     // Handle atomic return_code_ by loading/storing its value
     u32 return_code_value = return_code_.load();
     ar(pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_,
@@ -246,43 +254,25 @@ class Task {
   }
 
   /**
-   * Serialize base task fields for outgoing network transfer (OUT and INOUT
-   * parameters) This method serializes the common task fields that are shared
-   * across all task types. Called automatically by archives when they detect
-   * Task inheritance.
+   * Serialize task for outgoing network transfer (OUT and INOUT parameters)
+   * This method serializes the base Task OUT fields first, then should be overridden
+   * by derived classes to serialize their specific OUT fields.
+   *
+   * IMPORTANT: Derived classes MUST call Task::SerializeOut(ar) first before
+   * serializing their own OUT fields.
+   *
    * @param ar Archive to serialize to
    */
-  template <typename Archive> void BaseSerializeOut(Archive &ar) {
+  template <typename Archive> void SerializeOut(Archive &ar) {
+    // Serialize base Task OUT fields only
     // Only serialize OUT fields - do NOT re-serialize IN fields
-    // (pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_ are
-    // all IN) Only return_code_ and completer_ are OUT fields that need to be sent back
+    // (pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_ are all IN)
+    // Only return_code_ and completer_ are OUT fields that need to be sent back
     u32 return_code_value = return_code_.load();
     ContainerId completer_value = completer_.load();
     ar(return_code_value, completer_value);
     return_code_.store(return_code_value);
     completer_.store(completer_value);
-  }
-
-  /**
-   * Serialize task for incoming network transfer (IN and INOUT parameters)
-   * This method should be implemented by each specific task type.
-   * Archives automatically call BaseSerializeIn first, then this method.
-   * @param ar Archive to serialize to
-   */
-  template <typename Archive> void SerializeIn(Archive &ar) {
-    // Base implementation does nothing - derived classes override to serialize
-    // their IN/INOUT fields
-  }
-
-  /**
-   * Serialize task for outgoing network transfer (OUT and INOUT parameters)
-   * This method should be implemented by each specific task type.
-   * Archives automatically call BaseSerializeOut first, then this method.
-   * @param ar Archive to serialize to
-   */
-  template <typename Archive> void SerializeOut(Archive &ar) {
-    // Base implementation does nothing - derived classes override to serialize
-    // their OUT/INOUT fields
   }
 
   /**
@@ -321,9 +311,13 @@ class Task {
   }
 
   /**
-   * Base aggregate method - propagates return codes from replica tasks
+   * Base aggregate method - propagates return codes and completer from replica tasks
    * Sets this task's return code to the replica's return code if replica has non-zero return code
    * Accepts any task type that inherits from Task
+   *
+   * IMPORTANT: Derived classes that override Aggregate MUST call Task::Aggregate(replica_task)
+   * first before aggregating their own fields.
+   *
    * @param replica_task The replica task to aggregate from
    */
   template<typename TaskT>

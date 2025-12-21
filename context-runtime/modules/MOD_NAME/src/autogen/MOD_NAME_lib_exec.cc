@@ -193,43 +193,37 @@ hipc::FullPtr<chi::Task> Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadT
   switch (method) {
     case Method::kCreate: {
       auto task_ptr = ipc_manager->NewTask<CreateTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kDestroy: {
       auto task_ptr = ipc_manager->NewTask<DestroyTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kCustom: {
       auto task_ptr = ipc_manager->NewTask<CustomTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kCoMutexTest: {
       auto task_ptr = ipc_manager->NewTask<CoMutexTestTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kCoRwLockTest: {
       auto task_ptr = ipc_manager->NewTask<CoRwLockTestTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
     case Method::kWaitTest: {
       auto task_ptr = ipc_manager->NewTask<WaitTestTask>();
-      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
-      task_ptr.ptr_->BaseSerializeIn(archive);
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       task_ptr.ptr_->SerializeIn(archive);
       return task_ptr.template Cast<chi::Task>();
     }
@@ -245,43 +239,37 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive,
   switch (method) {
     case Method::kCreate: {
       auto typed_task = task_ptr.template Cast<CreateTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kDestroy: {
       auto typed_task = task_ptr.template Cast<DestroyTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kCustom: {
       auto typed_task = task_ptr.template Cast<CustomTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kCoMutexTest: {
       auto typed_task = task_ptr.template Cast<CoMutexTestTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kCoRwLockTest: {
       auto typed_task = task_ptr.template Cast<CoRwLockTestTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
     case Method::kWaitTest: {
       auto typed_task = task_ptr.template Cast<WaitTestTask>();
-      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
-      typed_task.ptr_->BaseSerializeOut(archive);
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
