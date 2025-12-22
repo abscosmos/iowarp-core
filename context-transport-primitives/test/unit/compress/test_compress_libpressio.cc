@@ -65,22 +65,28 @@ double calculate_max_relative_error(const float* original, const float* decompre
 TEST_CASE("TestCompressLibPressio") {
   // Generate floating-point test data designed to produce noticeable loss
   // Use high-precision values with fine-grained variation to trigger lossy compression
+  // Fine precision values will be affected by FPZIP's 12-bit precision quantization
   const size_t num_floats = 1024;
   std::vector<float> original_floats(num_floats);
   
   // Generate test data with:
   // 1. High precision floating-point values (many decimal places)
-  // 2. Small variations that lossy compressors will approximate
+  // 2. Fine-grained variations that will be quantized by lossy compressors
   // 3. Mix of large and small values to test dynamic range
-  // 4. Some noise to make exact reconstruction harder
+  // 4. Values with many decimal places to make quantization errors visible
   for (size_t i = 0; i < num_floats; ++i) {
     float x = static_cast<float>(i);
-    // Combine multiple frequencies and add small variations
+    // Combine multiple frequencies and add fine-grained variations
+    // Use irrational multipliers and modulo operations to create values
+    // that don't align perfectly with quantization grids
     float value = std::sin(x * 0.1F) * 1000.0F + 
                   std::cos(x * 0.03F) * 500.0F +
                   std::sin(x * 0.007F) * 100.0F +
-                  static_cast<float>(i % 17) * 0.1234567F +  // Small variations
-                  static_cast<float>(i % 23) * 0.0000123F;   // Very small variations
+                  static_cast<float>(i % 17) * 0.123456789F +     // Fine variations
+                  static_cast<float>(i % 23) * 0.000012345F +     // Very fine variations
+                  static_cast<float>(i % 31) * 0.000000123F +     // Ultra-fine variations
+                  static_cast<float>(i % 7) * 1.23456789F +       // Medium-fine variations
+                  std::sin(x * 0.001F) * 0.987654321F;            // Continuous fine variations
     original_floats[i] = value;
   }
   
@@ -191,13 +197,15 @@ TEST_CASE("TestCompressLibPressioAutoSelect") {
   const size_t num_floats = 1024;
   std::vector<float> original_floats(num_floats);
   
-  // Generate floating-point test data
+  // Generate floating-point test data with fine precision for lossy compression testing
   for (size_t i = 0; i < num_floats; ++i) {
     float x = static_cast<float>(i);
     float value = std::sin(x * 0.1F) * 1000.0F + 
                   std::cos(x * 0.03F) * 500.0F +
                   std::sin(x * 0.007F) * 100.0F +
-                  static_cast<float>(i % 17) * 0.1234567F;
+                  static_cast<float>(i % 17) * 0.123456789F +    // Fine variations
+                  static_cast<float>(i % 23) * 0.000012345F +    // Very fine variations
+                  std::sin(x * 0.001F) * 0.987654321F;            // Continuous fine variations
     original_floats[i] = value;
   }
   

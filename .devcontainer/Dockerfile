@@ -120,11 +120,12 @@ RUN /home/iowarp/miniconda3/bin/conda init bash \
 # Accept Anaconda Terms of Service and install all development dependencies via conda
 # This avoids library conflicts between system packages and conda packages
 # Dependencies installed:
-#   - Build tools: cmake, ninja, conda-build
+#   - Build tools: cmake, ninja, conda-build, pkg-config
 #   - Core libraries: boost, hdf5, yaml-cpp, zeromq, cppzmq, cereal
 #   - Testing: catch2
 #   - Network: libcurl, openssl
-#   - Compression: zlib
+#   - Compression libraries: zlib, bzip2, lzo, zstd, lz4, xz (lzma), brotli, snappy
+#   - Lossy compression: sz3, zfp (scientific compressors, available via conda)
 #   - Optional: poco (for Globus support), nlohmann_json
 #   - GPU: CUDA installed from NVIDIA repos (see below)
 RUN /home/iowarp/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
@@ -133,6 +134,7 @@ RUN /home/iowarp/miniconda3/bin/conda tos accept --override-channels --channel h
         conda-build \
         cmake \
         ninja \
+        pkg-config \
         boost \
         hdf5 \
         yaml-cpp \
@@ -143,15 +145,66 @@ RUN /home/iowarp/miniconda3/bin/conda tos accept --override-channels --channel h
         libcurl \
         openssl \
         zlib \
+        bzip2 \
+        lzo \
+        zstd \
+        lz4-c \
+        xz \
+        brotli \
+        snappy \
+        sz3 \
+        zfp \
         poco \
         nlohmann_json \
     && /home/iowarp/miniconda3/bin/conda clean -ya
 
 # Create Python virtual environment in user's home directory
 # Note: Users can choose between conda environments or venv
+# Install Python packages for data analysis and benchmarking
 RUN python3 -m venv /home/iowarp/venv \
     && /home/iowarp/venv/bin/pip install --upgrade pip setuptools wheel \
-    && /home/iowarp/venv/bin/pip install pyyaml nanobind
+    && /home/iowarp/venv/bin/pip install pyyaml nanobind \
+    && /home/iowarp/venv/bin/pip install pandas matplotlib seaborn numpy
+
+# Switch back to root for libpressio installation
+USER root
+
+# Install lossy compression libraries and LibPressio
+# This provides scientific data compression capabilities for IOWarp Core
+RUN cd /tmp \
+    # Install FPZIP library (fast floating-point compressor)
+    && git clone https://github.com/LLNL/fpzip.git fpzip_src \
+    && cd fpzip_src \
+    && mkdir -p build && cd build \
+    && cmake .. -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_POLICY_DEFAULT_CMP0025=NEW \
+                -DBUILD_SHARED_LIBS=ON \
+                -DBUILD_TESTING=OFF \
+                -DBUILD_UTILITIES=OFF \
+    && make -j$(nproc) \
+    && make install \
+    && ldconfig \
+    # Install LibPressio with compression plugins enabled (only working compressors)
+    && cd /tmp \
+    && git clone https://github.com/robertu94/libpressio.git libpressio_src \
+    && cd libpressio_src \
+    && mkdir -p build && cd build \
+    && cmake .. -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DLIBPRESSIO_HAS_ZFP=ON \
+                -DLIBPRESSIO_HAS_SZ3=ON \
+                -DLIBPRESSIO_HAS_FPZIP=ON \
+                -DBUILD_TESTING=OFF \
+    && make -j$(nproc) libpressio \
+    && make install \
+    && ldconfig \
+    # Cleanup temporary build files
+    && cd /tmp \
+    && rm -rf fpzip_src libpressio_src
+
+# Switch back to iowarp user
+USER iowarp
 
 # Add conda activation and CUDA paths to bashrc
 # Conda base environment is auto-activated to ensure all conda dependencies are available
@@ -166,6 +219,8 @@ RUN echo '' >> /home/iowarp/.bashrc \
     && echo '# >>> conda initialize >>>' >> /home/iowarp/.bashrc \
     && echo '# Conda base environment is auto-activated with all dev dependencies' >> /home/iowarp/.bashrc \
     && echo '# This includes: boost, hdf5, yaml-cpp, zeromq, cereal, catch2, etc.' >> /home/iowarp/.bashrc \
+    && echo '# Compression libraries: zlib, bzip2, lzo, zstd, lz4, xz, brotli, snappy, sz3, zfp' >> /home/iowarp/.bashrc \
+    && echo '# Lossy compression: ZFP, SZ3, FPZIP (via LibPressio)' >> /home/iowarp/.bashrc \
     && echo '# Create custom environments if needed: conda create -n myenv' >> /home/iowarp/.bashrc \
     && echo 'eval "$(/home/iowarp/miniconda3/bin/conda shell.bash hook)"' >> /home/iowarp/.bashrc \
     && echo '# <<< conda initialize <<<' >> /home/iowarp/.bashrc \
