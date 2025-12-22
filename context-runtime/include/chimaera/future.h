@@ -12,6 +12,7 @@ namespace chi {
 // Forward declarations
 class Task;
 class IpcManager;
+struct RunContext;
 
 /**
  * FutureShm - Shared memory container for task future state
@@ -60,12 +61,20 @@ class Future {
  public:
   using FutureT = FutureShm<AllocT>;
 
+  // Allow all Future instantiations to access each other's private members
+  // This enables the Cast method to work across different task types
+  template<typename OtherTaskT, typename OtherAllocT>
+  friend class Future;
+
  private:
   /** FullPtr to the task (wraps private memory with null allocator) */
   hipc::FullPtr<TaskT> task_ptr_;
 
   /** FullPtr to the shared FutureShm object */
   hipc::FullPtr<FutureT> future_shm_;
+
+  /** Parent task RunContext pointer (nullptr if no parent waiting) */
+  RunContext* parent_task_;
 
  public:
   /**
@@ -74,7 +83,8 @@ class Future {
    * @param task_ptr FullPtr to the task (wraps private memory with null allocator)
    */
   Future(AllocT* alloc, hipc::FullPtr<TaskT> task_ptr)
-      : task_ptr_(task_ptr) {
+      : task_ptr_(task_ptr),
+        parent_task_(nullptr) {
     // Allocate FutureShm object
     future_shm_ = alloc->template NewObj<FutureT>(alloc).template Cast<FutureT>();
     // Copy pool_id to FutureShm
@@ -92,7 +102,8 @@ class Future {
    */
   Future(AllocT* alloc, hipc::FullPtr<TaskT> task_ptr, hipc::ShmPtr<FutureT> future_shm)
       : task_ptr_(task_ptr),
-        future_shm_(alloc, future_shm) {}
+        future_shm_(alloc, future_shm),
+        parent_task_(nullptr) {}
 
   /**
    * Constructor from FullPtr<FutureShm> and FullPtr<Task>
@@ -101,14 +112,15 @@ class Future {
    */
   Future(hipc::FullPtr<FutureT> future_shm, hipc::FullPtr<TaskT> task_ptr)
       : task_ptr_(task_ptr),
-        future_shm_(future_shm) {
+        future_shm_(future_shm),
+        parent_task_(nullptr) {
     // No need to copy pool_id - FutureShm already has it
   }
 
   /**
    * Default constructor - creates null future
    */
-  Future() {}
+  Future() : parent_task_(nullptr) {}
 
   /**
    * Constructor from ShmPtr<FutureShm> - used by ring buffer deserialization
@@ -116,7 +128,8 @@ class Future {
    * @param future_shm_ptr ShmPtr to FutureShm object
    */
   explicit Future(const hipc::ShmPtr<FutureT>& future_shm_ptr)
-      : future_shm_(nullptr, future_shm_ptr) {
+      : future_shm_(nullptr, future_shm_ptr),
+        parent_task_(nullptr) {
     // Task pointer starts null - will be set in ProcessNewTasks
     task_ptr_.SetNull();
   }
@@ -137,7 +150,8 @@ class Future {
    */
   Future(const Future& other)
       : task_ptr_(other.task_ptr_),
-        future_shm_(other.future_shm_) {}
+        future_shm_(other.future_shm_),
+        parent_task_(other.parent_task_) {}
 
   /**
    * Copy assignment operator
@@ -148,6 +162,7 @@ class Future {
     if (this != &other) {
       task_ptr_ = other.task_ptr_;
       future_shm_ = other.future_shm_;
+      parent_task_ = other.parent_task_;
     }
     return *this;
   }
@@ -158,7 +173,10 @@ class Future {
    */
   Future(Future&& other) noexcept
       : task_ptr_(std::move(other.task_ptr_)),
-        future_shm_(std::move(other.future_shm_)) {}
+        future_shm_(std::move(other.future_shm_)),
+        parent_task_(other.parent_task_) {
+    other.parent_task_ = nullptr;
+  }
 
   /**
    * Move assignment operator
@@ -169,6 +187,8 @@ class Future {
     if (this != &other) {
       task_ptr_ = std::move(other.task_ptr_);
       future_shm_ = std::move(other.future_shm_);
+      parent_task_ = other.parent_task_;
+      other.parent_task_ = nullptr;
     }
     return *this;
   }
@@ -289,6 +309,43 @@ class Future {
     if (!future_shm_.IsNull()) {
       future_shm_->pool_id_ = pool_id;
     }
+  }
+
+  /**
+   * Cast this Future to a Future of a different task type
+   *
+   * This is a safe operation because Future<TaskT> and Future<NewTaskT>
+   * have identical memory layouts - they both store the same underlying
+   * pointers (task_ptr_, future_shm_, parent_task_).
+   *
+   * @tparam NewTaskT The new task type to cast to
+   * @return Future<NewTaskT> with the same underlying state
+   */
+  template<typename NewTaskT>
+  Future<NewTaskT, AllocT> Cast() const {
+    Future<NewTaskT, AllocT> result;
+    // Use reinterpret_cast to copy the memory layout
+    // This works because Future<TaskT> and Future<NewTaskT> have identical sizes
+    result.task_ptr_ = task_ptr_.template Cast<NewTaskT>();
+    result.future_shm_ = future_shm_;
+    result.parent_task_ = parent_task_;
+    return result;
+  }
+
+  /**
+   * Get the parent task RunContext pointer
+   * @return Pointer to parent RunContext or nullptr
+   */
+  RunContext* GetParentTask() const {
+    return parent_task_;
+  }
+
+  /**
+   * Set the parent task RunContext pointer
+   * @param parent_task Pointer to parent RunContext
+   */
+  void SetParentTask(RunContext* parent_task) {
+    parent_task_ = parent_task;
   }
 };
 

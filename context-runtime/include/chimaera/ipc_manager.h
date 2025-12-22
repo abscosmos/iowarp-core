@@ -1,14 +1,6 @@
 #ifndef CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_IPC_MANAGER_H_
 #define CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_IPC_MANAGER_H_
 
-#include "chimaera/chimaera_manager.h"
-#include "chimaera/task.h"
-#include "chimaera/task_queue.h"
-#include "chimaera/types.h"
-#include "chimaera/worker.h"
-#include "chimaera/future.h"
-#include "chimaera/local_task_archives.h"
-#include "hermes_shm/memory/backend/posix_shm_mmap.h"
 #include <atomic>
 #include <iostream>
 #include <memory>
@@ -16,6 +8,15 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "chimaera/chimaera_manager.h"
+#include "chimaera/future.h"
+#include "chimaera/local_task_archives.h"
+#include "chimaera/task.h"
+#include "chimaera/task_queue.h"
+#include "chimaera/types.h"
+#include "chimaera/worker.h"
+#include "hermes_shm/memory/backend/posix_shm_mmap.h"
 
 namespace chi {
 
@@ -32,7 +33,7 @@ struct IpcSharedHeader {
   TaskQueue worker_queues;  // Multi-lane worker task queue in shared memory
   u32 num_workers;          // Number of workers for which queues are allocated
   u32 num_sched_queues;     // Number of scheduling queues for task distribution
-  u64 node_id;              // 64-bit hash of the hostname for node identification
+  u64 node_id;  // 64-bit hash of the hostname for node identification
 };
 
 /**
@@ -40,8 +41,8 @@ struct IpcSharedHeader {
  * Contains IP address and corresponding 64-bit node ID
  */
 struct Host {
-  std::string ip_address; // IP address as string (IPv4 or IPv6)
-  u64 node_id;            // 64-bit representation of IP address
+  std::string ip_address;  // IP address as string (IPv4 or IPv6)
+  u64 node_id;             // 64-bit representation of IP address
 
   /**
    * Default constructor
@@ -76,7 +77,7 @@ struct Host {
  * Uses HSHM global cross pointer variable singleton pattern.
  */
 class IpcManager {
-public:
+ public:
   /**
    * Initialize client components
    * @return true if initialization successful, false otherwise
@@ -106,7 +107,7 @@ public:
    */
   template <typename TaskT, typename... Args>
   hipc::FullPtr<TaskT> NewTask(Args &&...args) {
-    TaskT* ptr = new TaskT(std::forward<Args>(args)...);
+    TaskT *ptr = new TaskT(std::forward<Args>(args)...);
     // Create a FullPtr with null allocator ID and zero offset (private memory)
     // Use explicit initialization to avoid template constructor overload issues
     hipc::FullPtr<TaskT> result(ptr);
@@ -117,9 +118,9 @@ public:
    * Delete a task from private memory (using standard delete)
    * @param task_ptr FullPtr to task to delete
    */
-  template <typename TaskT> void DelTask(hipc::FullPtr<TaskT> task_ptr) {
-    if (task_ptr.IsNull())
-      return;
+  template <typename TaskT>
+  void DelTask(hipc::FullPtr<TaskT> task_ptr) {
+    if (task_ptr.IsNull()) return;
 
     delete task_ptr.ptr_;
   }
@@ -159,13 +160,16 @@ public:
    * Creates a Future wrapper, serializes task inputs, and enqueues to worker
    *
    * Two execution paths:
-   * - Client mode (!IsRuntime): Serialize task and copy Future with null task pointer
-   * - Runtime mode (IsRuntime): Create Future with task pointer directly (no copy)
+   * - Client mode (!IsRuntime): Serialize task and copy Future with null task
+   * pointer
+   * - Runtime mode (IsRuntime): Create Future with task pointer directly (no
+   * copy)
    *
    * @param task_ptr Task to send
    * @return Future<TaskT> for polling completion and retrieving results
    */
-  template <typename TaskT> Future<TaskT> Send(hipc::FullPtr<TaskT> task_ptr) {
+  template <typename TaskT>
+  Future<TaskT> Send(hipc::FullPtr<TaskT> task_ptr) {
     // Get main allocator for FutureShm allocation
     auto *alloc = GetMainAlloc();
 
@@ -182,10 +186,11 @@ public:
       archive << (*task_ptr.ptr_);
 
       // 3. Get serialized data and copy to FutureShm's hipc::vector
-      const std::vector<char>& serialized = archive.GetData();
-      auto& future_shm = user_future.GetFutureShm();
+      const std::vector<char> &serialized = archive.GetData();
+      auto &future_shm = user_future.GetFutureShm();
       future_shm->serialized_task_.resize(serialized.size());
-      memcpy(future_shm->serialized_task_.data(), serialized.data(), serialized.size());
+      memcpy(future_shm->serialized_task_.data(), serialized.data(),
+             serialized.size());
 
       // 4. Create a separate Future for the queue with null task pointer
       // This Future shares the same FutureShm but has a null task pointer
@@ -196,15 +201,14 @@ public:
       // 5. Map task to lane using configured policy
       u32 num_lanes = shared_header_->num_sched_queues;
       if (num_lanes == 0) {
-        return user_future; // Avoid division by zero
+        return user_future;  // Avoid division by zero
       }
 
       // 6. Enqueue the Future object to the worker queue
       LaneId lane_id = MapTaskToLane(num_lanes);
-      auto& lane_ref = worker_queues_->GetLane(lane_id, 0);
+      auto &lane_ref = worker_queues_->GetLane(lane_id, 0);
       // Convert Future<TaskT> to Future<Task> for the queue
-      Future<Task> task_future(queue_future.GetFutureShm(),
-                               hipc::FullPtr<Task>(queue_future.GetTaskPtr().ptr_));
+      Future<Task> task_future = queue_future.template Cast<Task>();
       lane_ref.Push(task_future);
 
       // 7. Awaken worker for this lane
@@ -213,28 +217,36 @@ public:
       // 8. Return the Future with task pointer set for the user
       return user_future;
     } else {
-      // RUNTIME PATH: Create Future with task pointer directly (no serialization copy)
+      // RUNTIME PATH: Create Future with task pointer directly (no
+      // serialization copy)
 
       // 1. Create Future with allocator and task_ptr (task pointer is set)
       Future<TaskT> future(alloc, task_ptr);
 
-      // 2. Map task to lane using configured policy
-      u32 num_lanes = shared_header_->num_sched_queues;
-      if (num_lanes == 0)
-        return future; // Avoid division by zero
+      // 2. Set the parent task RunContext from current worker (if available)
+      Worker *worker = CHI_CUR_WORKER;
+      if (worker) {
+        RunContext *run_ctx = worker->GetCurrentRunContext();
+        if (run_ctx) {
+          future.SetParentTask(run_ctx);
+        }
+      }
 
-      // 3. Enqueue the Future object to the worker queue
+      // 3. Map task to lane using configured policy
+      u32 num_lanes = shared_header_->num_sched_queues;
+      if (num_lanes == 0) return future;  // Avoid division by zero
+
+      // 4. Enqueue the Future object to the worker queue
       LaneId lane_id = MapTaskToLane(num_lanes);
-      auto& lane_ref = worker_queues_->GetLane(lane_id, 0);
+      auto &lane_ref = worker_queues_->GetLane(lane_id, 0);
       // Convert Future<TaskT> to Future<Task> for the queue
-      Future<Task> task_future(future.GetFutureShm(),
-                               hipc::FullPtr<Task>(future.GetTaskPtr().ptr_));
+      Future<Task> task_future = future.template Cast<Task>();
       lane_ref.Push(task_future);
 
-      // 4. Awaken worker for this lane
+      // 5. Awaken worker for this lane
       AwakenWorker(&lane_ref);
 
-      // 5. Return the Future with task pointer
+      // 6. Return the Future with task pointer
       return future;
     }
   }
@@ -245,21 +257,24 @@ public:
    *
    * Two execution paths:
    * - Client mode (!IsRuntime): Poll and deserialize task outputs (full path)
-   * - Runtime mode (IsRuntime): Only poll for completion (no deserialization needed)
+   * - Runtime mode (IsRuntime): Only poll for completion (no deserialization
+   * needed)
    *
    * @param future Future containing completed task
    */
-  template <typename TaskT> void Recv(Future<TaskT>& future) {
+  template <typename TaskT>
+  void Recv(Future<TaskT> &future) {
     // 1. Wait for completion using Task::Wait() which checks is_complete atomic
-    auto& future_shm = future.GetFutureShm();
-    TaskT* task_ptr = future.get();
+    auto &future_shm = future.GetFutureShm();
+    TaskT *task_ptr = future.get();
     task_ptr->Wait(future_shm->is_complete_);
 
     if (!CHI_CHIMAERA_MANAGER->IsRuntime()) {
       // CLIENT PATH: Deserialize task outputs from FutureShm
 
       // 2. Get the serialized task data from FutureShm
-      hipc::vector<char, CHI_MAIN_ALLOC_T>& serialized = future_shm->serialized_task_;
+      hipc::vector<char, CHI_MAIN_ALLOC_T> &serialized =
+          future_shm->serialized_task_;
 
       // 3. Convert hipc::vector to std::vector for LocalLoadTaskArchive
       std::vector<char> buffer(serialized.begin(), serialized.end());
@@ -271,9 +286,9 @@ public:
       // 5. Deserialize task outputs into the Future's task pointer
       archive >> (*task_ptr);
     }
-    // RUNTIME PATH: No deserialization needed - task already has correct outputs
+    // RUNTIME PATH: No deserialization needed - task already has correct
+    // outputs
   }
-
 
   /**
    * Get TaskQueue for task processing
@@ -315,9 +330,10 @@ public:
    * Awaken a worker by sending a signal to its thread
    * Sends SIGUSR1 to the worker's thread ID stored in the TaskLane
    * Only sends signal if the worker is inactive (blocked in epoll_wait)
-   * @param lane Pointer to the TaskLane containing the worker's tid and active status
+   * @param lane Pointer to the TaskLane containing the worker's tid and active
+   * status
    */
-  void AwakenWorker(TaskLane* lane);
+  void AwakenWorker(TaskLane *lane);
 
   /**
    * Set the node ID in the shared memory header
@@ -413,7 +429,8 @@ public:
    * Convert ShmPtr to FullPtr by checking allocator IDs
    * Matches the ShmPtr's allocator ID against main, data, and rdata allocators
    * @param shm_ptr The ShmPtr to convert
-   * @return FullPtr with matching allocator and pointer, or null FullPtr if no match
+   * @return FullPtr with matching allocator and pointer, or null FullPtr if no
+   * match
    */
   template <typename T>
   hipc::FullPtr<T> ToFullPtr(const hipc::ShmPtr<T> &shm_ptr) {
@@ -423,12 +440,14 @@ public:
     }
 
     // Check client data allocator
-    if (client_data_allocator_ && shm_ptr.alloc_id_ == client_data_allocator_->GetId()) {
+    if (client_data_allocator_ &&
+        shm_ptr.alloc_id_ == client_data_allocator_->GetId()) {
       return hipc::FullPtr<T>(client_data_allocator_, shm_ptr);
     }
 
     // Check runtime data allocator
-    if (runtime_data_allocator_ && shm_ptr.alloc_id_ == runtime_data_allocator_->GetId()) {
+    if (runtime_data_allocator_ &&
+        shm_ptr.alloc_id_ == runtime_data_allocator_->GetId()) {
       return hipc::FullPtr<T>(runtime_data_allocator_, shm_ptr);
     }
 
@@ -440,7 +459,8 @@ public:
    * Convert raw pointer to FullPtr by checking allocators
    * Uses ContainsPtr() on each allocator to find the matching one
    * @param ptr The raw pointer to convert
-   * @return FullPtr with matching allocator and pointer, or null FullPtr if no match
+   * @return FullPtr with matching allocator and pointer, or null FullPtr if no
+   * match
    */
   template <typename T>
   hipc::FullPtr<T> ToFullPtr(T *ptr) {
@@ -463,7 +483,7 @@ public:
     return hipc::FullPtr<T>();
   }
 
-private:
+ private:
   /**
    * Map task to lane ID using the configured policy
    * Dispatches to the appropriate policy-specific function
@@ -573,24 +593,24 @@ private:
   std::unique_ptr<hshm::lbm::Server> main_server_;
 
   // Hostfile management
-  std::unordered_map<u64, Host> hostfile_map_; // Map node_id -> Host
+  std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host
   mutable std::vector<Host>
-      hosts_cache_; // Cached vector of hosts for GetAllHosts
-  mutable bool hosts_cache_valid_ = false; // Flag to track cache validity
-  Host this_host_;                         // Identified host for this node
+      hosts_cache_;  // Cached vector of hosts for GetAllHosts
+  mutable bool hosts_cache_valid_ = false;  // Flag to track cache validity
+  Host this_host_;                          // Identified host for this node
 
   // Lane mapping policy
   LaneMapPolicy lane_map_policy_ = LaneMapPolicy::kRoundRobin;
-  std::atomic<u32> round_robin_counter_{0}; // Counter for round-robin policy
+  std::atomic<u32> round_robin_counter_{0};  // Counter for round-robin policy
 
   // Client-side server waiting configuration (from environment variables)
   u32 wait_server_timeout_ =
-      30; // CHI_WAIT_SERVER: timeout in seconds (default 30)
+      30;  // CHI_WAIT_SERVER: timeout in seconds (default 30)
   u32 poll_server_interval_ =
-      1; // CHI_POLL_SERVER: poll interval in seconds (default 1)
+      1;  // CHI_POLL_SERVER: poll interval in seconds (default 1)
 };
 
-} // namespace chi
+}  // namespace chi
 
 // Global pointer variable declaration for IPC manager singleton
 HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
@@ -602,7 +622,7 @@ HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
 // This avoids circular dependency issues between future.h and ipc_manager.h
 namespace chi {
 
-template<typename TaskT, typename AllocT>
+template <typename TaskT, typename AllocT>
 void Future<TaskT, AllocT>::Wait() {
   if (!task_ptr_.IsNull()) {
     // Call IpcManager::Recv() to poll for completion and deserialize results
@@ -612,4 +632,4 @@ void Future<TaskT, AllocT>::Wait() {
 
 }  // namespace chi
 
-#endif // CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_IPC_MANAGER_H_
+#endif  // CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_IPC_MANAGER_H_

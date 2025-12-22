@@ -4,15 +4,16 @@
 
 #include "chimaera/worker.h"
 
+#include <signal.h>
+#include <sys/epoll.h>
+#include <sys/signalfd.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <boost/context/detail/fcontext.hpp>
 #include <cstdlib>
 #include <iostream>
 #include <unordered_set>
-#include <sys/epoll.h>
-#include <sys/signalfd.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sys/syscall.h>
 
 // Include task_queue.h before other chimaera headers to ensure proper
 // resolution
@@ -39,6 +40,7 @@ Worker::Worker(u32 worker_id, ThreadType thread_type)
       task_did_work_(false),
       current_run_context_(nullptr),
       assigned_lane_(nullptr),
+      event_queue_(nullptr),
       last_long_queue_check_(0),
       iteration_count_(0),
       idle_iterations_(0),
@@ -68,10 +70,20 @@ bool Worker::Init() {
   // Note: assigned_lane_ will be set by WorkOrchestrator during external queue
   // initialization
 
+  // Allocate and initialize event queue from main allocator
+  auto *alloc = CHI_IPC->GetMainAlloc();
+  event_queue_ =
+      alloc
+          ->template NewObj<
+              hipc::mpsc_ring_buffer<RunContext *, CHI_MAIN_ALLOC_T>>(
+              alloc, EVENT_QUEUE_DEPTH)
+          .ptr_;
+
   // Create epoll file descriptor for efficient worker suspension
   epoll_fd_ = epoll_create1(0);
   if (epoll_fd_ == -1) {
-    HELOG(kError, "Worker {}: Failed to create epoll file descriptor", worker_id_);
+    HELOG(kError, "Worker {}: Failed to create epoll file descriptor",
+          worker_id_);
     return false;
   }
 
@@ -182,7 +194,8 @@ void Worker::Run() {
     return;
   }
 
-  HILOG(kDebug, "Worker {}: Set up signalfd={} for tid={}", worker_id_, signal_fd, tid);
+  HILOG(kDebug, "Worker {}: Set up signalfd={} for tid={}", worker_id_,
+        signal_fd, tid);
 
   // Main worker loop - process tasks from assigned lane
   while (is_running_) {
@@ -240,8 +253,9 @@ u32 Worker::ProcessNewTasks() {
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
     Future<Task> future;
     // Pop Future<Task> from assigned lane
-    if (assigned_lane_ && assigned_lane_->Pop(future)) {
+    if (assigned_lane_->Pop(future)) {
       tasks_processed++;
+      SetCurrentRunContext(nullptr);
 
       // Fix the allocator pointer after popping from ring buffer
       auto *ipc_manager = CHI_IPC;
@@ -286,14 +300,7 @@ u32 Worker::ProcessNewTasks() {
 
       // Allocate stack and RunContext before routing
       if (!task_full_ptr->IsRouted()) {
-        BeginTask(task_full_ptr, container, assigned_lane_,
-                  destroy_in_end_task);
-      }
-
-      // Store future in RunContext
-      RunContext *run_ctx = task_full_ptr->run_ctx_;
-      if (run_ctx) {
-        run_ctx->future_ = future;
+        BeginTask(future, container, assigned_lane_, destroy_in_end_task);
       }
 
       // Route task using consolidated routing function
@@ -369,8 +376,10 @@ void Worker::SuspendMe() {
     assigned_lane_->SetActive(false);
 
     // Wait for signal using epoll_wait with calculated timeout
-    int timeout_ms = static_cast<int>(current_sleep_us_ / 1000);  // Convert microseconds to milliseconds
-    int nfds = epoll_wait(epoll_fd_, epoll_events_, MAX_EPOLL_EVENTS, timeout_ms);
+    int timeout_ms = static_cast<int>(
+        current_sleep_us_ / 1000);  // Convert microseconds to milliseconds
+    int nfds =
+        epoll_wait(epoll_fd_, epoll_events_, MAX_EPOLL_EVENTS, timeout_ms);
 
     // Mark worker as active again
     assigned_lane_->SetActive(true);
@@ -889,8 +898,9 @@ void Worker::DeallocateStackAndContext(RunContext *run_ctx) {
   // std::queue always succeeds in pushing (will grow dynamically)
 }
 
-void Worker::BeginTask(const FullPtr<Task> &task_ptr, Container *container,
+void Worker::BeginTask(Future<Task> &future, Container *container,
                        TaskLane *lane, bool destroy_in_end_task) {
+  FullPtr<Task> task_ptr = future.GetTaskPtr();
   if (task_ptr.IsNull()) {
     return;
   }
@@ -910,14 +920,14 @@ void Worker::BeginTask(const FullPtr<Task> &task_ptr, Container *container,
   // Initialize RunContext for new task
   run_ctx->thread_type = thread_type_;
   run_ctx->worker_id = worker_id_;
-  run_ctx->task = task_ptr;            // Store task in RunContext
-  run_ctx->is_blocked = false;         // Initially not blocked
-  run_ctx->container = container;      // Store container for CHI_CUR_CONTAINER
-  run_ctx->lane = lane;                // Store lane for CHI_CUR_LANE
-  run_ctx->waiting_for_tasks.clear();  // Clear waiting tasks for new task
+  run_ctx->task = task_ptr;        // Store task in RunContext
+  run_ctx->is_yielded_ = false;    // Initially not blocked
+  run_ctx->container = container;  // Store container for CHI_CUR_CONTAINER
+  run_ctx->lane = lane;            // Store lane for CHI_CUR_LANE
+  run_ctx->event_queue_ = event_queue_;  // Set pointer to worker's event queue
   run_ctx->destroy_in_end_task_ = destroy_in_end_task;  // Set destroy flag
-  // Note: future_ will be set later in ProcessNewTasks after Future is
-  // constructed Set RunContext pointer in task
+  run_ctx->future_ = future;  // Store future in RunContext
+  // Set RunContext pointer in task
   task_ptr->run_ctx_ = run_ctx;
 
   // Set current run context
@@ -947,8 +957,9 @@ void Worker::BeginFiber(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // The fiber_result contains the worker context for the task to use
   run_ctx->yield_context = fiber_result;
 
-  // Update resume_context only if the task actually yielded (is_blocked = true)
-  if (run_ctx->is_blocked) {
+  // Update resume_context only if the task actually yielded (is_yielded_ =
+  // true)
+  if (run_ctx->is_yielded_) {
     run_ctx->resume_context = fiber_result;
   }
 }
@@ -1012,8 +1023,8 @@ void Worker::ResumeFiber(const FullPtr<Task> &task_ptr, RunContext *run_ctx) {
   // Update yield_context with current worker context so task can return here
   run_ctx->yield_context = resume_result;
 
-  // Update resume_context only if the task yielded again (is_blocked = true)
-  if (run_ctx->is_blocked) {
+  // Update resume_context only if the task yielded again (is_yielded_ = true)
+  if (run_ctx->is_yielded_) {
     run_ctx->resume_context = resume_result;
   }
 }
@@ -1044,7 +1055,7 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   }
 
   // Common cleanup logic for both fiber and direct execution
-  if (run_ctx->is_blocked) {
+  if (run_ctx->is_yielded_) {
     // Task is blocked - don't clean up, will be resumed later
     return;  // Task is not completed, blocked for later resume
   }
@@ -1123,6 +1134,15 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     // 2. Mark task as complete
     run_ctx->future_.SetComplete();
 
+    // 2.5. Wake up parent task if waiting for this subtask
+    RunContext *parent_task = run_ctx->future_.GetParentTask();
+    if (parent_task != nullptr && parent_task->event_queue_ != nullptr) {
+      auto *parent_event_queue = reinterpret_cast<
+          hipc::mpsc_ring_buffer<RunContext *, CHI_MAIN_ALLOC_T> *>(
+          parent_task->event_queue_);
+      parent_event_queue->Emplace(parent_task);
+    }
+
     // 3. Delete task using container->DelTask (only if destroy_in_end_task is
     // true)
     if (run_ctx->destroy_in_end_task_) {
@@ -1178,27 +1198,26 @@ void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,
       continue;
     }
 
-    // Check if all subtasks are completed
-    if (run_ctx->AreSubtasksCompleted()) {
-      // Determine if this is a resume (task was started before) or first
-      // execution
-      bool is_started = run_ctx->task->task_flags_.Any(TASK_STARTED);
+    // Always execute tasks from blocked queue
+    // (Event queue will handle subtask completion wakeup)
+    // Determine if this is a resume (task was started before) or first
+    // execution
+    bool is_started = run_ctx->task->task_flags_.Any(TASK_STARTED);
 
-      run_ctx->block_count_ = 0;
+    run_ctx->yield_count_ = 0;
 
-      // CRITICAL: Clear the is_blocked flag before resuming the task
-      // This allows the task to call Wait() again if needed
-      run_ctx->is_blocked = false;
+    // CRITICAL: Clear the is_yielded_ flag before resuming the task
+    // This allows the task to call Wait() again if needed
+    run_ctx->is_yielded_ = false;
 
-      // Execute task with existing RunContext
-      ExecTask(run_ctx->task, run_ctx, is_started);
+    // Execute task with existing RunContext
+    ExecTask(run_ctx->task, run_ctx, is_started);
 
-      // Don't re-add to queue
-      continue;
-    }
+    // Don't re-add to queue
+    continue;
 
     // Re-add to appropriate blocked queue based on current block count
-    // AddToBlockedQueue will increment block_count_ and determine the queue
+    // AddToBlockedQueue will increment yield_count_ and determine the queue
     AddToBlockedQueue(run_ctx);
   }
 }
@@ -1227,13 +1246,13 @@ void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
     }
 
     // Check if the time threshold has been surpassed
-    if (run_ctx->block_start.GetUsecFromStart() >= run_ctx->block_time_us) {
+    if (run_ctx->block_start.GetUsecFromStart() >= run_ctx->yield_time_us_) {
       // Time threshold reached - execute the task
       bool is_started = run_ctx->task->task_flags_.Any(TASK_STARTED);
 
-      // CRITICAL: Clear the is_blocked flag before resuming the task
+      // CRITICAL: Clear the is_yielded_ flag before resuming the task
       // This allows the task to call Wait() again if needed
-      run_ctx->is_blocked = false;
+      run_ctx->is_yielded_ = false;
 
       // For periodic tasks, unmark TASK_ROUTED and route again
       run_ctx->task->ClearFlags(TASK_ROUTED);
@@ -1251,7 +1270,26 @@ void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
   }
 }
 
+void Worker::ProcessEventQueue() {
+  // Process all tasks in the event queue
+  RunContext *run_ctx;
+  while (event_queue_->Pop(run_ctx)) {
+    if (!run_ctx || run_ctx->task.IsNull()) {
+      continue;
+    }
+
+    // Reset the is_yielded_ flag before executing the task
+    run_ctx->is_yielded_ = false;
+
+    // Execute the task
+    ExecTask(run_ctx->task, run_ctx, true);
+  }
+}
+
 void Worker::ContinueBlockedTasks(bool force) {
+  // Process event queue to wake up tasks waiting for subtask completion
+  ProcessEventQueue();
+
   if (force) {
     // Force mode: process all blocked queues regardless of iteration count
     for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
@@ -1306,17 +1344,23 @@ void Worker::ContinueBlockedTasks(bool force) {
   }
 }
 
-void Worker::AddToBlockedQueue(RunContext *run_ctx) {
+void Worker::AddToBlockedQueue(RunContext *run_ctx, bool wait_for_task) {
   if (!run_ctx || run_ctx->task.IsNull()) {
+    return;
+  }
+
+  // If wait_for_task is true, do not add to blocked queue
+  // The task is waiting for subtask completion and will be woken by event queue
+  if (wait_for_task) {
     return;
   }
 
   // Check if task should go to blocked queue or periodic queue
   // Go to blocked queue if: block_time is 0 OR task is already started
-  if (run_ctx->block_time_us == 0.0) {
+  if (run_ctx->yield_time_us_ == 0.0) {
     // Cooperative task waiting for subtasks - add to blocked queue
     // Increment block count for cooperative tasks
-    run_ctx->block_count_++;
+    run_ctx->yield_count_++;
 
     // Determine which blocked queue based on block count:
     // Queue[0]: Tasks blocked <=2 times (checked every % 2 iterations)
@@ -1324,11 +1368,11 @@ void Worker::AddToBlockedQueue(RunContext *run_ctx) {
     // Queue[2]: Tasks blocked <= 8 times (checked every % 8 iterations)
     // Queue[3]: Tasks blocked > 8 times (checked every % 16 iterations)
     u32 queue_idx;
-    if (run_ctx->block_count_ <= 2) {
+    if (run_ctx->yield_count_ <= 2) {
       queue_idx = 0;
-    } else if (run_ctx->block_count_ <= 4) {
+    } else if (run_ctx->yield_count_ <= 4) {
       queue_idx = 1;
-    } else if (run_ctx->block_count_ <= 8) {
+    } else if (run_ctx->yield_count_ <= 8) {
       queue_idx = 2;
     } else {
       queue_idx = 3;
@@ -1341,17 +1385,17 @@ void Worker::AddToBlockedQueue(RunContext *run_ctx) {
     // Record the time when task was blocked
     run_ctx->block_start.Now();
 
-    // Determine which periodic queue based on block_time_us:
-    // Queue[0]: block_time_us <= 50us
-    // Queue[1]: block_time_us <= 200us
-    // Queue[2]: block_time_us <= 50ms (50000us)
-    // Queue[3]: block_time_us > 50ms
+    // Determine which periodic queue based on yield_time_us_:
+    // Queue[0]: yield_time_us_ <= 50us
+    // Queue[1]: yield_time_us_ <= 200us
+    // Queue[2]: yield_time_us_ <= 50ms (50000us)
+    // Queue[3]: yield_time_us_ > 50ms
     u32 queue_idx;
-    if (run_ctx->block_time_us <= 50.0) {
+    if (run_ctx->yield_time_us_ <= 50.0) {
       queue_idx = 0;
-    } else if (run_ctx->block_time_us <= 200.0) {
+    } else if (run_ctx->yield_time_us_ <= 200.0) {
       queue_idx = 1;
-    } else if (run_ctx->block_time_us <= 50000.0) {
+    } else if (run_ctx->yield_time_us_ <= 50000.0) {
       queue_idx = 2;
     } else {
       queue_idx = 3;
@@ -1379,7 +1423,7 @@ void Worker::ReschedulePeriodicTask(RunContext *run_ctx,
   task_ptr->ClearFlags(TASK_STARTED);
 
   // Add to blocked queue - block count will be incremented automatically
-  run_ctx->block_time_us = task_ptr->period_ns_ / 1000.0;
+  run_ctx->yield_time_us_ = task_ptr->period_ns_ / 1000.0;
   AddToBlockedQueue(run_ctx);
 }
 

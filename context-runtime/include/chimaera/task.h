@@ -131,15 +131,15 @@ class Task {
    * Wait for task completion (blocking)
    * Uses Future's is_complete flag to determine when waiting is done
    * @param is_complete Reference to atomic completion flag from Future
-   * @param block_time_us Blocking duration in microseconds (default: 0.0 for cooperative tasks)
+   * @param yield_time_us Yield duration in microseconds (default: 0.0 for cooperative tasks)
    */
-  HSHM_CROSS_FUN void Wait(std::atomic<u32>& is_complete, double block_time_us = 0.0);
+  HSHM_CROSS_FUN void Wait(std::atomic<u32>& is_complete, double yield_time_us = 0.0);
 
   /**
    * Yield execution back to worker by waiting for task completion
-   * @param block_time_us Blocking duration in microseconds (default: 0.0 for cooperative tasks)
+   * @param yield_time_us Yield duration in microseconds (default: 0.0 for cooperative tasks)
    */
-  HSHM_CROSS_FUN void Yield(double block_time_us = 0.0);
+  HSHM_CROSS_FUN void Yield(double yield_time_us = 0.0);
 
   /**
    * Check if task is periodic
@@ -353,9 +353,9 @@ struct RunContext {
   ThreadType thread_type;
   u32 worker_id;
   FullPtr<Task> task; // Task being executed by this context
-  bool is_blocked;    // Task is waiting for completion
+  bool is_yielded_;    // Task is waiting for completion
   double est_load;    // Estimated time until task should wake up (microseconds)
-  double block_time_us;  // Time in microseconds for task to block
+  double yield_time_us_;  // Time in microseconds for task to yield
   hshm::Timepoint block_start; // Time when task was blocked (real time)
   boost::context::detail::transfer_t
       yield_context; // boost::context transfer from FiberExecutionFunction
@@ -366,21 +366,21 @@ struct RunContext {
   Container *container;  // Current container being executed
   TaskLane *lane;        // Current lane being processed
   ExecMode exec_mode;    // Execution mode (kExec or kDynamicSchedule)
-  std::vector<FullPtr<Task>>
-      waiting_for_tasks; // Tasks this task is waiting for completion
+  void *event_queue_;    // Pointer to worker's event queue (mpsc_queue<RunContext*>)
   std::vector<PoolQuery> pool_queries;  // Pool queries for task distribution
   std::vector<FullPtr<Task>> subtasks_; // Replica tasks for this execution
   u32 completed_replicas_; // Count of completed replicas
-  u32 block_count_;  // Number of times task has been blocked
+  u32 yield_count_;  // Number of times task has yielded
   Future<Task> future_;  // Future for async completion tracking
   bool destroy_in_end_task_;  // Flag to indicate if task should be destroyed in EndTask
 
   RunContext()
       : stack_ptr(nullptr), stack_base_for_free(nullptr), stack_size(0),
-        thread_type(kSchedWorker), worker_id(0), is_blocked(false),
-        est_load(0.0), block_time_us(0.0), block_start(), yield_context{}, resume_context{},
+        thread_type(kSchedWorker), worker_id(0), is_yielded_(false),
+        est_load(0.0), yield_time_us_(0.0), block_start(), yield_context{}, resume_context{},
         container(nullptr), lane(nullptr), exec_mode(ExecMode::kExec),
-        completed_replicas_(0), block_count_(0), destroy_in_end_task_(false) {
+        event_queue_(nullptr),
+        completed_replicas_(0), yield_count_(0), destroy_in_end_task_(false) {
   }
 
   /**
@@ -391,18 +391,20 @@ struct RunContext {
         stack_base_for_free(other.stack_base_for_free),
         stack_size(other.stack_size), thread_type(other.thread_type),
         worker_id(other.worker_id), task(std::move(other.task)),
-        is_blocked(other.is_blocked), est_load(other.est_load),
-        block_time_us(other.block_time_us), block_start(other.block_start),
+        is_yielded_(other.is_yielded_), est_load(other.est_load),
+        yield_time_us_(other.yield_time_us_), block_start(other.block_start),
         yield_context(other.yield_context), resume_context(other.resume_context),
         container(other.container), lane(other.lane),
         exec_mode(other.exec_mode),
-        waiting_for_tasks(std::move(other.waiting_for_tasks)),
+        event_queue_(other.event_queue_),
         pool_queries(std::move(other.pool_queries)),
         subtasks_(std::move(other.subtasks_)),
         completed_replicas_(other.completed_replicas_),
-        block_count_(other.block_count_),
+        yield_count_(other.yield_count_),
         future_(std::move(other.future_)),
-        destroy_in_end_task_(other.destroy_in_end_task_) {}
+        destroy_in_end_task_(other.destroy_in_end_task_) {
+    other.event_queue_ = nullptr;
+  }
 
   /**
    * Move assignment operator
@@ -415,22 +417,23 @@ struct RunContext {
       thread_type = other.thread_type;
       worker_id = other.worker_id;
       task = std::move(other.task);
-      is_blocked = other.is_blocked;
+      is_yielded_ = other.is_yielded_;
       est_load = other.est_load;
-      block_time_us = other.block_time_us;
+      yield_time_us_ = other.yield_time_us_;
       block_start = other.block_start;
       yield_context = other.yield_context;
       resume_context = other.resume_context;
       container = other.container;
       lane = other.lane;
       exec_mode = other.exec_mode;
-      waiting_for_tasks = std::move(other.waiting_for_tasks);
+      event_queue_ = other.event_queue_;
       pool_queries = std::move(other.pool_queries);
       subtasks_ = std::move(other.subtasks_);
       completed_replicas_ = other.completed_replicas_;
-      block_count_ = other.block_count_;
+      yield_count_ = other.yield_count_;
       future_ = std::move(other.future_);
       destroy_in_end_task_ = other.destroy_in_end_task_;
+      other.event_queue_ = nullptr;
     }
     return *this;
   }
@@ -444,27 +447,13 @@ struct RunContext {
    * Does not touch pointers or primitive types
    */
   void Clear() {
-    waiting_for_tasks.clear();
     pool_queries.clear();
     subtasks_.clear();
     completed_replicas_ = 0;
     est_load = 0.0;
-    block_time_us = 0.0;
+    yield_time_us_ = 0.0;
     block_start = hshm::Timepoint();
-    block_count_ = 0;
-  }
-
-  /**
-   * Check if all subtasks this task is waiting for are completed
-   * Subtasks are considered complete when Wait() on them has returned
-   * which removes them from waiting_for_tasks. So if waiting_for_tasks
-   * is empty, all subtasks are done.
-   * @return true if all subtasks are completed, false otherwise
-   */
-  bool AreSubtasksCompleted() const {
-    // If waiting_for_tasks is empty, all subtasks are completed
-    // Tasks are removed from waiting_for_tasks when they complete
-    return waiting_for_tasks.empty();
+    yield_count_ = 0;
   }
 };
 

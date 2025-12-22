@@ -172,8 +172,9 @@ public:
    * Add run context to blocked queue based on block count
    * @param run_ctx_ptr Pointer to run context (task accessible via
    * run_ctx_ptr->task)
+   * @param wait_for_task If true, do not add to blocked queue (task is waiting for subtask completion)
    */
-  void AddToBlockedQueue(RunContext *run_ctx_ptr);
+  void AddToBlockedQueue(RunContext *run_ctx_ptr, bool wait_for_task = false);
 
   /**
    * Reschedule a periodic task for next execution
@@ -259,6 +260,12 @@ private:
   void ProcessPeriodicQueue(std::queue<RunContext *> &queue,
                             u32 queue_idx);
 
+  /**
+   * Process event queue for waking up tasks when subtasks complete
+   * Iterates over event_queue_, removes tasks from blocked_queue_, and calls ExecTask
+   */
+  void ProcessEventQueue();
+
 public:
   /**
    * Check if task should be processed locally based on task flags and pool
@@ -307,13 +314,12 @@ private:
 
   /**
    * Begin task execution using boost::fiber for context switching
-   * @param task_ptr Full pointer to task to execute (RunContext will be
-   * allocated and set in task)
+   * @param future Future object containing the task and completion state
    * @param container Container for the task
    * @param lane Lane for the task (can be nullptr)
    * @param destroy_in_end_task Flag indicating if task should be destroyed in EndTask
    */
-  void BeginTask(const FullPtr<Task> &task_ptr, Container *container,
+  void BeginTask(Future<Task> &future, Container *container,
                  TaskLane *lane, bool destroy_in_end_task);
 
   /**
@@ -410,11 +416,16 @@ private:
   static constexpr u32 BLOCKED_QUEUE_SIZE = 1024;
   std::queue<RunContext *> blocked_queues_[NUM_BLOCKED_QUEUES];
 
+  // Event queue for waking up tasks when their subtasks complete
+  // Allocated from main allocator with same depth as TaskLane
+  static constexpr u32 EVENT_QUEUE_DEPTH = 1024;
+  hipc::mpsc_ring_buffer<RunContext*, CHI_MAIN_ALLOC_T>* event_queue_;
+
   // Periodic queue system for time-based periodic tasks:
-  // - Queue[0]: Tasks with block_time_us <= 50us (checked every 16 iterations)
-  // - Queue[1]: Tasks with block_time_us <= 200us (checked every 32 iterations)
-  // - Queue[2]: Tasks with block_time_us <= 50ms/50000us (checked every 64 iterations)
-  // - Queue[3]: Tasks with block_time_us > 50ms (checked every 128 iterations)
+  // - Queue[0]: Tasks with yield_time_us_ <= 50us (checked every 16 iterations)
+  // - Queue[1]: Tasks with yield_time_us_ <= 200us (checked every 32 iterations)
+  // - Queue[2]: Tasks with yield_time_us_ <= 50ms/50000us (checked every 64 iterations)
+  // - Queue[3]: Tasks with yield_time_us_ > 50ms (checked every 128 iterations)
   // Using std::queue for O(1) enqueue/dequeue operations
   static constexpr u32 NUM_PERIODIC_QUEUES = 4;
   static constexpr u32 PERIODIC_QUEUE_SIZE = 1024;

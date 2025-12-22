@@ -153,3 +153,21 @@ We should update chi_refresh_repo to do Promise instead of Future for all inputs
 
 Let's add a new hipc::mpsc_queue to the WorkOrchestrator.
 This queue should be called network_queue. 
+
+
+@CLAUDE.md
+
+# Task
+Add a new flag called TASK_FIRE_AND_FORGET.
+Add the SetFireAndForget, IsFireAndForget, and UnsetFireAndForget methods.
+
+# Worker::EndTask
+If the task is marked as TASK_FIRE_AND_FORGET, then delete the task.
+It should check ``run_ctx->destroy_in_end_task_ || task->flags_.Any(TASK_FIRE_AND_FORGET)``
+when deciding if to delete the task.
+TASK_FIRE_AND_FORGET should only be checked in the non-remote part of the method.
+
+# Admin::SendTask
+Mark this task as TASK_FIRE_AND_FORGET.
+Both SendIn and SendOut will never be awaited.
+
