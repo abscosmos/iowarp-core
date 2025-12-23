@@ -169,7 +169,7 @@ class IpcManager {
    * @return Future<TaskT> for polling completion and retrieving results
    */
   template <typename TaskT>
-  Future<TaskT> Send(hipc::FullPtr<TaskT> task_ptr) {
+  Future<TaskT> Send(hipc::FullPtr<TaskT> task_ptr, bool awake_event = true) {
     // Get main allocator for FutureShm allocation
     auto *alloc = GetMainAlloc();
 
@@ -223,12 +223,15 @@ class IpcManager {
       // 1. Create Future with allocator and task_ptr (task pointer is set)
       Future<TaskT> future(alloc, task_ptr);
 
-      // 2. Set the parent task RunContext from current worker (if available)
-      Worker *worker = CHI_CUR_WORKER;
-      if (worker) {
-        RunContext *run_ctx = worker->GetCurrentRunContext();
-        if (run_ctx) {
-          future.SetParentTask(run_ctx);
+      // 2. Set the parent task RunContext from current worker (if available and
+      // awake_event is true)
+      if (awake_event && !task_ptr->IsFireAndForget()) {
+        Worker *worker = CHI_CUR_WORKER;
+        if (worker) {
+          RunContext *run_ctx = worker->GetCurrentRunContext();
+          if (run_ctx) {
+            future.SetParentTask(run_ctx);
+          }
         }
       }
 

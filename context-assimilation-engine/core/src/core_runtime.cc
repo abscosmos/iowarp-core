@@ -27,6 +27,12 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext& ctx) {
         pool_name_, pool_id_);
 }
 
+chi::u64 Runtime::GetWorkRemaining() const {
+  // CAE doesn't currently track work remaining
+  // Return 0 to indicate no pending work
+  return 0;
+}
+
 void Runtime::ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunContext& ctx) {
   HILOG(kInfo, "ParseOmni called with {} bytes of serialized data",
         task->serialized_ctx_.size());

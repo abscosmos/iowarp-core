@@ -12,6 +12,7 @@
 #include <chimaera/pool_manager.h>
 #include <chimaera/task_archives.h>
 #include <chimaera/worker.h>
+#include <zmq.h>
 
 #include <chrono>
 #include <memory>
@@ -19,7 +20,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include <zmq.h>
 
 namespace chimaera::admin {
 
@@ -126,7 +126,8 @@ void Runtime::GetOrCreatePool(
   } catch (const std::exception &e) {
     task->return_code_ = 99;
     auto alloc = CHI_IPC->GetMainAlloc();
-    std::string error_msg = std::string("Exception during pool creation: ") + e.what();
+    std::string error_msg =
+        std::string("Exception during pool creation: ") + e.what();
     task->error_message_ = chi::priv::string(alloc, error_msg);
     HELOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
   }
@@ -176,7 +177,8 @@ void Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
   } catch (const std::exception &e) {
     task->return_code_ = 99;
     auto alloc = CHI_IPC->GetMainAlloc();
-    std::string error_msg = std::string("Exception during pool destruction: ") + e.what();
+    std::string error_msg =
+        std::string("Exception during pool destruction: ") + e.what();
     task->error_message_ = chi::priv::string(alloc, error_msg);
     HELOG(kError, "Admin: Pool destruction failed with exception: {}",
           e.what());
@@ -207,7 +209,8 @@ void Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
   } catch (const std::exception &e) {
     task->return_code_ = 99;
     auto alloc = CHI_IPC->GetMainAlloc();
-    std::string error_msg = std::string("Exception during runtime shutdown: ") + e.what();
+    std::string error_msg =
+        std::string("Exception during runtime shutdown: ") + e.what();
     task->error_message_ = chi::priv::string(alloc, error_msg);
     HELOG(kError, "Admin: Runtime shutdown failed with exception: {}",
           e.what());
@@ -263,7 +266,7 @@ void Runtime::Flush(hipc::FullPtr<FlushTask> task, chi::RunContext &rctx) {
 
     // Store the final work count (should be 0)
     task->total_work_done_ = total_work_remaining;
-    task->return_code_ = 0; // Success - all work completed
+    task->return_code_ = 0;  // Success - all work completed
 
     HILOG(kDebug,
           "Admin: Flush completed - no work remaining across all containers");
@@ -285,7 +288,7 @@ void Runtime::Flush(hipc::FullPtr<FlushTask> task, chi::RunContext &rctx) {
  */
 void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
   // Set I/O size to 1MB to ensure routing to slow workers
-  task->stat_.io_size_ = 1024 * 1024; // 1MB
+  task->stat_.io_size_ = 1024 * 1024;  // 1MB
 
   auto *ipc_manager = CHI_IPC;
   auto *pool_manager = CHI_POOL_MANAGER;
@@ -355,12 +358,14 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
       target_node_id =
           pool_manager->GetContainerNodeId(origin_task->pool_id_, container_id);
     } else if (query.IsBroadcastMode()) {
-      HELOG(kError, "Admin: Broadcast mode should be handled by "
-                    "TaskDispatcher, not SendIn");
+      HELOG(kError,
+            "Admin: Broadcast mode should be handled by "
+            "TaskDispatcher, not SendIn");
       continue;
     } else if (query.IsDirectHashMode()) {
-      HELOG(kError, "Admin: DirectHash mode should be handled by "
-                    "TaskDispatcher, not SendIn");
+      HELOG(kError,
+            "Admin: DirectHash mode should be handled by "
+            "TaskDispatcher, not SendIn");
       continue;
     } else {
       HELOG(kError, "Admin: Unsupported or unrecognized query type for SendIn");
@@ -385,7 +390,8 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
     chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn, lbm_client.get());
 
     // Create task copy
-    hipc::FullPtr<chi::Task> task_copy = container->NewCopyTask(origin_task->method_, origin_task, true);
+    hipc::FullPtr<chi::Task> task_copy =
+        container->NewCopyTask(origin_task->method_, origin_task, true);
     origin_task_rctx->subtasks_[i] = task_copy;
 
     // Set net_key in task_id to match send_map_key
@@ -419,9 +425,8 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
       continue;
     }
 
-    HILOG(kDebug,
-          "[SEND] Task {} sent to node {}",
-          task_copy->task_id_, target_node_id);
+    HILOG(kDebug, "[SEND] Task {} sent to node {}", task_copy->task_id_,
+          target_node_id);
   }
 
   HILOG(kDebug, "=== [SendIn END] Task {} completed sending to {} targets ===",
@@ -435,7 +440,7 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
  */
 void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
   // Set I/O size to 1MB to ensure routing to slow workers
-  task->stat_.io_size_ = 1024 * 1024; // 1MB
+  task->stat_.io_size_ = 1024 * 1024;  // 1MB
 
   auto *ipc_manager = CHI_IPC;
   auto *pool_manager = CHI_POOL_MANAGER;
@@ -530,8 +535,7 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
       continue;
     }
 
-    HILOG(kDebug,
-          "[SEND] Task {} outputs sent back to node {}",
+    HILOG(kDebug, "[SEND] Task {} outputs sent back to node {}",
           origin_task->task_id_, target_node_id);
   }
 
@@ -576,7 +580,7 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
                      chi::LoadTaskArchive &archive,
                      hshm::lbm::Server *lbm_server) {
   // Set I/O size to 1MB to ensure routing to slow workers
-  task->stat_.io_size_ = 1024 * 1024; // 1MB
+  task->stat_.io_size_ = 1024 * 1024;  // 1MB
 
   auto *ipc_manager = CHI_IPC;
   auto *pool_manager = CHI_POOL_MANAGER;
@@ -630,7 +634,8 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
     }
 
     // Call LoadTask to allocate and deserialize the task
-    hipc::FullPtr<chi::Task> task_ptr = container->LoadTask(task_info.method_id_, archive);
+    hipc::FullPtr<chi::Task> task_ptr =
+        container->LoadTask(task_info.method_id_, archive);
 
     if (task_ptr.IsNull()) {
       HELOG(kError, "Admin: Failed to load task");
@@ -639,7 +644,8 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
 
     // Mark task as remote, set as data owner, unset periodic and TASK_FORCE_NET
     task_ptr->SetFlags(TASK_REMOTE | TASK_DATA_OWNER);
-    task_ptr->ClearFlags(TASK_PERIODIC | TASK_FORCE_NET | TASK_ROUTED);
+    task_ptr->ClearFlags(TASK_PERIODIC | TASK_FORCE_NET | TASK_ROUTED |
+                         TASK_FIRE_AND_FORGET);
 
     // Add task to recv_map for later lookup (use net_key from task_id)
     size_t net_key = task_ptr->task_id_.net_key_;
@@ -654,9 +660,10 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
           "recv_map",
           task_ptr->task_id_, task_info.pool_id_, net_key);
 
-    // Send task for execution using IpcManager::Send
+    // Send task for execution using IpcManager::Send with awake_event=false
     // Note: This creates a Future and enqueues it to worker lanes
-    (void)ipc_manager->Send(task_ptr);
+    // awake_event=false prevents setting parent task for received remote tasks
+    (void)ipc_manager->Send(task_ptr, false);
     HILOG(kDebug, "[RECV] Task {} received and sent for execution",
           task_ptr->task_id_);
   }
@@ -675,7 +682,7 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
                       chi::LoadTaskArchive &archive,
                       hshm::lbm::Server *lbm_server) {
   // Set I/O size to 1MB to ensure routing to slow workers
-  task->stat_.io_size_ = 1024 * 1024; // 1MB
+  task->stat_.io_size_ = 1024 * 1024;  // 1MB
 
   auto *pool_manager = CHI_POOL_MANAGER;
 
@@ -809,8 +816,7 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
 
     // Aggregate replica results into origin task
     container->Aggregate(origin_task->method_, origin_task, replica);
-    HILOG(kDebug,
-          "[RECV] Task {} outputs received and aggregated",
+    HILOG(kDebug, "[RECV] Task {} outputs received and aggregated",
           origin_task->task_id_);
 
     // Increment completed replicas counter in origin's rctx
@@ -847,7 +853,8 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
       }
 
       // Add task back to blocked queue for both periodic and non-periodic tasks
-      // ExecTask will handle checking if the task is complete and ending it properly
+      // ExecTask will handle checking if the task is complete and ending it
+      // properly
       auto *worker = CHI_CUR_WORKER;
       worker->AddToBlockedQueue(origin_rctx);
       HILOG(kDebug, "[RecvOut] Added origin task {} back to blocked queue",
@@ -881,7 +888,7 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
     chi::Worker *worker = CHI_CUR_WORKER;
     if (worker) {
       // Cast to ZeroMqServer to access GetFd()
-      auto *zmq_server = static_cast<hshm::lbm::ZeroMqServer*>(lbm_server);
+      auto *zmq_server = static_cast<hshm::lbm::ZeroMqServer *>(lbm_server);
       int zmq_fd = zmq_server->GetFd();
 
       // Add ZeroMQ FD to worker's epoll for event-driven polling
@@ -893,7 +900,8 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
         HELOG(kError, "Admin: Failed to add ZeroMQ FD to worker epoll");
       } else {
         zmq_fd_added = true;
-        HILOG(kDebug, "Admin: Added ZeroMQ FD {} to worker {} epoll", zmq_fd, worker->GetId());
+        HILOG(kDebug, "Admin: Added ZeroMQ FD {} to worker {} epoll", zmq_fd,
+              worker->GetId());
       }
     }
   }
@@ -929,10 +937,11 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
 
   // Log message type
   chi::MsgType msg_type = archive.GetMsgType();
-  const char* msg_type_str =
-    (msg_type == chi::MsgType::kSerializeIn) ? "SerializeIn" :
-    (msg_type == chi::MsgType::kSerializeOut) ? "SerializeOut" :
-    (msg_type == chi::MsgType::kHeartbeat) ? "Heartbeat" : "Unknown";
+  const char *msg_type_str =
+      (msg_type == chi::MsgType::kSerializeIn)    ? "SerializeIn"
+      : (msg_type == chi::MsgType::kSerializeOut) ? "SerializeOut"
+      : (msg_type == chi::MsgType::kHeartbeat)    ? "Heartbeat"
+                                                  : "Unknown";
   HILOG(kDebug, "Admin: Received metadata (type: {})", msg_type_str);
 
   // Dispatch based on message type
@@ -991,7 +1000,7 @@ chi::u64 Runtime::GetWorkRemaining() const {
 
 // Task Serialization Method Implementations now in autogen/admin_lib_exec.cc
 
-} // namespace chimaera::admin
+}  // namespace chimaera::admin
 
 // Define ChiMod entry points using CHI_TASK_CC macro
 CHI_TASK_CC(chimaera::admin::Runtime)
