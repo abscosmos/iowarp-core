@@ -58,10 +58,10 @@ RUN getent group docker || groupadd docker
 
 # Set up Docker socket permissions script
 RUN echo '#!/bin/bash\n\
-if [ -S /var/run/docker.sock ]; then\n\
+    if [ -S /var/run/docker.sock ]; then\n\
     sudo chmod 666 /var/run/docker.sock\n\
-fi\n\
-exec "$@"' > /usr/local/bin/docker-entrypoint.sh \
+    fi\n\
+    exec "$@"' > /usr/local/bin/docker-entrypoint.sh \
     && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Allow iowarp user to manage docker socket permissions without password
@@ -71,8 +71,8 @@ RUN echo "iowarp ALL=(ALL) NOPASSWD: /bin/chmod 666 /var/run/docker.sock" >> /et
 # Install NVIDIA Container Toolkit repository
 RUN curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
     && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-        tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+    tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
 
 # Install CUDA from NVIDIA's official repository
 # This installs the complete CUDA toolkit + runtime libraries for actual GPU execution
@@ -81,19 +81,19 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86
     && rm cuda-keyring_1.1-1_all.deb \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        cuda-toolkit-12-6 \
-        cuda-cudart-12-6 \
-        cuda-libraries-12-6 \
-        cuda-nvrtc-12-6 \
-        cuda-nvml-dev-12-6 \
-        libcublas-12-6 \
-        libcufft-12-6 \
-        libcurand-12-6 \
-        libcusolver-12-6 \
-        libcusparse-12-6 \
-        libnpp-12-6 \
-        libnvidia-container-tools \
-        libnvidia-container1 \
+    cuda-toolkit-12-6 \
+    cuda-cudart-12-6 \
+    cuda-libraries-12-6 \
+    cuda-nvrtc-12-6 \
+    cuda-nvml-dev-12-6 \
+    libcublas-12-6 \
+    libcufft-12-6 \
+    libcurand-12-6 \
+    libcusolver-12-6 \
+    libcusparse-12-6 \
+    libnpp-12-6 \
+    libnvidia-container-tools \
+    libnvidia-container1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Set CUDA environment variables for runtime execution
@@ -130,21 +130,21 @@ RUN /home/iowarp/miniconda3/bin/conda init bash \
 RUN /home/iowarp/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
     && /home/iowarp/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r \
     && /home/iowarp/miniconda3/bin/conda install -y \
-        conda-build \
-        cmake \
-        ninja \
-        boost \
-        hdf5 \
-        yaml-cpp \
-        zeromq \
-        cppzmq \
-        cereal \
-        catch2 \
-        libcurl \
-        openssl \
-        zlib \
-        poco \
-        nlohmann_json \
+    conda-build \
+    cmake \
+    ninja \
+    boost \
+    hdf5 \
+    yaml-cpp \
+    zeromq \
+    cppzmq \
+    cereal \
+    catch2 \
+    libcurl \
+    openssl \
+    zlib \
+    poco \
+    nlohmann_json \
     && /home/iowarp/miniconda3/bin/conda clean -ya
 
 # Create Python virtual environment in user's home directory
