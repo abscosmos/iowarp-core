@@ -89,7 +89,7 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
     // Allocate entire region with GPU memory
     region_ = GpuApi::Malloc<char>(total_size);
     if (!region_) {
-      HILOG(kError, "Failed to allocate GPU memory");
+      HLOG(kError, "Failed to allocate GPU memory");
       return false;
     }
 
@@ -144,7 +144,7 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
 
     // TODO: Implement IPC handle registry lookup by URL
     // For now, we can't attach without a shared mechanism to exchange IPC handles
-    HILOG(kError, "GpuMalloc::shm_attach requires IPC handle registry (not yet implemented)");
+    HLOG(kError, "GpuMalloc::shm_attach requires IPC handle registry (not yet implemented)");
     return false;
 
     // Future implementation would:

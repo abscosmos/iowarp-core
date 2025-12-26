@@ -111,6 +111,7 @@ option(HSHM_ENABLE_PTHREADS "Support spawning pthreads" OFF)
 option(HSHM_ENABLE_WINDOWS_THREADS "Support spawning windows threads" OFF)
 option(HSHM_DEBUG_LOCK "Used for debugging locks" OFF)
 option(HSHM_NO_COMPILE "Disable compiling / installing this library" OFF)
+set(HSHM_LOG_LEVEL "1" CACHE STRING "Log level threshold (0=Debug, 1=Info, 2=Warning, 3=Error, 4=Fatal)")
 
 #------------------------------------------------------------------------------
 # Chimaera (context-runtime) Options

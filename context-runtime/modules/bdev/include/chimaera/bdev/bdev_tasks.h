@@ -208,7 +208,7 @@ struct CreateParams {
     perf_metrics_.iops_ = 1000.0;
 
     // Debug: Log what parameters were received
-    HILOG(kDebug,
+    HLOG(kDebug,
           "DEBUG: CreateParams constructor called with: bdev_type={}, "
           "total_size={}, io_depth={}, alignment={}",
           static_cast<chi::u32>(bdev_type_), total_size_, io_depth_,
@@ -223,7 +223,7 @@ struct CreateParams {
     // Set performance metrics (use provided metrics or defaults)
     if (perf_metrics != nullptr) {
       perf_metrics_ = *perf_metrics;
-      HILOG(kDebug,
+      HLOG(kDebug,
             "DEBUG: CreateParams constructor called with custom performance: "
             "bdev_type={}, total_size={}, io_depth={}, alignment={}, "
             "read_bw={}, write_bw={}",
@@ -237,7 +237,7 @@ struct CreateParams {
       perf_metrics_.read_latency_us_ = 1000.0;
       perf_metrics_.write_latency_us_ = 1200.0;
       perf_metrics_.iops_ = 1000.0;
-      HILOG(kDebug,
+      HLOG(kDebug,
             "DEBUG: CreateParams constructor called with default performance: "
             "bdev_type={}, total_size={}, io_depth={}, alignment={}",
             static_cast<chi::u32>(bdev_type_), total_size_, io_depth_,

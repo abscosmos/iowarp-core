@@ -532,12 +532,12 @@ void Runtime::GetOrCreatePool(
 
     if (!existing_pool_id.IsNull()) {
       // Pool exists locally - route to local execution only
-      HILOG(kDebug, "Admin: Pool '{}' found locally (ID: {}), using Local query",
+      HLOG(kDebug, "Admin: Pool '{}' found locally (ID: {}), using Local query",
             pool_name, existing_pool_id);
       task->pool_query_ = chi::PoolQuery::Local();
     } else {
       // Pool doesn't exist - broadcast creation to all nodes
-      HILOG(kDebug, "Admin: Pool '{}' not found locally, broadcasting creation",
+      HLOG(kDebug, "Admin: Pool '{}' not found locally, broadcasting creation",
             pool_name);
       task->pool_query_ = chi::PoolQuery::Broadcast();
     }
@@ -545,7 +545,7 @@ void Runtime::GetOrCreatePool(
   }
 
   // PHASE 2: Normal execution - actually create/get the pool
-  HILOG(kDebug, "Admin: Executing GetOrCreatePool task - ChiMod: {}, Pool: {}",
+  HLOG(kDebug, "Admin: Executing GetOrCreatePool task - ChiMod: {}, Pool: {}",
         task->chimod_name_.str(), pool_name);
 
   task->return_code_ = 0;
@@ -561,7 +561,7 @@ void Runtime::GetOrCreatePool(
     task->return_code_ = 0;
     pools_created_++;
 
-    HILOG(kDebug, "Admin: Pool operation completed successfully - ID: {}, Name: {}",
+    HLOG(kDebug, "Admin: Pool operation completed successfully - ID: {}, Name: {}",
           task->new_pool_id_, pool_name);
 
   } catch (const std::exception &e) {
@@ -569,7 +569,7 @@ void Runtime::GetOrCreatePool(
     task->error_message_ = chi::priv::string(
         CHI_IPC->GetMainAlloc(),
         std::string("Exception during pool creation: ") + e.what());
-    HELOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
+    HLOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
   }
 }
 ```

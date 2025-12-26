@@ -35,7 +35,7 @@ TEST_CASE("TestTimepoint") {
   hshm::Timepoint timer;
   timer.Now();
   sleep(2);
-  HILOG(kInfo, "Print timer: {}", timer.GetSecFromStart());
+  HLOG(kInfo, "Print timer: {}", timer.GetSecFromStart());
 }
 
 TEST_CASE("TestTimer") {
@@ -43,7 +43,7 @@ TEST_CASE("TestTimer") {
   timer.Resume();
   sleep(3);
   timer.Pause();
-  HILOG(kInfo, "Print timer: {}", timer.GetSec());
+  HLOG(kInfo, "Print timer: {}", timer.GetSec());
 }
 
 #ifdef HSHM_ENABLE_MPI
@@ -52,10 +52,10 @@ TEST_CASE("TestMpiTimer") {
   mpi_timer.Resume();
   sleep(3);
   mpi_timer.Pause();
-  HILOG(kInfo, "Print timer (Collect): {}", mpi_timer.Collect().GetSec());
-  HILOG(kInfo, "Print timer (Min): {}", mpi_timer.CollectMin().GetSec());
-  HILOG(kInfo, "Print timer (Max): {}", mpi_timer.CollectMax().GetSec());
-  HILOG(kInfo, "Print timer (Avg): {}", mpi_timer.CollectAvg().GetSec());
+  HLOG(kInfo, "Print timer (Collect): {}", mpi_timer.Collect().GetSec());
+  HLOG(kInfo, "Print timer (Min): {}", mpi_timer.CollectMin().GetSec());
+  HLOG(kInfo, "Print timer (Max): {}", mpi_timer.CollectMax().GetSec());
+  HLOG(kInfo, "Print timer (Avg): {}", mpi_timer.CollectAvg().GetSec());
 }
 #endif
 
@@ -71,6 +71,6 @@ TEST_CASE("TestOmpTimer") {
 #pragma omp barrier
   }
   omp_timer.Collect();
-  HILOG(kInfo, "Print timer: {}", omp_timer.GetSec());
+  HLOG(kInfo, "Print timer: {}", omp_timer.GetSec());
 }
 #endif

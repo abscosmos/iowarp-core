@@ -89,7 +89,7 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
     SystemInfo::DestroySharedMemory(url);
     if (!SystemInfo::CreateNewSharedMemory(fd_, url, backend_size)) {
       char *err_buf = strerror(errno);
-      HILOG(kError, "shm_open failed: {}", err_buf);
+      HLOG(kError, "shm_open failed: {}", err_buf);
       return false;
     }
     url_ = url;
@@ -98,7 +98,7 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
     header_ = reinterpret_cast<MemoryBackendHeader *>(
         SystemInfo::MapSharedMemory(fd_, kBackendHeaderSize, 0));
     if (!header_) {
-      HILOG(kError, "Failed to map header");
+      HLOG(kError, "Failed to map header");
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
@@ -110,7 +110,7 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
     region_ = reinterpret_cast<char *>(
         SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_size, 0));
     if (!region_) {
-      HILOG(kError, "Failed to create mixed mapping");
+      HLOG(kError, "Failed to create mixed mapping");
       SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
@@ -153,7 +153,7 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
       const char *err_buf = strerror(errno);
-      HILOG(kError, "shm_open failed: {}", err_buf);
+      HLOG(kError, "shm_open failed: {}", err_buf);
       return false;
     }
     url_ = url;
@@ -162,7 +162,7 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
     header_ = reinterpret_cast<MemoryBackendHeader *>(
         SystemInfo::MapSharedMemory(fd_, kBackendHeaderSize, 0));
     if (!header_) {
-      HILOG(kError, "Failed to map header");
+      HLOG(kError, "Failed to map header");
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
@@ -175,7 +175,7 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
     region_ = reinterpret_cast<char *>(
         SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_size, 0));
     if (!region_) {
-      HILOG(kError, "Failed to create mixed mapping");
+      HLOG(kError, "Failed to create mixed mapping");
       SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
       SystemInfo::CloseSharedMemory(fd_);
       return false;

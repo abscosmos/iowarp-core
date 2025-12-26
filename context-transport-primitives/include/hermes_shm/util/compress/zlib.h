@@ -31,7 +31,7 @@ class Zlib : public Compressor {
     stream.opaque = Z_NULL;
 
     if (deflateInit(&stream, Z_DEFAULT_COMPRESSION) != Z_OK) {
-      HELOG(kError, "Error initializing zlib compression.");
+      HLOG(kError, "Error initializing zlib compression.");
       return false;
     }
 
@@ -60,7 +60,7 @@ class Zlib : public Compressor {
     stream.opaque = Z_NULL;
 
     if (inflateInit(&stream) != Z_OK) {
-      HELOG(kError, "Error initializing zlib decompression.");
+      HLOG(kError, "Error initializing zlib decompression.");
       return false;
     }
 
@@ -71,7 +71,7 @@ class Zlib : public Compressor {
     stream.next_out = reinterpret_cast<Bytef *>(output);
 
     if (inflate(&stream, Z_FINISH) != Z_STREAM_END) {
-      HELOG(kError, "Error decompressing data with zlib.");
+      HLOG(kError, "Error decompressing data with zlib.");
       inflateEnd(&stream);
       return false;
     }

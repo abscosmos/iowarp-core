@@ -158,7 +158,7 @@ bool Heap::Allocate(size_t block_size, int block_type, Block &block) {
   // Align the requested size
   chi::u64 aligned_size =
       ((block_size + alignment - 1) / alignment) * alignment;
-  HILOG(kDebug,
+  HLOG(kDebug,
         "Allocating block: block_size = {}, alignment = {}, aligned_size = {}",
         block_size, alignment, aligned_size);
 
@@ -210,7 +210,7 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
   // Get the pool name which serves as the file path for file-based operations
   std::string pool_name = task->pool_name_.str();
 
-  HILOG(kDebug,
+  HLOG(kDebug,
         "Bdev runtime received params: bdev_type={}, pool_name='{}', "
         "total_size={}, io_depth={}, alignment={}",
         static_cast<chi::u32>(params.bdev_type_), pool_name, params.total_size_,
@@ -224,7 +224,7 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
     // File-based storage initialization - use pool_name as file path
     file_fd_ = open(pool_name.c_str(), O_RDWR | O_CREAT | O_DIRECT, 0644);
     if (file_fd_ < 0) {
-      HELOG(kError, "Failed to open file: {}, fd: {}, errno: {}, strerror: {}",
+      HLOG(kError, "Failed to open file: {}, fd: {}, errno: {}, strerror: {}",
             pool_name, file_fd_, errno, strerror(errno));
       task->return_code_ = 1;
       return;
@@ -240,7 +240,7 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
     }
 
     file_size_ = st.st_size;
-    HILOG(kDebug, "File stat: st.st_size={}, params.total_size={}", file_size_, params.total_size_);
+    HLOG(kDebug, "File stat: st.st_size={}, params.total_size={}", file_size_, params.total_size_);
 
     if (params.total_size_ > 0 && params.total_size_ < file_size_) {
       file_size_ = params.total_size_;
@@ -250,17 +250,17 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
     if (file_size_ == 0) {
       file_size_ = (params.total_size_ > 0) ? params.total_size_
                                             : (1ULL << 30); // 1GB default
-      HILOG(kDebug, "File is empty, setting file_size_ to {} and calling ftruncate", file_size_);
+      HLOG(kDebug, "File is empty, setting file_size_ to {} and calling ftruncate", file_size_);
       if (ftruncate(file_fd_, file_size_) != 0) {
         task->return_code_ = 3;
-        HELOG(kError, "Failed to truncate file: {}, errno: {}, strerror: {}", pool_name, errno, strerror(errno));
+        HLOG(kError, "Failed to truncate file: {}, errno: {}, strerror: {}", pool_name, errno, strerror(errno));
         close(file_fd_);
         file_fd_ = -1;
         return;
       }
-      HILOG(kDebug, "ftruncate succeeded, file_size_={}", file_size_);
+      HLOG(kDebug, "ftruncate succeeded, file_size_={}", file_size_);
     }
-    HILOG(kDebug, "Create: Final file_size_={}, initializing allocator", file_size_);
+    HLOG(kDebug, "Create: Final file_size_={}, initializing allocator", file_size_);
 
     // Initialize async I/O for file backend
     InitializeAsyncIO();
@@ -376,7 +376,7 @@ void Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
         global_block_map_.FreeBlock(worker_id, allocated_block);
       }
       task->blocks_.clear();
-      HELOG(kError, "Out of space: {} bytes requested", total_size);
+      HLOG(kError, "Out of space: {} bytes requested", total_size);
       task->return_code_ = 1; // Out of space
       return;
     }
@@ -388,7 +388,7 @@ void Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
         global_block_map_.FreeBlock(worker_id, allocated_block);
       }
       task->blocks_.clear();
-      HELOG(kError, "Operation requires {} blocks but max_blocks_per_operation is {}",
+      HLOG(kError, "Operation requires {} blocks but max_blocks_per_operation is {}",
             io_divisions.size(), max_blocks_per_operation_);
       task->return_code_ = 2; // Too many blocks required
       return;
@@ -465,7 +465,7 @@ void Runtime::GetStats(hipc::FullPtr<GetStatsTask> task, chi::RunContext &ctx) {
   // Get remaining size from heap allocator
   chi::u64 remaining = heap_.GetRemainingSize();
   task->remaining_size_ = remaining;
-  HILOG(kDebug, "GetStats: file_size_={}, remaining={}", file_size_, remaining);
+  HLOG(kDebug, "GetStats: file_size_={}, remaining={}", file_size_, remaining);
   task->return_code_ = 0;
 }
 
@@ -564,7 +564,7 @@ chi::u32 Runtime::PerformAsyncIO(bool is_write, chi::u64 offset, void *buffer,
       break;
     } else if (error_code != EINPROGRESS) {
       // Operation failed
-      HELOG(kError, "Failed to perform async I/O: {}, errno: {}, strerror: {}", error_code, errno, strerror(errno));
+      HLOG(kError, "Failed to perform async I/O: {}, errno: {}, strerror: {}", error_code, errno, strerror(errno));
       return 3;
     }
     // Operation still in progress, yield the current task
@@ -695,7 +695,7 @@ void Runtime::WriteToRam(hipc::FullPtr<WriteTask> task) {
     if (block.offset_ + block_write_size > ram_size_) {
       task->return_code_ = 1; // Write beyond buffer bounds
       task->bytes_written_ = total_bytes_written;
-      HELOG(kError,
+      HLOG(kError,
             "Write to RAM beyond buffer bounds offset: {}, length: {}, "
             "ram_size: {}",
             block.offset_, block_write_size, ram_size_);
@@ -827,7 +827,7 @@ void Runtime::ReadFromRam(hipc::FullPtr<ReadTask> task) {
     if (block.offset_ + block_read_size > ram_size_) {
       task->return_code_ = 1; // Read beyond buffer bounds
       task->bytes_read_ = total_bytes_read;
-      HELOG(kError,
+      HLOG(kError,
             "Read from RAM beyond buffer bounds offset: {}, length: {}, "
             "ram_size: {}",
             block.offset_, block_read_size, ram_size_);

@@ -48,7 +48,7 @@ bool ContentTransferEngine::ClientInit(const chi::PoolQuery &pool_query) {
   // Check if Create operation succeeded
   chi::u32 return_code = create_task->GetReturnCode();
   if (return_code != 0) {
-    HILOG(kError, "CTE ClientInit: Failed to create CTE pool '{}' with return code: {}",
+    HLOG(kError, "CTE ClientInit: Failed to create CTE pool '{}' with return code: {}",
           wrp_cte::core::kCtePoolName, return_code);
     is_initializing_ = false;
     return false;

@@ -189,7 +189,7 @@ public:
   int AWriteOrdered(File &f, AdapterStat &stat, const void *ptr, int count,
                     MPI_Datatype datatype, MPI_Request *request,
                     FsIoOptions opts) {
-    HILOG(kDebug, "Starting an asynchronous write");
+    HLOG(kDebug, "Starting an asynchronous write");
     return BaseWriteOrdered<true>(f, stat, ptr, count, datatype, nullptr,
                                   request, opts);
   }
@@ -232,11 +232,11 @@ public:
                   stat.comm_);
     MPI_Allreduce(&whence, &sum_whence, 1, MPI_INT, MPI_SUM, stat.comm_);
     if (sum_offset / comm_participators != offset) {
-      HELOG(kError, "Same offset should be passed "
+      HLOG(kError, "Same offset should be passed "
                     "across the opened file communicator.");
     }
     if (sum_whence / comm_participators != whence) {
-      HELOG(kError, "Same whence should be passed "
+      HLOG(kError, "Same whence should be passed "
                     "across the opened file communicator.");
     }
     Seek(f, stat, offset, whence);
@@ -521,14 +521,14 @@ public:
 
     // NOTE(llogan): Allowing scratch mode to create empty files for MPI to
     // satisfy IOR.
-    HILOG(kDebug, "Beginning real MPI open: {}",
+    HLOG(kDebug, "Beginning real MPI open: {}",
           (void *)real_api_->MPI_File_open);
     f.mpi_status_ = real_api_->MPI_File_open(
         stat.comm_, path.c_str(), stat.amode_, stat.info_, &stat.mpi_fh_);
     if (f.mpi_status_ != MPI_SUCCESS) {
       f.status_ = false;
     }
-    HILOG(kDebug, "Finished real MPI open");
+    HLOG(kDebug, "Finished real MPI open");
 
     /*if (stat.hflags_.Any(WRP_CTE_FS_CREATE)) {
       if (stat.adapter_mode_ != AdapterMode::kScratch) {
@@ -600,7 +600,7 @@ public:
     true_size = buf.st_size;
     close(fd);
 
-    HILOG(kDebug, "The size of the file {} on disk is {} bytes", filename,
+    HLOG(kDebug, "The size of the file {} on disk is {} bytes", filename,
           true_size);
     return true_size;
   }
@@ -609,7 +609,7 @@ public:
   void WriteBlob(const std::string &bkt_name, const Blob &full_blob,
                  const FsIoOptions &opts, IoStatus &status) override {
     status.success_ = true;
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Write called for: {}"
           " on offset: {}"
           " and size: {}",
@@ -635,7 +635,7 @@ public:
     MPI_Get_count(status.mpi_status_ptr_, opts.mpi_type_, &write_count);
     if (write_count != opts.mpi_count_) {
       status.success_ = false;
-      HELOG(kError, "writing failed: wrote {} / {}", write_count,
+      HLOG(kError, "writing failed: wrote {} / {}", write_count,
             opts.mpi_count_);
     }
 
@@ -649,7 +649,7 @@ public:
   void ReadBlob(const std::string &bkt_name, Blob &full_blob,
                 const FsIoOptions &opts, IoStatus &status) override {
     status.success_ = true;
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Reading from: {}"
           " on offset: {}"
           " and size: {}",
@@ -675,7 +675,7 @@ public:
     MPI_Get_count(status.mpi_status_ptr_, opts.mpi_type_, &read_count);
     if (read_count != opts.mpi_count_) {
       status.success_ = false;
-      HELOG(kError, "reading failed: read {} / {}", read_count,
+      HLOG(kError, "reading failed: read {} / {}", read_count,
             opts.mpi_count_);
     }
 

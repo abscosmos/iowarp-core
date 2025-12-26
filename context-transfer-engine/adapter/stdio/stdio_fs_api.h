@@ -41,7 +41,7 @@ public:
       return ret;
     }
     stat.fh_ = ret;
-    HILOG(kDebug, "Reopen file for filename: {} in mode {}", user_path, mode);
+    HLOG(kDebug, "Reopen file for filename: {} in mode {}", user_path, mode);
     stat.UpdateTime();
     return (FILE *)&stat;
   }
@@ -201,7 +201,7 @@ public:
     true_size = buf.st_size;
     close(fd);
 
-    HILOG(kDebug, "The size of the file {} on disk is {}", filename, true_size);
+    HLOG(kDebug, "The size of the file {} on disk is {}", filename, true_size);
     return true_size;
   }
 
@@ -209,7 +209,7 @@ public:
   void WriteBlob(const std::string &bkt_name, const Blob &full_blob,
                  const FsIoOptions &opts, IoStatus &status) override {
     status.success_ = true;
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Writing to file: {}"
           " offset: {}"
           " size: {}",
@@ -233,7 +233,7 @@ public:
   void ReadBlob(const std::string &bkt_name, Blob &full_blob,
                 const FsIoOptions &opts, IoStatus &status) override {
     status.success_ = true;
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Reading from file: {}"
           " offset: {}"
           " size: {}",

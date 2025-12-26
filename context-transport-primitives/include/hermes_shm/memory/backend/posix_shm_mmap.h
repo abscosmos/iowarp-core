@@ -72,7 +72,7 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     SystemInfo::DestroySharedMemory(url);
     if (!SystemInfo::CreateNewSharedMemory(fd_, url, total_file_size)) {
       char *err_buf = strerror(errno);
-      HILOG(kError, "shm_open failed: {}", err_buf);
+      HLOG(kError, "shm_open failed: {}", err_buf);
       return false;
     }
     url_ = url;
@@ -81,7 +81,7 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     header_ = reinterpret_cast<MemoryBackendHeader *>(
         SystemInfo::MapSharedMemory(fd_, kBackendHeaderSize, 0));
     if (!header_) {
-      HILOG(kError, "Failed to map backend header");
+      HLOG(kError, "Failed to map backend header");
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
@@ -94,7 +94,7 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     region_ = reinterpret_cast<char *>(
         SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_portion_size, kBackendHeaderSize));
     if (!region_) {
-      HILOG(kError, "Failed to create mixed mapping");
+      HLOG(kError, "Failed to create mixed mapping");
       SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
@@ -122,9 +122,9 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     // Copy all header fields to backend header (file offset 0)
     (*header_) = (const MemoryBackendHeader&)*this;
 
-    HILOG(kInfo, "shm_init: Initialized with backend_size={}, data_capacity={}",
+    HLOG(kInfo, "shm_init: Initialized with backend_size={}, data_capacity={}",
           backend_size_, data_capacity_);
-    HILOG(kInfo, "shm_init: header_={}, region_={}, data_={}",
+    HLOG(kInfo, "shm_init: header_={}, region_={}, data_={}",
           (void*)header_, (void*)region_, (void*)data_);
 
     // Mark this process as the owner of the backend
@@ -146,7 +146,7 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
   bool shm_attach(const std::string &url) {
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
       const char *err_buf = strerror(errno);
-      HILOG(kError, "shm_open failed: {}", err_buf);
+      HLOG(kError, "shm_open failed: {}", err_buf);
       return false;
     }
     url_ = url;
@@ -155,7 +155,7 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     header_ = reinterpret_cast<MemoryBackendHeader *>(
         SystemInfo::MapSharedMemory(fd_, kBackendHeaderSize, 0));
     if (!header_) {
-      HILOG(kError, "Failed to map backend header");
+      HLOG(kError, "Failed to map backend header");
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
@@ -164,14 +164,14 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     // Read backend_size from backend header
     size_t backend_size = header_->backend_size_;
 
-    HILOG(kInfo, "shm_attach: Read backend_size={} from backend header at {}",
+    HLOG(kInfo, "shm_attach: Read backend_size={} from backend header at {}",
           backend_size, (void*)header_);
-    HILOG(kInfo, "shm_attach: Header fields: id_=({},{}), data_capacity_={}, priv_header_off_={}",
+    HLOG(kInfo, "shm_attach: Header fields: id_=({},{}), data_capacity_={}, priv_header_off_={}",
           header_->id_.major_, header_->id_.minor_, header_->data_capacity_, header_->priv_header_off_);
 
     // Validate backend_size before subtraction to prevent underflow
     if (backend_size < kBackendHeaderSize) {
-      HELOG(kError, "Invalid backend_size in header: {} bytes (must be >= {} bytes)",
+      HLOG(kError, "Invalid backend_size in header: {} bytes (must be >= {} bytes)",
             backend_size, kBackendHeaderSize);
       SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
       SystemInfo::CloseSharedMemory(fd_);
@@ -186,7 +186,7 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     region_ = reinterpret_cast<char *>(
         SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_portion_size, kBackendHeaderSize));
     if (!region_) {
-      HILOG(kError, "Failed to create mixed mapping during attach");
+      HLOG(kError, "Failed to create mixed mapping during attach");
       SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
@@ -203,9 +203,9 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     // region_[8KB...) = data (maps to file offset 8KB...)
     data_ = region_ + 2 * kBackendHeaderSize;
 
-    HILOG(kInfo, "shm_attach: Attached with backend_size={}, data_capacity={}",
+    HLOG(kInfo, "shm_attach: Attached with backend_size={}, data_capacity={}",
           backend_size, header_->data_capacity_);
-    HILOG(kInfo, "shm_attach: header_={}, region_={}, data_={}",
+    HLOG(kInfo, "shm_attach: header_={}, region_={}, data_={}",
           (void*)header_, (void*)region_, (void*)data_);
 
     // Mark this process as NOT the owner (attaching to existing backend)

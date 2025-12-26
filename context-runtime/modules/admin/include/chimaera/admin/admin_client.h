@@ -271,7 +271,7 @@ class Client : public chi::ContainerClient {
 
     // Iterate over each pool configuration
     for (const auto& pool_config : compose_config.pools_) {
-      HILOG(kInfo, "Compose: Creating pool {} (module: {})",
+      HLOG(kInfo, "Compose: Creating pool {} (module: {})",
             pool_config.pool_name_, pool_config.mod_name_);
 
       // Create ComposeTask with PoolConfig passed directly to constructor
@@ -289,20 +289,20 @@ class Client : public chi::ContainerClient {
       // Check return code
       chi::u32 return_code = task->GetReturnCode();
       if (return_code != 0) {
-        HELOG(kError, "Compose: Failed to create pool {} (module: {}), return code: {}",
+        HLOG(kError, "Compose: Failed to create pool {} (module: {}), return code: {}",
               pool_config.pool_name_, pool_config.mod_name_, return_code);
         ipc_manager->DelTask(task.GetTaskPtr());
         return false;
       }
 
-      HILOG(kInfo, "Compose: Successfully created pool {} (module: {})",
+      HLOG(kInfo, "Compose: Successfully created pool {} (module: {})",
             pool_config.pool_name_, pool_config.mod_name_);
 
       // Cleanup task
       ipc_manager->DelTask(task.GetTaskPtr());
     }
 
-    HILOG(kInfo, "Compose: All {} pools created successfully", compose_config.pools_.size());
+    HLOG(kInfo, "Compose: All {} pools created successfully", compose_config.pools_.size());
     return true;
   }
 

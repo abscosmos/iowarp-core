@@ -26,12 +26,12 @@ HSHM_DEFINE_GLOBAL_PTR_VAR_CC(wrp::cae::CaeConfig, g_cae_config);
 
 bool CaeConfig::LoadFromFile(const std::string &config_path) {
   if (config_path.empty()) {
-    HILOG(kWarning, "Empty config path provided for CAE configuration");
+    HLOG(kWarning, "Empty config path provided for CAE configuration");
     return false;
   }
 
   if (!std::filesystem::exists(config_path)) {
-    HILOG(kWarning, "CAE config file does not exist: {}", config_path);
+    HLOG(kWarning, "CAE config file does not exist: {}", config_path);
     return false;
   }
 
@@ -39,7 +39,7 @@ bool CaeConfig::LoadFromFile(const std::string &config_path) {
     YAML::Node config = YAML::LoadFile(config_path);
     return LoadFromYaml(config);
   } catch (const YAML::Exception &e) {
-    HELOG(kError, "Failed to load CAE config from file {}: {}", config_path,
+    HLOG(kError, "Failed to load CAE config from file {}: {}", config_path,
           e.what());
     return false;
   }
@@ -47,7 +47,7 @@ bool CaeConfig::LoadFromFile(const std::string &config_path) {
 
 bool CaeConfig::LoadFromString(const std::string &yaml_content) {
   if (yaml_content.empty()) {
-    HILOG(kWarning, "Empty YAML content provided for CAE configuration");
+    HLOG(kWarning, "Empty YAML content provided for CAE configuration");
     return false;
   }
 
@@ -55,7 +55,7 @@ bool CaeConfig::LoadFromString(const std::string &yaml_content) {
     YAML::Node config = YAML::Load(yaml_content);
     return LoadFromYaml(config);
   } catch (const YAML::Exception &e) {
-    HELOG(kError, "Failed to load CAE config from YAML string: {}", e.what());
+    HLOG(kError, "Failed to load CAE config from YAML string: {}", e.what());
     return false;
   }
 }
@@ -79,14 +79,14 @@ bool CaeConfig::LoadFromYaml(const YAML::Node &config) {
 
               // Log if pattern was expanded
               if (expanded_pattern != pattern) {
-                HILOG(kDebug, "Expanded include pattern: {} -> {}", pattern,
+                HLOG(kDebug, "Expanded include pattern: {} -> {}", pattern,
                       expanded_pattern);
               }
             }
           }
         }
       } else {
-        HELOG(kError, "CAE config 'include' must be a sequence");
+        HLOG(kError, "CAE config 'include' must be a sequence");
         return false;
       }
     }
@@ -107,14 +107,14 @@ bool CaeConfig::LoadFromYaml(const YAML::Node &config) {
 
               // Log if pattern was expanded
               if (expanded_pattern != pattern) {
-                HILOG(kDebug, "Expanded exclude pattern: {} -> {}", pattern,
+                HLOG(kDebug, "Expanded exclude pattern: {} -> {}", pattern,
                       expanded_pattern);
               }
             }
           }
         }
       } else {
-        HELOG(kError, "CAE config 'exclude' must be a sequence");
+        HLOG(kError, "CAE config 'exclude' must be a sequence");
         return false;
       }
     }
@@ -129,7 +129,7 @@ bool CaeConfig::LoadFromYaml(const YAML::Node &config) {
     if (config["adapter_page_size"]) {
       adapter_page_size_ = config["adapter_page_size"].as<size_t>();
       if (adapter_page_size_ == 0) {
-        HILOG(kWarning, "Invalid adapter page size 0, using default 4096");
+        HLOG(kWarning, "Invalid adapter page size 0, using default 4096");
         adapter_page_size_ = 4096;
       }
     }
@@ -144,7 +144,7 @@ bool CaeConfig::LoadFromYaml(const YAML::Node &config) {
                       [](const PathPattern &p) { return p.include; });
     size_t exclude_count = patterns_.size() - include_count;
 
-    HILOG(kInfo,
+    HLOG(kInfo,
           "CAE config loaded: {} include patterns, {} exclude patterns, "
           "page size {} bytes, interception {}",
           include_count, exclude_count, adapter_page_size_,
@@ -152,14 +152,14 @@ bool CaeConfig::LoadFromYaml(const YAML::Node &config) {
     return true;
 
   } catch (const YAML::Exception &e) {
-    HELOG(kError, "Failed to parse CAE config YAML: {}", e.what());
+    HLOG(kError, "Failed to parse CAE config YAML: {}", e.what());
     return false;
   }
 }
 
 bool CaeConfig::SaveToFile(const std::string &config_path) const {
   if (config_path.empty()) {
-    HELOG(kError, "Empty config path provided for saving CAE configuration");
+    HLOG(kError, "Empty config path provided for saving CAE configuration");
     return false;
   }
 
@@ -172,7 +172,7 @@ bool CaeConfig::SaveToFile(const std::string &config_path) const {
 
     std::ofstream file(config_path);
     if (!file.is_open()) {
-      HELOG(kError, "Failed to open CAE config file for writing: {}",
+      HLOG(kError, "Failed to open CAE config file for writing: {}",
             config_path);
       return false;
     }
@@ -180,11 +180,11 @@ bool CaeConfig::SaveToFile(const std::string &config_path) const {
     file << ToYamlString();
     file.close();
 
-    HILOG(kInfo, "CAE config saved to: {}", config_path);
+    HLOG(kInfo, "CAE config saved to: {}", config_path);
     return true;
 
   } catch (const std::exception &e) {
-    HELOG(kError, "Failed to save CAE config to file {}: {}", config_path,
+    HLOG(kError, "Failed to save CAE config to file {}: {}", config_path,
           e.what());
     return false;
   }
@@ -247,7 +247,7 @@ bool CaeConfig::IsPathTracked(const std::string &path) const {
         return pattern_entry.include;
       }
     } catch (const std::regex_error &e) {
-      HELOG(kWarning, "Invalid regex pattern '{}': {}", pattern_entry.pattern,
+      HLOG(kWarning, "Invalid regex pattern '{}': {}", pattern_entry.pattern,
             e.what());
       continue;
     }
@@ -270,7 +270,7 @@ void CaeConfig::AddIncludePattern(const std::string &pattern) {
               return a.pattern.length() > b.pattern.length();
             });
 
-  HILOG(kDebug, "Added include pattern: {}", pattern);
+  HLOG(kDebug, "Added include pattern: {}", pattern);
 }
 
 void CaeConfig::AddExcludePattern(const std::string &pattern) {
@@ -286,12 +286,12 @@ void CaeConfig::AddExcludePattern(const std::string &pattern) {
               return a.pattern.length() > b.pattern.length();
             });
 
-  HILOG(kDebug, "Added exclude pattern: {}", pattern);
+  HLOG(kDebug, "Added exclude pattern: {}", pattern);
 }
 
 void CaeConfig::ClearPatterns() {
   patterns_.clear();
-  HILOG(kDebug, "Cleared all patterns");
+  HLOG(kDebug, "Cleared all patterns");
 }
 
 bool WRP_CAE_CONFIG_INIT(const std::string &config_path) {

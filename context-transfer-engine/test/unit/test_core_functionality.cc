@@ -434,7 +434,7 @@ TEST_CASE("FUNCTIONAL - Register Target",
  
     bool target_found = false;
     for (const auto &target_name_found : targets) {
-      HILOG(kInfo, "target: {} vs {}", target_name_found, target_name);
+      HLOG(kInfo, "target: {} vs {}", target_name_found, target_name);
       if (target_name_found == target_name) {
         target_found = true;
         INFO("SUCCESS: Found registered target: " << target_name);
@@ -2331,13 +2331,13 @@ TEST_CASE(
   double get_avg_completer =
       static_cast<double>(get_completer_sum) / static_cast<double>(num_iterations);
 
-  HILOG(kInfo, "PutBlob completer statistics:");
-  HILOG(kInfo, "  Sum: {}", put_completer_sum);
-  HILOG(kInfo, "  Average: {}", put_avg_completer);
+  HLOG(kInfo, "PutBlob completer statistics:");
+  HLOG(kInfo, "  Sum: {}", put_completer_sum);
+  HLOG(kInfo, "  Average: {}", put_avg_completer);
 
-  HILOG(kInfo, "GetBlob completer statistics:");
-  HILOG(kInfo, "  Sum: {}", get_completer_sum);
-  HILOG(kInfo, "  Average: {}", get_avg_completer);
+  HLOG(kInfo, "GetBlob completer statistics:");
+  HLOG(kInfo, "  Sum: {}", get_completer_sum);
+  HLOG(kInfo, "  Average: {}", get_avg_completer);
 
   // Validation: If multiple nodes exist, average completer should be > 0
   // indicating distributed execution

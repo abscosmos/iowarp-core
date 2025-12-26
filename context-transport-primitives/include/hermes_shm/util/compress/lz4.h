@@ -26,7 +26,7 @@ class Lz4 : public Compressor {
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
     if ((size_t)LZ4_compressBound(input_size) > output_size) {
-      HILOG(kInfo, "Lz4: output buffer is potentially too small");
+      HLOG(kInfo, "Lz4: output buffer is potentially too small");
     }
     output_size = LZ4_compress_default((char *)input, (char *)output,
                                        (int)input_size, (int)output_size);

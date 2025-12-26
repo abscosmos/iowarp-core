@@ -3,12 +3,15 @@
  */
 
 #include "chimaera/module_manager.h"
-#include "chimaera/container.h"
+
+#include <dlfcn.h>
+#include <libgen.h>
+#include <limits.h>
+
 #include <cstring>
 #include <filesystem>
-#include <dlfcn.h>
-#include <limits.h>
-#include <libgen.h>
+
+#include "chimaera/container.h"
 
 // Global pointer variable definition for Module manager singleton
 HSHM_DEFINE_GLOBAL_PTR_VAR_CC(chi::ModuleManager, g_module_manager);
@@ -17,8 +20,8 @@ namespace chi {
 
 // Helper function to get a symbol address for dladdr
 // This avoids issues with member function pointer casts
-static void* GetSymbolForDlAddr() {
-  return reinterpret_cast<void*>(&GetSymbolForDlAddr);
+static void *GetSymbolForDlAddr() {
+  return reinterpret_cast<void *>(&GetSymbolForDlAddr);
 }
 
 // Constructor and destructor removed - handled by HSHM singleton pattern
@@ -28,13 +31,13 @@ bool ModuleManager::ServerInit() {
     return true;
   }
 
-  HILOG(kDebug, "Initializing Module Manager...");
+  HLOG(kDebug, "Initializing Module Manager...");
 
   // Scan for and load ChiMods
   ScanForChiMods();
 
-  HILOG(kDebug, "Module Manager initialized with {} ChiMods loaded",
-        chimods_.size());
+  HLOG(kDebug, "Module Manager initialized with {} ChiMods loaded",
+       chimods_.size());
 
   is_initialized_ = true;
   return true;
@@ -45,7 +48,7 @@ void ModuleManager::Finalize() {
     return;
   }
 
-  HILOG(kDebug, "Finalizing Module Manager...");
+  HLOG(kDebug, "Finalizing Module Manager...");
 
   // Clear all loaded ChiMods - SharedLibrary destructor handles cleanup
   chimods_.clear();
@@ -60,14 +63,16 @@ bool ModuleManager::LoadChiMod(const std::string &lib_path) {
   // Load the shared library
   chimod_info->lib.Load(lib_path);
   if (chimod_info->lib.IsNull()) {
-    HILOG(kInfo, "Skipping library {} (failed to load): {}", lib_path,
-          chimod_info->lib.GetError());
+    HLOG(kDebug, "Skipping library {} (failed to load): {}", lib_path,
+         chimod_info->lib.GetError());
     return false;
   }
 
   // Validate ChiMod entry points
   if (!ValidateChiMod(chimod_info->lib)) {
-    HILOG(kInfo, "Skipping library {} (invalid ChiMod - missing required symbols)", lib_path);
+    HLOG(kDebug,
+         "Skipping library {} (invalid ChiMod - missing required symbols)",
+         lib_path);
     return false;
   }
 
@@ -84,7 +89,7 @@ bool ModuleManager::LoadChiMod(const std::string &lib_path) {
   // Get ChiMod name
   if (chimod_info->name_func) {
     chimod_info->name = chimod_info->name_func();
-    HILOG(kInfo, "Loaded ChiMod: {} from {}", chimod_info->name, lib_path);
+    HLOG(kInfo, "Loaded ChiMod: {} from {}", chimod_info->name, lib_path);
   } else {
     return false;
   }
@@ -141,13 +146,13 @@ void ModuleManager::ScanForChiMods() {
         if (entry.is_regular_file()) {
           std::string file_path = entry.path().string();
           if (IsSharedLibrary(file_path)) {
-            HILOG(kInfo, "Attempting to load ChiMod from: {}", file_path);
+            HLOG(kDebug, "Attempting to load ChiMod from: {}", file_path);
             LoadChiMod(file_path);
           }
         }
       }
     } catch (const std::exception &e) {
-      HELOG(kError, "Error scanning directory {}: {}", dir, e.what());
+      HLOG(kError, "Error scanning directory {}: {}", dir, e.what());
     }
   }
 }
@@ -201,9 +206,9 @@ std::vector<std::string> ModuleManager::GetScanDirectories() const {
   directories.push_back("/usr/local/lib");
 
   // Print all scan directories
-  HILOG(kInfo, "ChiMod scan directories:");
+  HLOG(kInfo, "ChiMod scan directories:");
   for (const auto &dir : directories) {
-    HILOG(kInfo, "  {}", dir);
+    HLOG(kInfo, "  {}", dir);
   }
 
   return directories;
@@ -212,7 +217,7 @@ std::vector<std::string> ModuleManager::GetScanDirectories() const {
 std::string ModuleManager::GetModuleDirectory() const {
   Dl_info dl_info;
   // Use address of a function in this shared object to identify it
-  void* symbol_addr = GetSymbolForDlAddr();
+  void *symbol_addr = GetSymbolForDlAddr();
 
   if (dladdr(symbol_addr, &dl_info) == 0) {
     return "";
@@ -254,4 +259,4 @@ bool ModuleManager::ValidateChiMod(hshm::SharedLibrary &lib) const {
           name_func != nullptr && destroy_func != nullptr);
 }
 
-} // namespace chi
+}  // namespace chi

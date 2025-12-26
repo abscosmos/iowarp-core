@@ -105,7 +105,7 @@
   do {                                                                      \
     if (X != hipSuccess) {                                                  \
       hipError_t hipErr = hipGetLastError();                                \
-      HELOG(kFatal, "HIP Error {}: {}", hipErr, hipGetErrorString(hipErr)); \
+      HLOG(kFatal, "HIP Error {}: {}", hipErr, hipGetErrorString(hipErr)); \
     }                                                                       \
   } while (false)
 
@@ -114,7 +114,7 @@
   do {                                            \
     if (X != cudaSuccess) {                       \
       cudaError_t cudaErr = cudaGetLastError();   \
-      HELOG(kFatal, "CUDA Error {}: {}", cudaErr, \
+      HLOG(kFatal, "CUDA Error {}: {}", cudaErr, \
             cudaGetErrorString(cudaErr));         \
     }                                             \
   } while (false)

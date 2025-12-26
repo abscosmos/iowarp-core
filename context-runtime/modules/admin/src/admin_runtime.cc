@@ -35,7 +35,7 @@ namespace chimaera::admin {
 
 void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
   // Admin container creation logic (IS_ADMIN=true)
-  HILOG(kDebug, "Admin: Initializing admin container");
+  HLOG(kDebug, "Admin: Initializing admin container");
 
   // Initialize the Admin container with pool information from the task
   // Note: Admin container is already initialized by the framework before Create
@@ -59,11 +59,11 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
   // Worker will automatically reschedule periodic tasks
   client_.AsyncRecv(chi::PoolQuery::Local(), 0, 25);
 
-  HILOG(kDebug,
-        "Admin: Container created and initialized for pool: {} (ID: {}, count: "
-        "{})",
-        pool_name_, task->new_pool_id_, create_count_);
-  HILOG(kDebug, "Admin: Spawned periodic Recv task with 25us period");
+  HLOG(kDebug,
+       "Admin: Container created and initialized for pool: {} (ID: {}, count: "
+       "{})",
+       pool_name_, task->new_pool_id_, create_count_);
+  HLOG(kDebug, "Admin: Spawned periodic Recv task with 25us period");
 }
 
 void Runtime::GetOrCreatePool(
@@ -82,30 +82,29 @@ void Runtime::GetOrCreatePool(
   if (rctx.exec_mode == chi::ExecMode::kDynamicSchedule) {
     // Dynamic routing with cache optimization
     // Check if pool exists locally first to avoid unnecessary broadcast
-    HILOG(kDebug,
-          "Admin: Dynamic routing for GetOrCreatePool - checking local cache");
+    HLOG(kDebug,
+         "Admin: Dynamic routing for GetOrCreatePool - checking local cache");
 
     chi::PoolId existing_pool_id = pool_manager->FindPoolByName(pool_name);
 
     if (!existing_pool_id.IsNull()) {
       // Pool exists locally - change pool query to Local
-      HILOG(kDebug,
-            "Admin: Pool '{}' found locally (ID: {}), using Local query",
-            pool_name, existing_pool_id);
+      HLOG(kDebug, "Admin: Pool '{}' found locally (ID: {}), using Local query",
+           pool_name, existing_pool_id);
       task->pool_query_ = chi::PoolQuery::Local();
     } else {
       // Pool doesn't exist locally - update pool query to Broadcast for
       // creation
-      HILOG(kDebug, "Admin: Pool '{}' not found locally, broadcasting creation",
-            pool_name);
+      HLOG(kDebug, "Admin: Pool '{}' not found locally, broadcasting creation",
+           pool_name);
       task->pool_query_ = chi::PoolQuery::Broadcast();
     }
     return;
   }
 
   // Pool get-or-create operation logic (IS_ADMIN=false)
-  HILOG(kDebug, "Admin: Executing GetOrCreatePool task - ChiMod: {}, Pool: {}",
-        task->chimod_name_.str(), pool_name);
+  HLOG(kDebug, "Admin: Executing GetOrCreatePool task - ChiMod: {}, Pool: {}",
+       task->chimod_name_.str(), pool_name);
 
   // Initialize output values
   task->return_code_ = 0;
@@ -124,10 +123,10 @@ void Runtime::GetOrCreatePool(
     task->return_code_ = 0;
     pools_created_++;
 
-    HILOG(kDebug,
-          "Admin: Pool operation completed successfully - ID: {}, Name: {} "
-          "(Total pools created: {})",
-          task->new_pool_id_, pool_name, pools_created_);
+    HLOG(kDebug,
+         "Admin: Pool operation completed successfully - ID: {}, Name: {} "
+         "(Total pools created: {})",
+         task->new_pool_id_, pool_name, pools_created_);
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
@@ -135,7 +134,7 @@ void Runtime::GetOrCreatePool(
     std::string error_msg =
         std::string("Exception during pool creation: ") + e.what();
     task->error_message_ = chi::priv::string(alloc, error_msg);
-    HELOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
+    HLOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
   }
 }
 
@@ -146,8 +145,8 @@ void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
 
 void Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
                           chi::RunContext &rctx) {
-  HILOG(kDebug, "Admin: Executing DestroyPool task - Pool ID: {}",
-        task->target_pool_id_);
+  HLOG(kDebug, "Admin: Executing DestroyPool task - Pool ID: {}",
+       task->target_pool_id_);
 
   // Initialize output values
   task->return_code_ = 0;
@@ -175,10 +174,10 @@ void Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
     task->return_code_ = 0;
     pools_destroyed_++;
 
-    HILOG(kDebug,
-          "Admin: Pool destroyed successfully - ID: {} (Total pools destroyed: "
-          "{})",
-          target_pool, pools_destroyed_);
+    HLOG(kDebug,
+         "Admin: Pool destroyed successfully - ID: {} (Total pools destroyed: "
+         "{})",
+         target_pool, pools_destroyed_);
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
@@ -186,15 +185,14 @@ void Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
     std::string error_msg =
         std::string("Exception during pool destruction: ") + e.what();
     task->error_message_ = chi::priv::string(alloc, error_msg);
-    HELOG(kError, "Admin: Pool destruction failed with exception: {}",
-          e.what());
+    HLOG(kError, "Admin: Pool destruction failed with exception: {}", e.what());
   }
 }
 
 void Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
                           chi::RunContext &rctx) {
-  HILOG(kDebug, "Admin: Executing StopRuntime task - Grace period: {}ms",
-        task->grace_period_ms_);
+  HLOG(kDebug, "Admin: Executing StopRuntime task - Grace period: {}ms",
+       task->grace_period_ms_);
 
   // Initialize output values
   task->return_code_ = 0;
@@ -210,7 +208,7 @@ void Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
     // Set success results
     task->return_code_ = 0;
 
-    HILOG(kDebug, "Admin: Runtime shutdown initiated successfully");
+    HLOG(kDebug, "Admin: Runtime shutdown initiated successfully");
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
@@ -218,14 +216,13 @@ void Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
     std::string error_msg =
         std::string("Exception during runtime shutdown: ") + e.what();
     task->error_message_ = chi::priv::string(alloc, error_msg);
-    HELOG(kError, "Admin: Runtime shutdown failed with exception: {}",
-          e.what());
+    HLOG(kError, "Admin: Runtime shutdown failed with exception: {}", e.what());
   }
 }
 
 void Runtime::InitiateShutdown(chi::u32 grace_period_ms) {
-  HILOG(kDebug, "Admin: Initiating runtime shutdown with {}ms grace period",
-        grace_period_ms);
+  HLOG(kDebug, "Admin: Initiating runtime shutdown with {}ms grace period",
+       grace_period_ms);
 
   // In a real implementation, this would:
   // 1. Signal all worker threads to stop
@@ -245,7 +242,7 @@ void Runtime::InitiateShutdown(chi::u32 grace_period_ms) {
 }
 
 void Runtime::Flush(hipc::FullPtr<FlushTask> task, chi::RunContext &rctx) {
-  HILOG(kDebug, "Admin: Executing Flush task");
+  HLOG(kDebug, "Admin: Executing Flush task");
 
   // Initialize output values
   task->return_code_ = 0;
@@ -262,9 +259,9 @@ void Runtime::Flush(hipc::FullPtr<FlushTask> task, chi::RunContext &rctx) {
     // Loop until all work is complete
     chi::u64 total_work_remaining = 0;
     while (work_orchestrator->HasWorkRemaining(total_work_remaining)) {
-      HILOG(kDebug,
-            "Admin: Flush found {} work units still remaining, waiting...",
-            total_work_remaining);
+      HLOG(kDebug,
+           "Admin: Flush found {} work units still remaining, waiting...",
+           total_work_remaining);
 
       // Brief sleep to avoid busy waiting
       task->Yield(25);
@@ -274,12 +271,12 @@ void Runtime::Flush(hipc::FullPtr<FlushTask> task, chi::RunContext &rctx) {
     task->total_work_done_ = total_work_remaining;
     task->return_code_ = 0;  // Success - all work completed
 
-    HILOG(kDebug,
-          "Admin: Flush completed - no work remaining across all containers");
+    HLOG(kDebug,
+         "Admin: Flush completed - no work remaining across all containers");
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
-    HELOG(kError, "Admin: Flush failed with exception: {}", e.what());
+    HLOG(kError, "Admin: Flush failed with exception: {}", e.what());
   }
 }
 
@@ -301,8 +298,8 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
 
   // Log host information at method entry
   auto &this_host = CHI_IPC->GetThisHost();
-  HILOG(kDebug, "SendIn executing on host {} (node_id: {})",
-        this_host.ip_address, this_host.node_id);
+  HLOG(kDebug, "SendIn executing on host {} (node_id: {})",
+       this_host.ip_address, this_host.node_id);
 
   // Validate origin_task
   hipc::FullPtr<chi::Task> origin_task = task->origin_task_;
@@ -318,9 +315,9 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
     return;
   }
 
-  HILOG(kDebug,
-        "=== [SendIn BEGIN] Task {} (pool: {}) starting distributed send ===",
-        origin_task->task_id_, origin_task->pool_id_);
+  HLOG(kDebug,
+       "=== [SendIn BEGIN] Task {} (pool: {}) starting distributed send ===",
+       origin_task->task_id_, origin_task->pool_id_);
 
   // Pre-allocate send_map_key using origin_task pointer
   // This ensures consistent net_key across all replicas
@@ -332,91 +329,98 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
     chi::ScopedCoMutex lock(send_map_locks_[lock_index]);
     send_map_[send_map_key] = origin_task;
   }
-  HILOG(kDebug, "[SendIn] Added origin task {} to send_map with net_key {}",
-        origin_task->task_id_, send_map_key);
+  HLOG(kDebug, "[SendIn] Added origin task {} to send_map with net_key {}",
+       origin_task->task_id_, send_map_key);
 
   // Reserve space for all replicas in subtasks vector BEFORE the loop
   // This ensures subtasks_.size() reflects the correct total replica count
   chi::RunContext *origin_task_rctx = origin_task->run_ctx_;
   size_t num_replicas = task->pool_queries_.size();
   origin_task_rctx->subtasks_.resize(num_replicas);
-  HILOG(kDebug, "[SendIn] Reserved space for {} replicas in subtasks vector",
-        num_replicas);
+  HLOG(kDebug, "[SendIn] Reserved space for {} replicas in subtasks vector",
+       num_replicas);
 
   // Send to each target in pool_queries
-  HILOG(kInfo, "[DEBUG] SendIn - processing {} replicas for pool_id={}",
-        num_replicas, origin_task->pool_id_);
+  HLOG(kDebug, "SendIn - processing {} replicas for pool_id={}", num_replicas,
+       origin_task->pool_id_);
 
   for (size_t i = 0; i < num_replicas; ++i) {
     const chi::PoolQuery &query = task->pool_queries_[i];
 
-    HILOG(kInfo, "[DEBUG] SendIn - replica {} routing_mode={}, range_offset={}, range_count={}",
-          i, static_cast<int>(query.GetRoutingMode()),
-          query.GetRangeOffset(), query.GetRangeCount());
+    HLOG(kDebug,
+         "SendIn - replica {} routing_mode={}, range_offset={}, range_count={}",
+         i, static_cast<int>(query.GetRoutingMode()), query.GetRangeOffset(),
+         query.GetRangeCount());
 
     // Determine target node_id based on query type
     chi::u64 target_node_id = 0;
 
     if (query.IsLocalMode()) {
       target_node_id = ipc_manager->GetNodeId();
-      HILOG(kInfo, "[DEBUG] SendIn - replica {} LocalMode -> target_node_id={}", i, target_node_id);
+      HLOG(kDebug, "SendIn - replica {} LocalMode -> target_node_id={}", i,
+           target_node_id);
     } else if (query.IsPhysicalMode()) {
       target_node_id = query.GetNodeId();
-      HILOG(kInfo, "[DEBUG] SendIn - replica {} PhysicalMode -> target_node_id={}", i, target_node_id);
+      HLOG(kDebug, "SendIn - replica {} PhysicalMode -> target_node_id={}", i,
+           target_node_id);
     } else if (query.IsDirectIdMode()) {
       chi::ContainerId container_id = query.GetContainerId();
       target_node_id =
           pool_manager->GetContainerNodeId(origin_task->pool_id_, container_id);
-      HILOG(kInfo, "[DEBUG] SendIn - replica {} DirectIdMode container_id={} -> target_node_id={}",
-            i, container_id, target_node_id);
+      HLOG(kDebug,
+           "SendIn - replica {} DirectIdMode container_id={} -> "
+           "target_node_id={}",
+           i, container_id, target_node_id);
     } else if (query.IsRangeMode()) {
       chi::u32 offset = query.GetRangeOffset();
       chi::ContainerId container_id(offset);
       target_node_id =
           pool_manager->GetContainerNodeId(origin_task->pool_id_, container_id);
-      HILOG(kInfo, "[DEBUG] SendIn - replica {} RangeMode offset={} container_id={} -> target_node_id={}",
-            i, offset, container_id, target_node_id);
+      HLOG(kDebug,
+           "SendIn - replica {} RangeMode offset={} container_id={} -> "
+           "target_node_id={}",
+           i, offset, container_id, target_node_id);
     } else if (query.IsBroadcastMode()) {
-      HELOG(kError,
-            "Admin: Broadcast mode should be handled by "
-            "TaskDispatcher, not SendIn");
+      HLOG(kError,
+           "Admin: Broadcast mode should be handled by "
+           "TaskDispatcher, not SendIn");
       continue;
     } else if (query.IsDirectHashMode()) {
-      HELOG(kError,
-            "Admin: DirectHash mode should be handled by "
-            "TaskDispatcher, not SendIn");
+      HLOG(kError,
+           "Admin: DirectHash mode should be handled by "
+           "TaskDispatcher, not SendIn");
       continue;
     } else {
-      HELOG(kError, "Admin: Unsupported or unrecognized query type for SendIn");
+      HLOG(kError, "Admin: Unsupported or unrecognized query type for SendIn");
       continue;
     }
 
     // Get host information for target node
     const chi::Host *target_host = ipc_manager->GetHost(target_node_id);
     if (!target_host) {
-      HELOG(kError, "[SendIn] Task {} FAILED: Host not found for node_id {}",
-            origin_task->task_id_, target_node_id);
+      HLOG(kError, "[SendIn] Task {} FAILED: Host not found for node_id {}",
+           origin_task->task_id_, target_node_id);
       continue;
     }
 
-    HILOG(kInfo, "[DEBUG] SendIn - replica {} target_host: ip={}, node_id={}",
-          i, target_host->ip_address, target_host->node_id);
+    HLOG(kDebug, "SendIn - replica {} target_host: ip={}, node_id={}", i,
+         target_host->ip_address, target_host->node_id);
 
     // Get or create persistent Lightbeam client using connection pool
     auto *config_manager = CHI_CONFIG_MANAGER;
     int port = static_cast<int>(config_manager->GetPort());
-    HILOG(kInfo, "[DEBUG] SendIn - getting pooled client to {}:{}",
-          target_host->ip_address, port);
+    HLOG(kDebug, "SendIn - getting pooled client to {}:{}",
+         target_host->ip_address, port);
     hshm::lbm::Client *lbm_client =
         ipc_manager->GetOrCreateClient(target_host->ip_address, port);
 
     if (!lbm_client) {
-      HELOG(kError, "[SendIn] Task {} FAILED: Could not get client for {}:{}",
-            origin_task->task_id_, target_host->ip_address, port);
+      HLOG(kError, "[SendIn] Task {} FAILED: Could not get client for {}:{}",
+           origin_task->task_id_, target_host->ip_address, port);
       continue;
     }
 
-    HILOG(kInfo, "[DEBUG] SendIn - lbm_client obtained from pool: OK");
+    HLOG(kDebug, "SendIn - lbm_client obtained from pool: OK");
 
     // Create SaveTaskArchive with SerializeIn mode and lbm_client
     chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn, lbm_client);
@@ -431,8 +435,8 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
     copy_id.net_key_ = send_map_key;
     copy_id.replica_id_ = i;
 
-    HILOG(kInfo, "[DEBUG] SendIn - created task copy {} with net_key {} for node {}",
-          task_copy->task_id_, send_map_key, target_node_id);
+    HLOG(kDebug, "SendIn - created task copy {} with net_key {} for node {}",
+         task_copy->task_id_, send_map_key, target_node_id);
 
     // Update the copy's pool query to current query
     task_copy->pool_query_ = query;
@@ -443,33 +447,33 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
 
     // Serialize the task using container->SaveTask (Expose will be called
     // automatically for bulks)
-    HILOG(kInfo, "[DEBUG] SendIn - serializing task...");
+    HLOG(kDebug, "SendIn - serializing task...");
     container->SaveTask(task_copy->method_, archive, task_copy);
 
     // Lock the client send mutex to prevent multi-part message interleaving
-    // ZeroMQ sockets are not thread-safe - concurrent sends corrupt message boundaries
+    // ZeroMQ sockets are not thread-safe - concurrent sends corrupt message
+    // boundaries
     {
       chi::ScopedCoMutex send_lock(client_send_locks_[target_node_id]);
 
       // Send using Lightbeam asynchronously (non-blocking)
-      HILOG(kInfo, "[DEBUG] SendIn - calling Lightbeam Send...");
+      HLOG(kDebug, "SendIn - calling Lightbeam Send...");
       hshm::lbm::LbmContext ctx(0);  // Non-blocking async send
       int rc = lbm_client->Send(archive, ctx);
 
       if (rc != 0) {
-        HELOG(kError,
-              "[SendIn] Task {} Lightbeam async Send FAILED with error code {}",
-              origin_task->task_id_, rc);
+        HLOG(kError,
+             "[SendIn] Task {} Lightbeam async Send FAILED with error code {}",
+             origin_task->task_id_, rc);
         continue;
       }
 
-      HILOG(kInfo, "[DEBUG] SendIn - task {} sent to node {} (rc={})",
-            task_copy->task_id_, target_node_id, rc);
+      HLOG(kDebug, "SendIn - task {} sent to node {} (rc={})",
+           task_copy->task_id_, target_node_id, rc);
     }
   }
 
-  HILOG(kInfo, "[DEBUG] SendIn END - completed sending to {} targets",
-        num_replicas);
+  HLOG(kDebug, "SendIn END - completed sending to {} targets", num_replicas);
   task->SetReturnCode(0);
 }
 
@@ -486,8 +490,8 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
 
   // Log host information at method entry
   auto &this_host = CHI_IPC->GetThisHost();
-  HILOG(kDebug, "SendOut executing on host {} (node_id: {})",
-        this_host.ip_address, this_host.node_id);
+  HLOG(kDebug, "SendOut executing on host {} (node_id: {})",
+       this_host.ip_address, this_host.node_id);
 
   // Validate origin_task
   hipc::FullPtr<chi::Task> origin_task = task->origin_task_;
@@ -503,25 +507,25 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
     return;
   }
 
-  HILOG(kDebug,
-        "=== [SendOut BEGIN] Task {} (pool: {}, method: {}) sending outputs "
-        "back ===",
-        origin_task->task_id_, origin_task->pool_id_, origin_task->method_);
+  HLOG(kDebug,
+       "=== [SendOut BEGIN] Task {} (pool: {}, method: {}) sending outputs "
+       "back ===",
+       origin_task->task_id_, origin_task->pool_id_, origin_task->method_);
 
   // Remove task from recv_map as we're completing it (use net_key for lookup)
   chi::RunContext *origin_rctx = origin_task->run_ctx_;
   size_t net_key = origin_task->task_id_.net_key_;
-  HILOG(kDebug, "[SendOut] Removing task {} from recv_map with net_key {}",
-        origin_task->task_id_, net_key);
+  HLOG(kDebug, "[SendOut] Removing task {} from recv_map with net_key {}",
+       origin_task->task_id_, net_key);
   {
     size_t lock_index = net_key % recv_map_locks_.size();
     chi::ScopedCoMutex lock(recv_map_locks_[lock_index]);
     auto it = recv_map_.find(net_key);
     if (it == nullptr) {
-      HELOG(kError,
-            "[SendOut] Task {} FAILED: Not found in recv_map (size: {}) with "
-            "net_key {}",
-            origin_task->task_id_, recv_map_.size(), net_key);
+      HLOG(kError,
+           "[SendOut] Task {} FAILED: Not found in recv_map (size: {}) with "
+           "net_key {}",
+           origin_task->task_id_, recv_map_.size(), net_key);
       task->SetReturnCode(3);
       return;
     }
@@ -538,15 +542,15 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
     if (query.IsPhysicalMode()) {
       target_node_id = query.GetNodeId();
     } else {
-      HELOG(kError, "Admin: SendOut only supports Physical query mode");
+      HLOG(kError, "Admin: SendOut only supports Physical query mode");
       continue;
     }
 
     // Get host information
     const chi::Host *target_host = ipc_manager->GetHost(target_node_id);
     if (!target_host) {
-      HELOG(kError, "[SendOut] Task {} FAILED: Host not found for node_id {}",
-            origin_task->task_id_, target_node_id);
+      HLOG(kError, "[SendOut] Task {} FAILED: Host not found for node_id {}",
+           origin_task->task_id_, target_node_id);
       continue;
     }
 
@@ -557,8 +561,8 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
         ipc_manager->GetOrCreateClient(target_host->ip_address, port);
 
     if (!lbm_client) {
-      HELOG(kError, "[SendOut] Task {} FAILED: Could not get client for {}:{}",
-            origin_task->task_id_, target_host->ip_address, port);
+      HLOG(kError, "[SendOut] Task {} FAILED: Could not get client for {}:{}",
+           origin_task->task_id_, target_host->ip_address, port);
       continue;
     }
 
@@ -571,7 +575,8 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
     container->SaveTask(origin_task->method_, archive, origin_task);
 
     // Lock the client send mutex to prevent multi-part message interleaving
-    // ZeroMQ sockets are not thread-safe - concurrent sends corrupt message boundaries
+    // ZeroMQ sockets are not thread-safe - concurrent sends corrupt message
+    // boundaries
     {
       chi::ScopedCoMutex send_lock(client_send_locks_[target_node_id]);
 
@@ -579,21 +584,21 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
       hshm::lbm::LbmContext ctx(0);
       int rc = lbm_client->Send(archive, ctx);
       if (rc != 0) {
-        HELOG(kError,
-              "[SendOut] Task {} Lightbeam Send FAILED with error code {}",
-              origin_task->task_id_, rc);
+        HLOG(kError,
+             "[SendOut] Task {} Lightbeam Send FAILED with error code {}",
+             origin_task->task_id_, rc);
         continue;
       }
 
-      HILOG(kDebug, "[SEND] Task {} outputs sent back to node {}",
-            origin_task->task_id_, target_node_id);
+      HLOG(kDebug, "[SEND] Task {} outputs sent back to node {}",
+           origin_task->task_id_, target_node_id);
     }
   }
 
   // Delete the task after sending outputs
   ipc_manager->DelTask(origin_task);
-  HILOG(kDebug, "=== [SendOut END] Task {} completed and deleted ===",
-        origin_task->task_id_);
+  HLOG(kDebug, "=== [SendOut END] Task {} completed and deleted ===",
+       origin_task->task_id_);
 
   task->SetReturnCode(0);
 }
@@ -611,11 +616,11 @@ void Runtime::Send(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
       break;
     case chi::MsgType::kHeartbeat:
       // Heartbeat message - just log and return success
-      HILOG(kDebug, "Admin: Received heartbeat message");
+      HLOG(kDebug, "Admin: Received heartbeat message");
       task->SetReturnCode(0);
       break;
     default:
-      HELOG(kError, "Admin: Unknown message type in Send");
+      HLOG(kError, "Admin: Unknown message type in Send");
       task->SetReturnCode(1);
       break;
   }
@@ -638,18 +643,17 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
 
   // Log host information at method entry
   auto &this_host = CHI_IPC->GetThisHost();
-  HILOG(kDebug, "RecvIn executing on host {} (node_id: {})",
-        this_host.ip_address, this_host.node_id);
+  HLOG(kDebug, "RecvIn executing on host {} (node_id: {})",
+       this_host.ip_address, this_host.node_id);
 
   const auto &task_infos = archive.GetTaskInfos();
-  HILOG(
-      kDebug,
-      "=== [RecvIn BEGIN] (node={}) Receiving {} task(s) from remote node ===",
-      ipc_manager->GetNodeId(), task_infos.size());
+  HLOG(kDebug,
+       "=== [RecvIn BEGIN] (node={}) Receiving {} task(s) from remote node ===",
+       ipc_manager->GetNodeId(), task_infos.size());
 
   // If no tasks to receive
   if (task_infos.empty()) {
-    HILOG(kDebug, "=== [RecvIn END] No tasks to receive ===");
+    HLOG(kDebug, "=== [RecvIn END] No tasks to receive ===");
     task->SetReturnCode(0);
     return;
   }
@@ -665,13 +669,13 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
   // Receive all bulk data using Lightbeam
   int rc = lbm_server->RecvBulks(archive);
   if (rc != 0) {
-    HELOG(kError, "Admin: Lightbeam RecvBulks failed with error code {}", rc);
+    HLOG(kError, "Admin: Lightbeam RecvBulks failed with error code {}", rc);
     task->SetReturnCode(4);
     return;
   }
 
-  HILOG(kDebug, "Admin: Received {} bulk transfers via Lightbeam",
-        archive.recv.size());
+  HLOG(kDebug, "Admin: Received {} bulk transfers via Lightbeam",
+       archive.recv.size());
 
   for (size_t task_idx = 0; task_idx < task_infos.size(); ++task_idx) {
     const auto &task_info = task_infos[task_idx];
@@ -679,8 +683,8 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
     // Get container associated with PoolId
     chi::Container *container = pool_manager->GetContainer(task_info.pool_id_);
     if (!container) {
-      HELOG(kError, "Admin: Container not found for pool_id {}",
-            task_info.pool_id_);
+      HLOG(kError, "Admin: Container not found for pool_id {}",
+           task_info.pool_id_);
       continue;
     }
 
@@ -689,7 +693,7 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
         container->LoadTask(task_info.method_id_, archive);
 
     if (task_ptr.IsNull()) {
-      HELOG(kError, "Admin: Failed to load task");
+      HLOG(kError, "Admin: Failed to load task");
       continue;
     }
 
@@ -706,20 +710,20 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
       recv_map_[net_key] = task_ptr;
     }
 
-    HILOG(kDebug,
-          "[RecvIn] Received task {} (pool: {}) with net_key {}, added to "
-          "recv_map",
-          task_ptr->task_id_, task_info.pool_id_, net_key);
+    HLOG(kDebug,
+         "[RecvIn] Received task {} (pool: {}) with net_key {}, added to "
+         "recv_map",
+         task_ptr->task_id_, task_info.pool_id_, net_key);
 
     // Send task for execution using IpcManager::Send with awake_event=false
     // Note: This creates a Future and enqueues it to worker lanes
     // awake_event=false prevents setting parent task for received remote tasks
     (void)ipc_manager->Send(task_ptr, false);
-    HILOG(kDebug, "[RECV] Task {} received and sent for execution",
-          task_ptr->task_id_);
+    HLOG(kDebug, "[RECV] Task {} received and sent for execution",
+         task_ptr->task_id_);
   }
 
-  HILOG(kDebug, "=== [RecvIn END] Processed {} task(s) ===", task_infos.size());
+  HLOG(kDebug, "=== [RecvIn END] Processed {} task(s) ===", task_infos.size());
   task->SetReturnCode(0);
 }
 
@@ -739,17 +743,17 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
 
   // Log host information at method entry
   auto &this_host = CHI_IPC->GetThisHost();
-  HILOG(kDebug, "RecvOut executing on host {} (node_id: {})",
-        this_host.ip_address, this_host.node_id);
+  HLOG(kDebug, "RecvOut executing on host {} (node_id: {})",
+       this_host.ip_address, this_host.node_id);
 
   const auto &task_infos = archive.GetTaskInfos();
-  HILOG(kDebug,
-        "=== [RecvOut BEGIN] Receiving {} task output(s) from remote node ===",
-        task_infos.size());
+  HLOG(kDebug,
+       "=== [RecvOut BEGIN] Receiving {} task output(s) from remote node ===",
+       task_infos.size());
 
   // If no task outputs to receive
   if (task_infos.empty()) {
-    HILOG(kDebug, "=== [RecvOut END] No task outputs to receive ===");
+    HLOG(kDebug, "=== [RecvOut END] No task outputs to receive ===");
     task->SetReturnCode(0);
     return;
   }
@@ -765,9 +769,9 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
 
     // Locate origin task from send_map using net_key
     size_t net_key = task_info.task_id_.net_key_;
-    HILOG(kDebug,
-          "[RecvOut] Looking up origin task for replica {} with net_key {}",
-          task_info.task_id_, net_key);
+    HLOG(kDebug,
+         "[RecvOut] Looking up origin task for replica {} with net_key {}",
+         task_info.task_id_, net_key);
 
     hipc::FullPtr<chi::Task> origin_task;
     {
@@ -775,24 +779,24 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
       chi::ScopedCoMutex lock(send_map_locks_[lock_index]);
       auto send_it = send_map_.find(net_key);
       if (send_it == nullptr) {
-        HELOG(kError,
-              "[RecvOut] Task {} FAILED: Origin task not found in send_map "
-              "(size: {}) with net_key {}",
-              task_info.task_id_, send_map_.size(), net_key);
+        HLOG(kError,
+             "[RecvOut] Task {} FAILED: Origin task not found in send_map "
+             "(size: {}) with net_key {}",
+             task_info.task_id_, send_map_.size(), net_key);
         task->SetReturnCode(5);
         return;
       }
       origin_task = *send_it;
     }
-    HILOG(kDebug, "[RecvOut] Found origin task {} for replica {}",
-          origin_task->task_id_, task_info.task_id_);
+    HLOG(kDebug, "[RecvOut] Found origin task {} for replica {}",
+         origin_task->task_id_, task_info.task_id_);
     chi::RunContext *origin_rctx = origin_task->run_ctx_;
 
     // Locate replica in origin's run_ctx using replica_id
     chi::u32 replica_id = task_info.task_id_.replica_id_;
     if (replica_id >= origin_rctx->subtasks_.size()) {
-      HELOG(kError, "Admin: Invalid replica_id {} (subtasks size: {})",
-            replica_id, origin_rctx->subtasks_.size());
+      HLOG(kError, "Admin: Invalid replica_id {} (subtasks size: {})",
+           replica_id, origin_rctx->subtasks_.size());
       task->SetReturnCode(7);
       return;
     }
@@ -803,8 +807,8 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
     chi::Container *container =
         pool_manager->GetContainer(origin_task->pool_id_);
     if (!container) {
-      HELOG(kError, "Admin: Container not found for pool_id {}",
-            origin_task->pool_id_);
+      HLOG(kError, "Admin: Container not found for pool_id {}",
+           origin_task->pool_id_);
       task->SetReturnCode(8);
       return;
     }
@@ -817,13 +821,13 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
   // Receive all bulk data using Lightbeam
   int rc = lbm_server->RecvBulks(archive);
   if (rc != 0) {
-    HELOG(kError, "Admin: Lightbeam RecvBulks failed with error code {}", rc);
+    HLOG(kError, "Admin: Lightbeam RecvBulks failed with error code {}", rc);
     task->SetReturnCode(4);
     return;
   }
 
-  HILOG(kDebug, "[RecvOut] Received {} bulk transfers via Lightbeam",
-        archive.recv.size());
+  HLOG(kDebug, "[RecvOut] Received {} bulk transfers via Lightbeam",
+       archive.recv.size());
 
   // Second pass: Aggregate results
   for (size_t task_idx = 0; task_idx < task_infos.size(); ++task_idx) {
@@ -837,9 +841,8 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
       chi::ScopedCoMutex lock(send_map_locks_[lock_index]);
       auto send_it = send_map_.find(net_key);
       if (send_it == nullptr) {
-        HELOG(kError,
-              "Admin: Origin task not found in send_map with net_key {}",
-              net_key);
+        HLOG(kError, "Admin: Origin task not found in send_map with net_key {}",
+             net_key);
         continue;
       }
       origin_task = *send_it;
@@ -849,8 +852,8 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
     // Locate replica in origin's run_ctx using replica_id
     chi::u32 replica_id = task_info.task_id_.replica_id_;
     if (replica_id >= origin_rctx->subtasks_.size()) {
-      HELOG(kError, "Admin: Invalid replica_id {} (subtasks size: {})",
-            replica_id, origin_rctx->subtasks_.size());
+      HLOG(kError, "Admin: Invalid replica_id {} (subtasks size: {})",
+           replica_id, origin_rctx->subtasks_.size());
       continue;
     }
 
@@ -860,21 +863,21 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
     chi::Container *container =
         pool_manager->GetContainer(origin_task->pool_id_);
     if (!container) {
-      HELOG(kError, "Admin: Container not found for pool_id {}",
-            origin_task->pool_id_);
+      HLOG(kError, "Admin: Container not found for pool_id {}",
+           origin_task->pool_id_);
       continue;
     }
 
     // Aggregate replica results into origin task
     container->Aggregate(origin_task->method_, origin_task, replica);
-    HILOG(kDebug, "[RECV] Task {} outputs received and aggregated",
-          origin_task->task_id_);
+    HLOG(kDebug, "[RECV] Task {} outputs received and aggregated",
+         origin_task->task_id_);
 
     // Increment completed replicas counter in origin's rctx
     origin_rctx->completed_replicas_++;
     chi::u32 completed = origin_rctx->completed_replicas_;
-    HILOG(kDebug, "[RecvOut] Origin task {} completed {}/{} replicas",
-          origin_task->task_id_, completed, origin_rctx->subtasks_.size());
+    HLOG(kDebug, "[RecvOut] Origin task {} completed {}/{} replicas",
+         origin_task->task_id_, completed, origin_rctx->subtasks_.size());
 
     // If all replicas completed
     if (completed == origin_rctx->subtasks_.size()) {
@@ -908,13 +911,13 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
       // properly
       auto *worker = CHI_CUR_WORKER;
       worker->AddToBlockedQueue(origin_rctx);
-      HILOG(kDebug, "[RecvOut] Added origin task {} back to blocked queue",
-            origin_task->task_id_);
+      HLOG(kDebug, "[RecvOut] Added origin task {} back to blocked queue",
+           origin_task->task_id_);
     }
   }
 
-  HILOG(kDebug,
-        "=== [RecvOut END] Processed {} task output(s) ===", task_infos.size());
+  HLOG(kDebug,
+       "=== [RecvOut END] Processed {} task output(s) ===", task_infos.size());
   task->SetReturnCode(0);
 }
 
@@ -926,7 +929,7 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
   recv_call_count++;
   // Only log every 100 calls to avoid spam
   if (recv_call_count <= 5 || recv_call_count % 100 == 0) {
-    HILOG(kInfo, "[DEBUG] Recv called (count={})", recv_call_count);
+    HLOG(kDebug, "Recv called (count={})", recv_call_count);
   }
 
   // Get the main server from CHI_IPC (already bound during initialization)
@@ -934,7 +937,7 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
   hshm::lbm::Server *lbm_server = ipc_manager->GetMainServer();
   if (!lbm_server) {
     if (recv_call_count <= 5) {
-      HILOG(kInfo, "[DEBUG] Recv - lbm_server is null!");
+      HLOG(kDebug, "Recv - lbm_server is null!");
     }
     chi::Worker *worker = CHI_CUR_WORKER;
     if (worker) {
@@ -966,17 +969,18 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
     task->SetReturnCode(0);
     return;
   }
-  HILOG(kInfo, "[DEBUG] Recv - RecvMetadata returned rc={}, has_more_parts={}", rc, has_more_parts);
+  HLOG(kDebug, "Recv - RecvMetadata returned rc={}, has_more_parts={}", rc,
+       has_more_parts);
   if (rc != 0) {
     // Error receiving metadata - could be various causes
     if (rc == -1) {
       // Deserialization failed - detailed logging already done in RecvMetadata
       // This might be stale bulk data from a previous operation, which is
       // handled gracefully by discarding and retrying on next poll
-      HILOG(kDebug, "Admin: RecvMetadata returned -1 (deserialization issue)");
+      HLOG(kDebug, "Admin: RecvMetadata returned -1 (deserialization issue)");
     } else {
-      HELOG(kError, "Admin: Lightbeam RecvMetadata failed with error code {}",
-            rc);
+      HLOG(kError, "Admin: Lightbeam RecvMetadata failed with error code {}",
+           rc);
     }
     task->SetReturnCode(2);
     return;
@@ -989,7 +993,7 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
       : (msg_type == chi::MsgType::kSerializeOut) ? "SerializeOut"
       : (msg_type == chi::MsgType::kHeartbeat)    ? "Heartbeat"
                                                   : "Unknown";
-  HILOG(kDebug, "Admin: Received metadata (type: {})", msg_type_str);
+  HLOG(kDebug, "Admin: Received metadata (type: {})", msg_type_str);
 
   // Dispatch based on message type
   switch (msg_type) {
@@ -1001,11 +1005,11 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
       break;
     case chi::MsgType::kHeartbeat:
       // Heartbeat message - just log and return success
-      HILOG(kDebug, "Admin: Received heartbeat message");
+      HLOG(kDebug, "Admin: Received heartbeat message");
       task->SetReturnCode(0);
       break;
     default:
-      HELOG(kError, "Admin: Unknown message type in Recv");
+      HLOG(kError, "Admin: Unknown message type in Recv");
       task->SetReturnCode(3);
       break;
   }

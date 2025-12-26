@@ -39,7 +39,8 @@
                 "WRP_CORE_ENABLE_OPENMP": "OFF",
                 "WRP_CORE_ENABLE_CUDA": "OFF",
                 "WRP_CORE_ENABLE_ROCM": "OFF",
-                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "HSHM_LOG_LEVEL": "1"
             }
         },
         {
@@ -75,7 +76,8 @@
                 "WRP_CORE_ENABLE_OPENMP": "OFF",
                 "WRP_CORE_ENABLE_CUDA": "OFF",
                 "WRP_CORE_ENABLE_ROCM": "OFF",
-                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "HSHM_LOG_LEVEL": "1"
             }
         },
         {
@@ -95,7 +97,8 @@
                 "WRP_CORE_ENABLE_ASAN": "OFF",
                 "WRP_CORE_ENABLE_RPATH": "ON",
                 "HSHM_ENABLE_ZMQ": "ON",
-                "HSHM_ENABLE_CEREAL": "ON"
+                "HSHM_ENABLE_CEREAL": "ON",
+                "HSHM_LOG_LEVEL": "0"
             }
         },
         {
@@ -151,7 +154,8 @@
                 "WRP_CORE_ENABLE_TESTS": "ON",
                 "WRP_CORE_ENABLE_ELF": "OFF",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "WRP_CORE_ENABLE_ASAN": "OFF"
+                "WRP_CORE_ENABLE_ASAN": "OFF",
+                "HSHM_LOG_LEVEL": "1"
             }
         }
     ]

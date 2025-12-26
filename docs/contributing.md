@@ -192,7 +192,7 @@ From `CLAUDE.md`:
 
 4. **Include units in timing:**
    ```cpp
-   HILOG(kInfo, "Operation took {} ms", elapsed);
+   HLOG(kInfo, "Operation took {} ms", elapsed);
    ```
 
 5. **No stub code** - Always implement real, working code

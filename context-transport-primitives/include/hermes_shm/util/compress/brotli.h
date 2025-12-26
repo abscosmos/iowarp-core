@@ -34,7 +34,7 @@ class Brotli : public Compressor {
 
     const size_t bufferSize = BrotliEncoderMaxCompressedSize(input_size);
     if (bufferSize > output_size) {
-      HELOG(kError,
+      HLOG(kError,
             "Output buffer is probably too small for Brotli compression.");
     }
     int ret = BrotliEncoderCompress(

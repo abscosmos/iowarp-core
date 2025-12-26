@@ -16,25 +16,25 @@ Hdf5FileAssimilator::Hdf5FileAssimilator(std::shared_ptr<wrp_cte::core::Client> 
     : cte_client_(cte_client) {}
 
 int Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx) {
-  HILOG(kInfo, "Hdf5FileAssimilator::Schedule() - ENTRY");
-  HILOG(kInfo, "  ctx.src: '{}'", ctx.src);
-  HILOG(kInfo, "  ctx.dst: '{}'", ctx.dst);
-  HILOG(kInfo, "  ctx.format: '{}'", ctx.format);
+  HLOG(kInfo, "Hdf5FileAssimilator::Schedule() - ENTRY");
+  HLOG(kInfo, "  ctx.src: '{}'", ctx.src);
+  HLOG(kInfo, "  ctx.dst: '{}'", ctx.dst);
+  HLOG(kInfo, "  ctx.format: '{}'", ctx.format);
 
   // Validate destination protocol
   std::string dst_protocol = GetUrlProtocol(ctx.dst);
-  HILOG(kInfo, "Hdf5FileAssimilator: Extracted destination protocol: '{}'", dst_protocol);
+  HLOG(kInfo, "Hdf5FileAssimilator: Extracted destination protocol: '{}'", dst_protocol);
   if (dst_protocol != "iowarp") {
-    HELOG(kError, "Hdf5FileAssimilator: Destination protocol must be 'iowarp', got '{}'",
+    HLOG(kError, "Hdf5FileAssimilator: Destination protocol must be 'iowarp', got '{}'",
           dst_protocol);
     return -1;
   }
 
   // Extract tag prefix from destination URL (remove iowarp:: prefix)
   std::string tag_prefix = GetUrlPath(ctx.dst);
-  HILOG(kInfo, "Hdf5FileAssimilator: Extracted tag prefix: '{}'", tag_prefix);
+  HLOG(kInfo, "Hdf5FileAssimilator: Extracted tag prefix: '{}'", tag_prefix);
   if (tag_prefix.empty()) {
-    HELOG(kError, "Hdf5FileAssimilator: Invalid destination URL, no tag name found");
+    HLOG(kError, "Hdf5FileAssimilator: Invalid destination URL, no tag name found");
     return -2;
   }
 
@@ -42,59 +42,59 @@ int Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx) {
   if (!ctx.depends_on.empty()) {
     // TODO: Implement dependency handling
     // For now, log that dependencies are not yet supported
-    HILOG(kInfo, "Hdf5FileAssimilator: Dependency handling not yet implemented (depends_on: {})",
+    HLOG(kInfo, "Hdf5FileAssimilator: Dependency handling not yet implemented (depends_on: {})",
           ctx.depends_on);
     return 0;
   }
 
   // Extract source file path
   std::string src_path = GetUrlPath(ctx.src);
-  HILOG(kInfo, "Hdf5FileAssimilator: Extracted source file path: '{}'", src_path);
+  HLOG(kInfo, "Hdf5FileAssimilator: Extracted source file path: '{}'", src_path);
   if (src_path.empty()) {
-    HELOG(kError, "Hdf5FileAssimilator: Invalid source URL, no file path found");
+    HLOG(kError, "Hdf5FileAssimilator: Invalid source URL, no file path found");
     return -3;
   }
 
   // Open HDF5 file
-  HILOG(kInfo, "Hdf5FileAssimilator: Opening HDF5 file...");
+  HLOG(kInfo, "Hdf5FileAssimilator: Opening HDF5 file...");
   hid_t file_id = OpenHdf5File(src_path);
   if (file_id < 0) {
-    HELOG(kError, "Hdf5FileAssimilator: Failed to open HDF5 file '{}'", src_path);
+    HLOG(kError, "Hdf5FileAssimilator: Failed to open HDF5 file '{}'", src_path);
     return -4;
   }
-  HILOG(kInfo, "Hdf5FileAssimilator: HDF5 file opened successfully (file_id: {})", file_id);
+  HLOG(kInfo, "Hdf5FileAssimilator: HDF5 file opened successfully (file_id: {})", file_id);
 
   // Discover all datasets in the file
-  HILOG(kInfo, "Hdf5FileAssimilator: Discovering datasets...");
+  HLOG(kInfo, "Hdf5FileAssimilator: Discovering datasets...");
   std::vector<std::string> dataset_paths;
   int discover_result = DiscoverDatasets(file_id, dataset_paths);
   if (discover_result != 0) {
-    HELOG(kError, "Hdf5FileAssimilator: Failed to discover datasets in '{}'", src_path);
+    HLOG(kError, "Hdf5FileAssimilator: Failed to discover datasets in '{}'", src_path);
     CloseHdf5File(file_id);
     return -5;
   }
 
-  HILOG(kInfo, "Hdf5FileAssimilator: Discovered {} dataset(s) in '{}'",
+  HLOG(kInfo, "Hdf5FileAssimilator: Discovered {} dataset(s) in '{}'",
         dataset_paths.size(), src_path);
 
   // Apply dataset filtering if patterns are specified
   std::vector<std::string> filtered_paths;
   if (!ctx.include_patterns.empty() || !ctx.exclude_patterns.empty()) {
-    HILOG(kInfo, "Hdf5FileAssimilator: Applying dataset filters...");
-    HILOG(kInfo, "  Include patterns: {}", ctx.include_patterns.size());
+    HLOG(kInfo, "Hdf5FileAssimilator: Applying dataset filters...");
+    HLOG(kInfo, "  Include patterns: {}", ctx.include_patterns.size());
     for (const auto& pattern : ctx.include_patterns) {
-      HILOG(kInfo, "    - '{}'", pattern);
+      HLOG(kInfo, "    - '{}'", pattern);
     }
-    HILOG(kInfo, "  Exclude patterns: {}", ctx.exclude_patterns.size());
+    HLOG(kInfo, "  Exclude patterns: {}", ctx.exclude_patterns.size());
     for (const auto& pattern : ctx.exclude_patterns) {
-      HILOG(kInfo, "    - '{}'", pattern);
+      HLOG(kInfo, "    - '{}'", pattern);
     }
 
-    HILOG(kInfo, "Hdf5FileAssimilator: Checking {} discovered datasets against filters",
+    HLOG(kInfo, "Hdf5FileAssimilator: Checking {} discovered datasets against filters",
           dataset_paths.size());
     // Print first 5 dataset paths for debugging
     for (size_t i = 0; i < std::min(size_t(5), dataset_paths.size()); ++i) {
-      HILOG(kInfo, "  Sample dataset {}: '{}'", i+1, dataset_paths[i]);
+      HLOG(kInfo, "  Sample dataset {}: '{}'", i+1, dataset_paths[i]);
     }
 
     for (const auto& dataset_path : dataset_paths) {
@@ -102,10 +102,10 @@ int Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx) {
         filtered_paths.push_back(dataset_path);
       }
     }
-    HILOG(kInfo, "Hdf5FileAssimilator: Filtered to {} dataset(s) (from {})",
+    HLOG(kInfo, "Hdf5FileAssimilator: Filtered to {} dataset(s) (from {})",
           filtered_paths.size(), dataset_paths.size());
   } else {
-    HILOG(kInfo, "Hdf5FileAssimilator: No dataset filters specified, processing all datasets");
+    HLOG(kInfo, "Hdf5FileAssimilator: No dataset filters specified, processing all datasets");
     filtered_paths = dataset_paths;
   }
 
@@ -113,62 +113,62 @@ int Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx) {
   int total_errors = 0;
   for (size_t i = 0; i < filtered_paths.size(); ++i) {
     const auto& dataset_path = filtered_paths[i];
-    HILOG(kInfo, "Hdf5FileAssimilator: Processing dataset {}/{}: '{}'",
+    HLOG(kInfo, "Hdf5FileAssimilator: Processing dataset {}/{}: '{}'",
           i + 1, filtered_paths.size(), dataset_path);
     int result = ProcessDataset(file_id, dataset_path, tag_prefix);
     if (result != 0) {
-      HELOG(kError, "Hdf5FileAssimilator: Failed to process dataset '{}' (error code: {})",
+      HLOG(kError, "Hdf5FileAssimilator: Failed to process dataset '{}' (error code: {})",
             dataset_path, result);
       total_errors++;
     } else {
-      HILOG(kInfo, "Hdf5FileAssimilator: Successfully processed dataset '{}'", dataset_path);
+      HLOG(kInfo, "Hdf5FileAssimilator: Successfully processed dataset '{}'", dataset_path);
     }
   }
 
-  HILOG(kInfo, "Hdf5FileAssimilator: Closing HDF5 file...");
+  HLOG(kInfo, "Hdf5FileAssimilator: Closing HDF5 file...");
   CloseHdf5File(file_id);
-  HILOG(kInfo, "Hdf5FileAssimilator: HDF5 file closed");
+  HLOG(kInfo, "Hdf5FileAssimilator: HDF5 file closed");
 
   if (total_errors > 0) {
-    HELOG(kError, "Hdf5FileAssimilator: Completed with {} error(s) out of {} dataset(s)",
+    HLOG(kError, "Hdf5FileAssimilator: Completed with {} error(s) out of {} dataset(s)",
           total_errors, filtered_paths.size());
     return -6;
   }
 
-  HILOG(kInfo, "Hdf5FileAssimilator: Successfully processed all {} dataset(s) from '{}'",
+  HLOG(kInfo, "Hdf5FileAssimilator: Successfully processed all {} dataset(s) from '{}'",
         filtered_paths.size(), src_path);
-  HILOG(kInfo, "Hdf5FileAssimilator::Schedule() - EXIT (success)");
+  HLOG(kInfo, "Hdf5FileAssimilator::Schedule() - EXIT (success)");
 
   return 0;
 }
 
 hid_t Hdf5FileAssimilator::OpenHdf5File(const std::string& file_path) {
-  HILOG(kInfo, "OpenHdf5File: Checking if file exists: '{}'", file_path);
+  HLOG(kInfo, "OpenHdf5File: Checking if file exists: '{}'", file_path);
   // Check if file exists
   struct stat st;
   if (stat(file_path.c_str(), &st) != 0) {
-    HELOG(kError, "Hdf5FileAssimilator: File does not exist: '{}'", file_path);
+    HLOG(kError, "Hdf5FileAssimilator: File does not exist: '{}'", file_path);
     return -1;
   }
-  HILOG(kInfo, "OpenHdf5File: File exists, size: {} bytes", st.st_size);
+  HLOG(kInfo, "OpenHdf5File: File exists, size: {} bytes", st.st_size);
 
   // Open HDF5 file for reading (serial, read-only)
-  HILOG(kInfo, "OpenHdf5File: Calling H5Fopen...");
+  HLOG(kInfo, "OpenHdf5File: Calling H5Fopen...");
   hid_t file_id = H5Fopen(file_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
   if (file_id < 0) {
-    HELOG(kError, "Hdf5FileAssimilator: H5Fopen failed for file '{}'", file_path);
+    HLOG(kError, "Hdf5FileAssimilator: H5Fopen failed for file '{}'", file_path);
     return -1;
   }
-  HILOG(kInfo, "OpenHdf5File: H5Fopen succeeded, file_id: {}", file_id);
+  HLOG(kInfo, "OpenHdf5File: H5Fopen succeeded, file_id: {}", file_id);
 
   return file_id;
 }
 
 void Hdf5FileAssimilator::CloseHdf5File(hid_t file_id) {
-  HILOG(kInfo, "CloseHdf5File: Closing file_id: {}", file_id);
+  HLOG(kInfo, "CloseHdf5File: Closing file_id: {}", file_id);
   if (file_id >= 0) {
     H5Fclose(file_id);
-    HILOG(kInfo, "CloseHdf5File: H5Fclose completed");
+    HLOG(kInfo, "CloseHdf5File: H5Fclose completed");
   }
 }
 
@@ -202,20 +202,20 @@ herr_t Hdf5FileAssimilator::VisitCallback(hid_t loc_id, const char* name,
 
 int Hdf5FileAssimilator::DiscoverDatasets(hid_t file_id,
                                           std::vector<std::string>& dataset_paths) {
-  HILOG(kInfo, "DiscoverDatasets: Starting dataset discovery for file_id: {}", file_id);
+  HLOG(kInfo, "DiscoverDatasets: Starting dataset discovery for file_id: {}", file_id);
   dataset_paths.clear();
 
   // Use H5Lvisit to visit all links in the file recursively (including nested groups)
   // H5Lvisit traverses the entire HDF5 hierarchy, unlike H5Literate which only visits root level
-  HILOG(kInfo, "DiscoverDatasets: Calling H5Lvisit...");
+  HLOG(kInfo, "DiscoverDatasets: Calling H5Lvisit...");
   herr_t status = H5Lvisit(file_id, H5_INDEX_NAME, H5_ITER_NATIVE,
                            VisitCallback, &dataset_paths);
 
   if (status < 0) {
-    HELOG(kError, "Hdf5FileAssimilator: H5Literate failed");
+    HLOG(kError, "Hdf5FileAssimilator: H5Literate failed");
     return -1;
   }
-  HILOG(kInfo, "DiscoverDatasets: H5Literate completed, found {} datasets", dataset_paths.size());
+  HLOG(kInfo, "DiscoverDatasets: H5Literate completed, found {} datasets", dataset_paths.size());
 
   return 0;
 }
@@ -223,51 +223,51 @@ int Hdf5FileAssimilator::DiscoverDatasets(hid_t file_id,
 int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
                                         const std::string& dataset_path,
                                         const std::string& tag_prefix) {
-  HILOG(kInfo, "ProcessDataset: ENTRY - dataset: '{}', tag_prefix: '{}'",
+  HLOG(kInfo, "ProcessDataset: ENTRY - dataset: '{}', tag_prefix: '{}'",
         dataset_path, tag_prefix);
 
   // Open dataset
-  HILOG(kInfo, "ProcessDataset: Opening dataset '{}'...", dataset_path);
+  HLOG(kInfo, "ProcessDataset: Opening dataset '{}'...", dataset_path);
   hid_t dataset_id = H5Dopen2(file_id, dataset_path.c_str(), H5P_DEFAULT);
   if (dataset_id < 0) {
-    HELOG(kError, "Hdf5FileAssimilator: Failed to open dataset '{}'", dataset_path);
+    HLOG(kError, "Hdf5FileAssimilator: Failed to open dataset '{}'", dataset_path);
     return -1;
   }
-  HILOG(kInfo, "ProcessDataset: Dataset opened, dataset_id: {}", dataset_id);
+  HLOG(kInfo, "ProcessDataset: Dataset opened, dataset_id: {}", dataset_id);
 
   // Get dataspace and datatype
-  HILOG(kInfo, "ProcessDataset: Getting dataspace...");
+  HLOG(kInfo, "ProcessDataset: Getting dataspace...");
   hid_t dataspace_id = H5Dget_space(dataset_id);
   if (dataspace_id < 0) {
-    HELOG(kError, "Hdf5FileAssimilator: Failed to get dataspace for dataset '{}'",
+    HLOG(kError, "Hdf5FileAssimilator: Failed to get dataspace for dataset '{}'",
           dataset_path);
     H5Dclose(dataset_id);
     return -2;
   }
-  HILOG(kInfo, "ProcessDataset: Got dataspace, dataspace_id: {}", dataspace_id);
+  HLOG(kInfo, "ProcessDataset: Got dataspace, dataspace_id: {}", dataspace_id);
 
-  HILOG(kInfo, "ProcessDataset: Getting datatype...");
+  HLOG(kInfo, "ProcessDataset: Getting datatype...");
   hid_t datatype_id = H5Dget_type(dataset_id);
   if (datatype_id < 0) {
-    HELOG(kError, "Hdf5FileAssimilator: Failed to get datatype for dataset '{}'",
+    HLOG(kError, "Hdf5FileAssimilator: Failed to get datatype for dataset '{}'",
           dataset_path);
     H5Sclose(dataspace_id);
     H5Dclose(dataset_id);
     return -3;
   }
-  HILOG(kInfo, "ProcessDataset: Got datatype, datatype_id: {}", datatype_id);
+  HLOG(kInfo, "ProcessDataset: Got datatype, datatype_id: {}", datatype_id);
 
   // Get dimensions
-  HILOG(kInfo, "ProcessDataset: Getting dimensions...");
+  HLOG(kInfo, "ProcessDataset: Getting dimensions...");
   int rank = H5Sget_simple_extent_ndims(dataspace_id);
   if (rank < 0) {
-    HELOG(kError, "Hdf5FileAssimilator: Failed to get rank for dataset '{}'", dataset_path);
+    HLOG(kError, "Hdf5FileAssimilator: Failed to get rank for dataset '{}'", dataset_path);
     H5Tclose(datatype_id);
     H5Sclose(dataspace_id);
     H5Dclose(dataset_id);
     return -4;
   }
-  HILOG(kInfo, "ProcessDataset: Rank: {}", rank);
+  HLOG(kInfo, "ProcessDataset: Rank: {}", rank);
 
   std::vector<hsize_t> dims(rank);
   H5Sget_simple_extent_dims(dataspace_id, dims.data(), nullptr);
@@ -279,7 +279,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
     total_elements *= dim;
   }
   size_t total_bytes = total_elements * type_size;
-  HILOG(kInfo, "ProcessDataset: Dataset info - rank: {}, total_elements: {}, type_size: {}, total_bytes: {}",
+  HLOG(kInfo, "ProcessDataset: Dataset info - rank: {}, total_elements: {}, type_size: {}, total_bytes: {}",
         rank, total_elements, type_size, total_bytes);
 
   // Create globally unique tag name: tag_prefix/dataset_path
@@ -289,35 +289,35 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
     dataset_path_clean = dataset_path_clean.substr(1);
   }
   std::string tag_name = tag_prefix + "/" + dataset_path_clean;
-  HILOG(kInfo, "ProcessDataset: Creating tag: '{}'", tag_name);
+  HLOG(kInfo, "ProcessDataset: Creating tag: '{}'", tag_name);
 
   // Get or create the tag in CTE
-    HILOG(kInfo, "ProcessDataset: Calling GetOrCreateTag for '{}'...", tag_name);
+    HLOG(kInfo, "ProcessDataset: Calling GetOrCreateTag for '{}'...", tag_name);
   wrp_cte::core::TagId tag_id = cte_client_->GetOrCreateTag(tag_name);
   if (tag_id.IsNull()) {
-    HELOG(kError, "Hdf5FileAssimilator: Failed to get or create tag '{}'", tag_name);
+    HLOG(kError, "Hdf5FileAssimilator: Failed to get or create tag '{}'", tag_name);
     H5Tclose(datatype_id);
     H5Sclose(dataspace_id);
     H5Dclose(dataset_id);
     return -5;
   }
-  HILOG(kInfo, "ProcessDataset: Tag created/retrieved, tag_id: {}", tag_id);
+  HLOG(kInfo, "ProcessDataset: Tag created/retrieved, tag_id: {}", tag_id);
 
   // Create and store tensor description as "description" blob
   std::string description = FormatTensorDescription(datatype_id, dims);
-  HILOG(kInfo, "ProcessDataset: Tensor description: '{}'", description);
+  HLOG(kInfo, "ProcessDataset: Tensor description: '{}'", description);
   size_t desc_size = description.size();
   auto desc_buffer = CHI_IPC->AllocateBuffer(desc_size);
   std::memcpy(desc_buffer.ptr_, description.c_str(), desc_size);
 
-  HILOG(kInfo, "ProcessDataset: Submitting description blob (size: {} bytes)...", desc_size);
+  HLOG(kInfo, "ProcessDataset: Submitting description blob (size: {} bytes)...", desc_size);
   auto desc_task = cte_client_->AsyncPutBlob(
       tag_id, "description", 0, desc_size, desc_buffer.shm_.template Cast<void>(), 1.0f, 0);
-  HILOG(kInfo, "ProcessDataset: Waiting for description blob task...");
+  HLOG(kInfo, "ProcessDataset: Waiting for description blob task...");
   desc_task.Wait();
 
   if (desc_task->return_code_ != 0) {
-    HELOG(kError, "Hdf5FileAssimilator: Failed to store description for dataset '{}', return_code: {}",
+    HLOG(kError, "Hdf5FileAssimilator: Failed to store description for dataset '{}', return_code: {}",
           dataset_path, desc_task->return_code_);
     CHI_IPC->DelTask(desc_task.GetTaskPtr());
     H5Tclose(datatype_id);
@@ -326,9 +326,9 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
     return -6;
   }
   CHI_IPC->DelTask(desc_task.GetTaskPtr());
-  HILOG(kInfo, "ProcessDataset: Description blob stored successfully");
+  HLOG(kInfo, "ProcessDataset: Description blob stored successfully");
 
-  HILOG(kInfo, "Hdf5FileAssimilator: Stored description for '{}': {}", tag_name, description);
+  HLOG(kInfo, "Hdf5FileAssimilator: Stored description for '{}': {}", tag_name, description);
 
   // Define chunking parameters
   static constexpr size_t kMaxChunkSize = 1024 * 1024;  // 1 MB
@@ -336,12 +336,12 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
 
   // Calculate number of chunks
   size_t num_chunks = (total_bytes + kMaxChunkSize - 1) / kMaxChunkSize;
-  HILOG(kInfo, "ProcessDataset: Starting data transfer - total_bytes: {}, num_chunks: {}, kMaxChunkSize: {}",
+  HLOG(kInfo, "ProcessDataset: Starting data transfer - total_bytes: {}, num_chunks: {}, kMaxChunkSize: {}",
         total_bytes, num_chunks, kMaxChunkSize);
 
   // Allocate buffer for reading chunks
   size_t buffer_size = std::min(kMaxChunkSize, total_bytes);
-  HILOG(kInfo, "ProcessDataset: Allocating read buffer of size: {} bytes", buffer_size);
+  HLOG(kInfo, "ProcessDataset: Allocating read buffer of size: {} bytes", buffer_size);
   auto read_buffer = CHI_IPC->AllocateBuffer(buffer_size);
   char* buffer = read_buffer.ptr_;
 
@@ -350,13 +350,13 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
   size_t bytes_processed = 0;
   std::vector<chi::Future<wrp_cte::core::PutBlobTask>> active_tasks;
 
-  HILOG(kInfo, "ProcessDataset: Starting chunk processing loop...");
+  HLOG(kInfo, "ProcessDataset: Starting chunk processing loop...");
   while (bytes_processed < total_bytes) {
-    HILOG(kInfo, "ProcessDataset: Loop iteration - bytes_processed: {}/{}, active_tasks: {}",
+    HLOG(kInfo, "ProcessDataset: Loop iteration - bytes_processed: {}/{}, active_tasks: {}",
           bytes_processed, total_bytes, active_tasks.size());
     // Submit tasks up to the parallel limit
     while (active_tasks.size() < kMaxParallelTasks && bytes_processed < total_bytes) {
-      HILOG(kInfo, "ProcessDataset: Preparing chunk {} (bytes_processed: {}/{})",
+      HLOG(kInfo, "ProcessDataset: Preparing chunk {} (bytes_processed: {}/{})",
             chunk_idx, bytes_processed, total_bytes);
       // Calculate chunk size
       size_t current_chunk_size = std::min(kMaxChunkSize, total_bytes - bytes_processed);
@@ -370,25 +370,25 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
       // For large datasets, we use hyperslab selection
       if (total_bytes <= kMaxChunkSize) {
         // Small dataset - read entire dataset in one go
-        HILOG(kInfo, "ProcessDataset: Reading small dataset (entire dataset in one go)...");
+        HLOG(kInfo, "ProcessDataset: Reading small dataset (entire dataset in one go)...");
         herr_t read_status = H5Dread(dataset_id, datatype_id, H5S_ALL, H5S_ALL,
                                      H5P_DEFAULT, buffer);
         if (read_status < 0) {
-          HELOG(kError, "Hdf5FileAssimilator: Failed to read dataset '{}'", dataset_path);
+          HLOG(kError, "Hdf5FileAssimilator: Failed to read dataset '{}'", dataset_path);
           CHI_IPC->FreeBuffer(read_buffer);
           H5Tclose(datatype_id);
           H5Sclose(dataspace_id);
           H5Dclose(dataset_id);
           return -7;
         }
-        HILOG(kInfo, "ProcessDataset: Small dataset read successfully");
+        HLOG(kInfo, "ProcessDataset: Small dataset read successfully");
       } else {
         // Large dataset - use hyperslab selection
         // Create memory dataspace for this chunk
         hsize_t mem_dims[1] = {elements_to_read};
         hid_t memspace = H5Screate_simple(1, mem_dims, nullptr);
         if (memspace < 0) {
-          HELOG(kError, "Hdf5FileAssimilator: Failed to create memory space for chunk {}",
+          HLOG(kError, "Hdf5FileAssimilator: Failed to create memory space for chunk {}",
                 chunk_idx);
           CHI_IPC->FreeBuffer(read_buffer);
           H5Tclose(datatype_id);
@@ -408,7 +408,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
         hsize_t total_elements_hsize = total_elements;
         hid_t flat_space = H5Screate_simple(1, &total_elements_hsize, nullptr);
         if (flat_space < 0) {
-          HELOG(kError, "Hdf5FileAssimilator: Failed to create flat space for chunk {}",
+          HLOG(kError, "Hdf5FileAssimilator: Failed to create flat space for chunk {}",
                 chunk_idx);
           H5Sclose(memspace);
           CHI_IPC->FreeBuffer(read_buffer);
@@ -421,7 +421,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
         herr_t select_status = H5Sselect_hyperslab(flat_space, H5S_SELECT_SET,
                                                    start, stride, count, block);
         if (select_status < 0) {
-          HELOG(kError, "Hdf5FileAssimilator: Failed to select hyperslab for chunk {}",
+          HLOG(kError, "Hdf5FileAssimilator: Failed to select hyperslab for chunk {}",
                 chunk_idx);
           H5Sclose(flat_space);
           H5Sclose(memspace);
@@ -439,7 +439,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
         H5Sclose(memspace);
 
         if (read_status < 0) {
-          HELOG(kError, "Hdf5FileAssimilator: Failed to read chunk {} from dataset '{}'",
+          HLOG(kError, "Hdf5FileAssimilator: Failed to read chunk {} from dataset '{}'",
                 chunk_idx, dataset_path);
           CHI_IPC->FreeBuffer(read_buffer);
           H5Tclose(datatype_id);
@@ -451,20 +451,20 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
 
       // Create blob name with chunk index
       std::string blob_name = "chunk_" + std::to_string(chunk_idx);
-      HILOG(kInfo, "ProcessDataset: Creating blob '{}' with size: {} bytes", blob_name, current_chunk_size);
+      HLOG(kInfo, "ProcessDataset: Creating blob '{}' with size: {} bytes", blob_name, current_chunk_size);
 
       // Allocate a new buffer for this chunk (since we need to keep reading)
       auto chunk_buffer = CHI_IPC->AllocateBuffer(current_chunk_size);
       std::memcpy(chunk_buffer.ptr_, buffer, current_chunk_size);
 
       // Submit PutBlob task asynchronously
-      HILOG(kInfo, "ProcessDataset: Submitting AsyncPutBlob for chunk {}...", chunk_idx);
+      HLOG(kInfo, "ProcessDataset: Submitting AsyncPutBlob for chunk {}...", chunk_idx);
       auto task = cte_client_->AsyncPutBlob(
           tag_id, blob_name, 0, current_chunk_size,
           chunk_buffer.shm_.template Cast<void>(), 1.0f, 0);
 
       active_tasks.push_back(task);
-      HILOG(kInfo, "ProcessDataset: Task submitted for chunk {}, active_tasks count: {}",
+      HLOG(kInfo, "ProcessDataset: Task submitted for chunk {}, active_tasks count: {}",
             chunk_idx, active_tasks.size());
 
       bytes_processed += current_chunk_size;
@@ -472,19 +472,19 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
 
       // For small datasets, we're done after one chunk
       if (total_bytes <= kMaxChunkSize) {
-        HILOG(kInfo, "ProcessDataset: Small dataset - exiting submission loop");
+        HLOG(kInfo, "ProcessDataset: Small dataset - exiting submission loop");
         break;
       }
     }
 
     // Wait for at least one task to complete before continuing
     if (!active_tasks.empty()) {
-      HILOG(kInfo, "ProcessDataset: Waiting for first task to complete...");
+      HLOG(kInfo, "ProcessDataset: Waiting for first task to complete...");
       auto& first_task = active_tasks.front();
       first_task.Wait();
 
       if (first_task->return_code_ != 0) {
-        HELOG(kError, "Hdf5FileAssimilator: PutBlob task failed with code {}",
+        HLOG(kError, "Hdf5FileAssimilator: PutBlob task failed with code {}",
               first_task->return_code_);
         // Free the buffer before deleting the task
         CHI_IPC->FreeBuffer(first_task->blob_data_.template Cast<char>());
@@ -496,7 +496,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
         return -12;
       }
 
-      HILOG(kInfo, "ProcessDataset: First task completed successfully");
+      HLOG(kInfo, "ProcessDataset: First task completed successfully");
       // Free the buffer before deleting the task
       CHI_IPC->FreeBuffer(first_task->blob_data_.template Cast<char>());
       CHI_IPC->DelTask(first_task.GetTaskPtr());
@@ -505,12 +505,12 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
   }
 
   // Wait for all remaining tasks to complete
-  HILOG(kInfo, "ProcessDataset: Waiting for {} remaining tasks to complete...",
+  HLOG(kInfo, "ProcessDataset: Waiting for {} remaining tasks to complete...",
         active_tasks.size());
   for (auto& task : active_tasks) {
     task.Wait();
     if (task->return_code_ != 0) {
-      HELOG(kError, "Hdf5FileAssimilator: PutBlob task failed with code {}",
+      HLOG(kError, "Hdf5FileAssimilator: PutBlob task failed with code {}",
             task->return_code_);
       // Free the buffer before deleting the task
       CHI_IPC->FreeBuffer(task->blob_data_.template Cast<char>());
@@ -526,19 +526,19 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
     CHI_IPC->DelTask(task.GetTaskPtr());
   }
 
-  HILOG(kInfo, "ProcessDataset: All tasks completed, cleaning up resources...");
+  HLOG(kInfo, "ProcessDataset: All tasks completed, cleaning up resources...");
   CHI_IPC->FreeBuffer(read_buffer);
-  HILOG(kInfo, "ProcessDataset: Buffer freed");
+  HLOG(kInfo, "ProcessDataset: Buffer freed");
   H5Tclose(datatype_id);
-  HILOG(kInfo, "ProcessDataset: Datatype closed");
+  HLOG(kInfo, "ProcessDataset: Datatype closed");
   H5Sclose(dataspace_id);
-  HILOG(kInfo, "ProcessDataset: Dataspace closed");
+  HLOG(kInfo, "ProcessDataset: Dataspace closed");
   H5Dclose(dataset_id);
-  HILOG(kInfo, "ProcessDataset: Dataset closed");
+  HLOG(kInfo, "ProcessDataset: Dataset closed");
 
-  HILOG(kInfo, "Hdf5FileAssimilator: Successfully transferred {} chunk(s) ({} bytes) for dataset '{}'",
+  HLOG(kInfo, "Hdf5FileAssimilator: Successfully transferred {} chunk(s) ({} bytes) for dataset '{}'",
         num_chunks, total_bytes, tag_name);
-  HILOG(kInfo, "ProcessDataset: EXIT - success");
+  HLOG(kInfo, "ProcessDataset: EXIT - success");
 
   return 0;
 }
@@ -615,7 +615,7 @@ bool Hdf5FileAssimilator::MatchesFilter(
   // First check exclude patterns - if any match, exclude the dataset
   for (const auto& exclude_pattern : exclude_patterns) {
     if (MatchGlobPattern(dataset_path, exclude_pattern)) {
-      HILOG(kDebug, "Dataset '{}' excluded by pattern '{}'",
+      HLOG(kDebug, "Dataset '{}' excluded by pattern '{}'",
             dataset_path, exclude_pattern);
       return false;
     }
@@ -629,17 +629,17 @@ bool Hdf5FileAssimilator::MatchesFilter(
   // Check if dataset matches any include pattern
   for (const auto& include_pattern : include_patterns) {
     bool matches = MatchGlobPattern(dataset_path, include_pattern);
-    HILOG(kInfo, "Checking dataset '{}' against pattern '{}': {}",
+    HLOG(kInfo, "Checking dataset '{}' against pattern '{}': {}",
           dataset_path, include_pattern, matches ? "MATCH" : "NO MATCH");
     if (matches) {
-      HILOG(kInfo, "Dataset '{}' included by pattern '{}'",
+      HLOG(kInfo, "Dataset '{}' included by pattern '{}'",
             dataset_path, include_pattern);
       return true;
     }
   }
 
   // No include pattern matched, so exclude the dataset
-  HILOG(kInfo, "Dataset '{}' does not match any include pattern",
+  HLOG(kInfo, "Dataset '{}' does not match any include pattern",
         dataset_path);
   return false;
 }

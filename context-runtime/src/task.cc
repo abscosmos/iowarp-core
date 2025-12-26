@@ -36,7 +36,7 @@ void Task::Wait(std::atomic<u32> &is_complete, double yield_time_us) {
 
     // Check if task is already yielded - this should never happen
     if (run_ctx->is_yielded_) {
-      HELOG(kFatal,
+      HLOG(kFatal,
             "Worker {}: Task is already yielded when calling Wait()! "
             "Task ptr: {:#x}, Pool: {}, Method: {}, TaskId: {}.{}.{}.{}.{}",
             worker->GetId(), reinterpret_cast<uintptr_t>(this), pool_id_,

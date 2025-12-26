@@ -197,7 +197,7 @@ auto *ipc_manager = CHI_IPC;
     task.Wait();
     bool result = (task->return_code_ == 0);
     if (!result) {
-      HELOG(kError, "PutBlob failed: {}", task->return_code_);
+      HLOG(kError, "PutBlob failed: {}", task->return_code_);
     }
     CHI_IPC->DelTask(task.GetTaskPtr());
     return result;

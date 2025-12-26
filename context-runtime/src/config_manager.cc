@@ -19,12 +19,12 @@ bool ConfigManager::ClientInit() {
 
   // Get configuration file path from environment
   config_file_path_ = GetServerConfigPath();
-  HILOG(kInfo, "Config at: {}", config_file_path_);
+  HLOG(kInfo, "Config at: {}", config_file_path_);
 
   // Load YAML configuration if path is provided
   if (!config_file_path_.empty()) {
     if (!LoadYaml(config_file_path_)) {
-      HELOG(kError,
+      HLOG(kError,
             "Warning: Failed to load configuration from {}, using defaults",
             config_file_path_);
     }
@@ -191,7 +191,7 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
       } else if (policy_str == "random") {
         lane_map_policy_ = LaneMapPolicy::kRandom;
       } else {
-        HELOG(kWarning, "Unknown lane_map_policy '{}', using default (round_robin)", policy_str);
+        HLOG(kWarning, "Unknown lane_map_policy '{}', using default (round_robin)", policy_str);
         lane_map_policy_ = LaneMapPolicy::kRoundRobin;
       }
     }

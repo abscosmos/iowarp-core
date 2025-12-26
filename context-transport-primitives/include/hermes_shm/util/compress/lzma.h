@@ -31,7 +31,7 @@ class Lzma : public Compressor {
     // Initialize the LZMA encoder with preset LZMA_PRESET_DEFAULT
     ret = lzma_easy_encoder(&strm, LZMA_PRESET_DEFAULT, LZMA_CHECK_CRC64);
     if (ret != LZMA_OK) {
-      HELOG(kError, "Error initializing LZMA compression.");
+      HLOG(kError, "Error initializing LZMA compression.");
       return false;
     }
 
@@ -46,7 +46,7 @@ class Lzma : public Compressor {
     // Compress the data
     ret = lzma_code(&strm, LZMA_FINISH);
     if (ret != LZMA_OK && ret != LZMA_STREAM_END) {
-      HELOG(kError, "Error compressing data with LZMA.");
+      HLOG(kError, "Error compressing data with LZMA.");
       lzma_end(&strm);
       return false;
     }
@@ -66,7 +66,7 @@ class Lzma : public Compressor {
     // Initialize the LZMA decoder
     ret = lzma_stream_decoder(&strm, UINT64_MAX, LZMA_CONCATENATED);
     if (ret != LZMA_OK) {
-      HELOG(kInfo, "Error initializing LZMA decompression.");
+      HLOG(kInfo, "Error initializing LZMA decompression.");
       return false;
     }
 
@@ -81,7 +81,7 @@ class Lzma : public Compressor {
     // Decompress the data
     ret = lzma_code(&strm, LZMA_FINISH);
     if (ret != LZMA_OK && ret != LZMA_STREAM_END) {
-      HELOG(kError, "Error decompressing data with LZMA.");
+      HLOG(kError, "Error decompressing data with LZMA.");
       lzma_end(&strm);
       return false;
     }

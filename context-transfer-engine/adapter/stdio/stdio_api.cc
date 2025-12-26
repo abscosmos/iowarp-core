@@ -42,7 +42,7 @@ FILE *WRP_CTE_DECL(fopen)(const char *path, const char *mode) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsPathTracked(path)) {
-    HILOG(kDebug, "Intercepting fopen({}, {})", path, mode);
+    HLOG(kDebug, "Intercepting fopen({}, {})", path, mode);
     AdapterStat stat;
     stat.mode_str_ = mode;
     return fs_api->Open(stat, path).hermes_fh_;
@@ -56,7 +56,7 @@ FILE *WRP_CTE_DECL(fopen64)(const char *path, const char *mode) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsPathTracked(path)) {
-    HILOG(kDebug, "Intercepting fopen64({}, {})", path, mode);
+    HLOG(kDebug, "Intercepting fopen64({}, {})", path, mode);
     AdapterStat stat;
     stat.mode_str_ = mode;
     return fs_api->Open(stat, path).hermes_fh_;
@@ -71,7 +71,7 @@ FILE *WRP_CTE_DECL(fdopen)(int fd, const char *mode) {
   auto fs_api = WRP_CTE_STDIO_FS;
   std::shared_ptr<AdapterStat> stat;
   if (fs_api->IsFdTracked(fd, stat)) {
-    HILOG(kDebug, "Intercepting fdopen({})", fd, mode);
+    HLOG(kDebug, "Intercepting fdopen({})", fd, mode);
     return fs_api->FdOpen(mode, stat);
   } else {
     return real_api->fdopen(fd, mode);
@@ -83,7 +83,7 @@ FILE *WRP_CTE_DECL(freopen)(const char *path, const char *mode, FILE *stream) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting freopen({}, {})", path, mode);
+    HLOG(kDebug, "Intercepting freopen({}, {})", path, mode);
     return fs_api->Reopen(path, mode, *(AdapterStat *)stream);
   }
   return real_api->freopen(path, mode, stream);
@@ -95,7 +95,7 @@ FILE *WRP_CTE_DECL(freopen64)(const char *path, const char *mode,
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting freopen64({}, {})", path, mode);
+    HLOG(kDebug, "Intercepting freopen64({}, {})", path, mode);
     return fs_api->Reopen(path, mode, *(AdapterStat *)stream);
   }
   return real_api->freopen64(path, mode, stream);
@@ -106,7 +106,7 @@ int WRP_CTE_DECL(fflush)(FILE *fp) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(fp)) {
-    HILOG(kDebug, "Intercepting fflush");
+    HLOG(kDebug, "Intercepting fflush");
     File f;
     f.hermes_fh_ = fp;
     return fs_api->Sync(f, stat_exists);
@@ -119,7 +119,7 @@ int WRP_CTE_DECL(fclose)(FILE *fp) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(fp)) {
-    HILOG(kDebug, "Intercepting fclose({})", (void *)fp);
+    HLOG(kDebug, "Intercepting fclose({})", (void *)fp);
     File f;
     f.hermes_fh_ = fp;
     return fs_api->Close(f, stat_exists);
@@ -133,7 +133,7 @@ size_t WRP_CTE_DECL(fwrite)(const void *ptr, size_t size, size_t nmemb,
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(fp)) {
-    HILOG(kDebug, "Intercepting fwrite with size: {} and nmemb: {}", size,
+    HLOG(kDebug, "Intercepting fwrite with size: {} and nmemb: {}", size,
           nmemb);
     File f;
     f.hermes_fh_ = fp;
@@ -153,7 +153,7 @@ int WRP_CTE_DECL(fputc)(int c, FILE *fp) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(fp)) {
-    HILOG(kDebug, "Intercepting fputc({})", c);
+    HLOG(kDebug, "Intercepting fputc({})", c);
     File f;
     f.hermes_fh_ = fp;
     IoStatus io_status;
@@ -172,7 +172,7 @@ int WRP_CTE_DECL(fgetpos)(FILE *fp, fpos_t *pos) {
   if (fs_api->IsFpTracked(fp) && pos) {
     File f;
     f.hermes_fh_ = fp;
-    HILOG(kDebug, "Intercepting fgetpos");
+    HLOG(kDebug, "Intercepting fgetpos");
     // TODO(chogan): @portability In the GNU C Library, fpos_t is an opaque
     // data structure that contains internal data to represent file offset and
     // conversion state information. In other systems, it might have a
@@ -193,7 +193,7 @@ int WRP_CTE_DECL(fgetpos64)(FILE *fp, fpos64_t *pos) {
   if (fs_api->IsFpTracked(fp) && pos) {
     File f;
     f.hermes_fh_ = fp;
-    HILOG(kDebug, "Intercepting fgetpos64");
+    HLOG(kDebug, "Intercepting fgetpos64");
     // TODO(chogan): @portability In the GNU C Library, fpos_t is an opaque
     // data structure that contains internal data to represent file offset and
     // conversion state information. In other systems, it might have a
@@ -213,7 +213,7 @@ int WRP_CTE_DECL(putc)(int c, FILE *fp) {
     File f;
     f.hermes_fh_ = fp;
     IoStatus io_status;
-    HILOG(kDebug, "Intercepting putc");
+    HLOG(kDebug, "Intercepting putc");
     fs_api->Write(f, stat_exists, &c, 1, io_status);
     return c;
   }
@@ -225,7 +225,7 @@ int WRP_CTE_DECL(putw)(int w, FILE *fp) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(fp)) {
-    HILOG(kDebug, "Intercepting putw");
+    HLOG(kDebug, "Intercepting putw");
     File f;
     f.hermes_fh_ = fp;
     IoStatus io_status;
@@ -244,7 +244,7 @@ int WRP_CTE_DECL(fputs)(const char *s, FILE *stream) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting fputs");
+    HLOG(kDebug, "Intercepting fputs");
     File f;
     f.hermes_fh_ = stream;
     IoStatus io_status;
@@ -258,7 +258,7 @@ size_t WRP_CTE_DECL(fread)(void *ptr, size_t size, size_t nmemb, FILE *stream) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting fread with size: {} and nmemb: {}", size,
+    HLOG(kDebug, "Intercepting fread with size: {} and nmemb: {}", size,
           nmemb);
     File f;
     f.hermes_fh_ = stream;
@@ -278,7 +278,7 @@ int WRP_CTE_DECL(fgetc)(FILE *stream) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting fgetc");
+    HLOG(kDebug, "Intercepting fgetc");
     File f;
     f.hermes_fh_ = stream;
     IoStatus io_status;
@@ -294,7 +294,7 @@ int WRP_CTE_DECL(getc)(FILE *stream) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting getc");
+    HLOG(kDebug, "Intercepting getc");
     File f;
     f.hermes_fh_ = stream;
     IoStatus io_status;
@@ -310,7 +310,7 @@ int WRP_CTE_DECL(getw)(FILE *stream) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting getw");
+    HLOG(kDebug, "Intercepting getw");
     File f;
     f.hermes_fh_ = stream;
     IoStatus io_status;
@@ -326,7 +326,7 @@ char *WRP_CTE_DECL(fgets)(char *s, int size, FILE *stream) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting fgets");
+    HLOG(kDebug, "Intercepting fgets");
     File f;
     f.hermes_fh_ = stream;
     IoStatus io_status;
@@ -360,7 +360,7 @@ void WRP_CTE_DECL(rewind)(FILE *stream) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting rewind");
+    HLOG(kDebug, "Intercepting rewind");
     File f;
     f.hermes_fh_ = stream;
     fs_api->Seek(f, stat_exists, SeekMode::kSet, 0);
@@ -374,7 +374,7 @@ int WRP_CTE_DECL(fseek)(FILE *stream, long offset, int whence) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting fseek offset: {} whence: {}", offset, whence);
+    HLOG(kDebug, "Intercepting fseek offset: {} whence: {}", offset, whence);
     File f;
     f.hermes_fh_ = stream;
     fs_api->Seek(f, stat_exists, static_cast<SeekMode>(whence), offset);
@@ -388,7 +388,7 @@ int WRP_CTE_DECL(fseeko)(FILE *stream, off_t offset, int whence) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting fseeko offset: {} whence: {}", offset, whence);
+    HLOG(kDebug, "Intercepting fseeko offset: {} whence: {}", offset, whence);
     File f;
     f.hermes_fh_ = stream;
     fs_api->Seek(f, stat_exists, static_cast<SeekMode>(whence), offset);
@@ -402,7 +402,7 @@ int WRP_CTE_DECL(fseeko64)(FILE *stream, off64_t offset, int whence) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting fseeko64 offset: {} whence: {}", offset,
+    HLOG(kDebug, "Intercepting fseeko64 offset: {} whence: {}", offset,
           whence);
     File f;
     f.hermes_fh_ = stream;
@@ -418,7 +418,7 @@ int WRP_CTE_DECL(fsetpos)(FILE *stream, const fpos_t *pos) {
   auto fs_api = WRP_CTE_STDIO_FS;
   off_t offset = pos->__pos;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting fsetpos offset: {}", offset);
+    HLOG(kDebug, "Intercepting fsetpos offset: {}", offset);
     File f;
     f.hermes_fh_ = stream;
     fs_api->Seek(f, stat_exists, SeekMode::kSet, offset);
@@ -433,7 +433,7 @@ int WRP_CTE_DECL(fsetpos64)(FILE *stream, const fpos64_t *pos) {
   auto fs_api = WRP_CTE_STDIO_FS;
   off_t offset = pos->__pos;
   if (fs_api->IsFpTracked(stream)) {
-    HILOG(kDebug, "Intercepting fsetpos64 offset: {}", offset);
+    HLOG(kDebug, "Intercepting fsetpos64 offset: {}", offset);
     File f;
     f.hermes_fh_ = stream;
     fs_api->Seek(f, stat_exists, SeekMode::kSet, offset);
@@ -447,7 +447,7 @@ long int WRP_CTE_DECL(ftell)(FILE *fp) {
   auto real_api = WRP_CTE_STDIO_API;
   auto fs_api = WRP_CTE_STDIO_FS;
   if (fs_api->IsFpTracked(fp)) {
-    HILOG(kDebug, "Intercepting ftell");
+    HLOG(kDebug, "Intercepting ftell");
     File f;
     f.hermes_fh_ = fp;
     off_t ret = fs_api->Tell(f, stat_exists);

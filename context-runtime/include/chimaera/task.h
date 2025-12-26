@@ -345,7 +345,7 @@ class Task {
     if (!base_replica.IsNull()) {
       SetCompleter(base_replica->GetCompleter());
     }
-    HILOG(kDebug, "[COMPLETER] Aggregated task {} with completer {}", task_id_, GetCompleter());
+    HLOG(kDebug, "[COMPLETER] Aggregated task {} with completer {}", task_id_, GetCompleter());
   }
 
   /**

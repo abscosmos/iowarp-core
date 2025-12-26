@@ -52,7 +52,7 @@ class Runtime : public chi::Container {
    * Destroy the container (Method::kDestroy)
    */
   void Destroy(hipc::FullPtr<chi::Task> task, chi::RunContext& ctx) {
-    HILOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
+    HLOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
           pool_name_, pool_id_);
   }
 

@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <vector>
 #include <algorithm>
+#include <functional>
 #include "hermes_shm/data_structures/ipc/rb_tree_pre.h"
 #include "hermes_shm/memory/backend/malloc_backend.h"
 #include "hermes_shm/memory/allocator/arena_allocator.h"

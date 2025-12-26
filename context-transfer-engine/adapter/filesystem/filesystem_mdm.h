@@ -81,7 +81,7 @@ public:
    *            false, if operation was unsuccessful.
    */
   bool Create(const File &f, std::shared_ptr<AdapterStat> &stat) {
-    HILOG(kDebug, "Create metadata for file handler");
+    HLOG(kDebug, "Create metadata for file handler");
     hshm::ScopedRwWriteLock md_lock(lock_, kMDM_Create);
     if (path_to_hermes_file_.find(stat->path_) == path_to_hermes_file_.end()) {
       path_to_hermes_file_.emplace(stat->path_, std::list<File>());
@@ -99,7 +99,7 @@ public:
    *            false, if operation was unsuccessful or entry doesn't exist.
    */
   bool Update(const File &f, const AdapterStat &stat) {
-    HILOG(kDebug, "Update metadata for file handler");
+    HLOG(kDebug, "Update metadata for file handler");
     hshm::ScopedRwWriteLock md_lock(lock_, kMDM_Update);
     auto iter = hermes_file_to_stat_.find(f);
     if (iter != hermes_file_to_stat_.end()) {
@@ -117,7 +117,7 @@ public:
    *            false, if operation was unsuccessful.
    */
   bool Delete(const std::string &path, const File &f) {
-    HILOG(kDebug, "Delete metadata for file handler");
+    HLOG(kDebug, "Delete metadata for file handler");
     hshm::ScopedRwWriteLock md_lock(lock_, kMDM_Delete);
     auto iter = hermes_file_to_stat_.find(f);
     if (iter != hermes_file_to_stat_.end()) {
