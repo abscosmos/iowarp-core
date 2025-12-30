@@ -138,6 +138,25 @@ The following Worker methods return `void`, not `bool`:
 
 These methods handle task execution flow internally and do not return success/failure status.
 
+## PoolManager Coroutine Methods
+
+The following PoolManager methods are coroutines that return `TaskResume`:
+- `CreatePool()` - Creates a pool and co_awaits the container's Create method
+- `DestroyPool()` - Destroys a pool (coroutine for consistency)
+
+**Why Coroutines:**
+These methods are coroutines to properly handle nested pool creation. When a ChiMod's Create method (e.g., CTE Create) needs to create sub-pools (e.g., bdev for storage), it uses `co_await`. The coroutine chain allows proper suspension and resumption:
+1. Admin's `GetOrCreatePool` co_awaits `PoolManager::CreatePool`
+2. `PoolManager::CreatePool` co_awaits `container->Run()` (the Create method)
+3. The Create method can co_await nested pool creations (e.g., bdev Create)
+4. When nested operations complete, the chain resumes automatically
+
+**Admin Runtime Methods:**
+The following admin runtime methods are also coroutines:
+- `GetOrCreatePool()` - co_awaits PoolManager::CreatePool
+- `DestroyPool()` - co_awaits PoolManager::DestroyPool
+- `Destroy()` - co_awaits DestroyPool (alias)
+
 ## Task Wait and Future Pattern
 
 ### Task::Wait() Signature and Usage

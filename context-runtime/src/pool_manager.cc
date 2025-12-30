@@ -46,7 +46,26 @@ bool PoolManager::ServerInit() {
 
   RunContext run_ctx;
 
-  if (!CreatePool(admin_task.Cast<Task>(), &run_ctx)) {
+  // CreatePool is now a coroutine - we need to run it to completion
+  // For admin pool creation during ServerInit, the coroutine won't yield
+  // (admin Create doesn't co_await anything), so we can run it synchronously
+  TaskResume task_resume = CreatePool(admin_task.Cast<Task>(), &run_ctx);
+  auto handle = task_resume.release();
+  if (handle) {
+    // Run the coroutine to completion
+    handle.resume();
+    // For admin Create, it should complete immediately (no yields)
+    if (!handle.done()) {
+      HLOG(kError, "PoolManager: Admin pool creation coroutine didn't complete");
+      handle.destroy();
+      ipc_manager->DelTask(admin_task);
+      return false;
+    }
+    handle.destroy();
+  }
+
+  // Check if pool creation succeeded by examining the task return code
+  if (admin_task->GetReturnCode() != 0) {
     // Cleanup the task we created
     ipc_manager->DelTask(admin_task);
     HLOG(kError,
@@ -303,10 +322,10 @@ AddressTable PoolManager::CreateAddressTable(PoolId pool_id,
   return address_table;
 }
 
-bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
+TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
   if (!is_initialized_) {
     HLOG(kError, "PoolManager: Not initialized for pool creation");
-    return false;
+    co_return;
   }
 
   // Cast generic Task to BaseCreateTask to access pool operation parameters
@@ -333,7 +352,7 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
 
   // Validate pool parameters
   if (!ValidatePoolParams(chimod_name, pool_name)) {
-    return false;
+    co_return;
   }
 
   // Check if pool already exists by name (get-or-create semantics)
@@ -346,7 +365,7 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
          "PoolManager: Pool with name '{}' for ChiMod '{}' already exists "
          "with PoolId {}, returning existing pool",
          pool_name, chimod_name, existing_pool_id);
-    return true;
+    co_return;
   }
 
   // Get the target pool ID from the task
@@ -357,7 +376,7 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     HLOG(kError,
          "PoolManager: Cannot create pool with null PoolId. Users must provide "
          "explicit pool ID.");
-    return false;
+    co_return;
   }
 
   // Check if pool already exists by ID (should not happen with proper
@@ -368,7 +387,7 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     HLOG(kInfo,
          "PoolManager: Pool {} already exists by ID, returning existing pool",
          target_pool_id);
-    return true;
+    co_return;
   }
 
   // Create address table for the pool
@@ -389,7 +408,7 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
   if (!module_manager) {
     HLOG(kError, "PoolManager: Module manager not available");
     pool_metadata_.erase(target_pool_id);
-    return false;
+    co_return;
   }
 
   Container* container = nullptr;
@@ -401,7 +420,7 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
       HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
            chimod_name);
       pool_metadata_.erase(target_pool_id);
-      return false;
+      co_return;
     }
 
     // Get this node's ID to use as the container ID
@@ -425,42 +444,24 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
       HLOG(kError, "PoolManager: Failed to register container");
       module_manager->DestroyContainer(chimod_name, container);
       pool_metadata_.erase(target_pool_id);
-      return false;
+      co_return;
     }
 
-    // Run create method on container (task and run_ctx guaranteed by
-    // CHIMAERA_INIT)
-    // Create methods can spawn tasks internally that need to find this
-    // container
-    TaskResume task_resume = container->Run(0, task, *run_ctx);  // Method::kCreate = 0
+    // Run create method on container as a coroutine
+    // The Create method returns a TaskResume that may yield (co_await) for
+    // nested pool creation (e.g., CTE Create calling bdev Create).
+    // By using co_await, we properly suspend and resume, allowing the worker
+    // to process nested tasks while we wait.
+    co_await container->Run(0, task, *run_ctx);  // Method::kCreate = 0
 
-    // Get the coroutine handle and resume it
-    // Create methods typically don't yield, so they should complete immediately
-    auto handle = task_resume.release();
-    if (handle) {
-      // Set the run context in the coroutine's promise
-      auto typed_handle = TaskResume::handle_type::from_address(handle.address());
-      typed_handle.promise().set_run_context(run_ctx);
-
-      // Resume the coroutine to run until completion
-      // initial_suspend returns suspend_always, so we need to resume to start
-      handle.resume();
-
-      // Destroy the handle after completion
-      // (Create methods should not yield, so they complete immediately)
-      if (handle.done()) {
-        handle.destroy();
-      }
-    }
-
-    if (!task->GetReturnCode() == 0) {
+    if (task->GetReturnCode() != 0) {
       HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
            chimod_name);
       // Unregister the container since Create failed
       UnregisterContainer(target_pool_id);
       module_manager->DestroyContainer(chimod_name, container);
       pool_metadata_.erase(target_pool_id);
-      return false;
+      co_return;
     }
 
   } catch (const std::exception& e) {
@@ -471,7 +472,7 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
       module_manager->DestroyContainer(chimod_name, container);
     }
     pool_metadata_.erase(target_pool_id);
-    return false;
+    co_return;
   }
 
   // Set success results
@@ -482,20 +483,20 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
   HLOG(kInfo,
        "PoolManager: Created complete pool {} with ChiMod {} ({} containers)",
        target_pool_id, chimod_name, num_containers);
-  return true;
+  co_return;
 }
 
-bool PoolManager::DestroyPool(PoolId pool_id) {
+TaskResume PoolManager::DestroyPool(PoolId pool_id) {
   if (!is_initialized_) {
     HLOG(kError, "PoolManager: Not initialized for pool destruction");
-    return false;
+    co_return;
   }
 
   // Check if pool exists in metadata
   auto metadata_it = pool_metadata_.find(pool_id);
   if (metadata_it == pool_metadata_.end()) {
     HLOG(kError, "PoolManager: Pool {} metadata not found", pool_id);
-    return false;
+    co_return;
   }
 
   // Destroy local pool components
@@ -503,14 +504,14 @@ bool PoolManager::DestroyPool(PoolId pool_id) {
     HLOG(kError,
          "PoolManager: Failed to destroy local pool components for pool {}",
          pool_id);
-    return false;
+    co_return;
   }
 
   // Remove pool metadata
   pool_metadata_.erase(metadata_it);
 
   HLOG(kInfo, "PoolManager: Destroyed complete pool {}", pool_id);
-  return true;
+  co_return;
 }
 
 const PoolInfo* PoolManager::GetPoolInfo(PoolId pool_id) const {

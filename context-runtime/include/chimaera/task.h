@@ -358,6 +358,8 @@ struct RunContext {
   u32 yield_count_;  /**< Number of times task has yielded */
   Future<Task> future_;  /**< Future for async completion tracking */
   bool destroy_in_end_task_;  /**< Flag to indicate if task should be destroyed in EndTask */
+  u64 generation_;  /**< Generation counter for stale reference detection */
+  std::atomic<bool> is_notified_;  /**< Atomic flag to prevent duplicate event queue additions */
 
   RunContext()
       : coro_handle_(nullptr),
@@ -365,7 +367,8 @@ struct RunContext {
         est_load(0.0), yield_time_us_(0.0), block_start(),
         container(nullptr), lane(nullptr), exec_mode(ExecMode::kExec),
         event_queue_(nullptr),
-        completed_replicas_(0), yield_count_(0), destroy_in_end_task_(false) {
+        completed_replicas_(0), yield_count_(0), destroy_in_end_task_(false),
+        generation_(0), is_notified_(false) {
   }
 
   /**
@@ -385,7 +388,9 @@ struct RunContext {
         completed_replicas_(other.completed_replicas_),
         yield_count_(other.yield_count_),
         future_(std::move(other.future_)),
-        destroy_in_end_task_(other.destroy_in_end_task_) {
+        destroy_in_end_task_(other.destroy_in_end_task_),
+        generation_(other.generation_),
+        is_notified_(other.is_notified_.load()) {
     other.coro_handle_ = nullptr;
     other.event_queue_ = nullptr;
   }
@@ -413,6 +418,8 @@ struct RunContext {
       yield_count_ = other.yield_count_;
       future_ = std::move(other.future_);
       destroy_in_end_task_ = other.destroy_in_end_task_;
+      generation_ = other.generation_;
+      is_notified_.store(other.is_notified_.load());
       other.coro_handle_ = nullptr;
       other.event_queue_ = nullptr;
     }
@@ -435,6 +442,7 @@ struct RunContext {
     yield_time_us_ = 0.0;
     block_start = hshm::Timepoint();
     yield_count_ = 0;
+    is_notified_.store(false);
   }
 };
 

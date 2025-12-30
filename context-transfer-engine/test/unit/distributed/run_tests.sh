@@ -101,20 +101,26 @@ start_environment() {
     print_header "Starting 4-Node Distributed Test Environment"
 
     print_msg "$BLUE" "Starting containers..."
-    docker compose up
+    docker compose up -d
 
-    # Wait for containers to be ready
+    # Wait for containers to be ready with retry logic
     print_msg "$BLUE" "Waiting for containers to start..."
-    sleep 5
+    local max_attempts=30
+    local attempt=0
+    while [ $attempt -lt $max_attempts ]; do
+        # Count all containers (running or exited)
+        local total=$(docker compose ps -a -q 2>/dev/null | wc -l)
+        if [ "$total" -ge 4 ]; then
+            print_success "All 4 containers started successfully"
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
 
-    # Check if all containers are running
-    local running=$(docker compose ps -q | wc -l)
-    if [ "$running" -lt 4 ]; then
-        print_error "Not all containers started (expected 4, got $running)"
-        docker compose logs
-        exit 1
-    fi
-    print_success "All 4 containers started successfully"
+    print_error "Not all containers started within ${max_attempts}s (expected 4, got $total)"
+    docker compose logs
+    exit 1
 }
 
 
@@ -269,16 +275,36 @@ main() {
     start_environment
 
     print_success "Test environment started. Containers are running."
-    print_msg "$BLUE" "Tests are executing. Use 'docker compose logs -f' to follow progress."
+    print_msg "$BLUE" "Tests are executing. Waiting for completion..."
+
+    # Wait for test container (node1) to complete and capture exit code
+    # Use docker wait which blocks until container exits and returns exit code
+    local exit_code=0
+    exit_code=$(docker wait cte-distributed-node1 2>/dev/null || echo "1")
+
+    # Show test logs after completion
+    print_header "Test Output"
+    docker logs cte-distributed-node1 2>&1 | tail -50
+
+    print_header "Test Results"
+    if [ "$exit_code" = "0" ]; then
+        print_success "All tests passed!"
+    else
+        print_error "Tests failed with exit code: $exit_code"
+    fi
 
     # Cleanup unless keep flag is set
     if [ "$keep_containers" = true ]; then
         print_warning "Containers kept running for debugging"
-        print_msg "$BLUE" "To view logs: docker compose logs -f"
+        print_msg "$BLUE" "To view logs: docker compose logs"
         print_msg "$BLUE" "To cleanup: docker compose down -v"
     else
-        print_msg "$BLUE" "Containers will keep running. Use 'docker compose down -v' to cleanup when done."
+        print_msg "$BLUE" "Cleaning up containers..."
+        docker compose down -v 2>/dev/null || true
+        print_success "Cleanup complete"
     fi
+
+    exit $exit_code
 }
 
 # Run main function

@@ -38,19 +38,19 @@ chi::TaskResume Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
     case Method::kDestroy: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<DestroyTask> typed_task = task_ptr.template Cast<DestroyTask>();
-      Destroy(typed_task, rctx);
+      co_await Destroy(typed_task, rctx);
       break;
     }
     case Method::kGetOrCreatePool: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<admin::GetOrCreatePoolTask<admin::CreateParams>> typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
-      GetOrCreatePool(typed_task, rctx);
+      co_await GetOrCreatePool(typed_task, rctx);
       break;
     }
     case Method::kDestroyPool: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<DestroyPoolTask> typed_task = task_ptr.template Cast<DestroyPoolTask>();
-      DestroyPool(typed_task, rctx);
+      co_await DestroyPool(typed_task, rctx);
       break;
     }
     case Method::kStopRuntime: {

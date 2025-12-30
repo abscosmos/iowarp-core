@@ -254,6 +254,7 @@ class TaskResume {
   template<typename PromiseT>
   bool await_suspend(std::coroutine_handle<PromiseT> caller_handle) noexcept {
     if (!handle_) {
+      HLOG(kDebug, "TaskResume::await_suspend: handle_ is null, returning false");
       return false;  // Nothing to run, don't suspend
     }
 
@@ -263,6 +264,8 @@ class TaskResume {
     // CRITICAL: Propagate RunContext from caller to inner coroutine
     // This allows nested co_await on Futures to properly suspend
     RunContext* caller_run_ctx = caller_handle.promise().get_run_context();
+    HLOG(kDebug, "TaskResume::await_suspend: caller_run_ctx={}, inner_handle={}",
+         (void*)caller_run_ctx, (void*)handle_.address());
     if (caller_run_ctx) {
       handle_.promise().set_run_context(caller_run_ctx);
     }
@@ -273,11 +276,15 @@ class TaskResume {
     // causing undefined behavior. We only set it after confirming suspension.
 
     // Resume the inner coroutine
+    HLOG(kDebug, "TaskResume::await_suspend: About to resume inner");
     handle_.resume();
+    HLOG(kDebug, "TaskResume::await_suspend: Returned from resume, done={}",
+         handle_.done());
 
     // Check if inner coroutine is done
     if (handle_.done()) {
       // Inner completed synchronously, destroy it
+      HLOG(kDebug, "TaskResume::await_suspend: Inner done, destroying");
       handle_.destroy();
       handle_ = nullptr;
       return false;  // Don't suspend caller
@@ -286,11 +293,13 @@ class TaskResume {
     // Inner coroutine suspended (on co_await Future or yield)
     // NOW it's safe to set caller_handle - the inner will complete asynchronously
     // and final_suspend will properly resume the caller
+    HLOG(kDebug, "TaskResume::await_suspend: Setting caller in inner's promise");
     handle_.promise().set_caller(caller_handle);
 
     // The inner's handle is now stored in run_ctx->coro_handle_ by Future::await_suspend
     // When the awaited Future completes, worker will resume inner via run_ctx->coro_handle_
     // When inner eventually completes, final_suspend will resume the caller (this coroutine)
+    HLOG(kDebug, "TaskResume::await_suspend: Returning true (suspended)");
     return true;
   }
 
@@ -399,6 +408,9 @@ class Future {
   /** Parent task RunContext pointer (nullptr if no parent waiting) */
   RunContext* parent_task_;
 
+  /** Parent generation at time of co_await - used to detect stale references */
+  u64 parent_generation_;
+
   /** Flag indicating if this Future owns the task and should destroy it */
   bool is_owner_;
 
@@ -411,6 +423,7 @@ class Future {
   Future(AllocT* alloc, hipc::FullPtr<TaskT> task_ptr)
       : task_ptr_(task_ptr),
         parent_task_(nullptr),
+        parent_generation_(0),
         is_owner_(false) {
     // Allocate FutureShm object
     future_shm_ = alloc->template NewObj<FutureT>(alloc).template Cast<FutureT>();
@@ -431,6 +444,7 @@ class Future {
       : task_ptr_(task_ptr),
         future_shm_(alloc, future_shm),
         parent_task_(nullptr),
+        parent_generation_(0),
         is_owner_(false) {}
 
   /**
@@ -442,6 +456,7 @@ class Future {
       : task_ptr_(task_ptr),
         future_shm_(future_shm),
         parent_task_(nullptr),
+        parent_generation_(0),
         is_owner_(false) {
     // No need to copy pool_id - FutureShm already has it
   }
@@ -449,7 +464,7 @@ class Future {
   /**
    * Default constructor - creates null future
    */
-  Future() : parent_task_(nullptr), is_owner_(false) {}
+  Future() : parent_task_(nullptr), parent_generation_(0), is_owner_(false) {}
 
   /**
    * Constructor from ShmPtr<FutureShm> - used by ring buffer deserialization
@@ -459,6 +474,7 @@ class Future {
   explicit Future(const hipc::ShmPtr<FutureT>& future_shm_ptr)
       : future_shm_(nullptr, future_shm_ptr),
         parent_task_(nullptr),
+        parent_generation_(0),
         is_owner_(false) {
     // Task pointer starts null - will be set in ProcessNewTasks
     task_ptr_.SetNull();
@@ -497,6 +513,7 @@ class Future {
       : task_ptr_(other.task_ptr_),
         future_shm_(other.future_shm_),
         parent_task_(other.parent_task_),
+        parent_generation_(other.parent_generation_),
         is_owner_(false) {}  // Copy does not transfer ownership
 
   /**
@@ -513,6 +530,7 @@ class Future {
       task_ptr_ = other.task_ptr_;
       future_shm_ = other.future_shm_;
       parent_task_ = other.parent_task_;
+      parent_generation_ = other.parent_generation_;
       is_owner_ = false;  // Copy does not transfer ownership
     }
     return *this;
@@ -526,8 +544,10 @@ class Future {
       : task_ptr_(std::move(other.task_ptr_)),
         future_shm_(std::move(other.future_shm_)),
         parent_task_(other.parent_task_),
+        parent_generation_(other.parent_generation_),
         is_owner_(other.is_owner_) {  // Transfer ownership
     other.parent_task_ = nullptr;
+    other.parent_generation_ = 0;
     other.is_owner_ = false;  // Source no longer owns
   }
 
@@ -545,8 +565,10 @@ class Future {
       task_ptr_ = std::move(other.task_ptr_);
       future_shm_ = std::move(other.future_shm_);
       parent_task_ = other.parent_task_;
+      parent_generation_ = other.parent_generation_;
       is_owner_ = other.is_owner_;  // Transfer ownership
       other.parent_task_ = nullptr;
+      other.parent_generation_ = 0;
       other.is_owner_ = false;  // Source no longer owns
     }
     return *this;
@@ -690,6 +712,7 @@ class Future {
     result.task_ptr_ = task_ptr_.template Cast<NewTaskT>();
     result.future_shm_ = future_shm_;
     result.parent_task_ = parent_task_;
+    result.parent_generation_ = parent_generation_;
     result.is_owner_ = false;  // Cast does not transfer ownership
     return result;
   }
@@ -703,11 +726,20 @@ class Future {
   }
 
   /**
-   * Set the parent task RunContext pointer
+   * Get the parent generation captured at co_await time
+   * @return Parent generation counter value
+   */
+  u64 GetParentGeneration() const {
+    return parent_generation_;
+  }
+
+  /**
+   * Set the parent task RunContext pointer and capture its generation
    * @param parent_task Pointer to parent RunContext
    */
   void SetParentTask(RunContext* parent_task) {
     parent_task_ = parent_task;
+    parent_generation_ = parent_task ? parent_task->generation_ : 0;
   }
 
   // =========================================================================
@@ -741,8 +773,11 @@ class Future {
     // Mark this Future as owner of the task (will be destroyed on Future destruction)
     is_owner_ = true;
     auto* run_ctx = handle.promise().get_run_context();
+    HLOG(kDebug, "Future::await_suspend: run_ctx={}, handle={}",
+         (void*)run_ctx, (void*)handle.address());
     if (!run_ctx) {
       // No RunContext available, don't suspend
+      HLOG(kWarning, "Future::await_suspend: run_ctx is null, not suspending!");
       return false;
     }
     // Store parent context for resumption tracking
@@ -751,6 +786,8 @@ class Future {
     run_ctx->coro_handle_ = handle;
     run_ctx->is_yielded_ = true;
     run_ctx->yield_time_us_ = 0.0;
+    HLOG(kDebug, "Future::await_suspend: Set coro_handle_={} on run_ctx={}",
+         (void*)handle.address(), (void*)run_ctx);
     return true;  // Suspend the coroutine
   }
 

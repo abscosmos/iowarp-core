@@ -254,10 +254,10 @@ class CTECoreFunctionalTestFixture {
       return result;
     }
 
-    // Get raw pointer from shared memory by creating FullPtr
+    // Get raw pointer from shared memory using ToFullPtr
+    // Cast to char first, then use ToFullPtr to get proper FullPtr with ptr_ set
     auto char_ptr = ptr.template Cast<char>();
-    hipc::FullPtr<char> buffer_fullptr;
-    buffer_fullptr.shm_ = char_ptr;
+    hipc::FullPtr<char> buffer_fullptr = CHI_IPC->ToFullPtr<char>(char_ptr);
     if (buffer_fullptr.ptr_ == nullptr) {
       INFO("Failed to get buffer data from hipc::ShmPtr<>");
       return result;

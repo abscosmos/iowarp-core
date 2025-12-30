@@ -855,6 +855,11 @@ void Worker::DeallocateContext(RunContext *run_ctx) {
     run_ctx->coro_handle_ = nullptr;
   }
 
+  // Increment generation counter to invalidate any stale parent references
+  // This prevents the race condition where a subtask completes after the
+  // parent's RunContext has been reused by a different task
+  ++run_ctx->generation_;
+
   // Add to cache for reuse instead of freeing
   CachedContext cache_entry(run_ctx);
   context_cache_.push(cache_entry);
@@ -975,7 +980,11 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx)
 
   // Resume the coroutine - it will run until next co_await or co_return
   try {
+    HLOG(kDebug, "ResumeCoroutine: About to resume coro_handle_={} for task method={}",
+         (void*)run_ctx->coro_handle_.address(), task_ptr->method_);
     run_ctx->coro_handle_.resume();
+    HLOG(kDebug, "ResumeCoroutine: Returned from resume, coro_handle_={}",
+         (void*)(run_ctx->coro_handle_ ? run_ctx->coro_handle_.address() : nullptr));
 
     // Check if coroutine completed after resumption
     if (run_ctx->coro_handle_.done()) {
@@ -1090,12 +1099,39 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   run_ctx->future_.SetComplete();
 
   // 2.5. Wake up parent task if waiting for this subtask
+  // Only wake parent if:
+  // 1. Parent exists and has valid event queue and coroutine handle
+  // 2. Parent's generation matches what was captured at co_await time
+  //    (prevents race condition where parent's RunContext was reused)
+  // 3. Parent hasn't already been notified by another subtask
+  //    (prevents duplicate event queue additions causing SIGILL)
   RunContext *parent_task = run_ctx->future_.GetParentTask();
-  if (parent_task != nullptr && parent_task->event_queue_ != nullptr) {
-    auto *parent_event_queue = reinterpret_cast<
-        hipc::mpsc_ring_buffer<RunContext *, CHI_MAIN_ALLOC_T> *>(
-        parent_task->event_queue_);
-    parent_event_queue->Emplace(parent_task);
+  u64 captured_generation = run_ctx->future_.GetParentGeneration();
+  HLOG(kDebug, "EndTask: parent_task={}, event_queue_={}, coro_handle_={}, "
+       "captured_gen={}, current_gen={}",
+       (void*)parent_task,
+       parent_task ? (void*)parent_task->event_queue_ : nullptr,
+       parent_task && parent_task->coro_handle_ ? (void*)parent_task->coro_handle_.address() : nullptr,
+       captured_generation,
+       parent_task ? parent_task->generation_ : 0);
+  if (parent_task != nullptr && parent_task->event_queue_ != nullptr &&
+      parent_task->coro_handle_ && !parent_task->coro_handle_.done() &&
+      parent_task->generation_ == captured_generation) {
+    // Use atomic compare_exchange to ensure only one subtask notifies the parent
+    bool expected = false;
+    if (parent_task->is_notified_.compare_exchange_strong(expected, true)) {
+      auto *parent_event_queue = reinterpret_cast<
+          hipc::mpsc_ring_buffer<RunContext *, CHI_MAIN_ALLOC_T> *>(
+          parent_task->event_queue_);
+      parent_event_queue->Emplace(parent_task);
+      HLOG(kDebug, "EndTask: Added parent to event queue, lane={}", (void*)parent_task->lane);
+      // Awaken parent worker in case it's sleeping
+      if (parent_task->lane != nullptr) {
+        CHI_IPC->AwakenWorker(parent_task->lane);
+      }
+    } else {
+      HLOG(kDebug, "EndTask: Parent already notified, skipping duplicate addition");
+    }
   }
 
   // 3. Delete task using container->DelTask (only if destroy_in_end_task is
@@ -1234,7 +1270,9 @@ void Worker::ProcessEventQueue() {
   // Process all tasks in the event queue
   RunContext *run_ctx;
   while (event_queue_->Pop(run_ctx)) {
+    HLOG(kDebug, "ProcessEventQueue: Popped run_ctx={}", (void*)run_ctx);
     if (!run_ctx || run_ctx->task.IsNull()) {
+      HLOG(kDebug, "ProcessEventQueue: Skipping null run_ctx or task");
       continue;
     }
 
@@ -1245,11 +1283,20 @@ void Worker::ProcessEventQueue() {
     // 2. Parent already completed and was destroyed before events were processed
     // 3. Coroutine completed synchronously (no suspension point hit)
     if (!run_ctx->coro_handle_ || run_ctx->coro_handle_.done()) {
+      HLOG(kDebug, "ProcessEventQueue: Skipping - coro_handle_={}, done={}",
+           (void*)run_ctx->coro_handle_.address(),
+           run_ctx->coro_handle_ ? run_ctx->coro_handle_.done() : false);
       continue;
     }
 
+    HLOG(kDebug, "ProcessEventQueue: Resuming task method={}, coro_handle_={}",
+         run_ctx->task->method_, (void*)run_ctx->coro_handle_.address());
+
     // Reset the is_yielded_ flag before executing the task
     run_ctx->is_yielded_ = false;
+
+    // Reset is_notified_ so this task can be notified again for subsequent co_await
+    run_ctx->is_notified_.store(false);
 
     // Execute the task
     ExecTask(run_ctx->task, run_ctx, true);

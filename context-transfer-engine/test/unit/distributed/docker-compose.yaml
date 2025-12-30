@@ -56,11 +56,11 @@ services:
         sync &&
         if [ -z \"$$TEST_FILTER\" ]; then
           echo 'Running all tests (no filter)' &&
-          test_core_functionality 2>&1
+          /workspace/build/bin/test_core_functionality 2>&1
           TEST_EXIT_CODE=$$?
         else
           echo \"Test filter: $$TEST_FILTER\" &&
-          test_core_functionality \"$$TEST_FILTER\" 2>&1
+          /workspace/build/bin/test_core_functionality \"$$TEST_FILTER\" 2>&1
           TEST_EXIT_CODE=$$?
         fi &&
         echo '========================================'

@@ -62,7 +62,7 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
   HLOG(kDebug, "Admin: Spawned periodic Recv and Send tasks with 25us period");
 }
 
-void Runtime::GetOrCreatePool(
+chi::TaskResume Runtime::GetOrCreatePool(
     hipc::FullPtr<
         chimaera::admin::GetOrCreatePoolTask<chimaera::admin::CreateParams>>
         task,
@@ -95,7 +95,7 @@ void Runtime::GetOrCreatePool(
            pool_name);
       task->pool_query_ = chi::PoolQuery::Broadcast();
     }
-    return;
+    co_return;
   }
 
   // Pool get-or-create operation logic (IS_ADMIN=false)
@@ -108,11 +108,13 @@ void Runtime::GetOrCreatePool(
 
   try {
     // Use the simplified PoolManager API that extracts all parameters from the
-    // task
-    if (!pool_manager->CreatePool(task.Cast<chi::Task>(), &rctx)) {
-      task->return_code_ = 2;
-      task->error_message_ = "Failed to create or get pool via PoolManager";
-      return;
+    // task. CreatePool is now a coroutine that co_awaits nested Create methods.
+    co_await pool_manager->CreatePool(task.Cast<chi::Task>(), &rctx);
+
+    // Check if CreatePool set an error (return code is set on the task)
+    if (task->return_code_ != 0) {
+      // Error already set by CreatePool
+      co_return;
     }
 
     // Set success results (task->new_pool_id_ is already updated by CreatePool)
@@ -132,14 +134,16 @@ void Runtime::GetOrCreatePool(
     task->error_message_ = chi::priv::string(alloc, error_msg);
     HLOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
   }
+  co_return;
 }
 
-void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
+chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
   // DestroyTask is aliased to DestroyPoolTask, so delegate to DestroyPool
-  DestroyPool(task, rctx);
+  co_await DestroyPool(task, rctx);
+  co_return;
 }
 
-void Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
+chi::TaskResume Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
                           chi::RunContext &rctx) {
   HLOG(kDebug, "Admin: Executing DestroyPool task - Pool ID: {}",
        task->target_pool_id_);
@@ -156,15 +160,12 @@ void Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
     if (!pool_manager || !pool_manager->IsInitialized()) {
       task->return_code_ = 1;
       task->error_message_ = "Pool manager not available";
-      return;
+      co_return;
     }
 
     // Use PoolManager to destroy the complete pool including metadata
-    if (!pool_manager->DestroyPool(target_pool)) {
-      task->return_code_ = 2;
-      task->error_message_ = "Failed to destroy pool via PoolManager";
-      return;
-    }
+    // DestroyPool is now a coroutine for consistency
+    co_await pool_manager->DestroyPool(target_pool);
 
     // Set success results
     task->return_code_ = 0;
@@ -183,6 +184,7 @@ void Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
     task->error_message_ = chi::priv::string(alloc, error_msg);
     HLOG(kError, "Admin: Pool destruction failed with exception: {}", e.what());
   }
+  co_return;
 }
 
 void Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,

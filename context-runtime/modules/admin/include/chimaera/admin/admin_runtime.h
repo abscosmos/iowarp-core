@@ -93,8 +93,9 @@ public:
 
   /**
    * Handle GetOrCreatePool task - Pool get-or-create operation (IS_ADMIN=false)
+   * This is a coroutine that can co_await nested Create methods
    */
-  void GetOrCreatePool(
+  chi::TaskResume GetOrCreatePool(
       hipc::FullPtr<
           chimaera::admin::GetOrCreatePoolTask<chimaera::admin::CreateParams>>
           task,
@@ -102,13 +103,15 @@ public:
 
   /**
    * Handle Destroy task - Alias for DestroyPool (DestroyTask = DestroyPoolTask)
+   * This is a coroutine for consistency with GetOrCreatePool
    */
-  void Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx);
+  chi::TaskResume Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx);
 
   /**
    * Handle DestroyPool task - Destroy an existing ChiPool
+   * This is a coroutine that can co_await pool destruction
    */
-  void DestroyPool(hipc::FullPtr<DestroyPoolTask> task, chi::RunContext &rctx);
+  chi::TaskResume DestroyPool(hipc::FullPtr<DestroyPoolTask> task, chi::RunContext &rctx);
 
   /**
    * Handle StopRuntime task - Stop the entire runtime

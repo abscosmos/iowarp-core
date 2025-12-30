@@ -14,6 +14,7 @@ namespace chi {
 class Container;
 class Task;
 struct RunContext;
+class TaskResume;
 
 /**
  * Address mapping table for pool management
@@ -243,19 +244,21 @@ class PoolManager {
   /**
    * Create or get a complete pool with get-or-create semantics
    * Extracts all parameters from the task (chimod_name, pool_name, chimod_params)
+   * This is a coroutine that can co_await nested Create methods
    * @param task Task containing pool creation parameters (updated with final pool ID)
    * @param run_ctx RunContext for container initialization
-   * @return true if operation successful, false otherwise
+   * @return TaskResume coroutine handle
    */
-  bool CreatePool(FullPtr<Task> task, RunContext* run_ctx);
+  TaskResume CreatePool(FullPtr<Task> task, RunContext* run_ctx);
 
 
   /**
    * Destroy a complete pool including metadata and local containers
+   * This is a coroutine for consistency with CreatePool
    * @param pool_id Pool identifier
-   * @return true if pool destruction successful, false otherwise
+   * @return TaskResume coroutine handle
    */
-  bool DestroyPool(PoolId pool_id);
+  TaskResume DestroyPool(PoolId pool_id);
 
   /**
    * Destroy a local pool and its containers on this node (simple version)
