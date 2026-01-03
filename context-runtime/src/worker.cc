@@ -908,11 +908,6 @@ void Worker::DeallocateContext(RunContext *run_ctx) {
     run_ctx->coro_handle_ = nullptr;
   }
 
-  // Increment generation counter to invalidate any stale parent references
-  // This prevents the race condition where a subtask completes after the
-  // parent's RunContext has been reused by a different task
-  ++run_ctx->generation_;
-
   // Add to cache for reuse instead of freeing
   CachedContext cache_entry(run_ctx);
   context_cache_.push(cache_entry);
@@ -1154,22 +1149,15 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // 2.5. Wake up parent task if waiting for this subtask
   // Only wake parent if:
   // 1. Parent exists and has valid event queue and coroutine handle
-  // 2. Parent's generation matches what was captured at co_await time
-  //    (prevents race condition where parent's RunContext was reused)
-  // 3. Parent hasn't already been notified by another subtask
+  // 2. Parent hasn't already been notified by another subtask
   //    (prevents duplicate event queue additions causing SIGILL)
   RunContext *parent_task = run_ctx->future_.GetParentTask();
-  u64 captured_generation = run_ctx->future_.GetParentGeneration();
-  HLOG(kDebug, "EndTask: parent_task={}, event_queue_={}, coro_handle_={}, "
-       "captured_gen={}, current_gen={}",
+  HLOG(kDebug, "EndTask: parent_task={}, event_queue_={}, coro_handle_={}",
        (void*)parent_task,
        parent_task ? (void*)parent_task->event_queue_ : nullptr,
-       parent_task && parent_task->coro_handle_ ? (void*)parent_task->coro_handle_.address() : nullptr,
-       captured_generation,
-       parent_task ? parent_task->generation_ : 0);
+       parent_task && parent_task->coro_handle_ ? (void*)parent_task->coro_handle_.address() : nullptr);
   if (parent_task != nullptr && parent_task->event_queue_ != nullptr &&
-      parent_task->coro_handle_ && !parent_task->coro_handle_.done() &&
-      parent_task->generation_ == captured_generation) {
+      parent_task->coro_handle_ && !parent_task->coro_handle_.done()) {
     // Use atomic compare_exchange to ensure only one subtask notifies the parent
     bool expected = false;
     if (parent_task->is_notified_.compare_exchange_strong(expected, true)) {

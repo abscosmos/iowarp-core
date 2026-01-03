@@ -408,9 +408,6 @@ class Future {
   /** Parent task RunContext pointer (nullptr if no parent waiting) */
   RunContext* parent_task_;
 
-  /** Parent generation at time of co_await - used to detect stale references */
-  u64 parent_generation_;
-
   /** Flag indicating if this Future owns the task and should destroy it */
   bool is_owner_;
 
@@ -423,7 +420,6 @@ class Future {
   Future(AllocT* alloc, hipc::FullPtr<TaskT> task_ptr)
       : task_ptr_(task_ptr),
         parent_task_(nullptr),
-        parent_generation_(0),
         is_owner_(false) {
     // Allocate FutureShm object
     future_shm_ = alloc->template NewObj<FutureT>(alloc).template Cast<FutureT>();
@@ -444,7 +440,6 @@ class Future {
       : task_ptr_(task_ptr),
         future_shm_(alloc, future_shm),
         parent_task_(nullptr),
-        parent_generation_(0),
         is_owner_(false) {}
 
   /**
@@ -456,7 +451,6 @@ class Future {
       : task_ptr_(task_ptr),
         future_shm_(future_shm),
         parent_task_(nullptr),
-        parent_generation_(0),
         is_owner_(false) {
     // No need to copy pool_id - FutureShm already has it
   }
@@ -464,7 +458,7 @@ class Future {
   /**
    * Default constructor - creates null future
    */
-  Future() : parent_task_(nullptr), parent_generation_(0), is_owner_(false) {}
+  Future() : parent_task_(nullptr), is_owner_(false) {}
 
   /**
    * Constructor from ShmPtr<FutureShm> - used by ring buffer deserialization
@@ -474,7 +468,6 @@ class Future {
   explicit Future(const hipc::ShmPtr<FutureT>& future_shm_ptr)
       : future_shm_(nullptr, future_shm_ptr),
         parent_task_(nullptr),
-        parent_generation_(0),
         is_owner_(false) {
     // Task pointer starts null - will be set in ProcessNewTasks
     task_ptr_.SetNull();
@@ -513,7 +506,6 @@ class Future {
       : task_ptr_(other.task_ptr_),
         future_shm_(other.future_shm_),
         parent_task_(other.parent_task_),
-        parent_generation_(other.parent_generation_),
         is_owner_(false) {}  // Copy does not transfer ownership
 
   /**
@@ -530,7 +522,6 @@ class Future {
       task_ptr_ = other.task_ptr_;
       future_shm_ = other.future_shm_;
       parent_task_ = other.parent_task_;
-      parent_generation_ = other.parent_generation_;
       is_owner_ = false;  // Copy does not transfer ownership
     }
     return *this;
@@ -544,10 +535,8 @@ class Future {
       : task_ptr_(std::move(other.task_ptr_)),
         future_shm_(std::move(other.future_shm_)),
         parent_task_(other.parent_task_),
-        parent_generation_(other.parent_generation_),
         is_owner_(other.is_owner_) {  // Transfer ownership
     other.parent_task_ = nullptr;
-    other.parent_generation_ = 0;
     other.is_owner_ = false;  // Source no longer owns
   }
 
@@ -565,10 +554,8 @@ class Future {
       task_ptr_ = std::move(other.task_ptr_);
       future_shm_ = std::move(other.future_shm_);
       parent_task_ = other.parent_task_;
-      parent_generation_ = other.parent_generation_;
       is_owner_ = other.is_owner_;  // Transfer ownership
       other.parent_task_ = nullptr;
-      other.parent_generation_ = 0;
       other.is_owner_ = false;  // Source no longer owns
     }
     return *this;
@@ -712,7 +699,6 @@ class Future {
     result.task_ptr_ = task_ptr_.template Cast<NewTaskT>();
     result.future_shm_ = future_shm_;
     result.parent_task_ = parent_task_;
-    result.parent_generation_ = parent_generation_;
     result.is_owner_ = false;  // Cast does not transfer ownership
     return result;
   }
@@ -726,20 +712,11 @@ class Future {
   }
 
   /**
-   * Get the parent generation captured at co_await time
-   * @return Parent generation counter value
-   */
-  u64 GetParentGeneration() const {
-    return parent_generation_;
-  }
-
-  /**
-   * Set the parent task RunContext pointer and capture its generation
+   * Set the parent task RunContext pointer
    * @param parent_task Pointer to parent RunContext
    */
   void SetParentTask(RunContext* parent_task) {
     parent_task_ = parent_task;
-    parent_generation_ = parent_task ? parent_task->generation_ : 0;
   }
 
   // =========================================================================
