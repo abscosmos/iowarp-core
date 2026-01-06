@@ -20,8 +20,7 @@ class WrpCte(Service):
 
         This method is called during service initialization.
         """
-        self.config_file_path = None
-        self.compose_config_path = None
+        self.compose_config_path = os.path.join(self.shared_dir, 'cte_compose.yaml')
         self.devices_from_resource_graph = []
 
     def _configure_menu(self):
@@ -112,9 +111,6 @@ class WrpCte(Service):
 
         # Build chimaera_compose compatible configuration
         compose_config = self._build_compose_config(devices)
-
-        # Save configuration to shared directory
-        self.compose_config_path = os.path.join(self.shared_dir, 'cte_compose.yaml')
 
         try:
             with open(self.compose_config_path, 'w') as f:

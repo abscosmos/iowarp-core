@@ -151,7 +151,7 @@ class WrpRuntime(Service):
             },
             'networking': {
                 'port': self.config['port'],
-                'hostfile': self.jarvis.hostfile.path
+                'hostfile': self.jarvis.hostfile.path if self.jarvis.hostfile.path else ''
             },
             'logging': {
                 'level': self.config['log_level'],

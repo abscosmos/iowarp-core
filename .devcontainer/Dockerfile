@@ -105,9 +105,14 @@ RUN echo '' >> /home/iowarp/.bashrc \
     && echo 'export NVIDIA_VISIBLE_DEVICES=all' >> /home/iowarp/.bashrc \
     && echo 'export NVIDIA_DRIVER_CAPABILITIES=compute,utility' >> /home/iowarp/.bashrc
 
+# Install libaio for Linux AIO support (required by bdev ChiMod)
+SHELL ["/bin/bash", "-c"]
+RUN source /home/iowarp/miniconda3/etc/profile.d/conda.sh \
+    && conda activate base \
+    && conda install -y libaio -c conda-forge
+
 # Install Jarvis (IOWarp runtime deployment tool)
 # Note: Must source conda in non-interactive shell since .bashrc isn't loaded during build
-SHELL ["/bin/bash", "-c"]
 RUN cd /home/iowarp \
     && git clone https://github.com/iowarp/runtime-deployment.git \
     && cd runtime-deployment \

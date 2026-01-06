@@ -13,11 +13,15 @@ message(STATUS "Found libaio headers: ${LIBAIO_INCLUDE_DIR}")
 
 # Create client library
 # Note: Admin headers are automatically available via chimaera_admin_client link dependency
+# Note: INCLUDE_DIRECTORIES includes libaio because bdev_runtime.h (in public includes)
+#       uses io_context_t type from libaio.h
 add_chimod_client(
   SOURCES
     src/bdev_client.cc
   LINK_LIBRARIES
     chimaera_admin_client  # Provides admin headers via transitive includes
+  INCLUDE_DIRECTORIES
+    ${LIBAIO_INCLUDE_DIR}  # Required for bdev_runtime.h which uses io_context_t
 )
 
 # Create runtime library

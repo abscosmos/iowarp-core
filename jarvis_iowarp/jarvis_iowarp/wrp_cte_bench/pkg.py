@@ -43,11 +43,18 @@ class WrpCteBench(Application):
                 'help': 'Put: Write benchmark, Get: Read benchmark, PutGet: Combined write+read benchmark'
             },
             {
-                'name': 'depth',
-                'msg': 'Number of async requests to generate',
+                'name': 'num_threads',
+                'msg': 'Number of worker threads',
                 'type': int,
                 'default': 4,
-                'help': 'Number of concurrent async I/O operations (e.g., 4 means 4 operations in flight)'
+                'help': 'Number of worker threads for parallel I/O (e.g., 4)'
+            },
+            {
+                'name': 'depth',
+                'msg': 'Number of async requests per thread',
+                'type': int,
+                'default': 4,
+                'help': 'Number of concurrent async I/O operations per thread (e.g., 4 means 4 operations in flight per thread)'
             },
             {
                 'name': 'io_size',
@@ -108,6 +115,10 @@ class WrpCteBench(Application):
         if self.config['test_case'] not in ['Put', 'Get', 'PutGet']:
             raise ValueError(f"Invalid test_case: {self.config['test_case']}. Must be Put, Get, or PutGet")
 
+        # Validate num_threads
+        if self.config['num_threads'] <= 0:
+            raise ValueError(f"Invalid num_threads: {self.config['num_threads']}. Must be > 0")
+
         # Validate depth
         if self.config['depth'] <= 0:
             raise ValueError(f"Invalid depth: {self.config['depth']}. Must be > 0")
@@ -154,9 +165,11 @@ class WrpCteBench(Application):
         self.log(f"Starting CTE benchmark: {self.config['test_case']}")
 
         # Build command line arguments
+        # Usage: wrp_cte_bench <test_case> <num_threads> <depth> <io_size> <io_count>
         cmd = [
             self.benchmark_executable,
             self.config['test_case'],
+            str(self.config['num_threads']),
             str(self.config['depth']),
             str(self.config['io_size']),
             str(self.config['io_count'])

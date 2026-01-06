@@ -22,7 +22,6 @@
 // resolution
 #include "chimaera/admin/admin_client.h"
 #include "chimaera/container.h"
-#include "chimaera/task.h"
 #include "chimaera/pool_manager.h"
 #include "chimaera/singletons.h"
 #include "chimaera/task.h"
@@ -112,8 +111,8 @@ bool Worker::RegisterEpollFd(int fd, u32 events, void *user_data) {
   // Lock to protect epoll_ctl from concurrent access
   hshm::ScopedMutex lock(epoll_mutex_, 0);
   if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) == -1) {
-    HLOG(kWarning, "Failed to register fd {} with worker {} epoll: {}",
-         fd, worker_id_, strerror(errno));
+    HLOG(kWarning, "Failed to register fd {} with worker {} epoll: {}", fd,
+         worker_id_, strerror(errno));
     return false;
   }
   return true;
@@ -127,8 +126,8 @@ bool Worker::UnregisterEpollFd(int fd) {
   // Lock to protect epoll_ctl from concurrent access
   hshm::ScopedMutex lock(epoll_mutex_, 0);
   if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) == -1) {
-    HLOG(kWarning, "Failed to unregister fd {} from worker {} epoll: {}",
-         fd, worker_id_, strerror(errno));
+    HLOG(kWarning, "Failed to unregister fd {} from worker {} epoll: {}", fd,
+         worker_id_, strerror(errno));
     return false;
   }
   return true;
@@ -146,8 +145,8 @@ bool Worker::ModifyEpollFd(int fd, u32 events, void *user_data) {
   // Lock to protect epoll_ctl from concurrent access
   hshm::ScopedMutex lock(epoll_mutex_, 0);
   if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) == -1) {
-    HLOG(kWarning, "Failed to modify fd {} in worker {} epoll: {}",
-         fd, worker_id_, strerror(errno));
+    HLOG(kWarning, "Failed to modify fd {} in worker {} epoll: {}", fd,
+         worker_id_, strerror(errno));
     return false;
   }
   return true;
@@ -243,7 +242,6 @@ void Worker::Run() {
     is_running_ = false;
     return;
   }
-
 
   // Main worker loop - process tasks from assigned lane
   while (is_running_) {
@@ -942,7 +940,7 @@ void Worker::BeginTask(Future<Task> &future, Container *container,
   run_ctx->lane = lane;            // Store lane for CHI_CUR_LANE
   run_ctx->event_queue_ = event_queue_;  // Set pointer to worker's event queue
   run_ctx->destroy_in_end_task_ = destroy_in_end_task;  // Set destroy flag
-  run_ctx->future_ = future;  // Store future in RunContext
+  run_ctx->future_ = future;        // Store future in RunContext
   run_ctx->coro_handle_ = nullptr;  // Coroutine not started yet
   // Set RunContext pointer in task
   task_ptr->run_ctx_ = run_ctx;
@@ -951,7 +949,8 @@ void Worker::BeginTask(Future<Task> &future, Container *container,
   SetCurrentRunContext(run_ctx);
 }
 
-void Worker::StartCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx) {
+void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
+                            RunContext *run_ctx) {
   // Set current run context
   SetCurrentRunContext(run_ctx);
 
@@ -971,7 +970,8 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx) 
 
   // Call the container's Run function which returns a TaskResume coroutine
   try {
-    TaskResume task_resume = container->Run(task_ptr->method_, task_ptr, *run_ctx);
+    TaskResume task_resume =
+        container->Run(task_ptr->method_, task_ptr, *run_ctx);
 
     // Store the coroutine handle in RunContext for later resumption
     auto handle = task_resume.release();
@@ -979,11 +979,13 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx) 
 
     // Set the run context in the coroutine's promise so it can access it
     if (handle) {
-      auto typed_handle = TaskResume::handle_type::from_address(handle.address());
+      auto typed_handle =
+          TaskResume::handle_type::from_address(handle.address());
       typed_handle.promise().set_run_context(run_ctx);
 
       // Resume the coroutine to run until first suspension point or completion
-      // initial_suspend returns suspend_always, so we need to resume to start execution
+      // initial_suspend returns suspend_always, so we need to resume to start
+      // execution
       handle.resume();
 
       // Check if coroutine completed (no suspension points)
@@ -1010,7 +1012,8 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx) 
   }
 }
 
-void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx) {
+void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
+                             RunContext *run_ctx) {
   // Set current run context
   SetCurrentRunContext(run_ctx);
 
@@ -1028,11 +1031,13 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx)
 
   // Resume the coroutine - it will run until next co_await or co_return
   try {
-    HLOG(kDebug, "ResumeCoroutine: About to resume coro_handle_={} for task method={}",
-         (void*)run_ctx->coro_handle_.address(), task_ptr->method_);
+    HLOG(kDebug,
+         "ResumeCoroutine: About to resume coro_handle_={} for task method={}",
+         (void *)run_ctx->coro_handle_.address(), task_ptr->method_);
     run_ctx->coro_handle_.resume();
     HLOG(kDebug, "ResumeCoroutine: Returned from resume, coro_handle_={}",
-         (void*)(run_ctx->coro_handle_ ? run_ctx->coro_handle_.address() : nullptr));
+         (void *)(run_ctx->coro_handle_ ? run_ctx->coro_handle_.address()
+                                        : nullptr));
 
     // Check if coroutine completed after resumption
     if (run_ctx->coro_handle_.done()) {
@@ -1152,26 +1157,20 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // 2. Parent hasn't already been notified by another subtask
   //    (prevents duplicate event queue additions causing SIGILL)
   RunContext *parent_task = run_ctx->future_.GetParentTask();
-  HLOG(kDebug, "EndTask: parent_task={}, event_queue_={}, coro_handle_={}",
-       (void*)parent_task,
-       parent_task ? (void*)parent_task->event_queue_ : nullptr,
-       parent_task && parent_task->coro_handle_ ? (void*)parent_task->coro_handle_.address() : nullptr);
   if (parent_task != nullptr && parent_task->event_queue_ != nullptr &&
       parent_task->coro_handle_ && !parent_task->coro_handle_.done()) {
-    // Use atomic compare_exchange to ensure only one subtask notifies the parent
+    // Use atomic compare_exchange to ensure only one subtask notifies the
+    // parent
     bool expected = false;
     if (parent_task->is_notified_.compare_exchange_strong(expected, true)) {
       auto *parent_event_queue = reinterpret_cast<
           hipc::mpsc_ring_buffer<RunContext *, CHI_MAIN_ALLOC_T> *>(
           parent_task->event_queue_);
       parent_event_queue->Emplace(parent_task);
-      HLOG(kDebug, "EndTask: Added parent to event queue, lane={}", (void*)parent_task->lane);
       // Awaken parent worker in case it's sleeping
       if (parent_task->lane != nullptr) {
         CHI_IPC->AwakenWorker(parent_task->lane);
       }
-    } else {
-      HLOG(kDebug, "EndTask: Parent already notified, skipping duplicate addition");
     }
   }
 
@@ -1232,12 +1231,14 @@ void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,
       continue;
     }
 
-    // Determine if this is a resume (task was started before) or first execution
+    // Determine if this is a resume (task was started before) or first
+    // execution
     bool is_started = run_ctx->task->task_flags_.Any(TASK_STARTED);
 
     // Skip if task was started but coroutine already completed
     // This can happen with orphan events from parallel subtasks
-    if (is_started && (!run_ctx->coro_handle_ || run_ctx->coro_handle_.done())) {
+    if (is_started &&
+        (!run_ctx->coro_handle_ || run_ctx->coro_handle_.done())) {
       continue;
     }
 
@@ -1311,7 +1312,7 @@ void Worker::ProcessEventQueue() {
   // Process all tasks in the event queue
   RunContext *run_ctx;
   while (event_queue_->Pop(run_ctx)) {
-    HLOG(kDebug, "ProcessEventQueue: Popped run_ctx={}", (void*)run_ctx);
+    HLOG(kDebug, "ProcessEventQueue: Popped run_ctx={}", (void *)run_ctx);
     if (!run_ctx || run_ctx->task.IsNull()) {
       HLOG(kDebug, "ProcessEventQueue: Skipping null run_ctx or task");
       continue;
@@ -1319,24 +1320,27 @@ void Worker::ProcessEventQueue() {
 
     // Skip if coroutine handle is null or already completed
     // This can legitimately happen when:
-    // 1. Multiple parallel subtasks complete and each posts an event to wake parent
+    // 1. Multiple parallel subtasks complete and each posts an event to wake
+    // parent
     //    Only the first event is needed; subsequent events are orphans
-    // 2. Parent already completed and was destroyed before events were processed
+    // 2. Parent already completed and was destroyed before events were
+    // processed
     // 3. Coroutine completed synchronously (no suspension point hit)
     if (!run_ctx->coro_handle_ || run_ctx->coro_handle_.done()) {
       HLOG(kDebug, "ProcessEventQueue: Skipping - coro_handle_={}, done={}",
-           (void*)run_ctx->coro_handle_.address(),
+           (void *)run_ctx->coro_handle_.address(),
            run_ctx->coro_handle_ ? run_ctx->coro_handle_.done() : false);
       continue;
     }
 
     HLOG(kDebug, "ProcessEventQueue: Resuming task method={}, coro_handle_={}",
-         run_ctx->task->method_, (void*)run_ctx->coro_handle_.address());
+         run_ctx->task->method_, (void *)run_ctx->coro_handle_.address());
 
     // Reset the is_yielded_ flag before executing the task
     run_ctx->is_yielded_ = false;
 
-    // Reset is_notified_ so this task can be notified again for subsequent co_await
+    // Reset is_notified_ so this task can be notified again for subsequent
+    // co_await
     run_ctx->is_notified_.store(false);
 
     // Execute the task
