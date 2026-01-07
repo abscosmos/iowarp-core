@@ -92,14 +92,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 USER iowarp
 WORKDIR /home/iowarp
 
-# Add CUDA paths to bashrc
-# Note: conda is inherited from base image with all dev dependencies pre-installed
-# Install Miniconda
-RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh \
-    && bash /tmp/miniconda.sh -b -p /home/iowarp/miniconda3 \
-    && rm /tmp/miniconda.sh
-
-# Initialize conda for bash
+# Initialize conda for bash (conda is inherited from base image)
 RUN /home/iowarp/miniconda3/bin/conda init bash \
     && /home/iowarp/miniconda3/bin/conda config --add channels conda-forge \
     && /home/iowarp/miniconda3/bin/conda config --set channel_priority strict
@@ -118,42 +111,37 @@ RUN /home/iowarp/miniconda3/bin/conda init bash \
 RUN /home/iowarp/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
     && /home/iowarp/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r \
     && /home/iowarp/miniconda3/bin/conda install -y \
-        conda-build \
-        cmake \
-        ninja \
-        pkg-config \
-        boost \
-        hdf5 \
-        yaml-cpp \
-        zeromq \
-        cppzmq \
-        cereal \
-        catch2 \
-        libcurl \
-        openssl \
-        zlib \
-        bzip2 \
-        lzo \
-        zstd \
-        lz4-c \
-        xz \
-        brotli \
-        snappy \
-        zfp \
-        poco \
-        nlohmann_json \
+    conda-build \
+    cmake \
+    ninja \
+    pkg-config \
+    boost \
+    hdf5 \
+    yaml-cpp \
+    zeromq \
+    cppzmq \
+    cereal \
+    catch2 \
+    libcurl \
+    openssl \
+    zlib \
+    bzip2 \
+    lzo \
+    zstd \
+    lz4-c \
+    xz \
+    brotli \
+    snappy \
+    zfp \
+    poco \
+    nlohmann_json \
+    adios2 \
     && /home/iowarp/miniconda3/bin/conda clean -ya
 
-# Create Python virtual environment in user's home directory
-# Note: Users can choose between conda environments or venv
-# Install Python packages for data analysis and benchmarking
-RUN python3 -m venv /home/iowarp/venv \
-    && /home/iowarp/venv/bin/pip install --upgrade pip setuptools wheel \
-    && /home/iowarp/venv/bin/pip install pyyaml nanobind \
-    && /home/iowarp/venv/bin/pip install pandas matplotlib seaborn numpy
-
 # Switch to root to install lossy compression libraries from source
+# Add conda's cmake to PATH for root user
 USER root
+ENV PATH="/home/iowarp/miniconda3/bin:${PATH}"
 
 # Install FPZIP (fast floating-point compressor)
 RUN cd /tmp \
@@ -161,10 +149,11 @@ RUN cd /tmp \
     && cd fpzip_src \
     && mkdir -p build && cd build \
     && cmake .. -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_INSTALL_PREFIX=/usr/local \
-                -DBUILD_SHARED_LIBS=ON \
-                -DBUILD_TESTING=OFF \
-                -DBUILD_UTILITIES=OFF \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_TESTING=OFF \
+    -DBUILD_UTILITIES=OFF \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     && make -j$(nproc) \
     && make install \
     && ldconfig \
@@ -176,9 +165,10 @@ RUN cd /tmp \
     && cd sz3_src \
     && mkdir -p build && cd build \
     && cmake .. -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_INSTALL_PREFIX=/usr/local \
-                -DBUILD_SHARED_LIBS=ON \
-                -DBUILD_TESTING=OFF \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_TESTING=OFF \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     && make -j$(nproc) \
     && make install \
     && ldconfig \
@@ -228,13 +218,7 @@ RUN echo 'export NVIDIA_DRIVER_CAPABILITIES=compute,utility' >> /home/iowarp/.ba
     && echo '# Create custom environments if needed: conda create -n myenv' >> /home/iowarp/.bashrc \
     && echo 'eval "$(/home/iowarp/miniconda3/bin/conda shell.bash hook)"' >> /home/iowarp/.bashrc \
     && echo '# <<< conda initialize <<<' >> /home/iowarp/.bashrc \
-    && echo '' >> /home/iowarp/.bashrc \
-    && echo '# Python virtual environment (alternative to conda)' >> /home/iowarp/.bashrc \
-    && echo '# Note: venv is NOT recommended when using conda dependencies' >> /home/iowarp/.bashrc \
-    && echo '# Uncomment to auto-activate venv instead of conda (use at your own risk):' >> /home/iowarp/.bashrc \
-    && echo '# if [ -f /home/iowarp/venv/bin/activate ]; then' >> /home/iowarp/.bashrc \
-    && echo '#     source /home/iowarp/venv/bin/activate' >> /home/iowarp/.bashrc \
-    && echo '# fi' >> /home/iowarp/.bashrc
+    && echo '' >> /home/iowarp/.bashrc
 
 WORKDIR /workspace
 
