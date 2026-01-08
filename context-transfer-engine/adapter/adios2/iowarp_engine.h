@@ -49,9 +49,15 @@ class IowarpEngine : public adios2::plugin::PluginEngineInterface {
   /**
    * Returns the current step
    * */
-  size_t CurrentStep() const final;
+  size_t CurrentStep() const override;
 
  protected:
+  /** Initialize parameters */
+  void InitParameters() override {}
+
+  /** Initialize transports */
+  void InitTransports() override {}
+
   /** Initialize (wrapper around Init_)*/
   void Init() override { Init_(); }
 

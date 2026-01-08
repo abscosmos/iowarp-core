@@ -40,37 +40,39 @@ target_link_libraries(test_adios2_adapter
 )
 
 # Add individual test cases to CTest
+# Note: simple_test.h filters by test NAME, not tags
 add_test(NAME adios2_adapter_init
-    COMMAND test_adios2_adapter "[adios2][adapter][init]")
+    COMMAND test_adios2_adapter "ADIOS2 Engine Initialization")
 
 add_test(NAME adios2_adapter_step
-    COMMAND test_adios2_adapter "[adios2][adapter][step]")
+    COMMAND test_adios2_adapter "ADIOS2 BeginStep and EndStep")
 
 add_test(NAME adios2_adapter_putsync
-    COMMAND test_adios2_adapter "[adios2][adapter][putsync]")
+    COMMAND test_adios2_adapter "ADIOS2 DoPutSync")
 
 add_test(NAME adios2_adapter_putdeferred
-    COMMAND test_adios2_adapter "[adios2][adapter][putdeferred]")
+    COMMAND test_adios2_adapter "ADIOS2 DoPutDeferred")
 
 add_test(NAME adios2_adapter_multistep
-    COMMAND test_adios2_adapter "[adios2][adapter][multistep]")
+    COMMAND test_adios2_adapter "ADIOS2 Multi-Step Write Workflow")
 
 add_test(NAME adios2_adapter_currentstep
-    COMMAND test_adios2_adapter "[adios2][adapter][currentstep]")
+    COMMAND test_adios2_adapter "ADIOS2 CurrentStep Management")
 
 add_test(NAME adios2_adapter_close
-    COMMAND test_adios2_adapter "[adios2][adapter][close]")
+    COMMAND test_adios2_adapter "ADIOS2 DoClose")
 
 add_test(NAME adios2_adapter_variable
-    COMMAND test_adios2_adapter "[adios2][adapter][variable]")
+    COMMAND test_adios2_adapter "ADIOS2 Variable Definition")
 
 add_test(NAME adios2_adapter_large
-    COMMAND test_adios2_adapter "[adios2][adapter][large]")
+    COMMAND test_adios2_adapter "ADIOS2 Large Data Handling")
 
 add_test(NAME adios2_adapter_integration
-    COMMAND test_adios2_adapter "[adios2][adapter][integration]")
+    COMMAND test_adios2_adapter "ADIOS2 Comprehensive Integration")
 
 # Set test properties for proper execution environment
+# Use CMAKE_CURRENT_SOURCE_DIR to get the path to cte_config.yaml
 set_tests_properties(
     adios2_adapter_init
     adios2_adapter_step
@@ -85,7 +87,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout for each test
         LABELS "unit;adapter;adios2"
-        ENVIRONMENT "ADIOS2_PLUGIN_PATH=/workspace/build/bin;LD_LIBRARY_PATH=/home/iowarp/miniconda3/lib:$ENV{LD_LIBRARY_PATH}"
+        ENVIRONMENT "ADIOS2_PLUGIN_PATH=${CMAKE_BINARY_DIR}/bin;CHIMAERA_WITH_RUNTIME=1;WRP_RUNTIME_CONF=${CMAKE_CURRENT_SOURCE_DIR}/cte_config.yaml;LD_LIBRARY_PATH=/home/iowarp/miniconda3/lib:$ENV{LD_LIBRARY_PATH}"
 )
 
 # Install test target

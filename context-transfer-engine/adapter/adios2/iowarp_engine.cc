@@ -11,7 +11,6 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 #include "iowarp_engine.h"
-#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -72,9 +71,9 @@ adios2::StepStatus IowarpEngine::BeginStep(adios2::StepMode mode,
   (void)mode;           // Suppress unused parameter warning
   (void)timeoutSeconds; // Suppress unused parameter warning
 
+  // Lazy initialization if not already initialized
   if (!open_) {
-    throw std::runtime_error(
-        "IowarpEngine::BeginStep: Engine not initialized");
+    Init_();
   }
 
   // Increment step counter
@@ -138,8 +137,9 @@ void IowarpEngine::DoClose(const int transportIndex) {
 template <typename T>
 void IowarpEngine::DoPutSync_(const adios2::core::Variable<T> &variable,
                               const T *values) {
+  // Lazy initialization if not already initialized
   if (!open_) {
-    throw std::runtime_error("IowarpEngine::DoPutSync_: Engine not initialized");
+    Init_();
   }
 
   if (!current_tag_) {
@@ -177,9 +177,9 @@ void IowarpEngine::DoPutSync_(const adios2::core::Variable<T> &variable,
 template <typename T>
 void IowarpEngine::DoPutDeferred_(const adios2::core::Variable<T> &variable,
                                   const T *values) {
+  // Lazy initialization if not already initialized
   if (!open_) {
-    throw std::runtime_error(
-        "IowarpEngine::DoPutDeferred_: Engine not initialized");
+    Init_();
   }
 
   if (!current_tag_) {
@@ -229,8 +229,9 @@ void IowarpEngine::DoPutDeferred_(const adios2::core::Variable<T> &variable,
 template <typename T>
 void IowarpEngine::DoGetSync_(const adios2::core::Variable<T> &variable,
                               T *values) {
+  // Lazy initialization if not already initialized
   if (!open_) {
-    throw std::runtime_error("IowarpEngine::DoGetSync_: Engine not initialized");
+    Init_();
   }
 
   if (!current_tag_) {
@@ -268,9 +269,9 @@ void IowarpEngine::DoGetSync_(const adios2::core::Variable<T> &variable,
 template <typename T>
 void IowarpEngine::DoGetDeferred_(const adios2::core::Variable<T> &variable,
                                   T *values) {
+  // Lazy initialization if not already initialized
   if (!open_) {
-    throw std::runtime_error(
-        "IowarpEngine::DoGetDeferred_: Engine not initialized");
+    Init_();
   }
 
   if (!current_tag_) {
