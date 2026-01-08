@@ -22,13 +22,20 @@ class Runtime : public chi::Container {
   ~Runtime() override = default;
 
   // Virtual methods implemented in autogen/core_lib_exec.cc
-  void Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) override;
-  void Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
+  chi::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   chi::u64 GetWorkRemaining() const override;
   void SaveTask(chi::u32 method, chi::SaveTaskArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive& archive, hipc::FullPtr<chi::Task>& task_ptr) override;
-  void NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task, hipc::FullPtr<chi::Task>& dup_task, bool deep) override;
-  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task, hipc::FullPtr<chi::Task> replica_task) override;
+  void LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
+                hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive& archive) override;
+  void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) override;
+  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr, bool deep) override;
+  hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_ptr, hipc::FullPtr<chi::Task> replica_task_ptr) override;
 
   /**
    * Initialize container with pool information (REQUIRED)
@@ -49,14 +56,16 @@ class Runtime : public chi::Container {
    * Destroy the container (Method::kDestroy)
    */
   void Destroy(hipc::FullPtr<chi::Task> task, chi::RunContext& ctx) {
-    HILOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
+    HLOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
           pool_name_, pool_id_);
   }
 
   /**
    * ParseOmni - Parse OMNI YAML file and schedule assimilation tasks (Method::kParseOmni)
+   * This is a coroutine that uses co_await for async assimilator operations.
+   * @return TaskResume for coroutine suspension/resumption
    */
-  void ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunContext& ctx);
+  chi::TaskResume ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunContext& ctx);
 
  private:
   Client client_;

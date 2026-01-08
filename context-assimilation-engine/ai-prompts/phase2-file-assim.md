@@ -72,7 +72,7 @@ This will call the Schedule function for the particular assimilation context.
 
 Update the ParseOmni task to take as inpute an AssimilationCtx. Since this 
 has std:: data structures, we should serialize it using cereal first and store
-the serialized context in a hipc::string.
+the serialized context in a hshm::priv::string.
 
 ### Binary File Assimilator
 

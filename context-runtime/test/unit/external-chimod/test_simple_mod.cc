@@ -58,18 +58,18 @@ int main() {
     
     try {
       // This will create the pool if it doesn't exist
-      simple_mod_client.Create(HSHM_MCTX, pool_query);
+      simple_mod_client.Create(pool_query);
       std::cout << "SUCCESS: Simple mod container created!" << std::endl;
       
       // Step 5: Demonstrate flush operation
       std::cout << "\n5. Testing simple_mod flush operation..." << std::endl;
       
-      simple_mod_client.Flush(HSHM_MCTX, pool_query);
+      simple_mod_client.Flush(pool_query);
       std::cout << "SUCCESS: Flush operation completed!" << std::endl;
       
       // Step 6: Destroy container for cleanup
       std::cout << "\n6. Destroying simple_mod container..." << std::endl;
-      simple_mod_client.Destroy(HSHM_MCTX, pool_query);
+      simple_mod_client.Destroy(pool_query);
       std::cout << "SUCCESS: Container destroyed!" << std::endl;
       
       std::cout << "\n=== External ChiMod Development Test completed successfully! ===" << std::endl;

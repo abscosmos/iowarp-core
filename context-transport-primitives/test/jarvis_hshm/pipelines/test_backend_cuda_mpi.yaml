@@ -1,8 +1,0 @@
-name: hermes_shm_cuda_mpi
-env: hermes_shm
-pkgs:
-  - pkg_type: hshm_unit_tests
-    pkg_name: hshm_unit_tests
-    do_dbg: false
-    dbg_port: 4000
-

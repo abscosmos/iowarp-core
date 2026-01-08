@@ -8,7 +8,6 @@
 #   cmake --build build/detect
 #
 # Output variables:
-#   NEED_BOOST - TRUE if Boost is missing
 #   NEED_ZEROMQ - TRUE if ZeroMQ is missing
 #   NEED_HDF5 - TRUE if HDF5 is missing (optional)
 
@@ -19,7 +18,6 @@ project(DependencyDetection)
 find_package(PkgConfig QUIET)
 
 # Initialize all detection variables to TRUE (assume missing)
-set(NEED_BOOST TRUE)
 set(NEED_ZEROMQ TRUE)
 set(NEED_HDF5 TRUE)
 set(NEED_YAML_CPP TRUE)
@@ -28,23 +26,6 @@ set(NEED_CATCH2 TRUE)
 
 # Output file for dependency detection results
 set(DETECTION_OUTPUT "${CMAKE_BINARY_DIR}/dependency_status.txt")
-
-#------------------------------------------------------------------------------
-# Boost Detection
-#------------------------------------------------------------------------------
-find_package(Boost QUIET COMPONENTS fiber context system filesystem atomic)
-if(Boost_FOUND)
-    set(NEED_BOOST FALSE)
-    message(STATUS "✓ Boost found at ${Boost_INCLUDE_DIRS}")
-else()
-    # Also check for static libraries in prefix
-    if(EXISTS "${CMAKE_PREFIX_PATH}/lib/libboost_fiber.a")
-        set(NEED_BOOST FALSE)
-        message(STATUS "✓ Boost libraries found in ${CMAKE_PREFIX_PATH}/lib")
-    else()
-        message(STATUS "✗ Boost NOT found - will build from submodule")
-    endif()
-endif()
 
 #------------------------------------------------------------------------------
 # ZeroMQ Detection
@@ -123,7 +104,6 @@ endif()
 file(WRITE ${DETECTION_OUTPUT} "# Dependency Detection Results\n")
 file(APPEND ${DETECTION_OUTPUT} "# Generated: ${CMAKE_CURRENT_LIST_FILE}\n\n")
 
-file(APPEND ${DETECTION_OUTPUT} "NEED_BOOST=${NEED_BOOST}\n")
 file(APPEND ${DETECTION_OUTPUT} "NEED_ZEROMQ=${NEED_ZEROMQ}\n")
 file(APPEND ${DETECTION_OUTPUT} "NEED_HDF5=${NEED_HDF5}\n")
 file(APPEND ${DETECTION_OUTPUT} "NEED_YAML_CPP=${NEED_YAML_CPP}\n")
@@ -140,7 +120,6 @@ message(STATUS "")
 message(STATUS "=================================================================")
 message(STATUS "Dependency Detection Summary:")
 message(STATUS "=================================================================")
-message(STATUS "  Boost:       ${NEED_BOOST}")
 message(STATUS "  ZeroMQ:      ${NEED_ZEROMQ}")
 message(STATUS "  HDF5:        ${NEED_HDF5}")
 message(STATUS "  yaml-cpp:    ${NEED_YAML_CPP}")

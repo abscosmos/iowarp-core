@@ -75,7 +75,7 @@ int WRP_CTE_DECL(open)(const char *path, int flags, ...) {
     va_end(arg);
   }
   if (real_api->IsInterceptorLoaded() && fs_api->IsPathTracked(path)) {
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Intercept open for filename: {}"
           " and mode: {}"
           " is tracked.",
@@ -107,7 +107,7 @@ int WRP_CTE_DECL(open64)(const char *path, int flags, ...) {
     va_end(arg);
   }
   if (real_api->IsInterceptorLoaded() && fs_api->IsPathTracked(path)) {
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Intercept open64 for filename: {}"
           " and mode: {}"
           " is tracked.",
@@ -130,7 +130,7 @@ int WRP_CTE_DECL(__open_2)(const char *path, int oflag) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (real_api->IsInterceptorLoaded() && fs_api->IsPathTracked(path)) {
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Intercept __open_2 for filename: {}"
           " and mode: {}"
           " is tracked.",
@@ -148,7 +148,7 @@ int WRP_CTE_DECL(creat)(const char *path, mode_t mode) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (real_api->IsInterceptorLoaded() && fs_api->IsPathTracked(path)) {
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Intercept creat for filename: {}"
           " and mode: {}"
           " is tracked.",
@@ -166,7 +166,7 @@ int WRP_CTE_DECL(creat64)(const char *path, mode_t mode) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (real_api->IsInterceptorLoaded() && fs_api->IsPathTracked(path)) {
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Intercept creat64 for filename: {}"
           " and mode: {}"
           " is tracked.",
@@ -184,7 +184,7 @@ ssize_t WRP_CTE_DECL(read)(int fd, void *buf, size_t count) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsFdTracked(fd)) {
-    HILOG(kDebug, "Intercept read.");
+    HLOG(kDebug, "Intercept read.");
     File f;
     f.hermes_fd_ = fd;
     IoStatus io_status;
@@ -200,7 +200,7 @@ ssize_t WRP_CTE_DECL(write)(int fd, const void *buf, size_t count) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsFdTracked(fd)) {
-    HILOG(kDebug, "Intercept write.");
+    HLOG(kDebug, "Intercept write.");
     File f;
     f.hermes_fd_ = fd;
     IoStatus io_status;
@@ -216,7 +216,7 @@ ssize_t WRP_CTE_DECL(pread)(int fd, void *buf, size_t count, off_t offset) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsFdTracked(fd)) {
-    HILOG(kDebug, "Intercept pread.");
+    HLOG(kDebug, "Intercept pread.");
     File f;
     f.hermes_fd_ = fd;
     IoStatus io_status;
@@ -236,7 +236,7 @@ ssize_t WRP_CTE_DECL(pwrite)(int fd, const void *buf, size_t count,
     File f;
     f.hermes_fd_ = fd;
     IoStatus io_status;
-    HILOG(kDebug, "Intercept pwrite.");
+    HLOG(kDebug, "Intercept pwrite.");
     size_t ret = fs_api->Write(f, stat_exists, buf, offset, count, io_status);
     if (stat_exists)
       return ret;
@@ -252,7 +252,7 @@ ssize_t WRP_CTE_DECL(pread64)(int fd, void *buf, size_t count, off64_t offset) {
     File f;
     f.hermes_fd_ = fd;
     IoStatus io_status;
-    HILOG(kDebug, "Intercept pread64.");
+    HLOG(kDebug, "Intercept pread64.");
     size_t ret = fs_api->Read(f, stat_exists, buf, offset, count, io_status);
     if (stat_exists)
       return ret;
@@ -269,7 +269,7 @@ ssize_t WRP_CTE_DECL(pwrite64)(int fd, const void *buf, size_t count,
     File f;
     f.hermes_fd_ = fd;
     IoStatus io_status;
-    HILOG(kDebug, "Intercept pwrite64.");
+    HLOG(kDebug, "Intercept pwrite64.");
     size_t ret = fs_api->Write(f, stat_exists, buf, offset, count, io_status);
     if (stat_exists)
       return ret;
@@ -284,7 +284,7 @@ off_t WRP_CTE_DECL(lseek)(int fd, off_t offset, int whence) {
   if (fs_api->IsFdTracked(fd)) {
     File f;
     f.hermes_fd_ = fd;
-    HILOG(kDebug, "Intercept lseek offset: {} whence: {}.", offset, whence);
+    HLOG(kDebug, "Intercept lseek offset: {} whence: {}.", offset, whence);
     return fs_api->Seek(f, stat_exists, static_cast<SeekMode>(whence), offset);
   }
   return real_api->lseek(fd, offset, whence);
@@ -297,7 +297,7 @@ off64_t WRP_CTE_DECL(lseek64)(int fd, off64_t offset, int whence) {
   if (fs_api->IsFdTracked(fd)) {
     File f;
     f.hermes_fd_ = fd;
-    HILOG(kDebug, "Intercept lseek64 offset: {} whence: {}.", offset, whence);
+    HLOG(kDebug, "Intercept lseek64 offset: {} whence: {}.", offset, whence);
     return fs_api->Seek(f, stat_exists, static_cast<SeekMode>(whence), offset);
   }
   return real_api->lseek64(fd, offset, whence);
@@ -308,7 +308,7 @@ int WRP_CTE_DECL(__fxstat)(int __ver, int fd, struct stat *buf) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsFdTracked(fd)) {
-    HILOG(kDebug, "Intercepted __fxstat.");
+    HLOG(kDebug, "Intercepted __fxstat.");
     File f;
     f.hermes_fd_ = fd;
     result = fs_api->Stat(f, buf);
@@ -324,7 +324,7 @@ int WRP_CTE_DECL(__fxstatat)(int __ver, int __fildes, const char *__filename,
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsPathTracked(__filename)) {
-    HILOG(kDebug, "Intercepted __fxstatat.");
+    HLOG(kDebug, "Intercepted __fxstatat.");
     result = fs_api->Stat(__filename, __stat_buf);
   } else {
     result =
@@ -339,7 +339,7 @@ int WRP_CTE_DECL(__xstat)(int __ver, const char *__filename,
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsPathTracked(__filename)) {
-    // HILOG(kDebug, "Intercepted __xstat for file {}.", __filename);
+    // HLOG(kDebug, "Intercepted __xstat for file {}.", __filename);
     result = fs_api->Stat(__filename, __stat_buf);
   } else {
     result = real_api->__xstat(__ver, __filename, __stat_buf);
@@ -353,7 +353,7 @@ int WRP_CTE_DECL(__lxstat)(int __ver, const char *__filename,
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsPathTracked(__filename)) {
-    HILOG(kDebug, "Intercepted __lxstat.");
+    HLOG(kDebug, "Intercepted __lxstat.");
     result = fs_api->Stat(__filename, __stat_buf);
   } else {
     result = real_api->__lxstat(__ver, __filename, __stat_buf);
@@ -366,7 +366,7 @@ int WRP_CTE_DECL(fstat)(int fd, struct stat *buf) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsFdTracked(fd)) {
-    HILOG(kDebug, "Intercepted fstat.");
+    HLOG(kDebug, "Intercepted fstat.");
     File f;
     f.hermes_fd_ = fd;
     result = fs_api->Stat(f, buf);
@@ -381,7 +381,7 @@ int WRP_CTE_DECL(stat)(const char *pathname, struct stat *buf) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsPathTracked(pathname)) {
-    HILOG(kDebug, "Intercepted stat.");
+    HLOG(kDebug, "Intercepted stat.");
     result = fs_api->Stat(pathname, buf);
   } else {
     result = real_api->stat(pathname, buf);
@@ -394,7 +394,7 @@ int WRP_CTE_DECL(__fxstat64)(int __ver, int fd, struct stat64 *buf) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsFdTracked(fd)) {
-    HILOG(kDebug, "Intercepted __fxstat.");
+    HLOG(kDebug, "Intercepted __fxstat.");
     File f;
     f.hermes_fd_ = fd;
     result = fs_api->Stat(f, buf);
@@ -410,7 +410,7 @@ int WRP_CTE_DECL(__fxstatat64)(int __ver, int __fildes, const char *__filename,
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsPathTracked(__filename)) {
-    HILOG(kDebug, "Intercepted __fxstatat.");
+    HLOG(kDebug, "Intercepted __fxstatat.");
     result = fs_api->Stat(__filename, __stat_buf);
   } else {
     result =
@@ -425,7 +425,7 @@ int WRP_CTE_DECL(__xstat64)(int __ver, const char *__filename,
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsPathTracked(__filename)) {
-    HILOG(kDebug, "Intercepted __xstat.");
+    HLOG(kDebug, "Intercepted __xstat.");
     result = fs_api->Stat(__filename, __stat_buf);
   } else {
     result = real_api->__xstat64(__ver, __filename, __stat_buf);
@@ -439,7 +439,7 @@ int WRP_CTE_DECL(__lxstat64)(int __ver, const char *__filename,
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsPathTracked(__filename)) {
-    HILOG(kDebug, "Intercepted __lxstat.");
+    HLOG(kDebug, "Intercepted __lxstat.");
     result = fs_api->Stat(__filename, __stat_buf);
   } else {
     result = real_api->__lxstat64(__ver, __filename, __stat_buf);
@@ -452,7 +452,7 @@ int WRP_CTE_DECL(fstat64)(int fd, struct stat64 *buf) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsFdTracked(fd)) {
-    HILOG(kDebug, "Intercepted fstat.");
+    HLOG(kDebug, "Intercepted fstat.");
     File f;
     f.hermes_fd_ = fd;
     result = fs_api->Stat(f, buf);
@@ -467,7 +467,7 @@ int WRP_CTE_DECL(stat64)(const char *pathname, struct stat64 *buf) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsPathTracked(pathname)) {
-    HILOG(kDebug, "Intercepted stat.");
+    HLOG(kDebug, "Intercepted stat.");
     result = fs_api->Stat(pathname, buf);
   } else {
     result = real_api->stat64(pathname, buf);
@@ -482,7 +482,7 @@ int WRP_CTE_DECL(fsync)(int fd) {
   if (fs_api->IsFdTracked(fd)) {
     File f;
     f.hermes_fd_ = fd;
-    HILOG(kDebug, "Intercepted fsync.");
+    HLOG(kDebug, "Intercepted fsync.");
     return fs_api->Sync(f, stat_exists);
   }
   return real_api->fsync(fd);
@@ -495,7 +495,7 @@ int WRP_CTE_DECL(ftruncate)(int fd, off_t length) {
   if (fs_api->IsFdTracked(fd)) {
     File f;
     f.hermes_fd_ = fd;
-    HILOG(kDebug, "Intercepted ftruncate.");
+    HLOG(kDebug, "Intercepted ftruncate.");
     return fs_api->Truncate(f, stat_exists, length);
   }
   return real_api->ftruncate(fd, length);
@@ -508,7 +508,7 @@ int WRP_CTE_DECL(ftruncate64)(int fd, off64_t length) {
   if (fs_api->IsFdTracked(fd)) {
     File f;
     f.hermes_fd_ = fd;
-    HILOG(kDebug, "Intercepted ftruncate.");
+    HLOG(kDebug, "Intercepted ftruncate.");
     return fs_api->Truncate(f, stat_exists, length);
   }
   return real_api->ftruncate64(fd, length);
@@ -519,7 +519,7 @@ int WRP_CTE_DECL(close)(int fd) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsFdTracked(fd)) {
-    HILOG(kDebug, "Intercepted close({}).", fd);
+    HLOG(kDebug, "Intercepted close({}).", fd);
     File f;
     f.hermes_fd_ = fd;
     return fs_api->Close(f, stat_exists);
@@ -531,7 +531,7 @@ int WRP_CTE_DECL(flock)(int fd, int operation) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsFdTracked(fd)) {
-    HILOG(kDebug, "Intercepted flock({}).", fd);
+    HLOG(kDebug, "Intercepted flock({}).", fd);
     // TODO(llogan): implement?
     return 0;
   }
@@ -542,7 +542,7 @@ int WRP_CTE_DECL(remove)(const char *pathname) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsPathTracked(pathname)) {
-    HILOG(kDebug, "Intercepted remove({})", pathname);
+    HLOG(kDebug, "Intercepted remove({})", pathname);
     return fs_api->Remove(pathname);
   }
   return real_api->remove(pathname);
@@ -552,7 +552,7 @@ int WRP_CTE_DECL(unlink)(const char *pathname) {
   auto real_api = WRP_CTE_POSIX_API;
   auto fs_api = WRP_CTE_POSIX_FS;
   if (fs_api->IsPathTracked(pathname)) {
-    HILOG(kDebug, "Intercepted unlink({})", pathname);
+    HLOG(kDebug, "Intercepted unlink({})", pathname);
     return fs_api->Remove(pathname);
   }
   return real_api->unlink(pathname);

@@ -5,7 +5,7 @@ Do the following:
 
 Let's use the paradigm ServerInit and ClientInit for initializing the managers. Manager that only execute server-side should be ServerInit. Ones that do both should be ClientInit and ServerInit.
 
-The process queue should store hipc::Pointer instead of u32. The pointer represents the .shm component of a FullPtr. It represents the shared-memory address of a Task.
+The process queue should store hipc::ShmPtr<> instead of u32. The pointer represents the .shm component of a FullPtr. It represents the shared-memory address of a Task.
 
 Ensure that tasks have an "emplace constructor". Also ensure to use HIPC_CONTAINER_TEMPLATE for the task and use it as documented in hshm.
 
@@ -210,7 +210,7 @@ struct CompressTask : public chi::Task {
 
 IN, INOUT, and OUT are empty macros used just for helping visualize which parameters are inputs and which are outputs.
 
-Tasks should be compatible with shared memory. Use hipc::strings and vectors for storing information within tasks.
+Tasks should be compatible with shared memory. Use chi::priv::strings and vectors for storing information within tasks.
 
 #### include/mod_name/mod_name_client.h and cc
 This will expose methods for external programs to send tasks to the chimaera runtime. This includes tasks for creating a pool of this container type.

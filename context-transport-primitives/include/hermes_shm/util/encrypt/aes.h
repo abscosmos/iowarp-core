@@ -47,7 +47,7 @@ class AES {
                              1, (unsigned char *)key_.c_str(),
                              (unsigned char *)iv_.c_str());
     if (!ret) {
-      HELOG(kError, "Failed to generate key");
+      HLOG(kError, "Failed to generate key");
     }
   }
 

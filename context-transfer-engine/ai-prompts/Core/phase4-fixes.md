@@ -17,7 +17,7 @@ Again, the logic is as follows:
 
 @CLAUDE.md No, you just slightly change the function name. The algorithm should work like this:
 ```
-ModifyExistingData(const std::vector<Block> &blocks, hipc::Pointer data, size_t data_size, size_t data_offset_in_blob):
+ModifyExistingData(const std::vector<Block> &blocks, hipc::ShmPtr<> data, size_t data_size, size_t data_offset_in_blob):
 1. Initially store the remaining_size equal to data_size. We iterate over every block in the blob.
 2. Store the offset of the block in the blob. The first block is offset 0. Call this block_offset_in_blob.
 3. If the data we are writing is within the range [block_offset_in_blob, block_offset_in_blob + block.size), then we should modify this data. 

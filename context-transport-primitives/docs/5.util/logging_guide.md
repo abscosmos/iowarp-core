@@ -26,7 +26,7 @@ The system defines several predefined log levels:
 
 ### Syntax
 ```cpp
-HILOG(SUB_CODE, format_string, ...args)
+HLOG(SUB_CODE, format_string, ...args)
 ```
 
 ### Purpose
@@ -46,34 +46,34 @@ filepath:line INFO thread_id function_name message
 
 #### Basic Information Logging
 ```cpp
-HILOG(kInfo, "Server started on port {}", 8080);
+HLOG(kInfo, "Server started on port {}", 8080);
 // Output: /path/to/file.cc:45 INFO 12345 main Server started on port 8080
 ```
 
 #### Performance Metrics
 ```cpp
-HILOG(kInfo, "{},{},{},{},{},{} ms,{} KOps", 
+HLOG(kInfo, "{},{},{},{},{},{} ms,{} KOps", 
       test_name, alloc_type, obj_size, msec, nthreads, count, kops);
 // Output: /path/to/file.cc:170 INFO 12345 benchmark_func test_malloc,malloc,1024,50 ms,4,1000000 KOps
 ```
 
 #### Debug Logging (Debug Builds Only)
 ```cpp
-HILOG(kDebug, "Acquired read lock for {}", owner);
+HLOG(kDebug, "Acquired read lock for {}", owner);
 // Output (debug builds): /path/to/file.cc:108 INFO 12345 acquire_lock Acquired read lock for thread_123
 ```
 
 #### Status Messages
 ```cpp
-HILOG(kInfo, "Lz4: output buffer is potentially too small");
-HILOG(kInfo, "test_name,alloc_type,obj_size,msec,nthreads,count,KOps");
+HLOG(kInfo, "Lz4: output buffer is potentially too small");
+HLOG(kInfo, "test_name,alloc_type,obj_size,msec,nthreads,count,KOps");
 ```
 
 ## HELOG (Hermes Error Log)
 
 ### Syntax
 ```cpp
-HELOG(LOG_CODE, format_string, ...args)
+HLOG(LOG_CODE, format_string, ...args)
 ```
 
 ### Purpose
@@ -93,29 +93,29 @@ filepath:line LEVEL thread_id function_name message
 
 #### Fatal Errors (Program Termination)
 ```cpp
-HELOG(kFatal, "Could not find this allocator type");
+HLOG(kFatal, "Could not find this allocator type");
 // Output: /path/to/file.cc:63 FATAL 12345 init_allocator Could not find this allocator type
 // Program exits after this message
 
-HELOG(kFatal, "Failed to find the memory allocator?");
-HELOG(kFatal, "Exception: {}", e.what());
+HLOG(kFatal, "Failed to find the memory allocator?");
+HLOG(kFatal, "Exception: {}", e.what());
 ```
 
 #### Non-Fatal Errors
 ```cpp
-HELOG(kError, "shm_open failed: {}", err_buf);
+HLOG(kError, "shm_open failed: {}", err_buf);
 // Output: /path/to/file.cc:66 ERROR 12345 open_shared_memory shm_open failed: Permission denied
 
-HELOG(kError, "Failed to generate key");
+HLOG(kError, "Failed to generate key");
 ```
 
 #### System/Hardware Errors
 ```cpp
 // CUDA error handling
-HELOG(kFatal, "CUDA Error {}: {}", cudaErr, cudaGetErrorString(cudaErr));
+HLOG(kFatal, "CUDA Error {}: {}", cudaErr, cudaGetErrorString(cudaErr));
 
 // HIP error handling  
-HELOG(kFatal, "HIP Error {}: {}", hipErr, hipGetErrorString(hipErr));
+HLOG(kFatal, "HIP Error {}: {}", hipErr, hipGetErrorString(hipErr));
 ```
 
 ## Advanced Features
@@ -148,20 +148,20 @@ export HSHM_LOG_OUT="/tmp/hermes_shm.log"
 ## Best Practices
 
 1. **Use appropriate log levels**:
-   - `HILOG(kInfo, ...)` for normal operational messages
-   - `HELOG(kError, ...)` for recoverable errors
-   - `HELOG(kFatal, ...)` for unrecoverable errors that should terminate the program
+   - `HLOG(kInfo, ...)` for normal operational messages
+   - `HLOG(kError, ...)` for recoverable errors
+   - `HLOG(kFatal, ...)` for unrecoverable errors that should terminate the program
 
 2. **Include context in error messages**:
    ```cpp
-   HELOG(kError, "Failed to allocate {} bytes: {}", size, strerror(errno));
+   HLOG(kError, "Failed to allocate {} bytes: {}", size, strerror(errno));
    ```
 
 3. **Use meaningful sub-codes** for `HILOG` to categorize different types of information
 
 4. **Format structured data consistently**:
    ```cpp
-   HILOG(kInfo, "operation={},duration_ms={},status={}", op_name, duration, status);
+   HLOG(kInfo, "operation={},duration_ms={},status={}", op_name, duration, status);
    ```
 
 5. **Avoid logging in tight loops** - use `HILOG_PERIODIC` instead

@@ -33,6 +33,20 @@
 // CTE headers
 #include <wrp_cte/core/core_client.h>
 
+// Bdev headers for storage target registration
+#include <chimaera/bdev/bdev_client.h>
+#include <chimaera/bdev/bdev_tasks.h>
+#include <filesystem>
+#include <thread>
+#include <chrono>
+
+namespace fs = std::filesystem;
+using namespace std::chrono_literals;
+
+// Storage configuration
+const std::string kTestStoragePath = "/tmp/cae_error_test_storage.dat";
+const chi::u64 kTestTargetSize = 100 * 1024 * 1024;  // 100MB
+
 // Test configuration
 const std::string kTestFileName = "/tmp/test_error_handling_file.bin";
 const std::string kNonExistentFile = "/tmp/nonexistent_file_12345.bin";
@@ -63,8 +77,11 @@ bool TestErrorCase(wrp_cae::core::Client& cae_client,
 
   // Call ParseOmni with vector containing single context
   std::vector<wrp_cae::core::AssimilationCtx> contexts = {ctx};
-  chi::u32 num_tasks_scheduled = 0;
-  chi::u32 result_code = cae_client.ParseOmni(HSHM_MCTX, contexts, num_tasks_scheduled);
+  auto parse_task = cae_client.AsyncParseOmni(contexts);
+  parse_task.Wait();
+  // Use result_code_ (operation result) not GetReturnCode() (task completion status)
+  chi::u32 result_code = parse_task->result_code_;
+  chi::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
 
   std::cout << "ParseOmni result: result_code=" << result_code
             << ", num_tasks=" << num_tasks_scheduled << std::endl;
@@ -141,6 +158,31 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[SETUP] Connecting to CTE..." << std::endl;
     wrp_cte::core::WRP_CTE_CLIENT_INIT();
 
+    // Set up storage target for CTE
+    std::cout << "\n[SETUP] Registering storage target..." << std::endl;
+
+    // Clean up any existing test storage file
+    if (fs::exists(kTestStoragePath)) {
+      fs::remove(kTestStoragePath);
+    }
+
+    // Create bdev storage target
+    chi::PoolId bdev_pool_id(200, 0);
+    chimaera::bdev::Client bdev_client(bdev_pool_id);
+    auto bdev_create_task = bdev_client.AsyncCreate(chi::PoolQuery::Dynamic(), kTestStoragePath,
+                                                     bdev_pool_id, chimaera::bdev::BdevType::kFile);
+    bdev_create_task.Wait();
+    std::this_thread::sleep_for(100ms);
+
+    // Register storage target with CTE
+    auto *cte_client = WRP_CTE_CLIENT;
+    auto reg_task = cte_client->AsyncRegisterTarget(kTestStoragePath,
+                                                     chimaera::bdev::BdevType::kFile,
+                                                     kTestTargetSize, chi::PoolQuery::Local(), bdev_pool_id);
+    reg_task.Wait();
+    std::this_thread::sleep_for(100ms);
+    std::cout << "Storage target registered: " << kTestStoragePath << std::endl;
+
     // Initialize CAE client
     std::cout << "\n[SETUP] Initializing CAE client..." << std::endl;
     WRP_CAE_CLIENT_INIT();
@@ -150,12 +192,12 @@ int main(int argc, char* argv[]) {
     wrp_cae::core::Client cae_client;
     wrp_cae::core::CreateParams params;
 
-    cae_client.Create(
-        HSHM_MCTX,
+    auto create_task = cae_client.AsyncCreate(
         chi::PoolQuery::Local(),
         "test_cae_error_pool",
         wrp_cae::core::kCaePoolId,
         params);
+    create_task.Wait();
 
     std::cout << "CAE pool created" << std::endl;
 
@@ -236,8 +278,11 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup
-    std::cout << "\n[CLEANUP] Removing test file..." << std::endl;
+    std::cout << "\n[CLEANUP] Removing test files..." << std::endl;
     std::remove(kTestFileName.c_str());
+    if (fs::exists(kTestStoragePath)) {
+      fs::remove(kTestStoragePath);
+    }
 
   } catch (const std::exception& e) {
     std::cerr << "ERROR: Exception caught: " << e.what() << std::endl;

@@ -5,7 +5,7 @@
             "name": "Debug ChiMod Runtime",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_runtime",
+            "program": "${workspaceFolder}/build/bin/chimaera_start_runtime",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -64,11 +64,77 @@
             "preLaunchTask": "cmake-build-debug"
         },
         {
-            "name": "Debug test_bdev_chimod",
+            "name": "Debug test_bdev_chimod (All Tests)",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/bin/chimaera_bdev_chimod_tests",
             "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug bdev_force_net_flag test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/chimaera_bdev_chimod_tests",
+            "args": [
+                "bdev_force_net_flag"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug bdev_parallel_io_operations test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/chimaera_bdev_chimod_tests",
+            "args": [
+                "bdev_parallel_io_operations"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug bdev_create_destroy test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/chimaera_bdev_chimod_tests",
+            "args": [
+                "bdev_create_destroy"
+            ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],
@@ -155,6 +221,287 @@
                 {
                     "name": "CHI_SERVER_CONF",
                     "value": "/workspace/context-assimilation-engine/test/unit/wrp_config.yaml"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug MP Allocator Allocate + Free Immediate",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_mp_allocator_exec",
+            "args": [
+                "MultiProcessAllocator - Allocate and Free Immediate"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set breakpoint at SetupTls",
+                    "text": "-break-insert ProcessBlock::SetupTls",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set breakpoint at lock acquisitions",
+                    "text": "-break-insert AllocateFromProcessOrGlobal",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "BuddyAllocator - Large Then Small",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_buddy_allocator_exec",
+            "args": [
+                "BuddyAllocator - Large Then Small"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug MP Allocator Multiprocess Test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_mp_allocator_multiprocess_exec",
+            "args": [
+                "1",
+                "1",
+                "1"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug BuddyAllocator Singlethread Test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_buddy_allocator_singlethread_exec",
+            "args": [
+                "1",
+                "1"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug BuddyAllocator Weird Offset Test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_buddy_allocator_exec",
+            "args": [
+                "BuddyAllocator - Weird Offset Allocation"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug MultiRingBuffer Test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_multi_ring_buffer_exec",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug chimaera_stop_runtime",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/chimaera_stop_runtime",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug GPU Malloc Test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_gpu_malloc",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug GPU Malloc Test (CUDA-GDB)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_gpu_malloc",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [
+                {
+                    "name": "CUDA_VISIBLE_DEVICES",
+                    "value": "0"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/local/cuda/bin/cuda-gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set CUDA API failures to be fatal",
+                    "text": "set cuda api_failures stop",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set CUDA launch failures to be fatal",
+                    "text": "set cuda launch_blocking on",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug GPU Malloc Test (Nsight)",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_gpu_malloc",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug Wait Test - Basic Depth 3",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/chimaera_wait_functionality_tests",
+            "args": [
+                "wait_test_basic_functionality"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [
+                {
+                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "value": "1"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug wrp_run_thrpt_benchmark",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/wrp_run_thrpt_benchmark",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [
+                {
+                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "value": "1"
                 }
             ],
             "externalConsole": false,

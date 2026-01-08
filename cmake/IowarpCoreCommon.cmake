@@ -192,6 +192,11 @@ function(add_cuda_executable TARGET DO_COPY)
         POSITION_INDEPENDENT_CODE ON
     )
 
+    # When copying sources, we need to add the include path back to the original source directory
+    if(${DO_COPY})
+        target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    endif()
+
     target_compile_options(${TARGET} PUBLIC
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 endfunction()
@@ -592,10 +597,8 @@ function(add_chimod_runtime)
     message(FATAL_ERROR "Neither chimaera::cxx, hermes_shm::cxx, HermesShm::cxx nor cxx target found")
   endif()
 
-  # Runtime-specific link libraries (includes Boost for runtime)
+  # Runtime-specific link libraries
   set(CHIMAERA_RUNTIME_LIBS
-    Boost::fiber
-    Boost::context
     Threads::Threads
   )
 

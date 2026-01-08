@@ -82,7 +82,7 @@ public:
 
     std::shared_ptr<AdapterStat> exists = mdm->Find(f);
     if (!exists) {
-      HILOG(kDebug, "File not opened before by adapter");
+      HLOG(kDebug, "File not opened before by adapter");
       // Normalize path strings
       stat.path_ = stdfs::absolute(path).string();
       // CTE uses standard strings, no need for chi::string conversion
@@ -108,7 +108,7 @@ public:
         // The file was opened regularly
         stat.file_size_ = GetBackendSize(stat.path_);
       }
-      HILOG(kDebug, "Tag vs file size: tag_id={},{}, file_size={}",
+      HLOG(kDebug, "Tag vs file size: tag_id={},{}, file_size={}",
             stat.tag_id_.major_, stat.tag_id_.minor_, stat.file_size_);
       // Update file position pointer
       if (stat.hflags_.Any(WRP_CTE_FS_APPEND)) {
@@ -122,7 +122,7 @@ public:
       HermesOpen(f, stat, fs_ctx);
       mdm->Create(f, stat_ptr);
     } else {
-      HILOG(kDebug, "File already opened by adapter");
+      HLOG(kDebug, "File already opened by adapter");
       exists->UpdateTime();
     }
   }
@@ -153,7 +153,7 @@ public:
     std::string filename = stat.path_;
     bool is_append = stat.st_ptr_ == std::numeric_limits<size_t>::max();
 
-    // HILOG(kInfo,
+    // HLOG(kInfo,
     //       "Write called for filename: {}"
     //       " on offset: {}"
     //       " from position: {}"
@@ -167,7 +167,7 @@ public:
       opts.backend_off_ = off;
       WriteBlob(filename, ptr, total_size, opts, io_status);
       if (!io_status.success_) {
-        HILOG(kDebug, "Failed to write blob of size {} to backend",
+        HLOG(kDebug, "Failed to write blob of size {} to backend",
               opts.backend_size_);
         return 0;
       }
@@ -181,7 +181,7 @@ public:
     if (is_append) {
       // TODO: Append operations not yet supported in CTE
       // Perform append
-      HILOG(kWarning, "Append operations not yet supported in CTE, treating as "
+      HLOG(kWarning, "Append operations not yet supported in CTE, treating as "
                       "regular write");
       // Fallback to regular write at end of file
       off = stat.file_size_;
@@ -216,7 +216,7 @@ public:
           file_tag.PutBlob(blob_name, data_ptr + bytes_written, bytes_to_write,
                            page_offset);
         } catch (const std::exception &e) {
-          HILOG(kError, "Tag PutBlob failed for page {}: {}", page_index,
+          HLOG(kError, "Tag PutBlob failed for page {}: {}", page_index,
                 e.what());
           io_status.success_ = false;
           return bytes_written;
@@ -235,7 +235,7 @@ public:
     io_status.size_ = total_size;
     UpdateIoStatus(opts, io_status);
 
-    HILOG(kDebug, "The size of file after write: {}", GetSize(f, stat));
+    HLOG(kDebug, "The size of file after write: {}", GetSize(f, stat));
     return total_size;
   }
 
@@ -248,7 +248,7 @@ public:
     (void)f;
     std::string filename = stat.path_;
 
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Read called for filename: {}"
           " on offset: {}"
           " from position: {}"
@@ -283,7 +283,7 @@ public:
         opts.backend_off_ = off;
         ReadBlob(filename, ptr, total_size, opts, io_status);
         if (!io_status.success_) {
-          HILOG(kDebug, "Failed to read blob of size {} from backend",
+          HLOG(kDebug, "Failed to read blob of size {} from backend",
                 opts.backend_size_);
           return 0;
         }
@@ -297,7 +297,7 @@ public:
     // CTE read operation - use page-based blob naming to match PutBlob
     if constexpr (ASYNC) {
       // TODO: Async read operations not yet fully supported in CTE adapter
-      HILOG(kWarning,
+      HLOG(kWarning,
             "Async read operations not yet fully supported, using sync read");
     }
 
@@ -328,7 +328,7 @@ public:
         file_tag.GetBlob(blob_name, data_ptr + bytes_read, bytes_to_read,
                          page_offset);
       } catch (const std::exception &e) {
-        HILOG(kError, "Tag GetBlob failed for page {}: {}", page_index,
+        HLOG(kError, "Tag GetBlob failed for page {}: {}", page_index,
               e.what());
         io_status.success_ = false;
         return bytes_read;
@@ -444,7 +444,7 @@ public:
       break;
     }
     default: {
-      HELOG(kError, "Invalid seek mode");
+      HLOG(kError, "Invalid seek mode");
       return (size_t)-1;
     }
     }
@@ -461,7 +461,7 @@ public:
       size_t cte_tag_size =
           cte_client->GetTagSize(hipc::MemContext(), stat.tag_id_);
 
-      HILOG(
+      HLOG(
           kDebug,
           "GetSize: queried CTE for tag_id={},{}, got size={}, cached_size={}",
           stat.tag_id_.major_, stat.tag_id_.minor_, cte_tag_size,
@@ -530,9 +530,9 @@ public:
     auto *cte_client = WRP_CTE_CLIENT;
     bool tag_deleted = cte_client->DelTag(hipc::MemContext(), canon_path);
     if (tag_deleted) {
-      HILOG(kDebug, "Deleted CTE tag for file: {}", pathname);
+      HLOG(kDebug, "Deleted CTE tag for file: {}", pathname);
     } else {
-      HILOG(kDebug, "No CTE tag found for file: {}", pathname);
+      HLOG(kDebug, "No CTE tag found for file: {}", pathname);
     }
 
     // Destroy all file descriptors
@@ -540,7 +540,7 @@ public:
     if (filesp == nullptr) {
       return ret;
     }
-    HILOG(kDebug, "Destroying the file descriptors: {}", pathname);
+    HLOG(kDebug, "Destroying the file descriptors: {}", pathname);
     std::list<File> files = *filesp;
     for (File &f : files) {
       std::shared_ptr<AdapterStat> stat = mdm->Find(f);

@@ -12,6 +12,8 @@ NEVER EVER EVER.
 
 ## Code Style
 
+Keeep code simple. Do not allow functions to be more than 100 lines of code. Make helper functions logically.
+
 Use the Google C++ style guide for C++.
 
 You should store the pointer returned by the singleton GetInstance method. Avoid dereferencing GetInstance method directly using either -> or *. E.g., do not do ``hshm::Singleton<T>::GetInstance()->var_``. You should do ``auto *x = hshm::Singleton<T>::GetInstance(); x->var_;``.
@@ -136,11 +138,82 @@ The following Worker methods return `void`, not `bool`:
 
 These methods handle task execution flow internally and do not return success/failure status.
 
+## PoolManager Coroutine Methods
+
+The following PoolManager methods are coroutines that return `TaskResume`:
+- `CreatePool()` - Creates a pool and co_awaits the container's Create method
+- `DestroyPool()` - Destroys a pool (coroutine for consistency)
+
+**Why Coroutines:**
+These methods are coroutines to properly handle nested pool creation. When a ChiMod's Create method (e.g., CTE Create) needs to create sub-pools (e.g., bdev for storage), it uses `co_await`. The coroutine chain allows proper suspension and resumption:
+1. Admin's `GetOrCreatePool` co_awaits `PoolManager::CreatePool`
+2. `PoolManager::CreatePool` co_awaits `container->Run()` (the Create method)
+3. The Create method can co_await nested pool creations (e.g., bdev Create)
+4. When nested operations complete, the chain resumes automatically
+
+**Admin Runtime Methods:**
+The following admin runtime methods are also coroutines:
+- `GetOrCreatePool()` - co_awaits PoolManager::CreatePool
+- `DestroyPool()` - co_awaits PoolManager::DestroyPool
+- `Destroy()` - co_awaits DestroyPool (alias)
+
+## Task Wait and Future Pattern
+
+### Task::Wait() Signature and Usage
+
+`Task::Wait()` takes an `is_complete` reference parameter from the Future object:
+
+```cpp
+void Task::Wait(std::atomic<u32>& is_complete, double block_time_us = 0.0);
+```
+
+**Key Points:**
+- Task::Wait() checks the `is_complete` flag from Future, not internal task state
+- The method yields execution in a loop until `is_complete` is set to 1
+- In runtime mode, uses cooperative multitasking with blocked queue mechanism
+- In client mode, busy-waits on the `is_complete` flag with yielding
+
+**Correct Usage Pattern:**
+```cpp
+// From IpcManager::Recv()
+template <typename TaskT> void Recv(Future<TaskT>& future) {
+  auto& future_shm = future.GetFutureShm();
+  TaskT* task_ptr = future.get();
+  task_ptr->Wait(future_shm->is_complete_);  // Pass future's is_complete flag
+  // ... deserialization logic ...
+}
+```
+
+**User-Facing API:**
+Users should call `Future::Wait()` instead of `Task::Wait()` directly:
+```cpp
+auto task = client.AsyncCreate(/* ... */);
+task.Wait();  // Calls IpcManager::Recv() which calls Task::Wait()
+```
+
+### Task::Yield() for Cooperative Yielding
+
+`Task::Yield()` is used for cooperative yielding during blocking operations (I/O, locks, etc.) without waiting for a specific completion condition:
+
+```cpp
+void Task::Yield(double block_time_us = 0.0);
+```
+
+**Usage Examples:**
+- CoMutex lock contention: `task->Yield();`
+- Async I/O polling: `task->Yield();`
+- Admin flush waiting: `task->Yield(25);`
+
+**Implementation:**
+- Adds task to blocked queue with specified blocking duration
+- Yields execution back to worker
+- Does NOT track subtask completion (unlike Wait)
+
 ## Type Aliases
 
 Use the `WorkQueue` typedef for worker queue types:
 ```cpp
-using WorkQueue = chi::ipc::mpsc_queue<hipc::TypedPointer<TaskLane>>;
+using WorkQueue = chi::ipc::mpsc_ring_buffer<hipc::TypedPointer<TaskLane>>;
 ```
 
 This simplifies code readability and maintenance for worker queue operations.
@@ -148,7 +221,7 @@ This simplifies code readability and maintenance for worker queue operations.
 **TaskLane Typedef:**
 The `TaskLane` typedef is defined globally in the `chi` namespace:
 ```cpp
-using TaskLane = chi::ipc::multi_mpsc_queue<hipc::TypedPointer<Task>, TaskQueueHeader>::queue_t;
+using TaskLane = chi::ipc::multi_mpsc_ring_buffer<hipc::TypedPointer<Task>, TaskQueueHeader>::queue_t;
 ```
 
 Use `TaskLane*` for all lane pointers in RunContext and other interfaces. Avoid `void*` and explicit type casts.
@@ -328,6 +401,18 @@ HSHM (HermesShm/context-transport-primitives) provides modular INTERFACE library
   - Provides: Data encryption support
   - Compile definitions: `HSHM_ENABLE_ENCRYPT`
 
+- **`hshm::cuda_cxx`** - CUDA GPU support
+  - Provides: CUDA-enabled HSHM library for GPU code
+  - Use for: CUDA kernel code and GPU device functions
+  - Compile definitions: `HSHM_ENABLE_CUDA=1`, `HSHM_ENABLE_ROCM=0`
+  - Note: Only available when `HSHM_ENABLE_CUDA=ON` at build time
+
+- **`hshm::rocm_cxx`** - ROCm GPU support
+  - Provides: ROCm-enabled HSHM library for GPU code
+  - Use for: HIP kernel code and GPU device functions
+  - Compile definitions: `HSHM_ENABLE_ROCM=1`, `HSHM_ENABLE_CUDA=0`
+  - Note: Only available when `HSHM_ENABLE_ROCM=ON` at build time
+
 **Linking Guidelines:**
 
 1. **Never link to yaml-cpp directly** - Use `hshm::configure` instead (except within hshm::configure itself)
@@ -336,6 +421,7 @@ HSHM (HermesShm/context-transport-primitives) provides modular INTERFACE library
 4. **ChiMod clients** - Should only link to `hshm::cxx` (automatically included)
 5. **ChiMod runtimes** - May link to additional modular targets as needed
 6. **Tests** - Link only to the specific modular targets they test
+7. **GPU code** - Use `hshm::cuda_cxx` or `hshm::rocm_cxx` for GPU kernel code; use `hshm::cxx` for host code
 
 **Example Usage:**
 ```cmake
@@ -356,6 +442,11 @@ target_link_libraries(my_adapter
 target_link_libraries(my_test
   hshm::cxx
   hshm::mpi                 # Only link MPI where needed
+)
+
+# GPU application using CUDA
+target_link_libraries(my_cuda_kernel
+  hshm::cuda_cxx            # For GPU kernel code
 )
 ```
 

@@ -21,14 +21,6 @@
 #include "hermes_shm/util/singleton.h"
 #include "hermes_shm/util/type_switch.h"
 
-TEST_CASE("ShmArchive") {
-  hipc::delay_ar<int> x;
-  x.shm_init(10);
-  REQUIRE(sizeof(hipc::delay_ar<int>) == sizeof(int));
-  REQUIRE(*x == 10);
-  x.shm_destroy();
-}
-
 TEST_CASE("TypeSwitch") {
   typedef hshm::type_switch<int, int, std::string, std::string, size_t,
                             size_t>::type internal_t;
@@ -101,19 +93,19 @@ TEST_CASE("TestAutoTrace") {
 }
 
 TEST_CASE("TestLogger") {
-  HILOG(kInfo, "I'm more likely to be printed: {}", 0);
-  HILOG(kDebug, "I'm not likely to be printed: {}", 10);
+  HLOG(kInfo, "I'm more likely to be printed: {}", 0);
+  HLOG(kDebug, "I'm not likely to be printed: {}", 10);
 
   HSHM_LOG->DisableCode(kDebug);
-  HILOG(kInfo, "I'm more likely to be printed (2): {}", 0);
-  HILOG(kDebug, "I won't be printed: {}", 10);
+  HLOG(kInfo, "I'm more likely to be printed (2): {}", 0);
+  HLOG(kDebug, "I won't be printed: {}", 10);
 
-  HELOG(kWarning, "I am a WARNING! Will NOT cause an EXIT!");
-  HELOG(kError, "I am an ERROR! I will NOT cause an EXIT!");
+  HLOG(kWarning, "I am a WARNING! Will NOT cause an EXIT!");
+  HLOG(kError, "I am an ERROR! I will NOT cause an EXIT!");
 }
 
 TEST_CASE("TestFatalLogger", "[error=FatalError]") {
-  HELOG(kFatal, "I will cause an EXIT!");
+  HLOG(kFatal, "I will cause an EXIT!");
 }
 
 TEST_CASE("TestFormatter") {

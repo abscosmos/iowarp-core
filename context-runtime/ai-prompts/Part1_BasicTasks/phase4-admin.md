@@ -16,9 +16,9 @@ For now, set the ContainerId to 0.
 The admin chimod should have a templated BaseCreateTask class. It takes as input a CreateParamsT. This data structure should be defined for each chimod. It should contain 
 a static constant named chimod_lib_name, which holds ${namespace}_${chimod}. This is used by the module manager to locate the chimod associated with the container. E.g., it may search the path lib${namespace}_${chimod}.so. This should correspond to the names output by the CMakeLists.txt. Namespace is the namespace stored in chimaera_repo.yaml.
 
-The CreateTask for all chimods should inherit from this base class, including the admin chimod's CreateTask. The parameters to this class should essentially be the same as CreateTask, but it should also have variable arguments to instantiate the CreateParamsT. The BaseCreateTask should have a  hipc::string for storing the serialized CreateParamsT. The string is initially unsized. 
+The CreateTask for all chimods should inherit from this base class, including the admin chimod's CreateTask. The parameters to this class should essentially be the same as CreateTask, but it should also have variable arguments to instantiate the CreateParamsT. The BaseCreateTask should have a  chi::priv::string for storing the serialized CreateParamsT. The string is initially unsized. 
 
-TheTask data structure should be augmented to have templated ``Serialize(hipc::string &, args..)`` and ``OutT Deserialize(hipc::string &)``. These funtions internally use the cereal library's BinaryOutputArchive for serializing and deserializing a set of data structures.
+TheTask data structure should be augmented to have templated ``Serialize(chi::priv::string &, args..)`` and ``OutT Deserialize(chi::priv::string &)``. These funtions internally use the cereal library's BinaryOutputArchive for serializing and deserializing a set of data structures.
 
 When creating a pool, the Container for the specific class should be created based on the chimod_lib_name variable. The specific Create function for the container is then called with the CreateTask.
 

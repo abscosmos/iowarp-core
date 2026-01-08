@@ -15,31 +15,31 @@
 #include "chimaera/types.h"
 
 int main(int argc, char* argv[]) {
-  HILOG(kDebug, "Stopping Chimaera runtime...");
+  HLOG(kDebug, "Stopping Chimaera runtime...");
 
   try {
     // Initialize Chimaera client components
-    HILOG(kDebug, "Initializing Chimaera client...");
+    HLOG(kDebug, "Initializing Chimaera client...");
     if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
-      HELOG(kError, "Failed to initialize Chimaera client components");
+      HLOG(kError, "Failed to initialize Chimaera client components");
       return 1;
     }
 
-    HILOG(kDebug, "Creating admin client connection...");
+    HLOG(kDebug, "Creating admin client connection...");
     // Create admin client connected to admin pool
     chimaera::admin::Client admin_client(chi::kAdminPoolId);
 
     // Check if IPC manager is available
     auto* ipc_manager = CHI_IPC;
     if (!ipc_manager || !ipc_manager->IsInitialized()) {
-      HELOG(kError, "IPC manager not available - is Chimaera runtime running?");
+      HLOG(kError, "IPC manager not available - is Chimaera runtime running?");
       return 1;
     }
 
     // Additional validation: check if TaskQueue is accessible
     auto* task_queue = ipc_manager->GetTaskQueue();
-    if (!task_queue || task_queue->IsNull()) {
-      HELOG(kError, "TaskQueue not available - runtime may not be properly initialized");
+    if (!task_queue) {
+      HLOG(kError, "TaskQueue not available - runtime may not be properly initialized");
       return 1;
     }
 
@@ -47,12 +47,12 @@ int main(int argc, char* argv[]) {
     try {
       chi::u32 num_lanes = task_queue->GetNumLanes();
       if (num_lanes == 0) {
-        HELOG(kError, "TaskQueue has no lanes configured - runtime initialization incomplete");
+        HLOG(kError, "TaskQueue has no lanes configured - runtime initialization incomplete");
         return 1;
       }
-      HILOG(kDebug, "TaskQueue validated with {} lanes", num_lanes);
+      HLOG(kDebug, "TaskQueue validated with {} lanes", num_lanes);
     } catch (const std::exception& e) {
-      HELOG(kError, "TaskQueue validation failed: {}", e.what());
+      HLOG(kError, "TaskQueue validation failed: {}", e.what());
       return 1;
     }
 
@@ -70,39 +70,38 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    HILOG(kDebug, "Sending stop runtime task to admin pool (grace period: {}ms)...", grace_period_ms);
+    HLOG(kDebug, "Sending stop runtime task to admin pool (grace period: {}ms)...", grace_period_ms);
 
     // Send StopRuntimeTask via admin client
-    HILOG(kDebug, "Calling admin client AsyncStopRuntime...");
+    HLOG(kDebug, "Calling admin client AsyncStopRuntime...");
     auto start_time = std::chrono::steady_clock::now();
 
     // Use the admin client's AsyncStopRuntime method - fire and forget
-    hipc::FullPtr<chimaera::admin::StopRuntimeTask> stop_task;
+    chi::Future<chimaera::admin::StopRuntimeTask> stop_task;
     try {
-      stop_task = admin_client.AsyncStopRuntime(
-          HSHM_MCTX, pool_query, shutdown_flags, grace_period_ms);
+      stop_task = admin_client.AsyncStopRuntime(pool_query, shutdown_flags, grace_period_ms);
       if (stop_task.IsNull()) {
-        HELOG(kError, "Failed to create stop runtime task - runtime may not be running");
+        HLOG(kError, "Failed to create stop runtime task - runtime may not be running");
         return 1;
       }
     } catch (const std::exception& e) {
-      HELOG(kError, "Error creating stop runtime task: {}", e.what());
+      HLOG(kError, "Error creating stop runtime task: {}", e.what());
       return 1;
     }
 
-    HILOG(kDebug, "Stop runtime task submitted successfully (fire-and-forget)");
+    HLOG(kDebug, "Stop runtime task submitted successfully (fire-and-forget)");
 
     auto end_time = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                         end_time - start_time)
                         .count();
 
-    HILOG(kDebug, "Runtime stop task submitted in {}ms", duration);
+    HLOG(kDebug, "Runtime stop task submitted in {}ms", duration);
 
     return 0;
 
   } catch (const std::exception& e) {
-    HELOG(kError, "Error stopping runtime: {}", e.what());
+    HLOG(kError, "Error stopping runtime: {}", e.what());
     return 1;
   }
 }

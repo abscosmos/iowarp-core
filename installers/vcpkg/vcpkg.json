@@ -14,10 +14,6 @@
       "name": "vcpkg-cmake-config",
       "host": true
     },
-    "boost-fiber",
-    "boost-context",
-    "boost-system",
-    "boost-filesystem",
     "zeromq",
     "yaml-cpp",
     "cereal",

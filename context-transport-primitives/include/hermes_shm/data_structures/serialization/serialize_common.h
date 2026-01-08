@@ -19,7 +19,7 @@
 #include <cereal/archives/binary.hpp>
 #endif
 
-#include "hermes_shm/data_structures/ipc/hash.h"
+// #include "hermes_shm/data_structures/ipc/hash.h"  // Deleted during hard refactoring
 
 namespace hshm::ipc {
 
@@ -102,7 +102,7 @@ template <typename Ar, typename T>
 inline constexpr bool is_serializeable_v =
     has_serialize_fun_v<Ar, T> || has_load_save_fun_v<Ar, T> ||
     has_serialize_cls_v<Ar, T> || has_load_save_cls_v<Ar, T> ||
-    std::is_arithmetic_v<T>;
+    std::is_arithmetic_v<T> || std::is_enum<T>::value;
 
 template <typename Ar, typename T>
 HSHM_CROSS_FUN void write_binary(Ar &ar, const T *data, size_t size) {
@@ -210,5 +210,28 @@ HSHM_CROSS_FUN void load_map(Ar &ar, ContainerT &obj) {
 }
 
 }  // namespace hshm::ipc
+
+#if HSHM_ENABLE_CEREAL
+// Forward declarations for hshm::priv types
+namespace hshm::priv {
+template <typename T, typename AllocT, size_t SSOSize> class basic_string;
+template <typename T, typename AllocT> class vector;
+}  // namespace hshm::priv
+
+// Tell cereal to use member load/save functions for hshm::priv types
+namespace cereal {
+template<typename T, typename AllocT, size_t SSOSize>
+struct specialize<cereal::BinaryOutputArchive, hshm::priv::basic_string<T, AllocT, SSOSize>, cereal::specialization::member_load_save> {};
+
+template<typename T, typename AllocT, size_t SSOSize>
+struct specialize<cereal::BinaryInputArchive, hshm::priv::basic_string<T, AllocT, SSOSize>, cereal::specialization::member_load_save> {};
+
+template<typename T, typename AllocT>
+struct specialize<cereal::BinaryOutputArchive, hshm::priv::vector<T, AllocT>, cereal::specialization::member_load_save> {};
+
+template<typename T, typename AllocT>
+struct specialize<cereal::BinaryInputArchive, hshm::priv::vector<T, AllocT>, cereal::specialization::member_load_save> {};
+}  // namespace cereal
+#endif  // HSHM_ENABLE_CEREAL
 
 #endif  // HSHM_SHM_SERIALIZE_COMMON_H_

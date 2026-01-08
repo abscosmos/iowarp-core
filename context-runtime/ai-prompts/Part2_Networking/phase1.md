@@ -37,12 +37,12 @@ Main operators
 * ``ar <<`` serialize (only for TaskOutput* archives)
 * ``ar >>`` deserialize (only for TaskInput* archives)
 * ``ar(a, b, c)`` serialize or deserialize depending on the archive
-* ``ar.bulk(hipc::Pointer p, size_t size, u32 flags)``: Bulk transfers
+* ``ar.bulk(hipc::ShmPtr<> p, size_t size, u32 flags)``: Bulk transfers
 
 ### Bulk Data Transfer Function
 
 ```cpp
-bulk(hipc::Pointer p, size_t size, u32 flags);
+bulk(hipc::ShmPtr<> p, size_t size, u32 flags);
 ```
 
 **Transfer Flags**:

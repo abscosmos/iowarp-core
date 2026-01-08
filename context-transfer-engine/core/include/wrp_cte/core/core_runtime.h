@@ -6,7 +6,7 @@
 #include <chimaera/comutex.h>
 #include <chimaera/corwlock.h>
 #include <chimaera/unordered_map_ll.h>
-#include <hermes_shm/data_structures/ipc/ring_queue.h>
+#include <hermes_shm/data_structures/ipc/ring_buffer.h>
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/core/core_config.h>
 #include <wrp_cte/core/core_tasks.h>
@@ -32,8 +32,9 @@ public:
   /**
    * Create the container (Method::kCreate)
    * This method both creates and initializes the container
+   * Returns TaskResume for coroutine-based async operations
    */
-  void Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx);
+  chi::TaskResume Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx);
 
   /**
    * Destroy the container (Method::kDestroy)
@@ -42,9 +43,10 @@ public:
 
   /**
    * Register a target (Method::kRegisterTarget)
+   * Returns TaskResume for coroutine-based async operations
    */
-  void RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
-                      chi::RunContext &ctx);
+  chi::TaskResume RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
+                                 chi::RunContext &ctx);
 
   /**
    * Unregister a target (Method::kUnregisterTarget)
@@ -70,31 +72,35 @@ public:
                       chi::RunContext &ctx);
 
   /**
-   * Put blob (Method::kPutBlob) - unimplemented for now
+   * Put blob (Method::kPutBlob) - allocates and writes data to blob
+   * Returns TaskResume for coroutine-based async operations
    */
-  void PutBlob(hipc::FullPtr<PutBlobTask> task, chi::RunContext &ctx);
+  chi::TaskResume PutBlob(hipc::FullPtr<PutBlobTask> task, chi::RunContext &ctx);
 
   /**
-   * Get blob (Method::kGetBlob) - unimplemented for now
+   * Get blob (Method::kGetBlob) - reads data from existing blob
+   * Returns TaskResume for coroutine-based async operations
    */
-  void GetBlob(hipc::FullPtr<GetBlobTask> task, chi::RunContext &ctx);
+  chi::TaskResume GetBlob(hipc::FullPtr<GetBlobTask> task, chi::RunContext &ctx);
 
   /**
    * Reorganize single blob (Method::kReorganizeBlob) - update score for single
-   * blob
+   * blob. Returns TaskResume for coroutine-based async operations
    */
-  void ReorganizeBlob(hipc::FullPtr<ReorganizeBlobTask> task,
-                      chi::RunContext &ctx);
+  chi::TaskResume ReorganizeBlob(hipc::FullPtr<ReorganizeBlobTask> task,
+                                 chi::RunContext &ctx);
 
   /**
    * Delete blob operation - removes blob and decrements tag size
+   * Returns TaskResume for coroutine-based async operations
    */
-  void DelBlob(hipc::FullPtr<DelBlobTask> task, chi::RunContext &ctx);
+  chi::TaskResume DelBlob(hipc::FullPtr<DelBlobTask> task, chi::RunContext &ctx);
 
   /**
    * Delete tag operation - removes all blobs from tag and removes tag
+   * Returns TaskResume for coroutine-based async operations
    */
-  void DelTag(hipc::FullPtr<DelTagTask> task, chi::RunContext &ctx);
+  chi::TaskResume DelTag(hipc::FullPtr<DelTagTask> task, chi::RunContext &ctx);
 
   /**
    * Get tag size operation - returns total size of all blobs in tag
@@ -104,20 +110,27 @@ public:
   // Pure virtual methods - implementations are in autogen/core_lib_exec.cc
   void Init(const chi::PoolId &pool_id, const std::string &pool_name,
             chi::u32 container_id = 0) override;
-  void Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
-           chi::RunContext &rctx) override;
+  chi::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
+                      chi::RunContext &rctx) override;
   void Monitor(chi::MonitorModeId mode, chi::u32 method,
-               hipc::FullPtr<chi::Task> task_ptr, chi::RunContext &rctx);
-  void Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
+               chi::Future<chi::Task>& task_future, chi::RunContext &rctx);
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   chi::u64 GetWorkRemaining() const override;
   void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
                 hipc::FullPtr<chi::Task> task_ptr) override;
   void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                hipc::FullPtr<chi::Task> &task_ptr) override;
-  void NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task> &orig_task,
-               hipc::FullPtr<chi::Task> &dup_task, bool deep) override;
-  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task,
-                 hipc::FullPtr<chi::Task> replica_task) override;
+                hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override;
+  void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive) override;
+  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive &archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr,
+                                        bool deep) override;
+  hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_ptr,
+                 hipc::FullPtr<chi::Task> replica_task_ptr) override;
 
 private:
   // Queue ID constants (REQUIRED: Use semantic names, not raw integers)
@@ -163,8 +176,8 @@ private:
   Config config_;
 
   // Telemetry ring buffer for performance monitoring
-  static const size_t kTelemetryRingSize = 1024; // Ring buffer size
-  hipc::circular_mpsc_queue<CteTelemetry> telemetry_log_;
+  static inline constexpr size_t kTelemetryRingSize = 1024; // Ring buffer size
+  std::unique_ptr<hipc::circular_mpsc_ring_buffer<CteTelemetry, CHI_MAIN_ALLOC_T>> telemetry_log_;
   std::atomic<std::uint64_t>
       telemetry_counter_; // Atomic counter for logical time
 
@@ -175,8 +188,9 @@ private:
 
   /**
    * Helper function to update target performance statistics
+   * Returns TaskResume for coroutine-based async operations
    */
-  void UpdateTargetStats(const chi::PoolId &target_id, TargetInfo &target_info);
+  chi::TaskResume UpdateTargetStats(const chi::PoolId &target_id, TargetInfo &target_info);
 
   /**
    * Helper function to get manual score for a target from storage device config
@@ -218,17 +232,19 @@ private:
    * @param target_info Target to allocate from
    * @param size Size to allocate
    * @param allocated_offset Output parameter for allocated offset
-   * @return True if allocation succeeded, false otherwise
+   * @param success Output parameter: true if allocation succeeded, false otherwise
+   * Returns TaskResume for coroutine-based async operations
    */
-  bool AllocateFromTarget(TargetInfo &target_info, chi::u64 size,
-                          chi::u64 &allocated_offset);
+  chi::TaskResume AllocateFromTarget(TargetInfo &target_info, chi::u64 size,
+                                     chi::u64 &allocated_offset, bool &success);
 
   /**
    * Free all blocks from a blob back to their respective targets
    * @param blob_info BlobInfo containing blocks to free
-   * @return 0 on success, non-zero on error
+   * @param error_code Output: 0 on success, non-zero on error
+   * Returns TaskResume for coroutine-based async operations
    */
-  chi::u32 FreeAllBlobBlocks(BlobInfo &blob_info);
+  chi::TaskResume FreeAllBlobBlocks(BlobInfo &blob_info, chi::u32 &error_code);
 
   /**
    * Check if blob exists and return pointer to BlobInfo if found
@@ -254,22 +270,24 @@ private:
    * @param offset Offset where data starts (for determining required size)
    * @param size Size of data to accommodate
    * @param blob_score Score for target selection
-   * @return Error code: 0 for success, 1 for failure
+   * @param error_code Output: 0 for success, 1 for failure
+   * Returns TaskResume for coroutine-based async operations
    */
-  chi::u32 AllocateNewData(BlobInfo &blob_info, chi::u64 offset, chi::u64 size,
-                           float blob_score);
+  chi::TaskResume AllocateNewData(BlobInfo &blob_info, chi::u64 offset, chi::u64 size,
+                                  float blob_score, chi::u32 &error_code);
 
   /**
    * Write data to existing blob blocks
-   * @param blob_info Blob containing the blocks to write to
-   * @param offset Offset within blob where data starts
-   * @param size Size of data to write
-   * @param blob_data Pointer to data to write
-   * @return Error code: 0 for success, 1 for failure
+   * @param blocks Vector of blob blocks to write to
+   * @param data Pointer to data to write
+   * @param data_size Size of data to write
+   * @param data_offset_in_blob Offset within blob where data starts
+   * @param error_code Output: 0 for success, 1 for failure
+   * Returns TaskResume for coroutine-based async operations
    */
-  chi::u32 ModifyExistingData(const std::vector<BlobBlock> &blocks,
-                              hipc::Pointer data, size_t data_size,
-                              size_t data_offset_in_blob);
+  chi::TaskResume ModifyExistingData(const std::vector<BlobBlock> &blocks,
+                                     hipc::ShmPtr<> data, size_t data_size,
+                                     size_t data_offset_in_blob, chi::u32 &error_code);
 
   /**
    * Read existing blob data from blocks
@@ -277,10 +295,11 @@ private:
    * @param data Output buffer to read data into
    * @param data_size Size of data to read
    * @param data_offset_in_blob Offset within blob where reading starts
-   * @return Error code: 0 for success, 1 for failure
+   * @param error_code Output: 0 for success, 1 for failure
+   * Returns TaskResume for coroutine-based async operations
    */
-  chi::u32 ReadData(const std::vector<BlobBlock> &blocks, hipc::Pointer data,
-                    size_t data_size, size_t data_offset_in_blob);
+  chi::TaskResume ReadData(const std::vector<BlobBlock> &blocks, hipc::ShmPtr<> data,
+                           size_t data_size, size_t data_offset_in_blob, chi::u32 &error_code);
 
   /**
    * Log telemetry data for CTE operations

@@ -1,306 +1,221 @@
-#ifndef HERMES_SHM_DATA_STRUCTURES_MULTI_RING_BUFFER_H_
-#define HERMES_SHM_DATA_STRUCTURES_MULTI_RING_BUFFER_H_
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * Distributed under BSD 3-Clause license.                                   *
+ * Copyright by The HDF Group.                                               *
+ * Copyright by the Illinois Institute of Technology.                        *
+ * All rights reserved.                                                      *
+ *                                                                           *
+ * This file is part of Hermes. The full Hermes copyright notice, including  *
+ * terms governing use, modification, and redistribution, is contained in    *
+ * the COPYING file, which can be found at the top directory. If you do not  *
+ * have access to the file, you may request a copy from help@hdfgroup.org.   *
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-#include <atomic>
+#ifndef HSHM_DATA_STRUCTURES_IPC_MULTI_RING_BUFFER_H_
+#define HSHM_DATA_STRUCTURES_IPC_MULTI_RING_BUFFER_H_
 
-#include "hermes_shm/types/qtok.h"
-#include "ring_queue.h"
-#include "vector.h"
+#include "hermes_shm/data_structures/ipc/shm_container.h"
+#include "hermes_shm/data_structures/ipc/vector.h"
+#include "hermes_shm/data_structures/ipc/ring_buffer.h"
+#include "hermes_shm/constants/macros.h"
+#include <cassert>
 
 namespace hshm::ipc {
 
 /**
- * Multi-lane concurrent ring buffer with priority levels
- * Structure: [lane][priority][queue]
+ * Multi-lane ring buffer container for shared memory.
  *
- * @tparam T The type of data stored in the queues
- * @tparam HDR Optional header type to store additional data (default: EmptyHeader)
- * @tparam RQ_FLAGS Ring queue configuration flags
- * @tparam HSHM_CLASS_TEMPL Template parameters for SHM containers
+ * This is a container of multiple ring_buffer instances organized as a vector.
+ * It provides lane-based access to independent ring buffers, where each lane
+ * can have multiple priority levels. This is useful for scenarios where you need
+ * to multiplex data across multiple independent queues (e.g., task scheduling
+ * with multiple lanes and priorities).
+ *
+ * Features:
+ * - Multiple independent ring buffers organized by lane and priority
+ * - Lane-based indexing with automatic index calculation
+ * - Configurable depth for all buffers
+ * - Process-independent storage using vector of ring_buffers
+ * - Type-safe access to ring buffers via GetLane()
+ *
+ * @tparam T The element type to store in each ring buffer
+ * @tparam AllocT The allocator type for shared memory allocation
+ * @tparam FLAGS Configuration flags controlling ring buffer behavior
  */
-template <typename T, typename HDR = EmptyHeader, RingQueueFlag RQ_FLAGS = RING_BUFFER_MPSC_FLAGS, HSHM_CLASS_TEMPL_WITH_DEFAULTS>
-class multi_ring_buffer : public ShmContainer {
+template<typename T,
+         typename AllocT,
+         uint32_t FLAGS = (RING_BUFFER_SPSC_FLAGS | RING_BUFFER_FIXED_SIZE | RING_BUFFER_ERROR_ON_NO_SPACE)>
+class multi_ring_buffer : public ShmContainer<AllocT> {
  public:
-  HIPC_CONTAINER_TEMPLATE((multi_ring_buffer), (T, HDR, RQ_FLAGS))
-
- public:
-  /**====================================
-   * Typedefs
-   * ===================================*/
-  typedef ring_queue_base<T, HDR, RQ_FLAGS, HSHM_CLASS_TEMPL_ARGS> queue_t;
-  typedef vector<queue_t, HSHM_CLASS_TEMPL_ARGS> queue_vector_t;
+  using allocator_type = AllocT;
+  using value_type = T;
+  using reference = T&;
+  using const_reference = const T&;
+  using pointer = T*;
+  using const_pointer = const T*;
+  using size_type = size_t;
+  using entry_type = RingBufferEntry<T>;
+  using ring_buffer_type = ring_buffer<T, AllocT, FLAGS>;
+  using lanes_vector = vector<ring_buffer_type, AllocT>;
 
  private:
-  /**====================================
-   * Variables
-   * ===================================*/
-  delay_ar<queue_vector_t> queues_;
-  std::atomic<size_t> round_robin_counter_;
-  size_t num_lanes_;
-  size_t num_priorities_;
-  ibitfield flags_;
-  HDR header_;
-
-  /**====================================
-   * Helper Methods
-   * ===================================*/
-
-  /** Calculate the index for a given lane and priority */
-  HSHM_INLINE_CROSS_FUN
-  size_t GetQueueIndex(size_t lane_id, size_t priority) const {
-    return lane_id * num_priorities_ + priority;
-  }
+  lanes_vector lanes_;       /**< Vector of OffsetPtrs to ring buffers */
+  size_t num_lanes_;         /**< Number of lanes */
+  size_t num_prios_;         /**< Number of priority levels per lane */
 
  public:
-  /**====================================
-   * Constructors
-   * ===================================*/
-
-  /** Default constructor */
-  template <typename... Args>
-  HSHM_CROSS_FUN explicit multi_ring_buffer(size_t num_lanes,
-                                            size_t num_priorities,
-                                            size_t queue_depth = 1024,
-                                            Args &&...args) {
-    shm_init(HSHM_MEMORY_MANAGER->GetDefaultAllocator<AllocT>(), num_lanes,
-             num_priorities, queue_depth, std::forward<Args>(args)...);
-  }
-
-  /** SHM constructor */
-  template <typename... Args>
-  HSHM_CROSS_FUN explicit multi_ring_buffer(
-      const hipc::CtxAllocator<AllocT> &alloc, size_t num_lanes,
-      size_t num_priorities, size_t queue_depth = 1024, Args &&...args) {
-    shm_init(alloc, num_lanes, num_priorities, queue_depth,
-             std::forward<Args>(args)...);
-  }
-
-  /** SHM initializer */
-  template <typename... Args>
-  HSHM_CROSS_FUN void shm_init(const hipc::CtxAllocator<AllocT> &alloc,
-                               size_t num_lanes, size_t num_priorities,
-                               size_t queue_depth = 1024, Args &&...args) {
-    init_shm_container(alloc);
-
-    // Store runtime dimensions
-    num_lanes_ = num_lanes;
-    num_priorities_ = num_priorities;
-
-    // Initialize the single queue vector with size = lanes * priorities
-    const size_t total_queues = num_lanes_ * num_priorities_;
-    queues_.shm_init(GetCtxAllocator(), total_queues);
-
-    // Initialize each queue
-    for (size_t i = 0; i < total_queues; ++i) {
-      (*queues_)[i].shm_init(GetCtxAllocator(), queue_depth,
-                             std::forward<Args>(args)...);
-    }
-
-    round_robin_counter_.store(0);
-    flags_.Clear();
-    if constexpr (!std::is_same_v<HDR, EmptyHeader>) {
-      header_ = HDR{};
-    }
-    SetNull();
-  }
-
-  /**====================================
-   * Copy Constructors
-   * ===================================*/
-
-  /** SHM copy constructor */
+  /**
+   * Constructor
+   *
+   * Initializes a multi-lane ring buffer with the specified number of lanes,
+   * priority levels per lane, and depth for each individual ring buffer.
+   * Total number of ring buffers created = num_lanes * num_prios.
+   *
+   * @param alloc The allocator to use for memory allocation
+   * @param num_lanes The number of lanes
+   * @param num_prios The number of priority levels per lane
+   * @param depth The depth (capacity) of each individual ring buffer
+   */
   HSHM_CROSS_FUN
-  explicit multi_ring_buffer(const hipc::CtxAllocator<AllocT> &alloc,
-                             const multi_ring_buffer &other) {
-    init_shm_container(alloc);
-    SetNull();
-    shm_strong_copy_op(other);
+  explicit multi_ring_buffer(AllocT *alloc, size_t num_lanes, size_t num_prios,
+                             size_t depth)
+      : ShmContainer<AllocT>(alloc),
+        num_lanes_(num_lanes),
+        num_prios_(num_prios),
+        lanes_(alloc, num_lanes * num_prios, depth) {
   }
 
-  /** SHM copy assignment operator */
-  HSHM_CROSS_FUN
-  multi_ring_buffer &operator=(const multi_ring_buffer &other) {
-    if (this != &other) {
-      shm_destroy();
-      shm_strong_copy_op(other);
-    }
-    return *this;
-  }
+  /**
+   * Copy constructor (deleted)
+   *
+   * IPC data structures must be allocated via allocator, not copied on stack.
+   */
+  multi_ring_buffer(const multi_ring_buffer &other) = delete;
 
-  /** SHM copy constructor + operator main */
-  HSHM_CROSS_FUN
-  void shm_strong_copy_op(const multi_ring_buffer &other) {
-    round_robin_counter_.store(other.round_robin_counter_.load());
-    num_lanes_ = other.num_lanes_;
-    num_priorities_ = other.num_priorities_;
-    (*queues_) = (*other.queues_);
-    if constexpr (!std::is_same_v<HDR, EmptyHeader>) {
-      header_ = other.header_;
-    }
-  }
+  /**
+   * Move constructor (deleted)
+   *
+   * IPC data structures must be allocated via allocator, not moved on stack.
+   */
+  multi_ring_buffer(multi_ring_buffer &&other) noexcept = delete;
 
-  /**====================================
-   * Move Constructors
-   * ===================================*/
-
-  /** Move constructor */
-  HSHM_CROSS_FUN
-  multi_ring_buffer(multi_ring_buffer &&other) noexcept {
-    shm_move_op<false>(other.GetCtxAllocator(),
-                       std::forward<multi_ring_buffer>(other));
-  }
-
-  /** SHM move constructor */
-  HSHM_CROSS_FUN
-  multi_ring_buffer(const hipc::CtxAllocator<AllocT> &alloc,
-                    multi_ring_buffer &&other) noexcept {
-    shm_move_op<false>(alloc, std::forward<multi_ring_buffer>(other));
-  }
-
-  /** SHM move assignment operator */
-  HSHM_CROSS_FUN
-  multi_ring_buffer &operator=(multi_ring_buffer &&other) noexcept {
-    if (this != &other) {
-      shm_move_op<true>(other.GetCtxAllocator(),
-                        std::forward<multi_ring_buffer>(other));
-    }
-    return *this;
-  }
-
-  /** SHM move assignment operator implementation */
-  template <bool IS_ASSIGN>
-  HSHM_CROSS_FUN void shm_move_op(const hipc::CtxAllocator<AllocT> &alloc,
-                                  multi_ring_buffer &&other) noexcept {
-    if constexpr (!IS_ASSIGN) {
-      init_shm_container(alloc);
-    }
-    if (GetAllocator() == other.GetAllocator()) {
-      round_robin_counter_.store(other.round_robin_counter_.load());
-      num_lanes_ = other.num_lanes_;
-      num_priorities_ = other.num_priorities_;
-      (*queues_) = std::move(*other.queues_);
-      if constexpr (!std::is_same_v<HDR, EmptyHeader>) {
-        header_ = std::move(other.header_);
-      }
-      other.SetNull();
-    } else {
-      shm_strong_copy_op(other);
-      other.shm_destroy();
-    }
-  }
-
-  /**====================================
+  /**
    * Destructor
-   * ===================================*/
-
-  /** SHM destructor */
-  HSHM_CROSS_FUN
-  void shm_destroy_main() { (*queues_).shm_destroy(); }
-
-  /** Check if the buffer is empty */
-  HSHM_CROSS_FUN
-  bool IsNull() const { return (*queues_).IsNull(); }
-
-  /** Sets this buffer as empty */
-  HSHM_CROSS_FUN
-  void SetNull() { round_robin_counter_.store(0); }
-
-  /**====================================
-   * Multi-Ring Buffer Methods
-   * ===================================*/
-
-
-  /**
-   * Get direct access to a specific lane (priority-specific queue)
    */
   HSHM_CROSS_FUN
-  queue_t &GetLane(size_t lane_id, size_t priority) {
-    size_t queue_idx = GetQueueIndex(lane_id, priority);
-    return (*queues_)[queue_idx];
+  ~multi_ring_buffer() {
+    // Vector destructor handles cleanup automatically
   }
 
   /**
-   * Get direct access to a specific lane (const version)
+   * Get ring buffer for a specific lane and priority level
+   *
+   * Returns a reference to the ring buffer at the specified lane and priority.
+   * The actual index is calculated as: lane_id * num_prios + prio.
+   *
+   * @param lane_id The lane identifier (must be < num_lanes_)
+   * @param prio The priority level (must be < num_prios_)
+   * @return Reference to the ring_buffer at the specified lane and priority
+   *
+   * Asserts that lane_id < num_lanes_ and prio < num_prios_
    */
-  HSHM_CROSS_FUN
-  const queue_t &GetLane(size_t lane_id, size_t priority) const {
-    size_t queue_idx = GetQueueIndex(lane_id, priority);
-    return (*queues_)[queue_idx];
+  HSHM_INLINE_CROSS_FUN
+  ring_buffer_type& GetLane(size_t lane_id, size_t prio) {
+    assert(lane_id < num_lanes_);
+    assert(prio < num_prios_);
+    size_t idx = lane_id * num_prios_ + prio;
+    // lanes_[idx] is a raw pointer to ring_buffer_type
+    return lanes_[idx];
+  }
+
+  /**
+   * Get ring buffer for a specific lane and priority level (const version)
+   *
+   * Returns a const reference to the ring buffer at the specified lane and
+   * priority. The actual index is calculated as: lane_id * num_prios + prio.
+   *
+   * @param lane_id The lane identifier (must be < num_lanes_)
+   * @param prio The priority level (must be < num_prios_)
+   * @return Const reference to the ring_buffer at the specified lane and priority
+   *
+   * Asserts that lane_id < num_lanes_ and prio < num_prios_
+   */
+  HSHM_INLINE_CROSS_FUN
+  const ring_buffer_type& GetLane(size_t lane_id, size_t prio) const {
+    assert(lane_id < num_lanes_);
+    assert(prio < num_prios_);
+    size_t idx = lane_id * num_prios_ + prio;
+    // lanes_[idx] is a raw pointer to ring_buffer_type
+    return lanes_[idx];
   }
 
   /**
    * Get the number of lanes
+   *
+   * @return The number of lanes in this multi-ring buffer
    */
-  HSHM_CROSS_FUN
-  size_t GetNumLanes() const { return num_lanes_; }
+  HSHM_INLINE_CROSS_FUN
+  size_t GetNumLanes() const {
+    return num_lanes_;
+  }
 
   /**
-   * Get the number of priorities
+   * Get the number of priority levels per lane
+   *
+   * @return The number of priority levels per lane
    */
-  HSHM_CROSS_FUN
-  size_t GetNumPriorities() const { return num_priorities_; }
-
-  /** Get header reference */
   HSHM_INLINE_CROSS_FUN
-  HDR& GetHeader() { return header_; }
+  size_t GetNumPrios() const {
+    return num_prios_;
+  }
 
-  /** Get const header reference */
+  /**
+   * Get the total number of ring buffers
+   *
+   * @return Total number of ring buffers (num_lanes * num_prios)
+   */
   HSHM_INLINE_CROSS_FUN
-  const HDR& GetHeader() const { return header_; }
+  size_t GetTotalBuffers() const {
+    return num_lanes_ * num_prios_;
+  }
+
 };
 
-// Multi-lane MPSC queue
-template <typename T, typename HDR = EmptyHeader, HSHM_CLASS_TEMPL_WITH_IPC_DEFAULTS>
-using multi_mpsc_queue =
-    multi_ring_buffer<T, HDR, RING_BUFFER_MPSC_FLAGS, HSHM_CLASS_TEMPL_ARGS>;
+/**
+ * Typedef for extensible ring buffer (single-thread only).
+ *
+ * This ring buffer will dynamically resize when capacity is reached,
+ * making it suitable for scenarios where size cannot be predicted upfront.
+ * NOT thread-safe for multiple producers.
+ */
+template <typename T, typename AllocT = hipc::Allocator>
+using multi_ext_ring_buffer =
+    multi_ring_buffer<T, AllocT, (RING_BUFFER_SPSC_FLAGS | RING_BUFFER_DYNAMIC_SIZE)>;
 
-// Multi-lane SPSC queue
-template <typename T, typename HDR = EmptyHeader, HSHM_CLASS_TEMPL_WITH_IPC_DEFAULTS>
-using multi_spsc_queue =
-    multi_ring_buffer<T, HDR, RING_BUFFER_SPSC_FLAGS, HSHM_CLASS_TEMPL_ARGS>;
+/**
+ * Typedef for fixed-size SPSC (Single Producer Single Consumer) ring buffer.
+ *
+ * This ring buffer is optimized for single-threaded scenarios and will
+ * return an error when attempting to push beyond capacity.
+ */
+template <typename T, typename AllocT = hipc::Allocator>
+using multi_spsc_ring_buffer =
+    multi_ring_buffer<T, AllocT,
+                (RING_BUFFER_SPSC_FLAGS | RING_BUFFER_FIXED_SIZE |
+                 RING_BUFFER_ERROR_ON_NO_SPACE)>;
 
-// Multi-lane fixed MPSC queue
-template <typename T, typename HDR = EmptyHeader, HSHM_CLASS_TEMPL_WITH_IPC_DEFAULTS>
-using multi_fixed_mpsc_queue =
-    multi_ring_buffer<T, HDR, RING_BUFFER_FIXED_MPMC_FLAGS,
-                      HSHM_CLASS_TEMPL_ARGS>;
-
-// Multi-lane circular MPSC queue
-template <typename T, typename HDR = EmptyHeader, HSHM_CLASS_TEMPL_WITH_IPC_DEFAULTS>
-using multi_circular_mpsc_queue =
-    multi_ring_buffer<T, HDR, RING_BUFFER_CIRCULAR_MPMC_FLAGS,
-                      HSHM_CLASS_TEMPL_ARGS>;
+/**
+ * Typedef for fixed-size MPSC (Multiple Producer Single Consumer) ring buffer.
+ *
+ * This ring buffer is optimized for scenarios where multiple threads push
+ * but only one thread consumes. Uses atomic operations for thread-safe
+ * multi-producer access while supporting single consumer.
+ */
+template <typename T, typename AllocT = hipc::Allocator>
+using multi_mpsc_ring_buffer =
+    multi_ring_buffer<T, AllocT,
+                      (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_FIXED_SIZE |
+                       RING_BUFFER_WAIT_FOR_SPACE)>;
 
 }  // namespace hshm::ipc
 
-namespace hshm {
-
-/**
- * Convenient typedefs for common multi-ring buffer configurations
- */
-
-// Multi-lane MPSC queue
-template <typename T, typename HDR = hipc::EmptyHeader, HSHM_CLASS_TEMPL_WITH_PRIV_DEFAULTS>
-using multi_mpsc_queue =
-    hipc::multi_ring_buffer<T, HDR, RING_BUFFER_MPSC_FLAGS, HSHM_CLASS_TEMPL_ARGS>;
-
-// Multi-lane SPSC queue
-template <typename T, typename HDR = hipc::EmptyHeader, HSHM_CLASS_TEMPL_WITH_PRIV_DEFAULTS>
-using multi_spsc_queue =
-    hipc::multi_ring_buffer<T, HDR, RING_BUFFER_SPSC_FLAGS, HSHM_CLASS_TEMPL_ARGS>;
-
-// Multi-lane fixed MPSC queue
-template <typename T, typename HDR = hipc::EmptyHeader, HSHM_CLASS_TEMPL_WITH_PRIV_DEFAULTS>
-using multi_fixed_mpsc_queue =
-    hipc::multi_ring_buffer<T, HDR, RING_BUFFER_FIXED_MPMC_FLAGS,
-                            HSHM_CLASS_TEMPL_ARGS>;
-
-// Multi-lane circular MPSC queue
-template <typename T, typename HDR = hipc::EmptyHeader, HSHM_CLASS_TEMPL_WITH_PRIV_DEFAULTS>
-using multi_circular_mpsc_queue =
-    hipc::multi_ring_buffer<T, HDR, RING_BUFFER_CIRCULAR_MPMC_FLAGS,
-                            HSHM_CLASS_TEMPL_ARGS>;
-
-}  // namespace hshm
-
-#endif  // HERMES_SHM_DATA_STRUCTURES_MULTI_RING_BUFFER_H_
+#endif  // HSHM_DATA_STRUCTURES_IPC_MULTI_RING_BUFFER_H_

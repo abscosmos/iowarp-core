@@ -63,7 +63,7 @@ A DomainQuery should be implemented that can be used for selecting basic regions
 5. GetGlobalBcast(): Replicates task to every node in the domain
 5. GetDynamic(): Send this request to the container's Monitor method with MonitorMode kGlobalSchedule
 
-Containers can internally create a set of concurrent queues for accepting requests. Queues have an ID. Lanes of these queues will be scheduled within the runtime when they have tasks to execute. The queues will be based on the multi_mpsc_queue data structure of hshm.
+Containers can internally create a set of concurrent queues for accepting requests. Queues have an ID. Lanes of these queues will be scheduled within the runtime when they have tasks to execute. The queues will be based on the multi_mpsc_ring_buffer data structure of hshm.
 
 ## The Base Task
 
@@ -154,7 +154,7 @@ After this, shared memory backends and allocators over those backends are create
  * ``CHI_CDATA_ALLOC_T``. The default value should be ``hipc::ThreadLocalAllocator``.  
  * ``CHI_RDATA_ALLOC_T``. The default value should be ``hipc::ThreadLocalAllocator``.  
 
-After this, a concurrent, priority queue named the process_queue is stored in the shared memory. This queue is for external processes to submit tasks to the runtime. The number of lanes (i.e., concurrency) is determined by the number of workers. There should be the following priorities: kLowLatency and kHighLatency. The queue lanes are implemented on top of multi_mpsc_queue from hshm. The queue should store a ``hipc::Pointer`` instead of a ``hipc::FullPtr``. This is because FullPtr stores both private and shared memory addresses, but the private address will not be correct at the runtime. The depth of the queue is configurable. It does not necessarily need to be a simple typedef.
+After this, a concurrent, priority queue named the process_queue is stored in the shared memory. This queue is for external processes to submit tasks to the runtime. The number of lanes (i.e., concurrency) is determined by the number of workers. There should be the following priorities: kLowLatency and kHighLatency. The queue lanes are implemented on top of multi_mpsc_ring_buffer from hshm. The queue should store a ``hipc::ShmPtr<>`` instead of a ``hipc::FullPtr``. This is because FullPtr stores both private and shared memory addresses, but the private address will not be correct at the runtime. The depth of the queue is configurable. It does not necessarily need to be a simple typedef.
 
 The chimaera configuration should include an entry for specifying the hostfile. ``hshm::ConfigParse::ParseHostfile`` should be used to load the set of hosts. In the runtime, the IPC manager reads this hostfile. It attempts to spawn a ZeroMQ server for each ip address. On the first success, it stops trying. The offset in this list + 1 is the ID of this node.
 

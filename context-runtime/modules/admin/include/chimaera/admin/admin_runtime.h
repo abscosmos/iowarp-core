@@ -6,9 +6,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/container.h>
 #include <chimaera/pool_manager.h>
-#include <chimaera/comutex.h>
 #include <chimaera/unordered_map_ll.h>
-#include <vector>
 
 namespace chimaera::admin {
 
@@ -51,14 +49,10 @@ private:
 
   // Network task tracking maps (keyed by net_key for efficient lookup)
   // Using lock-free unordered_map_ll with 1024 buckets for high concurrency
+  // Thread safety: All Send/Recv tasks are routed to a single dedicated net worker
   static constexpr size_t kNumMapBuckets = 1024;
   chi::unordered_map_ll<size_t, hipc::FullPtr<chi::Task>> send_map_{kNumMapBuckets};  // Tasks sent to remote nodes
   chi::unordered_map_ll<size_t, hipc::FullPtr<chi::Task>> recv_map_{kNumMapBuckets};  // Tasks received from remote nodes
-
-  // CoMutex vector for synchronizing map access (one per worker thread)
-  // Mutable to allow locking in const methods like GetWorkRemaining()
-  mutable std::vector<chi::CoMutex> send_map_locks_;
-  mutable std::vector<chi::CoMutex> recv_map_locks_;
 
 public:
   /**
@@ -80,13 +74,13 @@ public:
   /**
    * Execute a method on a task
    */
-  void Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
-           chi::RunContext &rctx) override;
+  chi::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
+                      chi::RunContext &rctx) override;
 
   /**
    * Delete/cleanup a task
    */
-  void Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
 
   //===========================================================================
   // Method implementations
@@ -99,8 +93,9 @@ public:
 
   /**
    * Handle GetOrCreatePool task - Pool get-or-create operation (IS_ADMIN=false)
+   * This is a coroutine that can co_await nested Create methods
    */
-  void GetOrCreatePool(
+  chi::TaskResume GetOrCreatePool(
       hipc::FullPtr<
           chimaera::admin::GetOrCreatePoolTask<chimaera::admin::CreateParams>>
           task,
@@ -108,13 +103,15 @@ public:
 
   /**
    * Handle Destroy task - Alias for DestroyPool (DestroyTask = DestroyPoolTask)
+   * This is a coroutine for consistency with GetOrCreatePool
    */
-  void Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx);
+  chi::TaskResume Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx);
 
   /**
    * Handle DestroyPool task - Destroy an existing ChiPool
+   * This is a coroutine that can co_await pool destruction
    */
-  void DestroyPool(hipc::FullPtr<DestroyPoolTask> task, chi::RunContext &rctx);
+  chi::TaskResume DestroyPool(hipc::FullPtr<DestroyPoolTask> task, chi::RunContext &rctx);
 
   /**
    * Handle StopRuntime task - Stop the entire runtime
@@ -124,7 +121,7 @@ public:
   /**
    * Handle Flush task - Flush administrative operations
    */
-  void Flush(hipc::FullPtr<FlushTask> task, chi::RunContext &rctx);
+  chi::TaskResume Flush(hipc::FullPtr<FlushTask> task, chi::RunContext &rctx);
 
   //===========================================================================
   // Distributed Task Scheduling Methods
@@ -138,12 +135,12 @@ public:
   /**
    * Helper: Send task inputs to remote node
    */
-  void SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx);
+  void SendIn(hipc::FullPtr<chi::Task> origin_task, chi::RunContext &rctx);
 
   /**
    * Helper: Send task outputs back to origin node
    */
-  void SendOut(hipc::FullPtr<SendTask> task);
+  void SendOut(hipc::FullPtr<chi::Task> origin_task);
 
   /**
    * Handle Recv - Receive task inputs or outputs from network
@@ -177,23 +174,50 @@ public:
                 hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
-   * Deserialize task parameters (IN or OUT based on archive mode)
+   * Deserialize task parameters into an existing task (IN or OUT based on archive mode)
    */
   void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                hipc::FullPtr<chi::Task>& task_ptr) override;
+                hipc::FullPtr<chi::Task> task_ptr) override;
+
+  /**
+   * Allocate and deserialize task parameters from network transfer
+   */
+  hipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override;
+
+  /**
+   * Deserialize task input parameters into an existing task using LocalSerialize
+   */
+  void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
+
+  /**
+   * Allocate and deserialize task input parameters using LocalSerialize
+   */
+  hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive) override;
+
+  /**
+   * Serialize task output parameters using LocalSerialize (for local transfers)
+   */
+  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive &archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
    * Create a new copy of a task (deep copy for distributed execution)
    */
-  void NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task> &orig_task,
-               hipc::FullPtr<chi::Task> &dup_task, bool deep) override;
+  hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr,
+                                        bool deep) override;
+
+  /**
+   * Create a new task of the specified method type
+   */
+  hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
 
   /**
    * Aggregate a replica task into the origin task (for merging replica results)
    */
   void Aggregate(chi::u32 method,
-                 hipc::FullPtr<chi::Task> origin_task,
-                 hipc::FullPtr<chi::Task> replica_task) override;
+                 hipc::FullPtr<chi::Task> origin_task_ptr,
+                 hipc::FullPtr<chi::Task> replica_task_ptr) override;
 
 private:
   /**

@@ -10,12 +10,6 @@
 // Main HSHM include
 #include <hermes_shm/hermes_shm.h>
 
-// Boost Fiber includes
-#include <boost/context/fiber_fcontext.hpp>
-
-// Namespace alias for boost::context::detail
-namespace bctx = boost::context::detail;
-
 /**
  * Core type definitions for Chimaera distributed task execution framework
  */
@@ -236,12 +230,11 @@ struct AddressHash {
 #define TASK_ROUTED BIT_OPT(chi::u32, 1)
 #define TASK_DATA_OWNER BIT_OPT(chi::u32, 2)
 #define TASK_REMOTE BIT_OPT(chi::u32, 3)
-#define TASK_FIRE_AND_FORGET BIT_OPT(chi::u32, 4)
 #define TASK_FORCE_NET                                                         \
   BIT_OPT(chi::u32,                                                            \
-          5) ///< Force task through network code even for local execution
+          4) ///< Force task through network code even for local execution
 #define TASK_STARTED                                                           \
-  BIT_OPT(chi::u32, 6) ///< Task execution has been started (set in BeginTask,
+  BIT_OPT(chi::u32, 5) ///< Task execution has been started (set in BeginTask,
                        ///< unset in ReschedulePeriodicTask)
 
 // Bulk transfer flags are defined in hermes_shm/lightbeam/lightbeam.h:
@@ -252,7 +245,8 @@ struct AddressHash {
 enum ThreadType {
   kSchedWorker = 0,    ///< Scheduler worker for fast tasks (EstCpuTime < 50us)
   kSlow = 1,           ///< Slow worker for long-running tasks (EstCpuTime >= 50us)
-  kProcessReaper = 2   ///< Process reaper thread
+  kProcessReaper = 2,  ///< Process reaper thread
+  kNetWorker = 3       ///< Network worker for Send/Recv tasks
 };
 
 // Lane mapping policies for task distribution
@@ -269,9 +263,9 @@ constexpr PoolId kAdminPoolId =
     UniqueId(1, 0); // Admin ChiMod pool ID (reserved)
 
 // Allocator type aliases using HSHM conventions
-#define CHI_MAIN_ALLOC_T hipc::ThreadLocalAllocator
-#define CHI_CDATA_ALLOC_T hipc::ThreadLocalAllocator
-#define CHI_RDATA_ALLOC_T hipc::ThreadLocalAllocator
+#define CHI_MAIN_ALLOC_T hipc::MultiProcessAllocator
+#define CHI_CDATA_ALLOC_T hipc::MultiProcessAllocator
+#define CHI_RDATA_ALLOC_T CHI_CDATA_ALLOC_T  // Runtime data uses same allocator as client data
 
 // Memory segment identifiers
 enum MemorySegment {
@@ -315,10 +309,26 @@ TaskId CreateTaskId();
 // Template aliases for full pointers using HSHM
 template <typename T> using FullPtr = hipc::FullPtr<T>;
 
-} // namespace chi
+}  // namespace chi
 
-// Create HSHM data structures template for chi namespace
-HSHM_DATA_STRUCTURES_TEMPLATE(chi, CHI_MAIN_ALLOC_T);
+namespace chi::priv {
+typedef hshm::priv::string<CHI_MAIN_ALLOC_T> string;
+
+template<typename T>
+using vector = hshm::priv::vector<T, CHI_MAIN_ALLOC_T>;
+}  // namespace chi::priv
+
+namespace chi::ipc {
+template <typename T>
+using multi_mpsc_ring_buffer =
+    hipc::multi_mpsc_ring_buffer<T, CHI_MAIN_ALLOC_T>;
+
+template <typename T>
+using mpsc_ring_buffer = hipc::mpsc_ring_buffer<T, CHI_MAIN_ALLOC_T>;
+
+template <typename T>
+using vector = hipc::vector<T, CHI_MAIN_ALLOC_T>;
+}  // namespace chi::ipc
 
 // Hash function specializations for std::unordered_map
 namespace std {

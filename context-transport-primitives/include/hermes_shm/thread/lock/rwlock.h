@@ -105,7 +105,7 @@ struct RwLock {
         if (ret) {
 #ifdef HSHM_DEBUG_LOCK
           owner_ = owner;
-          HILOG(kDebug, "Acquired read lock for {}", owner);
+          HLOG(kDebug, "Acquired read lock for {}", owner);
 #endif
           return;
         }
@@ -140,7 +140,7 @@ struct RwLock {
         if (cur_writer == tkt) {
 #ifdef HSHM_DEBUG_LOCK
           owner_ = owner;
-          HILOG(kDebug, "Acquired write lock for {}", owner);
+          HLOG(kDebug, "Acquired write lock for {}", owner);
 #endif
           return;
         }

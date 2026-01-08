@@ -161,6 +161,14 @@ class ModuleManager {
   bool IsSharedLibrary(const std::string& file_path) const;
 
   /**
+   * Check if shared object follows ChiMod naming convention
+   * ChiMod libraries must contain "_runtime" in their name
+   * @param file_path Path to shared object file
+   * @return true if file follows ChiMod naming convention
+   */
+  bool HasModuleNamingConvention(const std::string& file_path) const;
+
+  /**
    * Validate that library has required ChiMod entry points
    * @param lib Shared library to validate
    * @return true if library has required functions

@@ -18,7 +18,7 @@ DpeType StringToDpeType(const std::string& dpe_str) {
   } else if (dpe_str == "max_bw" || dpe_str == "maxbw") {
     return DpeType::kMaxBW;
   } else {
-    HELOG(kError, "Unknown DPE type: {}, defaulting to random", dpe_str);
+    HLOG(kError, "Unknown DPE type: {}, defaulting to random", dpe_str);
     return DpeType::kRandom;
   }
 }
@@ -168,7 +168,7 @@ std::unique_ptr<DataPlacementEngine> DpeFactory::CreateDpe(DpeType dpe_type) {
     case DpeType::kMaxBW:
       return std::make_unique<MaxBwDpe>();
     default:
-      HELOG(kError, "Unknown DPE type, defaulting to Random");
+      HLOG(kError, "Unknown DPE type, defaulting to Random");
       return std::make_unique<RandomDpe>();
   }
 }

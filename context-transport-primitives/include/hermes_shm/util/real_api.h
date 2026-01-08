@@ -30,7 +30,7 @@
 
 #define REQUIRE_API(api_name)                                            \
   if (!(api_name)) {                                                     \
-    HELOG(kFatal, "HERMES Adapter failed to map symbol: {}", #api_name); \
+    HLOG(kFatal, "HERMES Adapter failed to map symbol: {}", #api_name); \
   }
 
 namespace hshm {

@@ -84,7 +84,7 @@ Chimaera::~Chimaera() {
 }
 
 bool Chimaera::ClientInit() {
-  HILOG(kInfo, "Chimaera::ClientInit");
+  HLOG(kInfo, "Chimaera::ClientInit");
   if (is_client_initialized_ || client_is_initializing_ || runtime_is_initializing_) {
     return true;
   }
@@ -93,7 +93,7 @@ bool Chimaera::ClientInit() {
   is_client_mode_ = true;
   client_is_initializing_ = true;
 
-  HILOG(kDebug, "IpcManager::ClientInit");
+  HLOG(kDebug, "IpcManager::ClientInit");
   // Initialize configuration manager
   auto *config_manager = CHI_CONFIG_MANAGER;
   if (!config_manager->Init()) {
@@ -102,7 +102,7 @@ bool Chimaera::ClientInit() {
     return false;
   }
 
-  HILOG(kDebug, "IpcManager::ClientInit");
+  HLOG(kDebug, "IpcManager::ClientInit");
   // Initialize IPC manager for client
   auto *ipc_manager = CHI_IPC;
   if (!ipc_manager->ClientInit()) {
@@ -117,7 +117,7 @@ bool Chimaera::ClientInit() {
   // Initialize CHI_ADMIN singleton
   // The admin container is already created by the runtime, so we just
   // construct the admin client directly with the admin pool ID
-  HILOG(kDebug, "Initializing CHI_ADMIN singleton");
+  HLOG(kDebug, "Initializing CHI_ADMIN singleton");
   if (CHI_ADMIN == nullptr) {
     g_admin = new chimaera::admin::Client(chi::kAdminPoolId);
   }
@@ -154,7 +154,7 @@ bool Chimaera::ServerInit() {
     return false;
   }
 
-  HILOG(kDebug, "Host identification successful: {}",
+  HLOG(kDebug, "Host identification successful: {}",
         ipc_manager->GetCurrentHostname());
 
   // Initialize module manager first (needed for admin chimod)
@@ -191,29 +191,46 @@ bool Chimaera::ServerInit() {
   // Process compose section if present
   const auto &compose_config = config_manager->GetComposeConfig();
   if (!compose_config.pools_.empty()) {
-    HILOG(kInfo, "Processing compose configuration with {} pools",
+    HLOG(kInfo, "Processing compose configuration with {} pools",
           compose_config.pools_.size());
 
     // Get admin client to process compose
     auto *admin_client = CHI_ADMIN;
     if (!admin_client) {
-      HELOG(kError, "Failed to get admin client for compose processing");
+      HLOG(kError, "Failed to get admin client for compose processing");
       return false;
     }
 
-    // Call compose to create all configured pools
-    if (!admin_client->Compose(compose_config)) {
-      HELOG(kError, "Compose processing failed");
-      return false;
+    // Iterate over each pool configuration and create asynchronously
+    for (const auto& pool_config : compose_config.pools_) {
+      HLOG(kInfo, "Compose: Creating pool {} (module: {})",
+            pool_config.pool_name_, pool_config.mod_name_);
+
+      // Create pool asynchronously and wait
+      auto task = admin_client->AsyncCompose(pool_config);
+      task.Wait();
+
+      // Check return code
+      u32 return_code = task->GetReturnCode();
+      if (return_code != 0) {
+        HLOG(kError, "Compose: Failed to create pool {} (module: {}), return code: {}",
+              pool_config.pool_name_, pool_config.mod_name_, return_code);
+        return false;
+      }
+
+      HLOG(kInfo, "Compose: Successfully created pool {} (module: {})",
+            pool_config.pool_name_, pool_config.mod_name_);
+
+      // Cleanup task
     }
 
-    HILOG(kInfo, "Compose processing completed successfully");
+    HLOG(kInfo, "Compose: All {} pools created successfully", compose_config.pools_.size());
   }
 
   // Start local server last - after all other initialization is complete
   // This ensures clients can connect only when runtime is fully ready
   if (!ipc_manager->StartLocalServer()) {
-    HELOG(kError, "Failed to start local server - runtime initialization failed");
+    HLOG(kError, "Failed to start local server - runtime initialization failed");
     is_runtime_mode_ = false;
     runtime_is_initializing_ = false;
     return false;

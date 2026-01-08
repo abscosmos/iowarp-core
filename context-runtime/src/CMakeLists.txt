@@ -32,14 +32,12 @@ target_compile_definitions(${CHIMAERA_LIB_NAME} PRIVATE
 )
 
 # Link libraries
-# Chimaera runtime links to Boost directly and hshm modular targets
+# Chimaera runtime links to hshm modular targets
 # Clients only link to hshm::cxx
 target_link_libraries(${CHIMAERA_LIB_NAME}
   PUBLIC
     hshm::cxx
     hshm::serialize  # For cereal
-    Boost::fiber
-    Boost::context
     Threads::Threads
     hshm::lightbeam  # For ZMQ transport
     # chimods_admin_client  # Admin client library for global task routing - TODO: Enable when admin chimod is built

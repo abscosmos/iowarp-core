@@ -210,6 +210,7 @@ if(HSHM_ENABLE_COMPRESS)
 endif()
 target_compile_definitions(compress INTERFACE
     HSHM_ENABLE_COMPRESS=$<BOOL:${HSHM_ENABLE_COMPRESS}>
+    HSHM_HAS_LIBPRESSIO=$<BOOL:${HSHM_HAS_LIBPRESSIO}>
 )
 add_library(hshm::compress ALIAS compress)
 
@@ -292,9 +293,24 @@ function(hshm_target_compile_definitions target)
         HSHM_DEBUG_LOCK=$<BOOL:${HSHM_DEBUG_LOCK}>
         HSHM_DEFAULT_ALLOC_T=hipc::ThreadLocalAllocator
         HSHM_ENABLE_DLL_EXPORT=$<BOOL:${BUILD_SHARED_LIBS}>
-        HSHM_ENABLE_CUDA=$<BOOL:${HSHM_ENABLE_CUDA}>
-        HSHM_ENABLE_ROCM=$<BOOL:${HSHM_ENABLE_ROCM}>
+        HSHM_LOG_LEVEL=${HSHM_LOG_LEVEL}
     )
+
+    # Add CUDA/ROCM definitions for all targets
+    # Host targets get 0, GPU targets get 1 (set explicitly in their target definitions)
+    if(target STREQUAL "hermes_shm_host" OR target STREQUAL "cxx")
+        # Host-only targets: explicitly disable GPU support
+        list(APPEND common_definitions
+            HSHM_ENABLE_CUDA=0
+            HSHM_ENABLE_ROCM=0
+        )
+    else()
+        # GPU and other targets: use CMake variable values
+        list(APPEND common_definitions
+            HSHM_ENABLE_CUDA=$<BOOL:${HSHM_ENABLE_CUDA}>
+            HSHM_ENABLE_ROCM=$<BOOL:${HSHM_ENABLE_ROCM}>
+        )
+    endif()
 
     if(target_type STREQUAL "INTERFACE_LIBRARY")
         target_compile_definitions(${target} INTERFACE ${common_definitions})
@@ -302,8 +318,6 @@ function(hshm_target_compile_definitions target)
         target_compile_definitions(${target} PUBLIC ${common_definitions})
         target_compile_definitions(${target} PRIVATE
             HSHM_ENABLE_DLL_EXPORT=$<BOOL:${BUILD_SHARED_LIBS}>
-            HSHM_ENABLE_CUDA=$<BOOL:${HSHM_ENABLE_CUDA}>
-            HSHM_ENABLE_ROCM=$<BOOL:${HSHM_ENABLE_ROCM}>
         )
     endif()
 endfunction()

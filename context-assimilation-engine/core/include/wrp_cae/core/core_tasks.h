@@ -24,10 +24,10 @@ struct CreateParams {
   CreateParams() {}
 
   // Constructor with allocator
-  CreateParams(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc) {}
+  CreateParams(CHI_MAIN_ALLOC_T *alloc) {}
 
   // Copy constructor with allocator (for BaseCreateTask)
-  CreateParams(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
+  CreateParams(CHI_MAIN_ALLOC_T *alloc,
                const CreateParams& other) {}
 
   // Serialization support for cereal
@@ -53,31 +53,30 @@ using DestroyTask = chi::Task;  // Simple task for destruction
  */
 struct ParseOmniTask : public chi::Task {
   // Task-specific data using HSHM macros
-  IN hipc::string serialized_ctx_;   // Input: Serialized AssimilationCtx (internal use)
+  IN chi::priv::string serialized_ctx_;   // Input: Serialized AssimilationCtx (internal use)
   OUT chi::u32 num_tasks_scheduled_; // Output: Number of assimilation tasks scheduled
   OUT chi::u32 result_code_;         // Output: Result code (0 = success)
-  OUT hipc::string error_message_;   // Output: Error message if failed
+  OUT chi::priv::string error_message_;   // Output: Error message if failed
 
   // SHM constructor
-  explicit ParseOmniTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc),
-        serialized_ctx_(alloc),
+  ParseOmniTask()
+      : chi::Task(),
+        serialized_ctx_(CHI_IPC->GetMainAlloc()),
         num_tasks_scheduled_(0),
         result_code_(0),
-        error_message_(alloc) {}
+        error_message_(CHI_IPC->GetMainAlloc()) {}
 
   // Emplace constructor - accepts vector of AssimilationCtx and serializes internally
   explicit ParseOmniTask(
-      const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
       const chi::TaskId &task_node,
       const chi::PoolId &pool_id,
       const chi::PoolQuery &pool_query,
       const std::vector<wrp_cae::core::AssimilationCtx> &contexts)
-      : chi::Task(alloc, task_node, pool_id, pool_query, Method::kParseOmni),
-        serialized_ctx_(alloc),
+      : chi::Task(task_node, pool_id, pool_query, Method::kParseOmni),
+        serialized_ctx_(CHI_IPC->GetMainAlloc()),
         num_tasks_scheduled_(0),
         result_code_(0),
-        error_message_(alloc) {
+        error_message_(CHI_IPC->GetMainAlloc()) {
     task_id_ = task_node;
     method_ = Method::kParseOmni;
     task_flags_.Clear();
@@ -89,15 +88,42 @@ struct ParseOmniTask : public chi::Task {
       cereal::BinaryOutputArchive ar(ss);
       ar(contexts);
     }
-    serialized_ctx_ = hipc::string(alloc, ss.str());
+    serialized_ctx_ = chi::priv::string(CHI_IPC->GetMainAlloc(), ss.str());
+  }
+
+  /**
+   * Serialize IN and INOUT parameters
+   */
+  template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(serialized_ctx_);
+  }
+
+  /**
+   * Serialize OUT and INOUT parameters
+   */
+  template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_tasks_scheduled_, result_code_, error_message_);
   }
 
   // Copy method for distributed execution (optional)
   void Copy(const hipc::FullPtr<ParseOmniTask> &other) {
+    // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     serialized_ctx_ = other->serialized_ctx_;
     num_tasks_scheduled_ = other->num_tasks_scheduled_;
     result_code_ = other->result_code_;
     error_message_ = other->error_message_;
+  }
+
+  /**
+   * Aggregate replica results into this task
+   * @param other Pointer to the replica task to aggregate from
+   */
+  void Aggregate(const hipc::FullPtr<ParseOmniTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
   }
 };
 

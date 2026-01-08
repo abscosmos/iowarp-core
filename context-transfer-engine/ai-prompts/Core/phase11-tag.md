@@ -20,16 +20,16 @@ public:
   void PutBlob(const std::string &blob_name, const char *data, size_t data_size, size_t off = 0);
 
   // PutBlob (SHM)
-  void PutBlob(const std::string &blob_name, const hipc::Pointer &data, size_t data_size, size_t off = 0, float score = 1)
+  void PutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data, size_t data_size, size_t off = 0, float score = 1)
 
   // Asynchrounous PutBlob
   FullPtr<PutBlobTask> AsyncPutBlob(const std::string &blob_name, const char *data,  size_t data_size, size_t off = 0, float score = 1);
 
   // Asynchronous PutBlob (SHM)
-  FullPtr<PutBlobTask> AsyncPutBlob(const std::string &blob_name, const hipc::Pointer &data,  size_t data_size, size_t off = 0, float score = 1);
+  FullPtr<PutBlobTask> AsyncPutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data,  size_t data_size, size_t off = 0, float score = 1);
 
   // Pointer does not need to exist. If data size is 0, Getblob should allocate a new pointer 
-  void GetBlob(const std::string &blob_name, hipc::Pointer data, size_t data_size, size_t off = 0);
+  void GetBlob(const std::string &blob_name, hipc::ShmPtr<> data, size_t data_size, size_t off = 0);
 
   // Get blob score
   void GetBlobScore(const std::string &blob_name);

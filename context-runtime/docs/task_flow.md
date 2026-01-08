@@ -43,7 +43,7 @@ Tasks progress through seven distinct stages in their lifecycle:
 
 #### TaskQueue (`include/chimaera/task_queue.h`)
 - **Role**: Multi-lane, lock-free queue system for task distribution
-- **Implementation**: Wrapper around `hipc::multi_mpsc_queue`
+- **Implementation**: Wrapper around `hipc::multi_mpsc_ring_buffer`
 - **Features**:
   - Configurable number of lanes (default: from config)
   - Per-lane headers with worker assignment and task count
@@ -87,7 +87,7 @@ Tasks progress through seven distinct stages in their lifecycle:
 │         IpcSharedHeader (in Main Segment)           │
 │  ┌────────────────────────────────────────────────┐ │
 │  │ external_queue: delay_ar<TaskQueue>            │ │
-│  │ worker_queues: delay_ar<vector<mpsc_queue>>    │ │
+│  │ worker_queues: delay_ar<vector<mpsc_ring_buffer>>    │ │
 │  │ num_workers: u32                               │ │
 │  └────────────────────────────────────────────────┘ │
 ├──────────────────────────────────────────────────────┤
@@ -280,7 +280,7 @@ Periodic task rescheduling checks if the lane is still assigned to the current w
                     ▼ ▼ ▼ ▼
          ┌──────────────────────────┐
          │    Worker Active Queues   │
-         │ mpsc_queue<FullPtr<Lane>>│
+         │ mpsc_ring_buffer<FullPtr<Lane>>│
          │    (One per worker)       │
          └──────────────────────────┘
                     │ │ │ │
@@ -304,7 +304,7 @@ The TaskQueueHeader structure maintains lane metadata including the container po
 │              Worker Queues                  │
 ├─────────────────────────────────────────────┤
 │ Active Queue:                               │
-│   - mpsc_queue<FullPtr<TaskLane>>          │
+│   - mpsc_ring_buffer<FullPtr<TaskLane>>          │
 │   - Lanes with pending tasks               │
 │                                             │
 │ Blocked Queue:                              │

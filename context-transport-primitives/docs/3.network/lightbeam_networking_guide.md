@@ -56,7 +56,7 @@ struct Bulk {
 
 **Key Features:**
 - Uses `hipc::FullPtr` for shared memory compatibility
-- Can be created from raw pointers, `hipc::Pointer`, or `hipc::FullPtr`
+- Can be created from raw pointers, `hipc::ShmPtr<>`, or `hipc::FullPtr`
 - Flags control bulk behavior:
   - **BULK_EXPOSE**: Bulk metadata is sent but no data is transferred (useful for shared memory)
   - **BULK_XFER**: Bulk marked for data transmission (data is transferred over network)
@@ -102,7 +102,7 @@ class Client {
  public:
     // Expose memory for transfer (creates Bulk descriptor)
     virtual Bulk Expose(const char* data, size_t data_size, u32 flags) = 0;
-    virtual Bulk Expose(const hipc::Pointer& ptr, size_t data_size, u32 flags) = 0;
+    virtual Bulk Expose(const hipc::ShmPtr<>& ptr, size_t data_size, u32 flags) = 0;
     virtual Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size, u32 flags) = 0;
 
     // Send metadata and bulk data
@@ -114,7 +114,7 @@ class Client {
 
 **Methods:**
 - `Expose()`: Registers memory for transfer, returns `Bulk` descriptor
-  - Accepts raw pointers, `hipc::Pointer`, or `hipc::FullPtr`
+  - Accepts raw pointers, `hipc::ShmPtr<>`, or `hipc::FullPtr`
   - **flags**: Use `BULK_XFER` to mark bulk for transmission
   - Returns immediately (no actual data transfer)
 - `Send()`: Transmits metadata and bulks in the send vector
@@ -135,7 +135,7 @@ class Server {
  public:
     // Expose memory for receiving data
     virtual Bulk Expose(char* data, size_t data_size, u32 flags) = 0;
-    virtual Bulk Expose(const hipc::Pointer& ptr, size_t data_size, u32 flags) = 0;
+    virtual Bulk Expose(const hipc::ShmPtr<>& ptr, size_t data_size, u32 flags) = 0;
     virtual Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size, u32 flags) = 0;
 
     // Two-phase receive
@@ -363,7 +363,7 @@ void shared_memory_example() {
 
     // Allocate shared memory
     size_t data_size = 1024;
-    hipc::Pointer shm_ptr = alloc->Allocate(data_size);
+    hipc::ShmPtr<> shm_ptr = alloc->Allocate(data_size);
     hipc::FullPtr<char> full_ptr(shm_ptr);
 
     // Write data to shared memory
@@ -373,7 +373,7 @@ void shared_memory_example() {
     auto client = std::make_unique<hshm::lbm::ZeroMqClient>("127.0.0.1", "tcp", 8890);
 
     LbmMeta meta;
-    // Can use either hipc::Pointer or hipc::FullPtr directly
+    // Can use either hipc::ShmPtr<> or hipc::FullPtr directly
     meta.send.push_back(client->Expose(full_ptr, data_size, BULK_XFER));
 
     int rc = client->Send(meta);

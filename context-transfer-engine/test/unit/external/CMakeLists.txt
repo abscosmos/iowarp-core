@@ -5,7 +5,7 @@ cmake_minimum_required(VERSION 3.20)
 project(cte_external_integration_test)
 
 # Set C++ standard
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Enable debug build by default for testing

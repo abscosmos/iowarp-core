@@ -1,7 +1,7 @@
 ---
 name: incremental-logic-builder
 description: Use this agent when you need to implement core logic and algorithms in a step-by-step manner, focusing on one class at a time. This agent ensures methodical development by implementing single units of functionality, then triggering code review after each implementation. Examples:\n\n<example>\nContext: The user needs to implement a data processing pipeline with multiple classes.\nuser: "Create a data processing system with Parser, Validator, and Transformer classes"\nassistant: "I'll use the incremental-logic-builder agent to implement these classes one at a time, with compilation reviews after each."\n<commentary>\nSince multiple classes need to be implemented with careful attention to quality, use the incremental-logic-builder agent to handle the step-by-step implementation and review process.\n</commentary>\n</example>\n\n<example>\nContext: The user wants to add a complex algorithm to their codebase.\nuser: "Implement a binary search tree with insert, delete, and search operations"\nassistant: "Let me use the incremental-logic-builder agent to implement the BST class and its methods incrementally."\n<commentary>\nThe user needs algorithmic implementation with careful attention to correctness, so the incremental-logic-builder agent should handle this with its step-by-step approach.\n</commentary>\n</example>
-model: sonnet
+model: haiku
 color: blue
 ---
 

@@ -12,27 +12,12 @@ class Client : public chi::ContainerClient {
   explicit Client(const chi::PoolId& pool_id) { Init(pool_id); }
 
   /**
-   * Synchronous Create - waits for completion
-   */
-  void Create(const hipc::MemContext& mctx,
-              const chi::PoolQuery& pool_query,
-              const std::string& pool_name,
-              const chi::PoolId& custom_pool_id,
-              const CreateParams& params = CreateParams()) {
-    auto task = AsyncCreate(mctx, pool_query, pool_name, custom_pool_id, params);
-    task->Wait();
-
-    // CRITICAL: Update client pool_id_ with the actual pool ID from the task
-    pool_id_ = task->new_pool_id_;
-
-    CHI_IPC->DelTask(task);
-  }
-
-  /**
    * Asynchronous Create - returns immediately
+   * After Wait(), caller should:
+   *   1. Update client pool_id_: client.Init(task->new_pool_id_)
+   * Note: Task is automatically freed when Future goes out of scope
    */
-  hipc::FullPtr<CreateTask> AsyncCreate(
-      const hipc::MemContext& mctx,
+  chi::Future<CreateTask> AsyncCreate(
       const chi::PoolQuery& pool_query,
       const std::string& pool_name,
       const chi::PoolId& custom_pool_id,
@@ -40,6 +25,7 @@ class Client : public chi::ContainerClient {
     auto* ipc_manager = CHI_IPC;
 
     // CRITICAL: CreateTask MUST use admin pool for GetOrCreatePool processing
+    // Pass 'this' as client pointer for PostWait callback
     auto task = ipc_manager->NewTask<CreateTask>(
         chi::CreateTaskId(),
         chi::kAdminPoolId,  // Always use admin pool for CreateTask
@@ -47,36 +33,19 @@ class Client : public chi::ContainerClient {
         CreateParams::chimod_lib_name,  // ChiMod name from CreateParams
         pool_name,                       // Pool name
         custom_pool_id,                  // Target pool ID
+        this,                            // Client pointer for PostWait
         params);                         // CreateParams with configuration
 
     // Submit to runtime
-    ipc_manager->Enqueue(task);
-    return task;
+    return ipc_manager->Send(task);
   }
 
   /**
-   * Synchronous ParseOmni - Parse OMNI YAML file and schedule assimilation tasks
-   * Accepts vector of AssimilationCtx and serializes it transparently
-   */
-  chi::u32 ParseOmni(const hipc::MemContext& mctx,
-                     const std::vector<AssimilationCtx>& contexts,
-                     chi::u32& num_tasks_scheduled) {
-    auto task = AsyncParseOmni(mctx, contexts);
-    task->Wait();
-
-    num_tasks_scheduled = task->num_tasks_scheduled_;
-    chi::u32 result = task->result_code_;
-
-    CHI_IPC->DelTask(task);
-    return result;
-  }
-
-  /**
-   * Asynchronous ParseOmni - returns immediately
+   * Asynchronous ParseOmni - Parse OMNI YAML file and schedule assimilation tasks
    * Accepts vector of AssimilationCtx and serializes it transparently in the task constructor
+   * After Wait(), access results via task->num_tasks_scheduled_ and task->result_code_
    */
-  hipc::FullPtr<ParseOmniTask> AsyncParseOmni(
-      const hipc::MemContext& mctx,
+  chi::Future<ParseOmniTask> AsyncParseOmni(
       const std::vector<AssimilationCtx>& contexts) {
     auto* ipc_manager = CHI_IPC;
 
@@ -86,8 +55,7 @@ class Client : public chi::ContainerClient {
         chi::PoolQuery::Local(),
         contexts);
 
-    ipc_manager->Enqueue(task);
-    return task;
+    return ipc_manager->Send(task);
   }
 
 };

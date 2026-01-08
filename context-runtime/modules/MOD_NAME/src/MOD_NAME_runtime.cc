@@ -19,20 +19,20 @@ namespace chimaera::MOD_NAME {
 //===========================================================================
 
 void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
-  HILOG(kDebug, "MOD_NAME: Executing Create task for pool {}", task->pool_id_);
+  HLOG(kDebug, "MOD_NAME: Executing Create task for pool {}", task->pool_id_);
 
   // Container is already initialized via Init() before Create is called
 
   create_count_++;
 
-  HILOG(kDebug,
+  HLOG(kDebug,
         "MOD_NAME: Container created and initialized for pool: {} (ID: {}, "
         "count: {})",
         pool_name_, task->pool_id_, create_count_);
 }
 
 void Runtime::Custom(hipc::FullPtr<CustomTask> task, chi::RunContext &rctx) {
-  HILOG(kDebug, "MOD_NAME: Executing Custom task with data: {}",
+  HLOG(kDebug, "MOD_NAME: Executing Custom task with data: {}",
         task->data_.c_str());
 
   custom_count_++;
@@ -40,11 +40,11 @@ void Runtime::Custom(hipc::FullPtr<CustomTask> task, chi::RunContext &rctx) {
   // Process custom task here
   // In a real implementation, this would perform the custom operation
 
-  HILOG(kDebug, "MOD_NAME: Custom completed (count: {})", custom_count_);
+  HLOG(kDebug, "MOD_NAME: Custom completed (count: {})", custom_count_);
 }
 
 void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
-  HILOG(kDebug, "MOD_NAME: Executing Destroy task - Pool ID: {}",
+  HLOG(kDebug, "MOD_NAME: Executing Destroy task - Pool ID: {}",
         task->target_pool_id_);
 
   // Initialize output values
@@ -53,7 +53,7 @@ void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
 
   // In a real implementation, this would clean up MOD_NAME-specific resources
   // For now, just mark as successful
-  HILOG(kDebug, "MOD_NAME: Container destroyed successfully");
+  HLOG(kDebug, "MOD_NAME: Container destroyed successfully");
 }
 
 chi::u64 Runtime::GetWorkRemaining() const {
@@ -67,7 +67,7 @@ chi::u64 Runtime::GetWorkRemaining() const {
 
 void Runtime::CoMutexTest(hipc::FullPtr<CoMutexTestTask> task,
                           chi::RunContext &rctx) {
-  HILOG(kDebug, "MOD_NAME: Executing CoMutexTest task {} (hold: {}ms)",
+  HLOG(kDebug, "MOD_NAME: Executing CoMutexTest task {} (hold: {}ms)",
         task->test_id_, task->hold_duration_ms_);
 
   // Use actual CoMutex synchronization primitive
@@ -88,12 +88,12 @@ void Runtime::CoMutexTest(hipc::FullPtr<CoMutexTestTask> task,
   }
 
   task->return_code_ = 0; // Success (0 means success in most conventions)
-  HILOG(kDebug, "MOD_NAME: CoMutexTest {} completed", task->test_id_);
+  HLOG(kDebug, "MOD_NAME: CoMutexTest {} completed", task->test_id_);
 }
 
 void Runtime::CoRwLockTest(hipc::FullPtr<CoRwLockTestTask> task,
                            chi::RunContext &rctx) {
-  HILOG(kDebug, "MOD_NAME: Executing CoRwLockTest task {} ({}, hold: {}ms)",
+  HLOG(kDebug, "MOD_NAME: Executing CoRwLockTest task {} ({}, hold: {}ms)",
         task->test_id_, (task->is_writer_ ? "writer" : "reader"),
         task->hold_duration_ms_);
 
@@ -133,12 +133,12 @@ void Runtime::CoRwLockTest(hipc::FullPtr<CoRwLockTestTask> task,
   }
 
   task->return_code_ = 0; // Success (0 means success in most conventions)
-  HILOG(kDebug, "MOD_NAME: CoRwLockTest {} completed", task->test_id_);
+  HLOG(kDebug, "MOD_NAME: CoRwLockTest {} completed", task->test_id_);
 }
 
-void Runtime::WaitTest(hipc::FullPtr<WaitTestTask> task,
-                       chi::RunContext &rctx) {
-  HILOG(kDebug,
+chi::TaskResume Runtime::WaitTest(hipc::FullPtr<WaitTestTask> task,
+                                  chi::RunContext &rctx) {
+  HLOG(kDebug,
         "MOD_NAME: Executing WaitTest task {} (depth: {}, current_depth: {})",
         task->test_id_, task->depth_, task->current_depth_);
 
@@ -147,29 +147,32 @@ void Runtime::WaitTest(hipc::FullPtr<WaitTestTask> task,
 
   // If we haven't reached the target depth, create a subtask and wait for it
   if (task->current_depth_ < task->depth_) {
-    HILOG(kDebug,
+    HLOG(kDebug,
           "MOD_NAME: WaitTest {} creating recursive subtask at depth {}",
           task->test_id_, task->current_depth_);
 
-    // Use the client API for recursive calls - this tests the Wait()
-    // functionality properly Create a subtask with remaining depth
-    hipc::MemContext mctx;
+    // Use the client API for recursive calls - this tests the co_await
+    // functionality properly. Create a subtask with remaining depth
     chi::u32 remaining_depth = task->depth_ - task->current_depth_;
-    chi::u32 origin_task_final_depth = client_.WaitTest(
-        mctx, task->pool_query_, remaining_depth, task->test_id_);
+    auto subtask = client_.AsyncWaitTest(
+        task->pool_query_, remaining_depth, task->test_id_);
+    co_await subtask;
+    chi::u32 origin_task_final_depth = subtask->current_depth_;
+    (void)origin_task_final_depth;
 
     // The subtask returns the final depth it reached, so we set our depth to
     // that
     task->current_depth_ = task->depth_;
 
-    HILOG(kDebug,
+    HLOG(kDebug,
           "MOD_NAME: WaitTest {} subtask completed via client API, final "
           "depth: {}",
           task->test_id_, task->current_depth_);
   }
 
-  HILOG(kDebug, "MOD_NAME: WaitTest {} completed at depth {}", task->test_id_,
+  HLOG(kDebug, "MOD_NAME: WaitTest {} completed at depth {}", task->test_id_,
         task->current_depth_);
+  co_return;
 }
 
 // Static member definitions

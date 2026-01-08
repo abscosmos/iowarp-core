@@ -249,7 +249,7 @@ static H5FD_t *H5FD__hermes_open(const char *name, unsigned flags,
   stat.st_mode_ = H5FD_WRP_CTE_POSIX_CREATE_MODE_RW;
   File f = fs_api->Open(stat, name);
   fd = f.hermes_fd_;
-  HILOG(kDebug, "");
+  HLOG(kDebug, "");
 #else
   fd = open(name, o_flags);
 #endif
@@ -301,7 +301,7 @@ static herr_t H5FD__hermes_close(H5FD_t *_file) {
   f.hermes_fd_ = file->fd;
   bool stat_exists;
   fs_api->Close(f, stat_exists);
-  HILOG(kDebug, "");
+  HLOG(kDebug, "");
 #else
   close(file->fd);
 #endif
@@ -460,7 +460,7 @@ static herr_t H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t type, hid_t dxpl_id,
   f.hermes_fd_ = file->fd;
   IoStatus io_status;
   size_t count = fs_api->Read(f, stat_exists, buf, addr, size, io_status);
-  HILOG(kDebug, "");
+  HLOG(kDebug, "");
 #else
   size_t count = read(file->fd, (char *)buf + addr, size);
 #endif
@@ -498,7 +498,7 @@ static herr_t H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t type, hid_t dxpl_id,
   f.hermes_fd_ = file->fd;
   IoStatus io_status;
   size_t count = fs_api->Write(f, stat_exists, buf, addr, size, io_status);
-  HILOG(kDebug, "");
+  HLOG(kDebug, "");
 #else
   size_t count = write(file->fd, (char *)buf + addr, size);
 #endif

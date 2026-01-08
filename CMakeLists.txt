@@ -111,6 +111,7 @@ option(HSHM_ENABLE_PTHREADS "Support spawning pthreads" OFF)
 option(HSHM_ENABLE_WINDOWS_THREADS "Support spawning windows threads" OFF)
 option(HSHM_DEBUG_LOCK "Used for debugging locks" OFF)
 option(HSHM_NO_COMPILE "Disable compiling / installing this library" OFF)
+set(HSHM_LOG_LEVEL "1" CACHE STRING "Log level threshold (0=Debug, 1=Info, 2=Warning, 3=Error, 4=Fatal)")
 
 #------------------------------------------------------------------------------
 # Chimaera (context-runtime) Options
@@ -131,6 +132,7 @@ option(WRP_CTE_ENABLE_STDIO_ADAPTER "Enable STDIO adapter" OFF)
 option(WRP_CTE_ENABLE_MPIIO_ADAPTER "Enable MPI-IO adapter" OFF)
 option(WRP_CTE_ENABLE_VFD "Enable HDF5 VFD adapter" OFF)
 option(WRP_CTE_ENABLE_NVIDIA_GDS_ADAPTER "Enable NVIDIA GDS adapter" OFF)
+option(WRP_CTE_ENABLE_ADIOS2_ADAPTER "Enable ADIOS2 adapter" OFF)
 
 #------------------------------------------------------------------------------
 # CAE (context-assimilation-engine) Options
@@ -144,6 +146,11 @@ option(CAE_ENABLE_GLOBUS "Enable Globus transfer support in CAE" OFF)
 #------------------------------------------------------------------------------
 option(WRP_CEE_ENABLE_TESTS "Enable tests for CEE" ON)
 option(WRP_CEE_ENABLE_BENCHMARKS "Enable benchmarks for CEE" ON)
+
+#------------------------------------------------------------------------------
+# External Examples and Applications
+#------------------------------------------------------------------------------
+option(WRP_CORE_ENABLE_GRAY_SCOTT "Enable Gray-Scott ADIOS2 example (requires ADIOS2)" OFF)
 
 #==============================================================================
 # END BUILD CONFIGURATION OPTIONS
@@ -265,12 +272,6 @@ if(yaml-cpp_FOUND)
     resolve_yaml_cpp_target()
 endif()
 
-# Boost components - find from system or install.sh installation
-find_package(Boost REQUIRED COMPONENTS fiber context system)
-if(Boost_FOUND)
-    message(STATUS "found boost at ${Boost_INCLUDE_DIRS}")
-endif()
-
 # Cereal - find from system or install.sh installation
 find_package(cereal REQUIRED)
 if(cereal_FOUND)
@@ -346,6 +347,36 @@ if(WRP_CORE_ENABLE_COMPRESS)
     pkg_check_modules(blosc2 REQUIRED blosc2)
     message(STATUS "found blosc2.h at ${blosc2_INCLUDE_DIRS}")
 
+    # LibPressio - try find_package first (CMake-based), fall back to pkg-config
+    # Make it optional since libpressio may not be installed
+    set(HSHM_HAS_LIBPRESSIO OFF)
+    find_package(LibPressio QUIET)
+    if(LibPressio_FOUND)
+        message(STATUS "found libpressio.h via CMake at ${LibPressio_INCLUDE_DIRS}")
+        if(TARGET LibPressio::libpressio)
+            set(libpressio_LIBRARIES LibPressio::libpressio)
+        elseif(TARGET libpressio)
+            set(libpressio_LIBRARIES libpressio)
+        else()
+            # Fallback - use the library directly
+            set(libpressio_LIBRARIES liblibpressio)
+        endif()
+        set(libpressio_INCLUDE_DIRS ${LibPressio_INCLUDE_DIRS})
+        set(libpressio_LIBRARY_DIRS "")
+        set(HSHM_HAS_LIBPRESSIO ON)
+    else()
+        pkg_check_modules(libpressio QUIET libpressio)
+        if(libpressio_FOUND)
+            message(STATUS "found libpressio.h at ${libpressio_INCLUDE_DIRS}")
+            set(HSHM_HAS_LIBPRESSIO ON)
+        else()
+            message(STATUS "libpressio not found - LibPressio wrapper will be disabled")
+            set(libpressio_LIBRARIES "")
+            set(libpressio_INCLUDE_DIRS "")
+            set(libpressio_LIBRARY_DIRS "")
+        endif()
+    endif()
+
     set(COMPRESS_LIBS
         bz2
         ${lzo2_LIBRARIES}
@@ -379,6 +410,12 @@ if(WRP_CORE_ENABLE_COMPRESS)
         ${snappy_LIBRARY_DIRS}
         ${blosc2_LIBRARY_DIRS}
     )
+    # Only add libpressio if found
+    if(HSHM_HAS_LIBPRESSIO)
+        list(APPEND COMPRESS_LIBS ${libpressio_LIBRARIES})
+        list(APPEND COMPRESS_INCLUDES ${libpressio_INCLUDE_DIRS})
+        list(APPEND COMPRESS_LIB_DIRS ${libpressio_LIBRARY_DIRS})
+    endif()
 endif()
 
 # Encryption libraries (conditional)
@@ -450,6 +487,27 @@ endif()
 find_package(Poco COMPONENTS Net NetSSL Crypto JSON QUIET)
 find_package(nlohmann_json QUIET)
 
+# ADIOS2 (optional - for Gray-Scott example)
+if(WRP_CORE_ENABLE_GRAY_SCOTT)
+    # Gray-Scott requires MPI - find it if not already found
+    if(NOT MPI_FOUND)
+        find_package(MPI REQUIRED COMPONENTS C CXX)
+        if(MPI_FOUND)
+            message(STATUS "found MPI for Gray-Scott at ${MPI_CXX_INCLUDE_DIRS}")
+        endif()
+    endif()
+
+    # Find ADIOS2
+    find_package(ADIOS2 REQUIRED)
+    if(ADIOS2_FOUND)
+        message(STATUS "found ADIOS2 at ${ADIOS2_DIR}")
+    else()
+        message(FATAL_ERROR "WRP_CORE_ENABLE_GRAY_SCOTT is ON but ADIOS2 not found. Please install ADIOS2 or disable the option.")
+    endif()
+else()
+    message(STATUS "Gray-Scott example disabled")
+endif()
+
 #------------------------------------------------------------------------------
 # Python Bindings Configuration
 #------------------------------------------------------------------------------
@@ -477,8 +535,17 @@ endif()
 # Global Settings
 #------------------------------------------------------------------------------
 # C++ Standard - Applied to all subdirectories
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# C++20 Coroutines support
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  add_compile_options(-fcoroutines)
+  message(STATUS "GCC detected - enabling coroutines with -fcoroutines")
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  # Clang 14+ supports coroutines in C++20 mode natively
+  message(STATUS "Clang detected - coroutines enabled via C++20 mode")
+endif()
 
 # Export compile commands for IDE integration - Applied to all subdirectories
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -505,15 +572,7 @@ if(IN_CONDA_BUILD)
     message(STATUS "  Adding Conda lib to RPATH: $ENV{CONDA_PREFIX}/lib")
 endif()
 
-# 3. Add Boost library directories (ABSOLUTE paths from find_package)
-if(Boost_LIBRARY_DIRS)
-    foreach(BOOST_LIB_DIR ${Boost_LIBRARY_DIRS})
-        list(APPEND ABSOLUTE_RPATH_LIST "${BOOST_LIB_DIR}")
-        message(STATUS "  Adding Boost lib to RPATH: ${BOOST_LIB_DIR}")
-    endforeach()
-endif()
-
-# 4. Add HDF5 library directories if enabled
+# 3. Add HDF5 library directories if enabled
 if(WRP_CORE_ENABLE_HDF5 AND HDF5_LIBRARY_DIRS)
     foreach(HDF5_LIB_DIR ${HDF5_LIBRARY_DIRS})
         list(APPEND ABSOLUTE_RPATH_LIST "${HDF5_LIB_DIR}")
@@ -686,6 +745,14 @@ else()
     message(STATUS "Context-exploration-engine component disabled")
 endif()
 
+# Gray-Scott Example Application
+if(WRP_CORE_ENABLE_GRAY_SCOTT)
+    message(STATUS "Building Gray-Scott ADIOS2 example")
+    add_subdirectory(external/iowarp-gray-scott)
+else()
+    message(STATUS "Gray-Scott example disabled")
+endif()
+
 #------------------------------------------------------------------------------
 # Unified IOWarp Core Package Configuration
 #------------------------------------------------------------------------------
@@ -745,6 +812,9 @@ message(STATUS "    Context Transfer Engine:    ${WRP_CORE_ENABLE_CTE}")
 message(STATUS "    Context Assimilation:       ${WRP_CORE_ENABLE_CAE}")
 message(STATUS "    Context Exploration:        ${WRP_CORE_ENABLE_CEE}")
 message(STATUS "  ")
+message(STATUS "  External Examples:")
+message(STATUS "    Gray-Scott (ADIOS2):        ${WRP_CORE_ENABLE_GRAY_SCOTT}")
+message(STATUS "  ")
 message(STATUS "  Global Options:")
 message(STATUS "    Enable Tests:               ${WRP_CORE_ENABLE_TESTS}")
 message(STATUS "    Python Bindings:            ${WRP_CORE_ENABLE_PYTHON}")
@@ -775,7 +845,7 @@ if(WRP_CORE_ENABLE_CPACK)
     set(CPACK_DEBIAN_PACKAGE_MAINTAINER "IOWarp Team <grc@illinoistech.edu>")
     set(CPACK_DEBIAN_PACKAGE_SECTION "devel")
     set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
-    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libboost-fiber-dev, libboost-context-dev, libboost-filesystem-dev, libzmq3-dev, libyaml-cpp-dev")
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libzmq3-dev, libyaml-cpp-dev")
 
     # Component installation
     set(CPACK_COMPONENTS_ALL libraries headers cmake)

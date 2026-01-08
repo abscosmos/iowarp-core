@@ -1,4 +1,0 @@
-# Runtime requirements
-cmake>=3.10
-
-# Build requirements are specified in pyproject.toml

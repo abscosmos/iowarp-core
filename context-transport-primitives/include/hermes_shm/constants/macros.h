@@ -105,7 +105,7 @@
   do {                                                                      \
     if (X != hipSuccess) {                                                  \
       hipError_t hipErr = hipGetLastError();                                \
-      HELOG(kFatal, "HIP Error {}: {}", hipErr, hipGetErrorString(hipErr)); \
+      HLOG(kFatal, "HIP Error {}: {}", hipErr, hipGetErrorString(hipErr)); \
     }                                                                       \
   } while (false)
 
@@ -114,7 +114,7 @@
   do {                                            \
     if (X != cudaSuccess) {                       \
       cudaError_t cudaErr = cudaGetLastError();   \
-      HELOG(kFatal, "CUDA Error {}: {}", cudaErr, \
+      HLOG(kFatal, "CUDA Error {}: {}", cudaErr, \
             cudaGetErrorString(cudaErr));         \
     }                                             \
   } while (false)
@@ -221,9 +221,8 @@ namespace hipc = hshm::ipc;
 #define HSHM_DEFAULT_ALLOC \
   HSHM_MEMORY_MANAGER->template GetDefaultAllocator<HSHM_DEFAULT_ALLOC_T>()
 
-/** Default memory context object */
-#define HSHM_DEFAULT_MEM_CTX (hipc::MemContext{})
-#define HSHM_MCTX HSHM_DEFAULT_MEM_CTX
+/** Default memory context macro (no longer used - kept for compatibility) */
+#define HSHM_MCTX (void)0
 
 /** Compatability hack for static_assert */
 template <bool TRUTH, typename T = int>

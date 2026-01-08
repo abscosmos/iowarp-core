@@ -45,7 +45,7 @@ TEST_CASE("MemorySlot") {
   if (rank != 0) {
     {
       std::cout << "Attaching SHMEM (rank 1)" << std::endl;
-      backend.shm_deserialize(shm_url);
+      backend.shm_attach(shm_url);
       char *ptr = backend.data_;
       REQUIRE(VerifyBuffer(ptr, backend.data_size_, nonce));
     }
@@ -54,7 +54,6 @@ TEST_CASE("MemorySlot") {
   if (rank == 0) {
     {
       std::cout << "Destroying shmem (rank 1)" << std::endl;
-      backend.shm_destroy();
     }
   }
 

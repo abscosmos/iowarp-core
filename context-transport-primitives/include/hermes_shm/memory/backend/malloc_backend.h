@@ -28,33 +28,54 @@ namespace hshm::ipc {
 
 class MallocBackend : public MemoryBackend {
  public:
-  CLS_CONST MemoryBackendType EnumType = MemoryBackendType::kMallocBackend;
-
- private:
-  size_t total_size_;
-
- public:
   HSHM_CROSS_FUN
   MallocBackend() = default;
 
   ~MallocBackend() {}
 
   HSHM_CROSS_FUN
-  bool shm_init(const MemoryBackendId &backend_id, size_t size) {
-    SetInitialized();
-    Own();
-    total_size_ = sizeof(MemoryBackendHeader) + size;
-    char *ptr = (char *)malloc(total_size_);
+  bool shm_init(const MemoryBackendId &backend_id, size_t backend_size) {
+    // Enforce minimum backend size of 1MB
+    constexpr size_t kMinBackendSize = 1024 * 1024;  // 1MB
+    if (backend_size < kMinBackendSize) {
+      backend_size = kMinBackendSize;
+    }
+
+    // Allocate total memory
+    char *ptr = (char *)malloc(backend_size);
+    if (!ptr) {
+      return false;
+    }
+
+    region_ = ptr;  // Save allocation start for cleanup
+
+    // Layout: [header (4KB)] [priv_header (4KB)] [shared_header (4KB)] [data...]
+    // header_ is the first part of the buffer
     header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
-    header_->type_ = MemoryBackendType::kMallocBackend;
-    header_->id_ = backend_id;
-    header_->data_size_ = size;
-    data_size_ = size;
-    data_ = (char *)(header_ + 1);
+    char *priv_header_ptr = ptr + kBackendHeaderSize;
+    char *shared_header_ptr = priv_header_ptr + kBackendHeaderSize;
+
+    id_ = backend_id;
+    backend_size_ = backend_size;
+
+    // data_ starts after shared header
+    data_ = shared_header_ptr + kBackendHeaderSize;
+    data_capacity_ = backend_size - 3 * kBackendHeaderSize;
+    data_id_ = -1;
+    priv_header_off_ = static_cast<size_t>(data_ - priv_header_ptr);
+    flags_.Clear();
+
+    // Copy all header fields to shared header
+    new (header_) MemoryBackendHeader();
+    (*header_) = (const MemoryBackendHeader&)*this;
+
+    // Mark this process as the owner of the backend
+    SetOwner();
+
     return true;
   }
 
-  bool shm_deserialize(const hshm::chararr &url) {
+  bool shm_attach(const std::string &url) {
     (void)url;
     HSHM_THROW_ERROR(SHMEM_NOT_SUPPORTED);
     return false;
@@ -65,9 +86,19 @@ class MallocBackend : public MemoryBackend {
   void shm_destroy() { _Destroy(); }
 
  protected:
-  void _Detach() { free(header_); }
+  void _Detach() {
+    if (region_) {
+      free(region_);  // Free from allocation start (includes private region)
+      region_ = nullptr;
+    }
+  }
 
-  void _Destroy() { free(header_); }
+  void _Destroy() {
+    if (region_) {
+      free(region_);  // Free from allocation start (includes private region)
+      region_ = nullptr;
+    }
+  }
 };
 
 }  // namespace hshm::ipc

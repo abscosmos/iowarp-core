@@ -187,7 +187,7 @@ class ConfigParse {
     } else if (suffix[0] == 'p' || suffix[0] == 'P') {
       return hshm::Unit<hshm::u64>::Petabytes(size);
     } else {
-      HELOG(kFatal, "Could not parse the size: {}", size_text);
+      HLOG(kFatal, "Could not parse the size: {}", size_text);
       exit(1);
     }
   }
@@ -212,7 +212,7 @@ class ConfigParse {
     } else if (suffix[0] == 's' || suffix[0] == 'S') {
       return hshm::Unit<hshm::u64>::Terabytes(size);
     }
-    HELOG(kFatal, "Could not parse the latency: {}", latency_text);
+    HLOG(kFatal, "Could not parse the latency: {}", latency_text);
     return 0;
   }
 
@@ -245,7 +245,7 @@ class ConfigParse {
       }
       file.close();
     } else {
-      HELOG(kError, "Could not open the hostfile: {}", path);
+      HLOG(kError, "Could not open the hostfile: {}", path);
     }
     return hosts;
   }
@@ -281,7 +281,7 @@ class BaseConfig {
       YAML::Node yaml_conf = YAML::LoadFile(real_path);
       ParseYAML(yaml_conf);
     } catch (std::exception &e) {
-      HELOG(kFatal, e.what());
+      HLOG(kFatal, e.what());
     }
   }
 

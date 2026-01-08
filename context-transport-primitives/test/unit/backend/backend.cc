@@ -26,5 +26,4 @@ TEST_CASE("BackendReserve") {
   memset(b1.data_, 0, hshm::Unit<size_t>::Megabytes(2));
 
   // Destroy SHMEM
-  b1.shm_destroy();
 }

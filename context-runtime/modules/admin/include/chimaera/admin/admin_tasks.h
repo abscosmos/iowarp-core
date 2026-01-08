@@ -59,39 +59,44 @@ template <typename CreateParamsT, chi::u32 MethodId = Method::kCreate,
           bool IS_ADMIN = false, bool DO_COMPOSE = false>
 struct BaseCreateTask : public chi::Task {
   // Pool operation parameters
-  INOUT hipc::string chimod_name_;
-  IN hipc::string pool_name_;
-  INOUT hipc::string
+  INOUT chi::priv::string chimod_name_;
+  IN chi::priv::string pool_name_;
+  INOUT chi::priv::string
       chimod_params_; // Serialized parameters for the specific ChiMod
   INOUT chi::PoolId new_pool_id_;
 
   // Results for pool operations
-  OUT hipc::string error_message_;
+  OUT chi::priv::string error_message_;
 
   // Volatile flags set by template parameters
   volatile bool is_admin_;
   volatile bool do_compose_;
 
+  // Client pointer for PostWait callback (not serialized)
+  chi::ContainerClient *client_;
+
   /** SHM default constructor */
-  explicit BaseCreateTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), chimod_name_(alloc), pool_name_(alloc),
-        chimod_params_(alloc), new_pool_id_(chi::PoolId::GetNull()),
-        error_message_(alloc), is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE) {}
+  BaseCreateTask()
+      : chi::Task(), chimod_name_(CHI_IPC->GetMainAlloc()), pool_name_(CHI_IPC->GetMainAlloc()),
+        chimod_params_(CHI_IPC->GetMainAlloc()), new_pool_id_(chi::PoolId::GetNull()),
+        error_message_(CHI_IPC->GetMainAlloc()), is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE),
+        client_(nullptr) {}
 
   /** Emplace constructor with CreateParams arguments */
   template <typename... CreateParamsArgs>
-  explicit BaseCreateTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
-                          const chi::TaskId &task_node,
+  explicit BaseCreateTask(const chi::TaskId &task_node,
                           const chi::PoolId &task_pool_id,
                           const chi::PoolQuery &pool_query,
                           const std::string &chimod_name,
                           const std::string &pool_name,
                           const chi::PoolId &target_pool_id,
+                          chi::ContainerClient *client,
                           CreateParamsArgs &&...create_params_args)
-      : chi::Task(alloc, task_node, task_pool_id, pool_query, 0),
-        chimod_name_(alloc, chimod_name), pool_name_(alloc, pool_name),
-        chimod_params_(alloc), new_pool_id_(target_pool_id),
-        error_message_(alloc), is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE) {
+      : chi::Task(task_node, task_pool_id, pool_query, 0),
+        chimod_name_(CHI_IPC->GetMainAlloc(), chimod_name), pool_name_(CHI_IPC->GetMainAlloc(), pool_name),
+        chimod_params_(CHI_IPC->GetMainAlloc()), new_pool_id_(target_pool_id),
+        error_message_(CHI_IPC->GetMainAlloc()), is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE),
+        client_(client) {
     // Initialize base task
     task_id_ = task_node;
     method_ = MethodId;
@@ -104,21 +109,20 @@ struct BaseCreateTask : public chi::Task {
       // Create and serialize the CreateParams with provided arguments
       CreateParamsT params(
           std::forward<CreateParamsArgs>(create_params_args)...);
-      chi::Task::Serialize(alloc, chimod_params_, params);
+      chi::Task::Serialize(CHI_IPC->GetMainAlloc(), chimod_params_, params);
     }
   }
 
   /** Compose constructor - takes PoolConfig directly */
-  explicit BaseCreateTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
-                          const chi::TaskId &task_node,
+  explicit BaseCreateTask(const chi::TaskId &task_node,
                           const chi::PoolId &task_pool_id,
                           const chi::PoolQuery &pool_query,
                           const chi::PoolConfig &pool_config)
-      : chi::Task(alloc, task_node, task_pool_id, pool_query, 0),
-        chimod_name_(alloc, pool_config.mod_name_),
-        pool_name_(alloc, pool_config.pool_name_), chimod_params_(alloc),
-        new_pool_id_(pool_config.pool_id_), error_message_(alloc),
-        is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE) {
+      : chi::Task(task_node, task_pool_id, pool_query, 0),
+        chimod_name_(CHI_IPC->GetMainAlloc(), pool_config.mod_name_),
+        pool_name_(CHI_IPC->GetMainAlloc(), pool_config.pool_name_), chimod_params_(CHI_IPC->GetMainAlloc()),
+        new_pool_id_(pool_config.pool_id_), error_message_(CHI_IPC->GetMainAlloc()),
+        is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE), client_(nullptr) {
     // Initialize base task
     task_id_ = task_node;
     method_ = MethodId;
@@ -126,7 +130,7 @@ struct BaseCreateTask : public chi::Task {
     pool_query_ = pool_query;
 
     // Serialize PoolConfig directly into chimod_params_
-    chi::Task::Serialize(alloc, chimod_params_, pool_config);
+    chi::Task::Serialize(CHI_IPC->GetMainAlloc(), chimod_params_, pool_config);
   }
 
   /**
@@ -134,7 +138,7 @@ struct BaseCreateTask : public chi::Task {
    * Does nothing if do_compose_ is true (compose mode)
    */
   template <typename... Args>
-  void SetParams(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
+  void SetParams(AllocT* alloc,
                  Args &&...args) {
     if (do_compose_) {
       return; // Skip SetParams in compose mode
@@ -149,7 +153,7 @@ struct BaseCreateTask : public chi::Task {
    * LoadConfig
    */
   CreateParamsT
-  GetParams(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc) const {
+  GetParams(AllocT* alloc) const {
     if (do_compose_) {
       // Compose mode: deserialize PoolConfig and load into CreateParams
       chi::PoolConfig pool_config =
@@ -168,6 +172,7 @@ struct BaseCreateTask : public chi::Task {
    * This includes: chimod_name_, pool_name_, chimod_params_, new_pool_id_
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(chimod_name_, pool_name_, chimod_params_, new_pool_id_);
   }
 
@@ -176,6 +181,7 @@ struct BaseCreateTask : public chi::Task {
    * This includes: chimod_name_, chimod_params_, new_pool_id_, error_message_
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(chimod_name_, chimod_params_, new_pool_id_, error_message_);
   }
 
@@ -185,6 +191,7 @@ struct BaseCreateTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<BaseCreateTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy BaseCreateTask-specific fields
     chimod_name_ = other->chimod_name_;
     pool_name_ = other->pool_name_;
@@ -193,6 +200,23 @@ struct BaseCreateTask : public chi::Task {
     error_message_ = other->error_message_;
     is_admin_ = other->is_admin_;
     do_compose_ = other->do_compose_;
+  }
+
+  /** Aggregate replica results into this task */
+  void Aggregate(const hipc::FullPtr<BaseCreateTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+
+  /**
+   * Post-wait callback called after task completion
+   * Sets client_->pool_id_ and client_->return_code_ from task results
+   */
+  void PostWait() {
+    if (client_ != nullptr) {
+      client_->pool_id_ = new_pool_id_;
+      client_->return_code_ = return_code_;
+    }
   }
 };
 
@@ -231,23 +255,22 @@ struct DestroyPoolTask : public chi::Task {
   IN chi::u32 destruction_flags_; ///< Flags controlling destruction behavior
 
   // Output results
-  OUT hipc::string error_message_; ///< Error description if destruction failed
+  OUT chi::priv::string error_message_; ///< Error description if destruction failed
 
   /** SHM default constructor */
-  explicit DestroyPoolTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), target_pool_id_(), destruction_flags_(0),
-        error_message_(alloc) {}
+  DestroyPoolTask()
+      : chi::Task(), target_pool_id_(), destruction_flags_(0),
+        error_message_(CHI_IPC->GetMainAlloc()) {}
 
   /** Emplace constructor */
-  explicit DestroyPoolTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
-                           const chi::TaskId &task_node,
+  explicit DestroyPoolTask(const chi::TaskId &task_node,
                            const chi::PoolId &pool_id,
                            const chi::PoolQuery &pool_query,
                            chi::PoolId target_pool_id,
                            chi::u32 destruction_flags = 0)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
+      : chi::Task(task_node, pool_id, pool_query, 10),
         target_pool_id_(target_pool_id), destruction_flags_(destruction_flags),
-        error_message_(alloc) {
+        error_message_(CHI_IPC->GetMainAlloc()) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -261,6 +284,7 @@ struct DestroyPoolTask : public chi::Task {
    * This includes: target_pool_id_, destruction_flags_
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(target_pool_id_, destruction_flags_);
   }
 
@@ -269,6 +293,7 @@ struct DestroyPoolTask : public chi::Task {
    * This includes: error_message_
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(error_message_);
   }
 
@@ -279,10 +304,17 @@ struct DestroyPoolTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<DestroyPoolTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy DestroyPoolTask-specific fields
     target_pool_id_ = other->target_pool_id_;
     destruction_flags_ = other->destruction_flags_;
     error_message_ = other->error_message_;
+  }
+
+  /** Aggregate replica results into this task */
+  void Aggregate(const hipc::FullPtr<DestroyPoolTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
   }
 };
 
@@ -295,23 +327,22 @@ struct StopRuntimeTask : public chi::Task {
   IN chi::u32 grace_period_ms_; ///< Grace period for clean shutdown
 
   // Output results
-  OUT hipc::string error_message_; ///< Error description if shutdown failed
+  OUT chi::priv::string error_message_; ///< Error description if shutdown failed
 
   /** SHM default constructor */
-  explicit StopRuntimeTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), shutdown_flags_(0), grace_period_ms_(5000),
-        error_message_(alloc) {}
+  StopRuntimeTask()
+      : chi::Task(), shutdown_flags_(0), grace_period_ms_(5000),
+        error_message_(CHI_IPC->GetMainAlloc()) {}
 
   /** Emplace constructor */
-  explicit StopRuntimeTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
-                           const chi::TaskId &task_node,
+  explicit StopRuntimeTask(const chi::TaskId &task_node,
                            const chi::PoolId &pool_id,
                            const chi::PoolQuery &pool_query,
                            chi::u32 shutdown_flags = 0,
                            chi::u32 grace_period_ms = 5000)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
+      : chi::Task(task_node, pool_id, pool_query, 10),
         shutdown_flags_(shutdown_flags), grace_period_ms_(grace_period_ms),
-        error_message_(alloc) {
+        error_message_(CHI_IPC->GetMainAlloc()) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -325,6 +356,7 @@ struct StopRuntimeTask : public chi::Task {
    * This includes: shutdown_flags_, grace_period_ms_
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(shutdown_flags_, grace_period_ms_);
   }
 
@@ -333,6 +365,7 @@ struct StopRuntimeTask : public chi::Task {
    * This includes: error_message_
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(error_message_);
   }
 
@@ -343,10 +376,17 @@ struct StopRuntimeTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<StopRuntimeTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy StopRuntimeTask-specific fields
     shutdown_flags_ = other->shutdown_flags_;
     grace_period_ms_ = other->grace_period_ms_;
     error_message_ = other->error_message_;
+  }
+
+  /** Aggregate replica results into this task */
+  void Aggregate(const hipc::FullPtr<StopRuntimeTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
   }
 };
 
@@ -360,14 +400,13 @@ struct FlushTask : public chi::Task {
                                  ///< containers
 
   /** SHM default constructor */
-  explicit FlushTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), total_work_done_(0) {}
+  FlushTask()
+      : chi::Task(), total_work_done_(0) {}
 
   /** Emplace constructor */
-  explicit FlushTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
-                     const chi::TaskId &task_node, const chi::PoolId &pool_id,
+  explicit FlushTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                      const chi::PoolQuery &pool_query)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
+      : chi::Task(task_node, pool_id, pool_query, 10),
         total_work_done_(0) {
     // Initialize task
     task_id_ = task_node;
@@ -382,8 +421,8 @@ struct FlushTask : public chi::Task {
    * No additional parameters for FlushTask
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
-    // No parameters to serialize for flush
-    (void)ar;
+    Task::SerializeIn(ar);
+    // No additional parameters to serialize for flush
   }
 
   /**
@@ -391,6 +430,7 @@ struct FlushTask : public chi::Task {
    * This includes: total_work_done_
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(total_work_done_);
   }
 
@@ -400,8 +440,15 @@ struct FlushTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<FlushTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy FlushTask-specific fields
     total_work_done_ = other->total_work_done_;
+  }
+
+  /** Aggregate replica results into this task */
+  void Aggregate(const hipc::FullPtr<FlushTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
   }
 };
 
@@ -412,41 +459,27 @@ struct FlushTask : public chi::Task {
 using DestroyTask = DestroyPoolTask;
 
 /**
- * SendTask - Unified task for sending task inputs or outputs over network
- * Replaces ClientSendTaskIn and ServerSendTaskOut
+ * SendTask - Periodic task for sending queued tasks over network
+ * Polls net_queue_ for tasks and sends them to remote nodes
+ * This is a periodic task similar to RecvTask
  */
 struct SendTask : public chi::Task {
-  // Message type: kSerializeIn (inputs), kSerializeOut (outputs), or kHeartbeat
-  IN chi::MsgType msg_type_;
-
-  // Subtask to serialize and send
-  INOUT hipc::FullPtr<chi::Task> origin_task_;
-
-  // Pool queries for target nodes
-  INOUT std::vector<chi::PoolQuery> pool_queries_;
-
   // Network transfer parameters
   IN chi::u32 transfer_flags_; ///< Flags controlling transfer behavior
 
   // Results
-  OUT hipc::string error_message_; ///< Error description if transfer failed
+  OUT chi::priv::string error_message_; ///< Error description if transfer failed
 
   /** SHM default constructor */
-  explicit SendTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), msg_type_(chi::MsgType::kSerializeIn),
-        origin_task_(hipc::FullPtr<chi::Task>()), pool_queries_(),
-        transfer_flags_(0), error_message_(alloc) {}
+  SendTask()
+      : chi::Task(), transfer_flags_(0), error_message_(CHI_IPC->GetMainAlloc()) {}
 
   /** Emplace constructor */
-  explicit SendTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
-                    const chi::TaskId &task_node, const chi::PoolId &pool_id,
-                    const chi::PoolQuery &pool_query, chi::MsgType msg_type,
-                    hipc::FullPtr<chi::Task> subtask,
-                    const std::vector<chi::PoolQuery> &pool_queries,
+  explicit SendTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
+                    const chi::PoolQuery &pool_query,
                     chi::u32 transfer_flags = 0)
-      : chi::Task(alloc, task_node, pool_id, pool_query, Method::kSend),
-        msg_type_(msg_type), origin_task_(subtask), pool_queries_(pool_queries),
-        transfer_flags_(transfer_flags), error_message_(alloc) {
+      : chi::Task(task_node, pool_id, pool_query, Method::kSend),
+        transfer_flags_(transfer_flags), error_message_(CHI_IPC->GetMainAlloc()) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -460,14 +493,16 @@ struct SendTask : public chi::Task {
    * Serialize IN and INOUT parameters for network transfer
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
-    ar(msg_type_, origin_task_, pool_queries_, transfer_flags_);
+    Task::SerializeIn(ar);
+    ar(transfer_flags_);
   }
 
   /**
    * Serialize OUT and INOUT parameters for network transfer
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
-    ar(msg_type_, origin_task_, pool_queries_, error_message_);
+    Task::SerializeOut(ar);
+    ar(error_message_);
   }
 
   /**
@@ -476,12 +511,16 @@ struct SendTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<SendTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy SendTask-specific fields
-    msg_type_ = other->msg_type_;
-    origin_task_ = other->origin_task_;
-    pool_queries_ = other->pool_queries_;
     transfer_flags_ = other->transfer_flags_;
     error_message_ = other->error_message_;
+  }
+
+  /** Aggregate replica results into this task */
+  void Aggregate(const hipc::FullPtr<SendTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
   }
 };
 
@@ -495,19 +534,18 @@ struct RecvTask : public chi::Task {
   IN chi::u32 transfer_flags_; ///< Flags controlling transfer behavior
 
   // Results
-  OUT hipc::string error_message_; ///< Error description if transfer failed
+  OUT chi::priv::string error_message_; ///< Error description if transfer failed
 
   /** SHM default constructor */
-  explicit RecvTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), transfer_flags_(0), error_message_(alloc) {}
+  RecvTask()
+      : chi::Task(), transfer_flags_(0), error_message_(CHI_IPC->GetMainAlloc()) {}
 
   /** Emplace constructor */
-  explicit RecvTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
-                    const chi::TaskId &task_node, const chi::PoolId &pool_id,
+  explicit RecvTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                     const chi::PoolQuery &pool_query,
                     chi::u32 transfer_flags = 0)
-      : chi::Task(alloc, task_node, pool_id, pool_query, Method::kRecv),
-        transfer_flags_(transfer_flags), error_message_(alloc) {
+      : chi::Task(task_node, pool_id, pool_query, Method::kRecv),
+        transfer_flags_(transfer_flags), error_message_(CHI_IPC->GetMainAlloc()) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -521,6 +559,7 @@ struct RecvTask : public chi::Task {
    * Serialize IN and INOUT parameters for network transfer
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     ar(transfer_flags_);
   }
 
@@ -528,6 +567,7 @@ struct RecvTask : public chi::Task {
    * Serialize OUT and INOUT parameters for network transfer
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(error_message_);
   }
 
@@ -537,9 +577,16 @@ struct RecvTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<RecvTask> &other) {
     // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
     // Copy RecvTask-specific fields
     transfer_flags_ = other->transfer_flags_;
     error_message_ = other->error_message_;
+  }
+
+  /** Aggregate replica results into this task */
+  void Aggregate(const hipc::FullPtr<RecvTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
   }
 };
 

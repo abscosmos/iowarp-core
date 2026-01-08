@@ -94,7 +94,7 @@ ctest
 
 To run the MPSC queue tests, do the following:
 ```
-ctest -VV -R test_mpsc_queue_mpi
+ctest -VV -R test_mpsc_ring_buffer_mpi
 ```
 
 ## Project Structure

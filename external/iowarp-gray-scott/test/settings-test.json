@@ -1,0 +1,19 @@
+{
+  "L": 32,
+  "Du": 0.2,
+  "Dv": 0.1,
+  "F": 0.02,
+  "k": 0.048,
+  "dt": 1.0,
+  "plotgap": 5,
+  "steps": 10,
+  "noise": 0.01,
+  "output": "gs-test.bp",
+  "checkpoint": false,
+  "checkpoint_freq": 20,
+  "checkpoint_output": "ckpt.bp",
+  "adios_config": "adios2.xml",
+  "adios_span": false,
+  "adios_memory_selection": false,
+  "mesh_type": "image"
+}

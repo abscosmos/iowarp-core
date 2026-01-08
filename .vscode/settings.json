@@ -12,7 +12,7 @@
         "*.inc": "cpp"
     },
     "C_Cpp.formatting": "Disabled",
-    "editor.formatOnSave": false,
+    "editor.formatOnSave": true,
     "clang-tidy.lintOnSave": true,
     "clang-tidy.checks": [
         "clang-analyzer-*",

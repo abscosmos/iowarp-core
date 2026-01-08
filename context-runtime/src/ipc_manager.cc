@@ -14,7 +14,10 @@
 #include <iostream>
 #include <memory>
 #include <netdb.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <zmq.h>
 
@@ -30,7 +33,7 @@ namespace chi {
 // Constructor and destructor removed - handled by HSHM singleton pattern
 
 bool IpcManager::ClientInit() {
-  HILOG(kDebug, "IpcManager::ClientInit");
+  HLOG(kDebug, "IpcManager::ClientInit");
   if (is_initialized_) {
     return true;
   }
@@ -38,8 +41,8 @@ bool IpcManager::ClientInit() {
   // Wait for local server to become available - critical for client
   // functionality TestLocalServer sends heartbeat to verify connectivity
   if (!WaitForLocalServer()) {
-    HELOG(kError, "CRITICAL ERROR: Cannot connect to local server.");
-    HELOG(kError, "Client initialization failed. Exiting.");
+    HLOG(kError, "CRITICAL ERROR: Cannot connect to local server.");
+    HLOG(kError, "Client initialization failed. Exiting.");
     return false;
   }
 
@@ -56,10 +59,10 @@ bool IpcManager::ClientInit() {
   // Retrieve node ID from shared header and store in this_host_
   if (shared_header_) {
     this_host_.node_id = shared_header_->node_id;
-    HILOG(kDebug, "Retrieved node ID from shared memory: 0x{:x}",
+    HLOG(kDebug, "Retrieved node ID from shared memory: 0x{:x}",
           this_host_.node_id);
   } else {
-    HELOG(kError, "Warning: Could not access shared header during ClientInit");
+    HLOG(kError, "Warning: Could not access shared header during ClientInit");
     this_host_ = Host(); // Default constructor gives node_id = 0
   }
 
@@ -78,7 +81,7 @@ bool IpcManager::ClientInit() {
   auto *config = CHI_CONFIG_MANAGER;
   if (config && config->IsValid()) {
     lane_map_policy_ = config->GetLaneMapPolicy();
-    HILOG(kDebug, "Lane mapping policy set to: {}",
+    HLOG(kDebug, "Lane mapping policy set to: {}",
           static_cast<int>(lane_map_policy_));
   }
 
@@ -103,7 +106,7 @@ bool IpcManager::ServerInit() {
 
   // Identify this host and store node ID in shared header
   if (!IdentifyThisHost()) {
-    HELOG(kError, "Warning: Could not identify host, using default node ID");
+    HLOG(kError, "Warning: Could not identify host, using default node ID");
     this_host_ = Host(); // Default constructor gives node_id = 0
     if (shared_header_) {
       shared_header_->node_id = this_host_.node_id;
@@ -114,7 +117,7 @@ bool IpcManager::ServerInit() {
       shared_header_->node_id = this_host_.node_id;
     }
 
-    HILOG(kDebug, "Node ID stored in shared memory: 0x{:x}",
+    HLOG(kDebug, "Node ID stored in shared memory: 0x{:x}",
           this_host_.node_id);
   }
 
@@ -126,7 +129,7 @@ bool IpcManager::ServerInit() {
   auto *config = CHI_CONFIG_MANAGER;
   if (config && config->IsValid()) {
     lane_map_policy_ = config->GetLaneMapPolicy();
-    HILOG(kDebug, "Lane mapping policy set to: {}",
+    HLOG(kDebug, "Lane mapping policy set to: {}",
           static_cast<int>(lane_map_policy_));
   }
 
@@ -152,8 +155,6 @@ void IpcManager::ServerFinalize() {
     return;
   }
 
-  auto mem_manager = HSHM_MEMORY_MANAGER;
-
   // Cleanup servers
   local_server_.reset();
   main_server_.reset();
@@ -167,75 +168,15 @@ void IpcManager::ServerFinalize() {
   client_data_allocator_ = nullptr;
   runtime_data_allocator_ = nullptr;
 
-  // Cleanup allocators
-  if (!main_allocator_id_.IsNull()) {
-    mem_manager->UnregisterAllocator(main_allocator_id_);
-  }
-  if (!client_data_allocator_id_.IsNull()) {
-    mem_manager->UnregisterAllocator(client_data_allocator_id_);
-  }
-  if (!runtime_data_allocator_id_.IsNull()) {
-    mem_manager->UnregisterAllocator(runtime_data_allocator_id_);
-  }
-
-  // Cleanup memory backends (always try to destroy if they were created)
-  if (is_initialized_) {
-    mem_manager->DestroyBackend(main_backend_id_);
-    mem_manager->DestroyBackend(client_data_backend_id_);
-    mem_manager->DestroyBackend(runtime_data_backend_id_);
-  }
-
   is_initialized_ = false;
 }
 
 // Template methods (NewTask, DelTask, AllocateBuffer, Enqueue) are implemented
 // inline in the header
 
-TaskQueue *IpcManager::GetTaskQueue() { return external_queue_.ptr_; }
+TaskQueue *IpcManager::GetTaskQueue() { return worker_queues_.ptr_; }
 
 bool IpcManager::IsInitialized() const { return is_initialized_; }
-
-bool IpcManager::InitializeWorkerQueues(u32 num_workers) {
-  if (!main_allocator_ || !shared_header_) {
-    return false;
-  }
-
-  try {
-    hipc::CtxAllocator<CHI_MAIN_ALLOC_T> ctx_alloc(HSHM_MCTX, main_allocator_);
-
-    // Initialize worker queues vector in shared header using delay_ar
-    // Single call to initialize vector with num_workers queues, each with depth
-    // 1024
-    shared_header_->worker_queues.shm_init(ctx_alloc, num_workers, 1024);
-
-    // Store worker count
-    shared_header_->num_workers = num_workers;
-
-    return true;
-  } catch (const std::exception &e) {
-    return false;
-  }
-}
-
-hipc::FullPtr<WorkQueue> IpcManager::GetWorkerQueue(u32 worker_id) {
-  if (!shared_header_) {
-    return hipc::FullPtr<WorkQueue>::GetNull();
-  }
-
-  if (worker_id >= shared_header_->num_workers) {
-    return hipc::FullPtr<WorkQueue>::GetNull();
-  }
-
-  // Get the vector of worker queues from delay_ar
-  auto &worker_queues_vector = shared_header_->worker_queues;
-
-  if (worker_id >= worker_queues_vector->size()) {
-    return hipc::FullPtr<WorkQueue>::GetNull();
-  }
-
-  // Return FullPtr reference to the specific worker's queue in the vector
-  return hipc::FullPtr<WorkQueue>(&(*worker_queues_vector)[worker_id]);
-}
 
 u32 IpcManager::GetWorkerCount() {
   if (!shared_header_) {
@@ -244,21 +185,31 @@ u32 IpcManager::GetWorkerCount() {
   return shared_header_->num_workers;
 }
 
+void IpcManager::AwakenWorker(TaskLane* lane) {
+  if (!lane) {
+    return;
+  }
+
+  // Only send signal if worker is inactive (blocked in epoll_wait)
+  if (!lane->IsActive()) {
+    pid_t tid = lane->GetTid();
+    if (tid > 0) {
+      // Send SIGUSR1 to the worker thread
+      syscall(SYS_tgkill, getpid(), tid, SIGUSR1);
+    }
+  }
+}
+
 bool IpcManager::ServerInitShm() {
-  auto mem_manager = HSHM_MEMORY_MANAGER;
   ConfigManager *config = CHI_CONFIG_MANAGER;
 
   try {
-    // Set backend and allocator IDs
-    main_backend_id_ = hipc::MemoryBackendId::Get(0);
-    client_data_backend_id_ = hipc::MemoryBackendId::Get(1);
-    runtime_data_backend_id_ = hipc::MemoryBackendId::Get(2);
+    // Set allocator IDs for each segment
+    main_allocator_id_ = hipc::AllocatorId::Get(1, 0);
+    client_data_allocator_id_ = hipc::AllocatorId::Get(2, 0);
+    runtime_data_allocator_id_ = hipc::AllocatorId::Get(3, 0);
 
-    main_allocator_id_ = hipc::AllocatorId(1, 0);
-    client_data_allocator_id_ = hipc::AllocatorId(2, 0);
-    runtime_data_allocator_id_ = hipc::AllocatorId(3, 0);
-
-    // Create memory backends using configurable segment names
+    // Get configurable segment names
     std::string main_segment_name =
         config->GetSharedMemorySegmentName(kMainSegment);
     std::string client_data_segment_name =
@@ -266,58 +217,60 @@ bool IpcManager::ServerInitShm() {
     std::string runtime_data_segment_name =
         config->GetSharedMemorySegmentName(kRuntimeDataSegment);
 
-    mem_manager->CreateBackend<hipc::PosixShmMmap>(
-        main_backend_id_,
-        hshm::Unit<size_t>::Bytes(config->GetMemorySegmentSize(kMainSegment)),
-        main_segment_name);
-
-    mem_manager->CreateBackend<hipc::PosixShmMmap>(
-        client_data_backend_id_,
-        hshm::Unit<size_t>::Bytes(
-            config->GetMemorySegmentSize(kClientDataSegment)),
-        client_data_segment_name);
-
-    mem_manager->CreateBackend<hipc::PosixShmMmap>(
-        runtime_data_backend_id_,
-        hshm::Unit<size_t>::Bytes(
-            config->GetMemorySegmentSize(kRuntimeDataSegment)),
-        runtime_data_segment_name);
-
-    // Create allocators with custom header for main allocator
+    // Initialize main backend with custom header size
     size_t custom_header_size = sizeof(IpcSharedHeader);
-    mem_manager->CreateAllocator<CHI_MAIN_ALLOC_T>(
-        main_backend_id_, main_allocator_id_, custom_header_size);
+    if (!main_backend_.shm_init(
+            main_allocator_id_,
+            hshm::Unit<size_t>::Bytes(config->GetMemorySegmentSize(kMainSegment)),
+            main_segment_name)) {
+      return false;
+    }
 
-    mem_manager->CreateAllocator<CHI_CDATA_ALLOC_T>(
-        client_data_backend_id_, client_data_allocator_id_, 0);
+    // Initialize client data backend
+    if (!client_data_backend_.shm_init(
+            client_data_allocator_id_,
+            hshm::Unit<size_t>::Bytes(
+                config->GetMemorySegmentSize(kClientDataSegment)),
+            client_data_segment_name)) {
+      return false;
+    }
 
-    mem_manager->CreateAllocator<CHI_RDATA_ALLOC_T>(
-        runtime_data_backend_id_, runtime_data_allocator_id_, 0);
+    // Initialize runtime data backend
+    if (!runtime_data_backend_.shm_init(
+            runtime_data_allocator_id_,
+            hshm::Unit<size_t>::Bytes(
+                config->GetMemorySegmentSize(kRuntimeDataSegment)),
+            runtime_data_segment_name)) {
+      return false;
+    }
 
-    // Cache allocator pointers
-    main_allocator_ =
-        mem_manager->GetAllocator<CHI_MAIN_ALLOC_T>(main_allocator_id_);
-    client_data_allocator_ =
-        mem_manager->GetAllocator<CHI_CDATA_ALLOC_T>(client_data_allocator_id_);
-    runtime_data_allocator_ = mem_manager->GetAllocator<CHI_RDATA_ALLOC_T>(
-        runtime_data_allocator_id_);
+    // Create allocators using backend's MakeAlloc method
+    main_allocator_ = main_backend_.MakeAlloc<CHI_MAIN_ALLOC_T>();
+    if (!main_allocator_) {
+      return false;
+    }
 
-    return main_allocator_ && client_data_allocator_ && runtime_data_allocator_;
+    client_data_allocator_ = client_data_backend_.MakeAlloc<CHI_CDATA_ALLOC_T>();
+    if (!client_data_allocator_) {
+      return false;
+    }
+
+    runtime_data_allocator_ = runtime_data_backend_.MakeAlloc<CHI_RDATA_ALLOC_T>();
+    if (!runtime_data_allocator_) {
+      return false;
+    }
+
+    return true;
   } catch (const std::exception &e) {
     return false;
   }
 }
 
 bool IpcManager::ClientInitShm() {
-  auto mem_manager = HSHM_MEMORY_MANAGER;
   ConfigManager *config = CHI_CONFIG_MANAGER;
 
   try {
-    // Set backend and allocator IDs (must match server)
-    main_backend_id_ = hipc::MemoryBackendId::Get(0);
-    client_data_backend_id_ = hipc::MemoryBackendId::Get(1);
-    runtime_data_backend_id_ = hipc::MemoryBackendId::Get(2);
-
+    // Set allocator IDs (must match server)
     main_allocator_id_ = hipc::AllocatorId(1, 0);
     client_data_allocator_id_ = hipc::AllocatorId(2, 0);
     runtime_data_allocator_id_ = hipc::AllocatorId(3, 0);
@@ -331,22 +284,35 @@ bool IpcManager::ClientInitShm() {
         config->GetSharedMemorySegmentName(kRuntimeDataSegment);
 
     // Attach to existing shared memory segments created by server
-    mem_manager->AttachBackend(hipc::MemoryBackendType::kPosixShmMmap,
-                               main_segment_name);
-    mem_manager->AttachBackend(hipc::MemoryBackendType::kPosixShmMmap,
-                               client_data_segment_name);
-    mem_manager->AttachBackend(hipc::MemoryBackendType::kPosixShmMmap,
-                               runtime_data_segment_name);
+    if (!main_backend_.shm_attach(main_segment_name)) {
+      return false;
+    }
 
-    // Cache allocator pointers
-    main_allocator_ =
-        mem_manager->GetAllocator<CHI_MAIN_ALLOC_T>(main_allocator_id_);
-    client_data_allocator_ =
-        mem_manager->GetAllocator<CHI_CDATA_ALLOC_T>(client_data_allocator_id_);
-    runtime_data_allocator_ = mem_manager->GetAllocator<CHI_RDATA_ALLOC_T>(
-        runtime_data_allocator_id_);
+    if (!client_data_backend_.shm_attach(client_data_segment_name)) {
+      return false;
+    }
 
-    return main_allocator_ && client_data_allocator_ && runtime_data_allocator_;
+    if (!runtime_data_backend_.shm_attach(runtime_data_segment_name)) {
+      return false;
+    }
+
+    // Attach to allocators using backend's AttachAlloc method
+    main_allocator_ = main_backend_.AttachAlloc<CHI_MAIN_ALLOC_T>();
+    if (!main_allocator_) {
+      return false;
+    }
+
+    client_data_allocator_ = client_data_backend_.AttachAlloc<CHI_CDATA_ALLOC_T>();
+    if (!client_data_allocator_) {
+      return false;
+    }
+
+    runtime_data_allocator_ = runtime_data_backend_.AttachAlloc<CHI_RDATA_ALLOC_T>();
+    if (!runtime_data_allocator_) {
+      return false;
+    }
+
+    return true;
   } catch (const std::exception &e) {
     return false;
   }
@@ -358,37 +324,52 @@ bool IpcManager::ServerInitQueues() {
   }
 
   try {
-    // Get the custom header from allocator
+    // Get the custom header from the backend
     shared_header_ =
-        main_allocator_->template GetCustomHeader<IpcSharedHeader>();
+        main_backend_.template GetSharedHeader<IpcSharedHeader>();
+
+    if (!shared_header_) {
+      return false;
+    }
 
     // Initialize shared header
-    shared_header_->num_workers = 0;
     shared_header_->node_id = 0; // Will be set after host identification
 
-    // Server creates the TaskQueue using delay_ar
-    hipc::CtxAllocator<CHI_MAIN_ALLOC_T> ctx_alloc(HSHM_MCTX, main_allocator_);
-
-    // Get number of sched workers from ConfigManager
-    // Number of lanes equals number of sched workers for optimal distribution
+    // Get worker counts from ConfigManager
     ConfigManager *config = CHI_CONFIG_MANAGER;
-    u32 num_lanes = config->GetWorkerThreadCount(kSchedWorker);
+    u32 sched_count = config->GetSchedulerWorkerCount();
+    u32 slow_count = config->GetSlowWorkerCount();
+    u32 net_worker_count = 1;  // Dedicated network worker (hardcoded to 1)
+    u32 total_workers = sched_count + slow_count + net_worker_count;
+
+    // Number of scheduling queues equals number of sched workers
+    u32 num_sched_queues = sched_count;
+
+    // Store worker count and scheduling queue count
+    shared_header_->num_workers = total_workers;
+    shared_header_->num_sched_queues = num_sched_queues;
 
     // Initialize TaskQueue in shared header
-    shared_header_->external_queue.shm_init(
-        ctx_alloc, ctx_alloc,
-        num_lanes, // num_lanes equals sched worker count
-        2,         // num_priorities (2 priorities: 0=normal, 1=resumed tasks)
-        1024);     // depth_per_queue
+    // Number of lanes equals total worker count (including net worker)
+    new (&shared_header_->worker_queues) TaskQueue(
+        main_allocator_,
+        total_workers,  // num_lanes equals total worker count
+        2,      // num_priorities (2 priorities: 0=normal, 1=resumed tasks)
+        1024);  // depth_per_queue
 
     // Create FullPtr reference to the shared TaskQueue
-    external_queue_ =
-        hipc::FullPtr<TaskQueue>(&shared_header_->external_queue.get_ref());
+    worker_queues_ = hipc::FullPtr<TaskQueue>(main_allocator_,
+                                              &shared_header_->worker_queues);
 
-    // Note: WorkOrchestrator scheduling is handled by WorkOrchestrator itself,
-    // not here
+    // Initialize network queue for send operations
+    // One lane with two priorities (SendIn and SendOut)
+    net_queue_ = main_allocator_->NewObj<NetQueue>(
+        main_allocator_,
+        1,     // num_lanes: single lane for network operations
+        2,     // num_priorities: 0=SendIn, 1=SendOut
+        1024); // depth_per_queue
 
-    return !external_queue_.IsNull();
+    return !worker_queues_.IsNull() && !net_queue_.IsNull();
   } catch (const std::exception &e) {
     return false;
   }
@@ -400,16 +381,20 @@ bool IpcManager::ClientInitQueues() {
   }
 
   try {
-    // Get the custom header from allocator
+    // Get the custom header from the backend
     shared_header_ =
-        main_allocator_->template GetCustomHeader<IpcSharedHeader>();
+        main_backend_.template GetSharedHeader<IpcSharedHeader>();
 
-    // Client accesses the server's shared TaskQueue via delay_ar
+    if (!shared_header_) {
+      return false;
+    }
+
+    // Client accesses the server's shared TaskQueue
     // Create FullPtr reference to the shared TaskQueue
-    external_queue_ =
-        hipc::FullPtr<TaskQueue>(shared_header_->external_queue.get());
+    worker_queues_ = hipc::FullPtr<TaskQueue>(main_allocator_,
+                                              &shared_header_->worker_queues);
 
-    return !external_queue_.IsNull();
+    return !worker_queues_.IsNull();
   } catch (const std::exception &e) {
     return false;
   }
@@ -428,14 +413,14 @@ bool IpcManager::StartLocalServer() {
         addr, hshm::lbm::Transport::kZeroMq, protocol, port);
 
     if (local_server_ != nullptr) {
-      HILOG(kInfo, "Successfully started local server at {}:{}", addr, port);
+      HLOG(kInfo, "Successfully started local server at {}:{}", addr, port);
       return true;
     }
 
-    HELOG(kError, "Failed to start local server at {}:{}", addr, port);
+    HLOG(kError, "Failed to start local server at {}:{}", addr, port);
     return false;
   } catch (const std::exception &e) {
-    HELOG(kError, "Exception starting local server: {}", e.what());
+    HLOG(kError, "Exception starting local server: {}", e.what());
     return false;
   }
 }
@@ -462,14 +447,14 @@ bool IpcManager::TestLocalServer() {
     int rc = client->Send(archive, ctx);
 
     if (rc == 0) {
-      HILOG(kDebug, "Successfully sent heartbeat to local server");
+      HLOG(kDebug, "Successfully sent heartbeat to local server");
       return true;
     }
 
-    HELOG(kDebug, "Failed to send heartbeat with error code {}", rc);
+    HLOG(kDebug, "Failed to send heartbeat with error code {}", rc);
     return false;
   } catch (const std::exception &e) {
-    HELOG(kWarning, "Exception during heartbeat send: {}", e.what());
+    HLOG(kWarning, "Exception during heartbeat send: {}", e.what());
     return false;
   }
 }
@@ -494,7 +479,7 @@ bool IpcManager::WaitForLocalServer() {
   }
 
   u32 port = config->GetPort() + 1;
-  HILOG(kInfo,
+  HLOG(kInfo,
         "Waiting for local server at 127.0.0.1:{} (timeout={}s, "
         "poll_interval={}s)",
         port, wait_server_timeout_, poll_server_interval_);
@@ -506,14 +491,14 @@ bool IpcManager::WaitForLocalServer() {
     attempt++;
 
     if (TestLocalServer()) {
-      HILOG(kInfo,
+      HLOG(kInfo,
             "Successfully connected to local server after {} seconds ({} "
             "attempts)",
             elapsed, attempt);
       return true;
     }
 
-    HILOG(kDebug, "Local server not available yet (attempt {}, elapsed {}s)",
+    HLOG(kDebug, "Local server not available yet (attempt {}, elapsed {}s)",
           attempt, elapsed);
 
     // Sleep for poll interval
@@ -521,13 +506,13 @@ bool IpcManager::WaitForLocalServer() {
     elapsed += poll_server_interval_;
   }
 
-  HELOG(kError,
+  HLOG(kError,
         "Timeout waiting for local server after {} seconds ({} attempts)",
         wait_server_timeout_, attempt);
-  HELOG(kError, "This usually means:");
-  HELOG(kError, "1. Chimaera runtime is not running");
-  HELOG(kError, "2. Local server failed to start");
-  HELOG(kError, "3. Network connectivity issues");
+  HLOG(kError, "This usually means:");
+  HLOG(kError, "1. Chimaera runtime is not running");
+  HLOG(kError, "2. Local server failed to start");
+  HLOG(kError, "3. Network connectivity issues");
   return false;
 }
 
@@ -557,7 +542,7 @@ bool IpcManager::LoadHostfile() {
 
   if (hostfile_path.empty()) {
     // No hostfile configured - assume localhost as node 0
-    HILOG(kDebug, "No hostfile configured, using localhost as node 0");
+    HLOG(kDebug, "No hostfile configured, using localhost as node 0");
     Host host("127.0.0.1", 0);
     hostfile_map_[0] = host;
     return true;
@@ -569,22 +554,22 @@ bool IpcManager::LoadHostfile() {
         hshm::ConfigParse::ParseHostfile(hostfile_path);
 
     // Create Host structs and populate map using linear offset-based node IDs
-    HILOG(kInfo, "=== Container to Node ID Mapping (Linear Offset) ===");
+    HLOG(kInfo, "=== Container to Node ID Mapping (Linear Offset) ===");
     for (size_t offset = 0; offset < host_ips.size(); ++offset) {
       u64 node_id = static_cast<u64>(offset);
       Host host(host_ips[offset], node_id);
       hostfile_map_[node_id] = host;
-      HILOG(kInfo, "  Hostfile[{}]: {} -> Node ID: {}", offset,
+      HLOG(kInfo, "  Hostfile[{}]: {} -> Node ID: {}", offset,
             host_ips[offset], node_id);
     }
-    HILOG(kInfo, "=== Total hosts loaded: {} ===", hostfile_map_.size());
+    HLOG(kInfo, "=== Total hosts loaded: {} ===", hostfile_map_.size());
     if (hostfile_map_.empty()) {
-      HELOG(kFatal, "There were no hosts in the hostfile {}", hostfile_path);
+      HLOG(kFatal, "There were no hosts in the hostfile {}", hostfile_path);
     }
     return true;
 
   } catch (const std::exception &e) {
-    HELOG(kError, "Error loading hostfile {}: {}", hostfile_path, e.what());
+    HLOG(kError, "Error loading hostfile {}: {}", hostfile_path, e.what());
     return false;
   }
 }
@@ -593,11 +578,11 @@ const Host *IpcManager::GetHost(u64 node_id) const {
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) {
     // Log all available node IDs when lookup fails
-    HILOG(kError,
+    HLOG(kError,
           "GetHost: Looking for node_id {} but not found. Available nodes:",
           node_id);
     for (const auto &pair : hostfile_map_) {
-      HILOG(kError, "  Node ID: {} -> IP: {}", pair.first,
+      HLOG(kError, "  Node ID: {} -> IP: {}", pair.first,
             pair.second.ip_address);
     }
     return nullptr;
@@ -634,22 +619,22 @@ const std::vector<Host> &IpcManager::GetAllHosts() const {
 size_t IpcManager::GetNumHosts() const { return hostfile_map_.size(); }
 
 bool IpcManager::IdentifyThisHost() {
-  HILOG(kDebug, "Identifying current host");
+  HLOG(kDebug, "Identifying current host");
 
   // Load hostfile if not already loaded
   if (hostfile_map_.empty()) {
     if (!LoadHostfile()) {
-      HELOG(kError, "Error: Failed to load hostfile");
+      HLOG(kError, "Error: Failed to load hostfile");
       return false;
     }
   }
 
   if (hostfile_map_.empty()) {
-    HELOG(kError, "ERROR: No hosts available for identification");
+    HLOG(kError, "ERROR: No hosts available for identification");
     return false;
   }
 
-  HILOG(kDebug, "Attempting to identify host among {} candidates",
+  HLOG(kDebug, "Attempting to identify host among {} candidates",
         hostfile_map_.size());
 
   // Get port number for error reporting
@@ -663,46 +648,46 @@ bool IpcManager::IdentifyThisHost() {
   for (const auto &pair : hostfile_map_) {
     const Host &host = pair.second;
     attempted_hosts.push_back(host.ip_address);
-    HILOG(kDebug, "Trying to bind TCP server to: {}", host.ip_address);
+    HLOG(kDebug, "Trying to bind TCP server to: {}", host.ip_address);
 
     try {
       if (TryStartMainServer(host.ip_address)) {
-        HILOG(kInfo, "SUCCESS: Main server started on {} (node={})",
+        HLOG(kInfo, "SUCCESS: Main server started on {} (node={})",
               host.ip_address, host.node_id);
         this_host_ = host;
         return true;
       }
     } catch (const std::exception &e) {
-      HILOG(kDebug, "Failed to bind to {}: {}", host.ip_address, e.what());
+      HLOG(kDebug, "Failed to bind to {}: {}", host.ip_address, e.what());
     } catch (...) {
-      HILOG(kDebug, "Failed to bind to {}: Unknown error", host.ip_address);
+      HLOG(kDebug, "Failed to bind to {}: Unknown error", host.ip_address);
     }
   }
 
   // Build detailed error message with hosts and port
-  HELOG(kError, "ERROR: Could not start TCP server on any host from hostfile");
-  HELOG(kError, "Port attempted: {}", port);
-  HELOG(kError, "Hosts checked ({} total):", attempted_hosts.size());
+  HLOG(kError, "ERROR: Could not start TCP server on any host from hostfile");
+  HLOG(kError, "Port attempted: {}", port);
+  HLOG(kError, "Hosts checked ({} total):", attempted_hosts.size());
   for (const auto &host_ip : attempted_hosts) {
-    HELOG(kError, "  - {}", host_ip);
+    HLOG(kError, "  - {}", host_ip);
   }
-  HELOG(kError, "");
-  HELOG(
+  HLOG(kError, "");
+  HLOG(
       kError,
       "This usually means another process is already running on the same port");
-  HELOG(kError, "");
-  HELOG(kError, "To check which process is using port {}, run:", port);
-  HELOG(kError, "  Linux:   sudo lsof -i :{} -P -n", port);
-  HELOG(kError, "           sudo netstat -tulpn | grep :{}", port);
-  HELOG(kError, "  macOS:   sudo lsof -i :{} -P -n", port);
-  HELOG(kError, "           sudo lsof -nP -iTCP:{} | grep LISTEN", port);
-  HELOG(kError, "");
-  HELOG(kError, "To stop the Chimaera runtime, run:");
-  HELOG(kError, "  chimaera_stop_runtime");
-  HELOG(kError, "");
-  HELOG(kError, "Or kill the process directly:");
-  HELOG(kError, "  pkill -9 chimaera_start_runtime");
-  HELOG(kFatal, "  kill -9 <PID>");
+  HLOG(kError, "");
+  HLOG(kError, "To check which process is using port {}, run:", port);
+  HLOG(kError, "  Linux:   sudo lsof -i :{} -P -n", port);
+  HLOG(kError, "           sudo netstat -tulpn | grep :{}", port);
+  HLOG(kError, "  macOS:   sudo lsof -i :{} -P -n", port);
+  HLOG(kError, "           sudo lsof -nP -iTCP:{} | grep LISTEN", port);
+  HLOG(kError, "");
+  HLOG(kError, "To stop the Chimaera runtime, run:");
+  HLOG(kError, "  chimaera_stop_runtime");
+  HLOG(kError, "");
+  HLOG(kError, "Or kill the process directly:");
+  HLOG(kError, "  pkill -9 chimaera_start_runtime");
+  HLOG(kFatal, "  kill -9 <PID>");
   return false;
 }
 
@@ -771,28 +756,28 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     std::string protocol = "tcp";
     u32 port = config->GetPort();
 
-    HILOG(kDebug, "Attempting to start main server on {}:{}", hostname, port);
+    HLOG(kDebug, "Attempting to start main server on {}:{}", hostname, port);
 
     main_server_ = hshm::lbm::TransportFactory::GetServer(
         hostname, hshm::lbm::Transport::kZeroMq, protocol, port);
 
     if (!main_server_) {
-      HILOG(kDebug,
+      HLOG(kDebug,
             "Failed to create main server on {}:{} - server creation returned "
             "null",
             hostname, port);
       return false;
     }
 
-    HILOG(kDebug, "Main server successfully bound to {}:{}", hostname, port);
+    HLOG(kDebug, "Main server successfully bound to {}:{}", hostname, port);
     return true;
 
   } catch (const std::exception &e) {
-    HILOG(kDebug, "Failed to start main server on {}:{} - exception: {}",
+    HLOG(kDebug, "Failed to start main server on {}:{} - exception: {}",
           hostname, config->GetPort(), e.what());
     return false;
   } catch (...) {
-    HILOG(kDebug, "Failed to start main server on {}:{} - unknown exception",
+    HLOG(kDebug, "Failed to start main server on {}:{} - unknown exception",
           hostname, config->GetPort());
     return false;
   }
@@ -826,23 +811,10 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
   // Loop until allocation succeeds
   FullPtr<char> buffer = FullPtr<char>::GetNull();
   while (buffer.IsNull()) {
-    buffer = allocator->AllocateObjs<char>(HSHM_MCTX, size);
+    buffer = allocator->AllocateObjs<char>(size);
     if (buffer.IsNull()) {
       // Allocation failed - yield to allow other tasks to run
-      Worker *worker = CHI_CUR_WORKER;
-      if (worker) {
-        // We're in a task context - yield from the current task
-        FullPtr<Task> current_task = worker->GetCurrentTask();
-        if (!current_task.IsNull()) {
-          current_task->Yield();
-        } else {
-          // No current task - yield from thread model
-          HSHM_THREAD_MODEL->Yield();
-        }
-      } else {
-        // Not in worker context - yield from thread model
-        HSHM_THREAD_MODEL->Yield();
-      }
+      HSHM_THREAD_MODEL->Yield();
     }
   }
 
@@ -854,20 +826,88 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
     return;
   }
 
-  auto *chimaera_manager = CHI_CHIMAERA_MANAGER;
-  auto *mem_manager = HSHM_MEMORY_MANAGER;
+  // Try runtime data allocator first, then client data allocator
+  auto *rdata_alloc = CHI_IPC->GetRdataAlloc();
+  if (rdata_alloc && buffer_ptr.shm_.alloc_id_ == runtime_data_allocator_id_) {
+    rdata_alloc->Free(buffer_ptr);
+  } else {
+    auto *cdata_alloc = CHI_IPC->GetDataAlloc();
+    if (cdata_alloc) {
+      cdata_alloc->Free(buffer_ptr);
+    }
+  }
+}
 
-  auto *allocator =
-      mem_manager->GetAllocator<CHI_RDATA_ALLOC_T>(buffer_ptr.shm_.alloc_id_);
-  allocator->Free(HSHM_MCTX, buffer_ptr);
+hshm::lbm::Client* IpcManager::GetOrCreateClient(const std::string& addr,
+                                                  int port) {
+  // Create key for the pool map
+  std::string key = addr + ":" + std::to_string(port);
 
-  //   if (buffer_ptr.shm_.GetAllocatorId() == runtime_data_allocator_id_) {
-  //     // Runtime uses rdata segment
-  //     runtime_data_allocator_->Free(HSHM_MCTX, buffer_ptr);
-  //   } else {
-  //     // Client uses cdata segment
-  //     client_data_allocator_->Free(HSHM_MCTX, buffer_ptr);
-  //   }
+  // Lock the pool for thread-safe access
+  std::lock_guard<std::mutex> lock(client_pool_mutex_);
+
+  // Check if client already exists
+  auto it = client_pool_.find(key);
+  if (it != client_pool_.end()) {
+    HLOG(kDebug, "[ClientPool] Reusing existing connection to {}", key);
+    return it->second.get();
+  }
+
+  // Create new persistent client connection
+  HLOG(kInfo, "[ClientPool] Creating new persistent connection to {}", key);
+  auto client = hshm::lbm::TransportFactory::GetClient(
+      addr, hshm::lbm::Transport::kZeroMq, "tcp", port);
+
+  if (!client) {
+    HLOG(kError, "[ClientPool] Failed to create client for {}", key);
+    return nullptr;
+  }
+
+  // Store in pool and return raw pointer
+  hshm::lbm::Client* raw_ptr = client.get();
+  client_pool_[key] = std::move(client);
+
+  HLOG(kInfo, "[ClientPool] Connection established to {}", key);
+  return raw_ptr;
+}
+
+void IpcManager::ClearClientPool() {
+  std::lock_guard<std::mutex> lock(client_pool_mutex_);
+  HLOG(kInfo, "[ClientPool] Clearing {} persistent connections",
+        client_pool_.size());
+  client_pool_.clear();
+}
+
+void IpcManager::EnqueueNetTask(Future<Task> future, NetQueuePriority priority) {
+  if (net_queue_.IsNull()) {
+    HLOG(kError, "EnqueueNetTask: net_queue_ is null");
+    return;
+  }
+
+  // Get lane 0 (single lane) with the specified priority
+  u32 priority_idx = static_cast<u32>(priority);
+  auto& lane = net_queue_->GetLane(0, priority_idx);
+  lane.Push(future);
+
+  HLOG(kDebug, "EnqueueNetTask: Enqueued task to priority {} queue", priority_idx);
+}
+
+bool IpcManager::TryPopNetTask(NetQueuePriority priority, Future<Task>& future) {
+  if (net_queue_.IsNull()) {
+    return false;
+  }
+
+  // Get lane 0 (single lane) with the specified priority
+  u32 priority_idx = static_cast<u32>(priority);
+  auto& lane = net_queue_->GetLane(0, priority_idx);
+
+  if (lane.Pop(future)) {
+    // Fix the allocator pointer after popping
+    future.SetAllocator(main_allocator_);
+    return true;
+  }
+
+  return false;
 }
 
 } // namespace chi

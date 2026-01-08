@@ -1,11 +1,11 @@
 name: Publish Python Package
 
 on:
-  push:
-    branches:
-      - '**'  # Trigger on all branches (allows safe testing from feature branches)
-    tags:
-      - 'v*.*.*'  # Publish releases to PyPI on version tags
+  # push:
+    # branches:
+    #   - '**'  # Trigger on all branches (allows safe testing from feature branches)
+    # tags:
+    #   - 'v*.*.*'  # Publish releases to PyPI on version tags
   workflow_dispatch:  # Allow manual triggering
 
 permissions:

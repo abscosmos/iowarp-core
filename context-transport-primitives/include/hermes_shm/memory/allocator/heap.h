@@ -10,68 +10,128 @@
  * have access to the file, you may request a copy from help@hdfgroup.org.   *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-#ifndef HSHM_SHM_INCLUDE_HSHM_SHM_MEMORY_ALLOCATOR_HEAP_H_
-#define HSHM_SHM_INCLUDE_HSHM_SHM_MEMORY_ALLOCATOR_HEAP_H_
+#ifndef HSHM_MEMORY_ALLOCATOR_HEAP_H_
+#define HSHM_MEMORY_ALLOCATOR_HEAP_H_
 
-#include "allocator.h"
-#include "hermes_shm/thread/lock.h"
+#include "hermes_shm/constants/macros.h"
+#include "hermes_shm/types/atomic.h"
+#include "hermes_shm/util/errors.h"
 
 namespace hshm::ipc {
 
-template <bool ATOMIC>
-struct HeapAllocator {
-  hshm::size_t region_off_;
-  hipc::opt_atomic<hshm::size_t, ATOMIC> heap_off_;
-  hshm::size_t heap_size_;
+/**
+ * Heap helper class for simple bump-pointer allocation
+ *
+ * This is not an allocator itself, but a utility for implementing
+ * allocators that need monotonically increasing offset allocation.
+ *
+ * @tparam ATOMIC Whether the heap pointer should be atomic
+ */
+template<bool ATOMIC>
+class Heap {
+ private:
+  hipc::opt_atomic<size_t, ATOMIC> heap_;  /// Current heap offset
+  size_t max_offset_;                      /// Maximum heap offset (initial_offset + max_size)
 
-  /** Default constructor */
+ public:
+  /**
+   * Default constructor
+   */
   HSHM_CROSS_FUN
-  HeapAllocator() : region_off_(0), heap_off_(0), heap_size_(0) {}
+  Heap() : heap_(0), max_offset_(0) {}
 
-  /** Emplace constructor */
+  /**
+   * Constructor with initial offset and max offset
+   *
+   * @param initial_offset Initial heap offset
+   * @param max_offset Maximum offset the heap can reach (initial_offset + max_size)
+   */
   HSHM_CROSS_FUN
-  explicit HeapAllocator(size_t region_off, size_t heap_size)
-      : region_off_(region_off), heap_off_(0), heap_size_(heap_size) {}
+  Heap(size_t initial_offset, size_t max_offset)
+      : heap_(initial_offset), max_offset_(max_offset) {}
 
-  /** Explicit initialization */
+  /**
+   * Initialize the heap
+   *
+   * @param initial_offset Initial heap offset
+   * @param max_offset Maximum offset the heap can reach (initial_offset + max_size)
+   */
   HSHM_CROSS_FUN
-  void shm_init(size_t region_off, size_t heap_size) {
-    region_off_ = region_off;
-    heap_off_ = 0;
-    heap_size_ = heap_size;
+  void Init(size_t initial_offset, size_t max_offset) {
+    heap_.store(initial_offset);
+    max_offset_ = max_offset;
   }
 
-  /** Explicit initialization */
+  /**
+   * Allocate space from the heap
+   *
+   * @param size Number of bytes to allocate
+   * @return Offset of the allocated region, or 0 on failure (out of memory)
+   */
   HSHM_CROSS_FUN
-  void shm_init(const OffsetPointer &region_off, size_t heap_size) {
-    region_off_ = region_off.off_.load();
-    heap_off_ = 0;
-    heap_size_ = heap_size;
-  }
-
-  /** Allocate off heap */
-  HSHM_INLINE_CROSS_FUN OffsetPointer AllocateOffset(size_t size) {
-    // if (size % 64 != 0) {
-    //   size = (size + 63) & ~63;
-    // }
-    hshm::size_t off = heap_off_.fetch_add((hshm::size_t)size);
-    if (off + size > heap_size_) {
-      // HSHM_THROW_ERROR(OUT_OF_MEMORY, size, heap_size_);
-      return OffsetPointer::GetNull();
+  size_t Allocate(size_t size) {
+    // Check if heap may have enough space
+    if (heap_.load() + size > max_offset_) {
+      return 0;
     }
-    return OffsetPointer((size_t)(region_off_ + off));
+    
+    // Atomically fetch current offset and advance heap by size
+    size_t off = heap_.fetch_add(size);
+
+    // Calculate actual end offset after this allocation
+    size_t end_off = off + size;
+
+    // Check if allocation would exceed maximum offset
+    if (end_off > max_offset_) {
+      max_offset_ = end_off;
+      return 0;  // Return 0 to indicate failure (out of memory)
+    }
+
+    return off;
   }
 
-  /** Copy assignment operator */
+  /**
+   * Get the current heap offset
+   *
+   * @return Current offset at the top of the heap
+   */
   HSHM_CROSS_FUN
-  HeapAllocator &operator=(const HeapAllocator &other) {
-    region_off_ = other.region_off_;
-    heap_off_ = other.heap_off_.load();
-    heap_size_ = other.heap_size_;
-    return *this;
+  size_t GetOffset() const {
+    return heap_.load();
+  }
+
+  /**
+   * Get the maximum heap offset
+   *
+   * @return Maximum offset the heap can reach
+   */
+  HSHM_CROSS_FUN
+  size_t GetMaxOffset() const {
+    return max_offset_;
+  }
+
+  /**
+   * Get the maximum heap size (for backward compatibility)
+   *
+   * @return Maximum size the heap can grow to
+   */
+  HSHM_CROSS_FUN
+  size_t GetMaxSize() const {
+    return max_offset_;
+  }
+
+  /**
+   * Get the remaining space in the heap
+   *
+   * @return Number of bytes remaining
+   */
+  HSHM_CROSS_FUN
+  size_t GetRemainingSize() const {
+    size_t current = heap_.load();
+    return (current < max_offset_) ? (max_offset_ - current) : 0;
   }
 };
 
 }  // namespace hshm::ipc
 
-#endif  // HSHM_SHM_INCLUDE_HSHM_SHM_MEMORY_ALLOCATOR_HEAP_H_
+#endif  // HSHM_MEMORY_ALLOCATOR_HEAP_H_

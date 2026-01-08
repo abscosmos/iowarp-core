@@ -100,6 +100,12 @@ public:
   int ContextDestroy(const std::vector<std::string> &context_names);
 
 private:
+  /**
+   * Ensure the interface is initialized (lazy initialization)
+   * @return true if initialization succeeded, false otherwise
+   */
+  bool EnsureInitialized();
+
   bool is_initialized_;  /**< Flag indicating whether the interface is initialized */
 };
 

@@ -12,6 +12,7 @@
 #include "chimaera/pool_query.h"
 #include "chimaera/task.h"
 #include "chimaera/task_archives.h"
+#include "chimaera/local_task_archives.h"
 #include "chimaera/task_queue.h"
 #include "chimaera/types.h"
 
@@ -85,14 +86,18 @@ class Container {
 
   /**
    * Execute a method on a task - must be implemented by derived classes
+   *
+   * This method returns TaskResume to support C++20 coroutine-based execution.
+   * The returned TaskResume holds the coroutine handle that the worker uses
+   * to suspend and resume task execution.
    */
-  virtual void Run(u32 method, hipc::FullPtr<Task> task_ptr,
-                   RunContext& rctx) = 0;
+  virtual TaskResume Run(u32 method, hipc::FullPtr<Task> task_ptr,
+                         RunContext& rctx) = 0;
 
   /**
    * Delete/cleanup a task - must be implemented by derived classes
    */
-  virtual void Del(u32 method, hipc::FullPtr<Task> task_ptr) = 0;
+  virtual void DelTask(u32 method, hipc::FullPtr<Task> task_ptr) = 0;
 
   /**
    * Get remaining work count for this container - PURE VIRTUAL
@@ -121,58 +126,97 @@ class Container {
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization
    * @param method The method ID to serialize
    * @param archive SaveTaskArchive configured with srl_mode (true=In, false=Out)
-   * @param task_ptr Pointer to the task to serialize
+   * @param task_ptr Full pointer to the task to serialize
    */
   virtual void SaveTask(u32 method, SaveTaskArchive& archive,
                         hipc::FullPtr<Task> task_ptr) = 0;
 
   /**
-   * Deserialize task parameters from network transfer (unified method)
+   * Deserialize task parameters into an existing task from network transfer
    * Must be implemented by derived classes
    * Uses switch-case structure based on method ID to dispatch to appropriate deserialization
+   * Does not allocate - assumes task_ptr is already allocated
    * @param method The method ID to deserialize
    * @param archive LoadTaskArchive configured with srl_mode (true=In, false=Out)
-   * @param task_ptr Pointer to the task to deserialize into
+   * @param task_ptr Full pointer to the pre-allocated task to load into
    */
   virtual void LoadTask(u32 method, LoadTaskArchive& archive,
-                        hipc::FullPtr<Task>& task_ptr) = 0;
+                        hipc::FullPtr<Task> task_ptr) = 0;
+
+  /**
+   * Allocate and deserialize task parameters from network transfer
+   * Wrapper that calls NewTask followed by LoadTask
+   * @param method The method ID to deserialize
+   * @param archive LoadTaskArchive configured with srl_mode (true=In, false=Out)
+   * @return Full pointer to the newly allocated and deserialized task
+   */
+  virtual hipc::FullPtr<Task> AllocLoadTask(u32 method, LoadTaskArchive& archive) = 0;
+
+  /**
+   * Deserialize task input parameters into an existing task using LocalSerialize
+   * Must be implemented by derived classes
+   * Uses switch-case structure based on method ID to dispatch to appropriate deserialization
+   * Does not allocate - assumes task_ptr is already allocated
+   * @param method The method ID to deserialize
+   * @param archive LocalLoadTaskArchive for deserializing inputs
+   * @param task_ptr Full pointer to the pre-allocated task to load into
+   */
+  virtual void LocalLoadTask(u32 method, LocalLoadTaskArchive& archive,
+                             hipc::FullPtr<Task> task_ptr) = 0;
+
+  /**
+   * Allocate and deserialize task input parameters using LocalSerialize
+   * Wrapper that calls NewTask followed by LocalLoadTask
+   * @param method The method ID to deserialize
+   * @param archive LocalLoadTaskArchive for deserializing inputs
+   * @return Full pointer to the newly allocated and loaded task
+   */
+  virtual hipc::FullPtr<Task> LocalAllocLoadTask(u32 method, LocalLoadTaskArchive& archive) = 0;
+
+  /**
+   * Serialize task output parameters using LocalSerialize (for local transfers)
+   * Must be implemented by derived classes
+   * Uses switch-case structure based on method ID to dispatch to appropriate serialization
+   * @param method The method ID to serialize
+   * @param archive LocalSaveTaskArchive for serializing outputs
+   * @param task_ptr Full pointer to the task to save outputs from
+   */
+  virtual void LocalSaveTask(u32 method, LocalSaveTaskArchive& archive,
+                              hipc::FullPtr<Task> task_ptr) = 0;
 
   /**
    * Create a new copy of a task (deep copy for distributed execution) - must be
    * implemented by derived classes Uses switch-case structure based on method
    * ID to dispatch to appropriate task type copying
+   * @param method The method ID for the task type
+   * @param orig_task_ptr Full pointer to the original task
+   * @param deep Whether to perform a deep copy
+   * @return Full pointer to the newly created copy
    */
-  HSHM_DLL virtual void NewCopy(u32 method,
-                               const hipc::FullPtr<Task> &orig_task,
-                               hipc::FullPtr<Task> &dup_task, bool deep) = 0;
+  HSHM_DLL virtual hipc::FullPtr<Task> NewCopyTask(u32 method,
+                                                    hipc::FullPtr<Task> orig_task_ptr,
+                                                    bool deep) = 0;
+
+  /**
+   * Create a new task of the specified method type
+   * Must be implemented by derived classes
+   * Uses switch-case structure based on method ID to dispatch to appropriate task type allocation
+   * @param method The method ID for the task type to create
+   * @return Full pointer to the newly allocated task (cast to base Task type)
+   */
+  HSHM_DLL virtual hipc::FullPtr<Task> NewTask(u32 method) = 0;
 
   /**
    * Aggregate a replica task into the origin task - must be implemented by derived classes
    * Uses switch-case structure based on method ID to dispatch to appropriate task type aggregation
    * This is used for merging replica results back into the origin task after distributed execution
    * @param method The method ID for the task type
-   * @param origin_task Pointer to the origin task to aggregate into
-   * @param replica_task Pointer to the replica task to aggregate from
+   * @param origin_task_ptr Full pointer to the origin task to aggregate into
+   * @param replica_task_ptr Full pointer to the replica task to aggregate from
    */
   HSHM_DLL virtual void Aggregate(u32 method,
-                                 hipc::FullPtr<Task> origin_task,
-                                 hipc::FullPtr<Task> replica_task) = 0;
-
- protected:
-  /**
-   * Get the allocator for this container
-   */
-  hipc::CtxAllocator<CHI_MAIN_ALLOC_T> GetAllocator() const {
-    return HSHM_MEMORY_MANAGER->GetDefaultAllocator<CHI_MAIN_ALLOC_T>();
-  }
-
-  /**
-   * Check if the container's pool ID is null/invalid
-   * @return true if pool_id_ is null, false otherwise
-   */
-  bool IsNull() const {
-    return pool_id_.IsNull();
-  }
+                                   hipc::FullPtr<Task> origin_task_ptr,
+                                   hipc::FullPtr<Task> replica_task_ptr) = 0; 
 };
 
 /**

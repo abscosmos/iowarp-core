@@ -37,42 +37,59 @@ namespace hshm::ipc {
 
 class PosixMmap : public MemoryBackend {
  public:
-  CLS_CONST MemoryBackendType EnumType = MemoryBackendType::kPosixMmap;
-
- private:
-  size_t total_size_;
-
- public:
   /** Constructor */
   HSHM_CROSS_FUN
   PosixMmap() = default;
 
   /** Destructor */
-  ~PosixMmap() {
-    if (IsOwned()) {
-      _Destroy();
-    } else {
-      _Detach();
-    }
-  }
+  ~PosixMmap() = default;
 
   /** Initialize backend */
-  bool shm_init(const MemoryBackendId &backend_id, size_t size) {
-    SetInitialized();
-    Own();
-    total_size_ = sizeof(MemoryBackendHeader) + size;
-    char *ptr = _Map(total_size_);
-    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
-    header_->type_ = MemoryBackendType::kPosixMmap;
-    header_->id_ = backend_id;
-    header_->data_size_ = size;
-    data_size_ = size;
-    data_ = reinterpret_cast<char *>(header_ + 1);
+  bool shm_init(const MemoryBackendId &backend_id, size_t backend_size) {
+    // Enforce minimum backend size of 1MB
+    constexpr size_t kMinBackendSize = 1024 * 1024;  // 1MB
+    if (backend_size < kMinBackendSize) {
+      backend_size = kMinBackendSize;
+    }
+
+    // Total layout: [backend header] [private header] [shared header] [data]
+
+    // Map memory
+    char *ptr = _Map(backend_size);
+    if (!ptr) {
+      return false;
+    }
+
+    region_ = ptr;
+    char *priv_header_ptr = ptr + kBackendHeaderSize;
+    char *shared_header_ptr = priv_header_ptr + kBackendHeaderSize;
+
+    // Initialize header at shared header location
+    header_ = reinterpret_cast<MemoryBackendHeader *>(shared_header_ptr +
+                                                      kBackendHeaderSize);
+
+    id_ = backend_id;
+    backend_size_ = backend_size;
+    data_capacity_ = backend_size - 3 * kBackendHeaderSize;
+    data_id_ = -1;
+    priv_header_off_ = static_cast<size_t>(priv_header_ptr - ptr);
+    flags_.Clear();
+
+    // data_ starts after shared header
+    data_ = shared_header_ptr + kBackendHeaderSize;
+
+    // Copy all header fields to shared header
+    new (header_) MemoryBackendHeader();
+    (*header_) = (const MemoryBackendHeader&)*this;
+
+    // Mark this process as the owner of the backend
+    SetOwner();
+
     return true;
   }
 
   /** Deserialize the backend */
-  bool shm_deserialize(const hshm::chararr &url) {
+  bool shm_attach(const std::string &url) {
     (void)url;
     HSHM_THROW_ERROR(SHMEM_NOT_SUPPORTED);
     return false;
@@ -98,20 +115,15 @@ class PosixMmap : public MemoryBackend {
 
   /** Unmap shared memory */
   void _Detach() {
-    if (!IsInitialized()) {
-      return;
+    if (region_) {
+      SystemInfo::UnmapMemory(region_, backend_size_);
+      region_ = nullptr;
     }
-    SystemInfo::UnmapMemory(reinterpret_cast<void *>(header_), total_size_);
-    UnsetInitialized();
   }
 
   /** Destroy shared memory */
   void _Destroy() {
-    if (!IsInitialized()) {
-      return;
-    }
     _Detach();
-    UnsetInitialized();
   }
 };
 

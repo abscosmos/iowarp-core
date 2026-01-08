@@ -6,36 +6,14 @@
     "dependencies": [
         "catch2",
         "cereal",
-        "boost-context",
-        "boost-coroutine",
-        "boost-fiber",
-        "boost-filesystem",	
-        "boost-headers",
-        "boost-math",	
-        "boost-regex",
-        "boost-serialization",	
-        "boost-system",
         "pkgconf",
-        "yaml-cpp"	
+        "yaml-cpp"
     ],
     "features": {
         "cereal": {
             "description": "Build with cereal support.",
             "dependencies": [
                 "cereal"
-            ]
-        },
-        "boost": {
-            "description": "Build with Boost support.",
-            "dependencies": [
-                "boost-context",
-                "boost-fiber",
-                "boost-coroutine",
-                "boost-regex",
-                "boost-system",
-                "boost-filesystem",
-                "boost-serialization",
-                "boost-math"
             ]
         }
     }

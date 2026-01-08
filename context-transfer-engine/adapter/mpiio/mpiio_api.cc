@@ -42,26 +42,26 @@ extern "C" {
  * MPI
  */
 int WRP_CTE_DECL(MPI_Init)(int *argc, char ***argv) {
-  HILOG(kDebug, "MPI Init intercepted.");
+  HLOG(kDebug, "MPI Init intercepted.");
   wrp_cte::core::WRP_CTE_CLIENT_INIT();
   auto real_api = WRP_CTE_MPIIO_API;
   return real_api->MPI_Init(argc, argv);
 }
 
 int WRP_CTE_DECL(MPI_Finalize)(void) {
-  HILOG(kDebug, "MPI Finalize intercepted.");
+  HLOG(kDebug, "MPI Finalize intercepted.");
   auto real_api = WRP_CTE_MPIIO_API;
   return real_api->MPI_Finalize();
 }
 
 int WRP_CTE_DECL(MPI_Wait)(MPI_Request *req, MPI_Status *status) {
-  HILOG(kDebug, "In MPI_Wait.");
+  HLOG(kDebug, "In MPI_Wait.");
   auto fs_api = WRP_CTE_MPIIO_FS;
   return fs_api->Wait(req, status);
 }
 
 int WRP_CTE_DECL(MPI_Waitall)(int count, MPI_Request *req, MPI_Status *status) {
-  HILOG(kDebug, "In MPI_Waitall.");
+  HLOG(kDebug, "In MPI_Waitall.");
   auto fs_api = WRP_CTE_MPIIO_FS;
   return fs_api->WaitAll(count, req, status);
 }
@@ -75,7 +75,7 @@ int WRP_CTE_DECL(MPI_File_open)(MPI_Comm comm, const char *filename, int amode,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsPathTracked(filename)) {
-    HILOG(kDebug, "Intercept MPI_File_open ({}) for filename: {} and mode {}",
+    HLOG(kDebug, "Intercept MPI_File_open ({}) for filename: {} and mode {}",
           (void *)MPI_File_open, filename, amode);
     AdapterStat stat;
     stat.comm_ = comm;
@@ -86,7 +86,7 @@ int WRP_CTE_DECL(MPI_File_open)(MPI_Comm comm, const char *filename, int amode,
     return f.mpi_status_;
   }
 #endif
-  HILOG(kDebug, "NOT intercept MPI_File_open ({}) for filename: {} and mode {}",
+  HLOG(kDebug, "NOT intercept MPI_File_open ({}) for filename: {} and mode {}",
         (void *)MPI_File_open, filename, amode);
   return real_api->MPI_File_open(comm, filename, amode, info, fh);
 }
@@ -97,7 +97,7 @@ int WRP_CTE_DECL(MPI_File_close)(MPI_File *fh) {
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(fh)) {
-    HILOG(kDebug, "Intercept MPI_File_close");
+    HLOG(kDebug, "Intercept MPI_File_close");
     File f;
     f.hermes_mpi_fh_ = *fh;
     return fs_api->Close(f, stat_exists);
@@ -112,7 +112,7 @@ int WRP_CTE_DECL(MPI_File_seek)(MPI_File fh, MPI_Offset offset, int whence) {
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_seek");
+    HLOG(kDebug, "Intercept MPI_File_seek");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->Seek(f, stat_exists, offset, whence);
@@ -128,7 +128,7 @@ int WRP_CTE_DECL(MPI_File_seek_shared)(MPI_File fh, MPI_Offset offset,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_seek_shared offset: {} whence: {}",
+    HLOG(kDebug, "Intercept MPI_File_seek_shared offset: {} whence: {}",
           offset, whence);
     File f;
     f.hermes_mpi_fh_ = fh;
@@ -144,7 +144,7 @@ int WRP_CTE_DECL(MPI_File_get_position)(MPI_File fh, MPI_Offset *offset) {
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_get_position");
+    HLOG(kDebug, "Intercept MPI_File_get_position");
     File f;
     f.hermes_mpi_fh_ = fh;
     (*offset) = static_cast<MPI_Offset>(fs_api->Tell(f, stat_exists));
@@ -161,7 +161,7 @@ int WRP_CTE_DECL(MPI_File_read_all)(MPI_File fh, void *buf, int count,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_read_all");
+    HLOG(kDebug, "Intercept MPI_File_read_all");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->ReadAll(f, stat_exists, buf, count, datatype, status);
@@ -178,7 +178,7 @@ int WRP_CTE_DECL(MPI_File_read_at_all)(MPI_File fh, MPI_Offset offset,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_read_at_all");
+    HLOG(kDebug, "Intercept MPI_File_read_at_all");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->ReadAll(f, stat_exists, buf, offset, count, datatype,
@@ -196,7 +196,7 @@ int WRP_CTE_DECL(MPI_File_read_at)(MPI_File fh, MPI_Offset offset, void *buf,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_read_at");
+    HLOG(kDebug, "Intercept MPI_File_read_at");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->Read(f, stat_exists, buf, offset, count, datatype, status);
@@ -211,7 +211,7 @@ int WRP_CTE_DECL(MPI_File_read)(MPI_File fh, void *buf, int count,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_read");
+    HLOG(kDebug, "Intercept MPI_File_read");
     File f;
     f.hermes_mpi_fh_ = fh;
     int ret = fs_api->Read(f, stat_exists, buf, count, datatype, status);
@@ -229,7 +229,7 @@ int WRP_CTE_DECL(MPI_File_read_ordered)(MPI_File fh, void *buf, int count,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_read_ordered");
+    HLOG(kDebug, "Intercept MPI_File_read_ordered");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->ReadOrdered(f, stat_exists, buf, count, datatype, status);
@@ -245,7 +245,7 @@ int WRP_CTE_DECL(MPI_File_read_shared)(MPI_File fh, void *buf, int count,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_read_shared");
+    HLOG(kDebug, "Intercept MPI_File_read_shared");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->Read(f, stat_exists, buf, count, datatype, status);
@@ -261,7 +261,7 @@ int WRP_CTE_DECL(MPI_File_write_all)(MPI_File fh, const void *buf, int count,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_write_all");
+    HLOG(kDebug, "Intercept MPI_File_write_all");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->WriteAll(f, stat_exists, buf, count, datatype, status);
@@ -278,7 +278,7 @@ int WRP_CTE_DECL(MPI_File_write_at_all)(MPI_File fh, MPI_Offset offset,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_write_at_all");
+    HLOG(kDebug, "Intercept MPI_File_write_at_all");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->WriteAll(f, stat_exists, buf, offset, count, datatype,
@@ -296,7 +296,7 @@ int WRP_CTE_DECL(MPI_File_write_at)(MPI_File fh, MPI_Offset offset,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_write_at");
+    HLOG(kDebug, "Intercept MPI_File_write_at");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->Write(f, stat_exists, buf, offset, count, datatype, status);
@@ -311,7 +311,7 @@ int WRP_CTE_DECL(MPI_File_write)(MPI_File fh, const void *buf, int count,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_write");
+    HLOG(kDebug, "Intercept MPI_File_write");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->Write(f, stat_exists, buf, count, datatype, status);
@@ -327,7 +327,7 @@ int WRP_CTE_DECL(MPI_File_write_ordered)(MPI_File fh, const void *buf,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_write_ordered");
+    HLOG(kDebug, "Intercept MPI_File_write_ordered");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->WriteOrdered(f, stat_exists, buf, count, datatype, status);
@@ -344,7 +344,7 @@ int WRP_CTE_DECL(MPI_File_write_shared)(MPI_File fh, const void *buf, int count,
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
     // NOTE(llogan): originally WriteOrdered
-    HILOG(kDebug, "Intercept MPI_File_write_shared");
+    HLOG(kDebug, "Intercept MPI_File_write_shared");
     File f;
     f.hermes_mpi_fh_ = fh;
     return fs_api->WriteOrdered(f, stat_exists, buf, count, datatype, status);
@@ -364,7 +364,7 @@ int WRP_CTE_DECL(MPI_File_iread_at)(MPI_File fh, MPI_Offset offset, void *buf,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_iread_at");
+    HLOG(kDebug, "Intercept MPI_File_iread_at");
     File f;
     f.hermes_mpi_fh_ = fh;
     fs_api->ARead(f, stat_exists, buf, offset, count, datatype, request);
@@ -380,7 +380,7 @@ int WRP_CTE_DECL(MPI_File_iread)(MPI_File fh, void *buf, int count,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_iread");
+    HLOG(kDebug, "Intercept MPI_File_iread");
     File f;
     f.hermes_mpi_fh_ = fh;
     fs_api->ARead(f, stat_exists, buf, count, datatype, request);
@@ -396,7 +396,7 @@ int WRP_CTE_DECL(MPI_File_iread_shared)(MPI_File fh, void *buf, int count,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_iread_shared");
+    HLOG(kDebug, "Intercept MPI_File_iread_shared");
     File f;
     f.hermes_mpi_fh_ = fh;
     fs_api->ARead(f, stat_exists, buf, count, datatype, request);
@@ -414,7 +414,7 @@ int WRP_CTE_DECL(MPI_File_iwrite_at)(MPI_File fh, MPI_Offset offset,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_iwrite_at");
+    HLOG(kDebug, "Intercept MPI_File_iwrite_at");
     File f;
     f.hermes_mpi_fh_ = fh;
     fs_api->AWrite(f, stat_exists, buf, offset, count, datatype, request);
@@ -432,7 +432,7 @@ int WRP_CTE_DECL(MPI_File_iwrite)(MPI_File fh, const void *buf, int count,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_iwrite");
+    HLOG(kDebug, "Intercept MPI_File_iwrite");
     File f;
     f.hermes_mpi_fh_ = fh;
     fs_api->AWrite(f, stat_exists, buf, count, datatype, request);
@@ -449,7 +449,7 @@ int WRP_CTE_DECL(MPI_File_iwrite_shared)(MPI_File fh, const void *buf,
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_iwrite_shared");
+    HLOG(kDebug, "Intercept MPI_File_iwrite_shared");
     File f;
     f.hermes_mpi_fh_ = fh;
     fs_api->AWriteOrdered(f, stat_exists, buf, count, datatype, request);
@@ -468,7 +468,7 @@ int WRP_CTE_DECL(MPI_File_sync)(MPI_File fh) {
   auto fs_api = WRP_CTE_MPIIO_FS;
 #ifndef WRP_CTE_DISABLE_MPIIO
   if (fs_api->IsMpiFpTracked(&fh)) {
-    HILOG(kDebug, "Intercept MPI_File_sync");
+    HLOG(kDebug, "Intercept MPI_File_sync");
     File f;
     f.hermes_mpi_fh_ = fh;
     fs_api->Sync(f, stat_exists);

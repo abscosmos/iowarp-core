@@ -190,7 +190,7 @@ private:
     // Allocate shared memory buffer for async operations
     auto shm_buffer = CHI_IPC->AllocateBuffer(io_size_);
     std::memcpy(shm_buffer.ptr_, data.data(), io_size_);
-    hipc::Pointer shm_ptr = shm_buffer.shm_;
+    hipc::ShmPtr<> shm_ptr = shm_buffer.shm_.template Cast<void>();
 
     auto start_time = high_resolution_clock::now();
 
@@ -200,7 +200,7 @@ private:
       }
 
       int batch_size = std::min(depth_, io_count_ - i);
-      std::vector<hipc::FullPtr<wrp_cte::core::PutBlobTask>> tasks;
+      std::vector<chi::Future<wrp_cte::core::PutBlobTask>> tasks;
       tasks.reserve(batch_size);
 
       // Generate async Put operations
@@ -216,8 +216,7 @@ private:
 
       // Wait for all async operations to complete
       for (auto &task : tasks) {
-        task->Wait();
-        CHI_IPC->DelTask(task);
+        task.Wait();
       }
     }
 
@@ -329,7 +328,7 @@ private:
     // Allocate shared memory buffer for async Put
     auto shm_buffer = CHI_IPC->AllocateBuffer(io_size_);
     std::memcpy(shm_buffer.ptr_, put_data.data(), io_size_);
-    hipc::Pointer shm_ptr = shm_buffer.shm_;
+    hipc::ShmPtr<> shm_ptr = shm_buffer.shm_.template Cast<void>();
 
     auto start_time = high_resolution_clock::now();
 
@@ -339,7 +338,7 @@ private:
       }
 
       int batch_size = std::min(depth_, io_count_ - i);
-      std::vector<hipc::FullPtr<wrp_cte::core::PutBlobTask>> put_tasks;
+      std::vector<chi::Future<wrp_cte::core::PutBlobTask>> put_tasks;
       put_tasks.reserve(batch_size);
 
       // Generate async Put operations
@@ -355,8 +354,7 @@ private:
 
       // Wait for Put operations
       for (auto &task : put_tasks) {
-        task->Wait();
-        CHI_IPC->DelTask(task);
+        task.Wait();
       }
 
       // Perform Get operations synchronously

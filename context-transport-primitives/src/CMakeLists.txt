@@ -7,14 +7,21 @@ set(HSHM_LIBS "")
 
 # BUILD HSHM FOR HOST ONLY
 set(SRC_FILES
+    system_info.cc
+    # memory_manager.cc  # NOTE: Deleted during hard refactoring
+)
 
-    # system_info.cc   # NOTE(llogan): Commented out because ROCm is annoying and buggy
-    memory_manager.cc)
+# Create library with system_info.cc
 add_library(hermes_shm_host ${SRC_FILES})
 target_link_libraries(hermes_shm_host PUBLIC
     ${REAL_TIME_FLAGS}
     configure
     thread_all
+)
+target_include_directories(hermes_shm_host PUBLIC
+    $<BUILD_INTERFACE:${HSHM_ROOT}/include>
+    $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+    $<INSTALL_INTERFACE:include>
 )
 hshm_target_compile_definitions(hermes_shm_host)
 list(APPEND HSHM_LIBS hermes_shm_host)
@@ -38,7 +45,7 @@ list(APPEND HSHM_LIBS cxx)
 if(HSHM_ENABLE_CUDA)
     add_cuda_library(hermes_shm_cuda SHARED TRUE ${SRC_FILES})
     target_link_libraries(hermes_shm_cuda PUBLIC host_deps)
-    target_compile_definitions(hermes_shm_cuda PUBLIC HSHM_ENABLE_CUDA)
+    target_compile_definitions(hermes_shm_cuda PUBLIC HSHM_ENABLE_CUDA=1)
     hshm_target_compile_definitions(hermes_shm_cuda)
     list(APPEND HSHM_LIBS hermes_shm_cuda)
     add_library(cudacxx INTERFACE)
@@ -48,7 +55,9 @@ if(HSHM_ENABLE_CUDA)
         $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
         $<INSTALL_INTERFACE:include>
     )
+    target_compile_definitions(cudacxx INTERFACE HSHM_ENABLE_CUDA=1 HSHM_ENABLE_ROCM=0)
     hshm_target_compile_definitions(cudacxx)
+    add_library(hshm::cuda_cxx ALIAS cudacxx)
     list(APPEND HSHM_LIBS cudacxx)
 endif()
 
@@ -56,7 +65,7 @@ endif()
 if(HSHM_ENABLE_ROCM)
     add_rocm_gpu_library(hermes_shm_rocm_gpu STATIC TRUE ${SRC_FILES})
     target_link_libraries(hermes_shm_rocm_gpu PUBLIC host_deps)
-    target_compile_definitions(hermes_shm_rocm_gpu PUBLIC HSHM_ENABLE_ROCM)
+    target_compile_definitions(hermes_shm_rocm_gpu PUBLIC HSHM_ENABLE_ROCM=1)
     hshm_target_compile_definitions(hermes_shm_rocm_gpu)
     list(APPEND HSHM_LIBS hermes_shm_rocm_gpu)
     add_library(rocmcxx_gpu INTERFACE)
@@ -66,11 +75,14 @@ if(HSHM_ENABLE_ROCM)
         $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
         $<INSTALL_INTERFACE:include>
     )
+    target_compile_definitions(rocmcxx_gpu INTERFACE HSHM_ENABLE_ROCM=1 HSHM_ENABLE_CUDA=0)
     hshm_target_compile_definitions(rocmcxx_gpu)
+    add_library(hshm::rocm_cxx ALIAS rocmcxx_gpu)
     list(APPEND HSHM_LIBS rocmcxx_gpu)
 
     add_rocm_host_library(hermes_shm_rocm_host TRUE ${SRC_FILES})
     target_link_libraries(hermes_shm_rocm_host PUBLIC host_deps)
+    target_compile_definitions(hermes_shm_rocm_host PUBLIC HSHM_ENABLE_ROCM=1)
     hshm_target_compile_definitions(hermes_shm_rocm_host)
     list(APPEND HSHM_LIBS hermes_shm_rocm_host)
     add_library(rocmcxx_host INTERFACE)
@@ -80,6 +92,7 @@ if(HSHM_ENABLE_ROCM)
         $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
         $<INSTALL_INTERFACE:include>
     )
+    target_compile_definitions(rocmcxx_host INTERFACE HSHM_ENABLE_ROCM=1 HSHM_ENABLE_CUDA=0)
     hshm_target_compile_definitions(rocmcxx_host)
     list(APPEND HSHM_LIBS rocmcxx_host)
 endif()

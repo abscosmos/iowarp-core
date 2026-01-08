@@ -1,30 +1,33 @@
 /**
  * wrp_cae_ingest - Ingest OMNI file for CAE processing
  *
- * This utility reads an OMNI YAML file and calls ParseOmni to schedule assimilation tasks.
- * Usage: wrp_cae_ingest <omni_file_path>
+ * This utility reads an OMNI YAML file and calls ParseOmni to schedule
+ * assimilation tasks. Usage: wrp_cae_ingest <omni_file_path>
  */
+
+#include <hermes_shm/util/config_parse.h>
+#include <wrp_cae/core/constants.h>
+#include <wrp_cae/core/core_client.h>
+#include <wrp_cae/core/factory/assimilation_ctx.h>
+#include <yaml-cpp/yaml.h>
 
 #include <iostream>
 #include <string>
 #include <vector>
-#include <wrp_cae/core/core_client.h>
-#include <wrp_cae/core/constants.h>
-#include <wrp_cae/core/factory/assimilation_ctx.h>
-#include <yaml-cpp/yaml.h>
-#include <hermes_shm/util/config_parse.h>
 
 /**
  * Load OMNI configuration file and produce vector of AssimilationCtx
  */
-std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(const std::string& omni_path) {
+std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(
+    const std::string& omni_path) {
   std::cout << "Loading OMNI file: " << omni_path << std::endl;
 
   YAML::Node config;
   try {
     config = YAML::LoadFile(omni_path);
   } catch (const YAML::Exception& e) {
-    throw std::runtime_error("Failed to load OMNI file: " + std::string(e.what()));
+    throw std::runtime_error("Failed to load OMNI file: " +
+                             std::string(e.what()));
   }
 
   // Check for required 'transfers' key
@@ -46,22 +49,28 @@ std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(const std::string& omni_pat
 
     // Validate required fields
     if (!transfer["src"]) {
-      throw std::runtime_error("Transfer " + std::to_string(i + 1) + " missing required 'src' field");
+      throw std::runtime_error("Transfer " + std::to_string(i + 1) +
+                               " missing required 'src' field");
     }
     if (!transfer["dst"]) {
-      throw std::runtime_error("Transfer " + std::to_string(i + 1) + " missing required 'dst' field");
+      throw std::runtime_error("Transfer " + std::to_string(i + 1) +
+                               " missing required 'dst' field");
     }
     if (!transfer["format"]) {
-      throw std::runtime_error("Transfer " + std::to_string(i + 1) + " missing required 'format' field");
+      throw std::runtime_error("Transfer " + std::to_string(i + 1) +
+                               " missing required 'format' field");
     }
 
     wrp_cae::core::AssimilationCtx ctx;
     ctx.src = transfer["src"].as<std::string>();
     ctx.dst = transfer["dst"].as<std::string>();
     ctx.format = transfer["format"].as<std::string>();
-    ctx.depends_on = transfer["depends_on"] ? transfer["depends_on"].as<std::string>() : "";
-    ctx.range_off = transfer["range_off"] ? transfer["range_off"].as<size_t>() : 0;
-    ctx.range_size = transfer["range_size"] ? transfer["range_size"].as<size_t>() : 0;
+    ctx.depends_on =
+        transfer["depends_on"] ? transfer["depends_on"].as<std::string>() : "";
+    ctx.range_off =
+        transfer["range_off"] ? transfer["range_off"].as<size_t>() : 0;
+    ctx.range_size =
+        transfer["range_size"] ? transfer["range_size"].as<size_t>() : 0;
 
     // Parse tokens and expand environment variables
     if (transfer["src_token"]) {
@@ -100,7 +109,8 @@ std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(const std::string& omni_pat
 
     contexts.push_back(ctx);
 
-    std::cout << "  Loaded transfer " << (i + 1) << "/" << transfers.size() << ":" << std::endl;
+    std::cout << "  Loaded transfer " << (i + 1) << "/" << transfers.size()
+              << ":" << std::endl;
     std::cout << "    src: " << ctx.src << std::endl;
     std::cout << "    dst: " << ctx.dst << std::endl;
     std::cout << "    format: " << ctx.format << std::endl;
@@ -128,13 +138,15 @@ std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(const std::string& omni_pat
     }
   }
 
-  std::cout << "Successfully loaded " << contexts.size() << " transfer(s) from OMNI file" << std::endl;
+  std::cout << "Successfully loaded " << contexts.size()
+            << " transfer(s) from OMNI file" << std::endl;
   return contexts;
 }
 
 void PrintUsage(const char* program_name) {
   std::cerr << "Usage: " << program_name << " <omni_file_path>" << std::endl;
-  std::cerr << "  omni_file_path - Path to the OMNI YAML file to ingest" << std::endl;
+  std::cerr << "  omni_file_path - Path to the OMNI YAML file to ingest"
+            << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -155,12 +167,15 @@ int main(int argc, char* argv[]) {
     // Verify Chimaera IPC is available
     auto* ipc_manager = CHI_IPC;
     if (!ipc_manager) {
-      std::cerr << "Error: Chimaera IPC not initialized. Is the runtime running?" << std::endl;
+      std::cerr
+          << "Error: Chimaera IPC not initialized. Is the runtime running?"
+          << std::endl;
       return 1;
     }
 
     // Load OMNI file and parse transfers
-    std::vector<wrp_cae::core::AssimilationCtx> contexts = LoadOmni(omni_file_path);
+    std::vector<wrp_cae::core::AssimilationCtx> contexts =
+        LoadOmni(omni_file_path);
 
     // Connect to CAE core container using the standard pool ID
     wrp_cae::core::Client client(wrp_cae::core::kCaePoolId);
@@ -169,15 +184,14 @@ int main(int argc, char* argv[]) {
     std::cout.flush();
 
     // Call ParseOmni with vector of contexts
-    chi::u32 num_tasks_scheduled = 0;
-    std::cout << "  Invoking client.ParseOmni()..." << std::endl;
-    std::cout.flush();
-    chi::u32 result = client.ParseOmni(HSHM_MCTX, contexts, num_tasks_scheduled);
-    std::cout << "  ParseOmni returned with result: " << result << std::endl;
-    std::cout.flush();
+    auto parse_task = client.AsyncParseOmni(contexts);
+    parse_task.Wait();
+    chi::u32 result = parse_task->GetReturnCode();
+    chi::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
 
     if (result != 0) {
-      std::cerr << "Error: ParseOmni failed with result code " << result << std::endl;
+      std::cerr << "Error: ParseOmni failed with result code " << result
+                << std::endl;
       return 1;
     }
 

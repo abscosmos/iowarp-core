@@ -27,7 +27,7 @@ struct CreateParams {
   CreateParams() = default;
 
   // Constructor with allocator
-  explicit CreateParams(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc) {
+  explicit CreateParams(AllocT* alloc) {
     (void)alloc;  // Simple mod doesn't need allocator-based initialization
   }
 
@@ -60,11 +60,11 @@ struct FlushTask : public chi::Task {
   OUT chi::u64 total_work_done_;  ///< Total amount of work completed
 
   /** SHM default constructor */
-  explicit FlushTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
+  explicit FlushTask(AllocT* alloc)
       : chi::Task(alloc), total_work_done_(0) {}
 
   /** Emplace constructor */
-  explicit FlushTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
+  explicit FlushTask(AllocT* alloc,
                      const chi::TaskId &task_node, const chi::PoolId &pool_id,
                      const chi::PoolQuery &pool_query)
       : chi::Task(alloc, task_node, pool_id, pool_query, 10),
@@ -83,6 +83,7 @@ struct FlushTask : public chi::Task {
    */
   template <typename Archive>
   void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
     // No parameters to serialize for flush
     (void)ar;
   }
@@ -93,7 +94,26 @@ struct FlushTask : public chi::Task {
    */
   template <typename Archive>
   void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
     ar(total_work_done_);
+  }
+
+  /**
+   * Copy from another FlushTask
+   */
+  void Copy(const hipc::FullPtr<FlushTask> &other) {
+    // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
+    total_work_done_ = other->total_work_done_;
+  }
+
+  /**
+   * Aggregate replica results into this task
+   * @param other Pointer to the replica task to aggregate from
+   */
+  void Aggregate(const hipc::FullPtr<FlushTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
   }
 };
 

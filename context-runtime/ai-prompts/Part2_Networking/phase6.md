@@ -87,7 +87,7 @@ Same structure as SaveTaskArchive and mostly same class variables. cereal::Binar
 ar(x, y, z) should just be the reverse from ClientSaveInArchive. 
 
 ### SerializeIn srl_mode
-ar.bulk() should call CHI_IPC->AllocateBuffer() to create new space. ar.bulk() should take as input a hipc::Pointer from the task. We then update the pointer.
+ar.bulk() should call CHI_IPC->AllocateBuffer() to create new space. ar.bulk() should take as input a hipc::ShmPtr<> from the task. We then update the pointer.
 
 ### SerializeOut srl_mode
 ar.bulk should do nothing, since the task already exists.

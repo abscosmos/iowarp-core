@@ -28,7 +28,7 @@ class Zstd : public Compressor {
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
     if (ZSTD_compressBound(input_size) > output_size) {
-      HILOG(kInfo, "Output buffer is potentially too small for compression");
+      HLOG(kInfo, "Output buffer is potentially too small for compression");
     }
     output_size =
         ZSTD_compress(output, output_size, input, input_size, ZSTD_maxCLevel());

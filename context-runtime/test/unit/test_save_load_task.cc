@@ -41,8 +41,8 @@ using namespace chi;
 
 namespace {
 // Helper allocator for tests
-hipc::CtxAllocator<CHI_MAIN_ALLOC_T> GetTestAllocator() {
-  return HSHM_MEMORY_MANAGER->GetDefaultAllocator<CHI_MAIN_ALLOC_T>();
+hipc::MultiProcessAllocator* GetTestAllocator() {
+  return CHI_IPC->GetMainAlloc();
 }
 
 // Initialize Chimaera runtime for tests
@@ -52,20 +52,22 @@ public:
     // Initialize Chimaera (client with embedded runtime)
     chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 
-    // Initialize admin module
-    auto *module_manager = CHI_MODULE_MANAGER;
-    auto *ipc_manager = CHI_IPC;
-
     // Create admin pool
     admin_client_ =
         std::make_unique<chimaera::admin::Client>(chi::kAdminPoolId);
-    admin_client_->Create(HSHM_MCTX, chi::PoolQuery::Local(), "admin",
-                          chi::kAdminPoolId);
+    auto create_task = admin_client_->AsyncCreate(chi::PoolQuery::Local(), "admin",
+                                                   chi::kAdminPoolId);
+    create_task.Wait();
+
+    // Update client pool_id_ with the actual pool ID from the task
+    admin_client_->pool_id_ = create_task->new_pool_id_;
+    admin_client_->return_code_ = create_task->return_code_;
 
     // Verify admin creation succeeded
-    if (admin_client_->GetReturnCode() != 0) {
+    if (create_task->GetReturnCode() != 0) {
       throw std::runtime_error("Failed to create admin pool");
     }
+    // Task automatically freed when create_task goes out of scope
   }
 
   ~ChimaeraTestFixture() {
@@ -96,7 +98,8 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
   auto orig_task = ipc_manager->NewTask<chimaera::admin::CreateTask>(
       chi::TaskId(100, 200, 300, 0, 400), // Specific task ID
       chi::kAdminPoolId, chi::PoolQuery::Local(), "test_chimod_lib",
-      "test_pool_name", chi::PoolId(5000, 0));
+      "test_pool_name", chi::PoolId(5000, 0),
+      nullptr);  // No client for test task
 
   REQUIRE(!orig_task.IsNull());
 
@@ -110,20 +113,28 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
 
   // Step 2: SaveIn - serialize IN/INOUT parameters
   chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
+  hipc::FullPtr<chi::Task> orig_task_ptr = orig_task.template Cast<chi::Task>();
   container->SaveTask(chimaera::admin::Method::kCreate, save_in_archive,
-                      orig_task.template Cast<chi::Task>());
+                      orig_task_ptr);
 
   // Step 3: LoadIn - deserialize IN/INOUT parameters into new task
   std::string save_in_data = save_in_archive.GetData();
   REQUIRE(!save_in_data.empty());
 
   chi::LoadTaskArchive load_in_archive(save_in_data);
-  hipc::FullPtr<chi::Task> loaded_in_task_ptr;
-  container->LoadTask(chimaera::admin::Method::kCreate, load_in_archive,
-                      loaded_in_task_ptr);
+  load_in_archive.msg_type_ = chi::MsgType::kSerializeIn;  // Explicitly set msg_type
+
+  // Create task manually (matching pattern from test_task_archive.cc)
+  auto loaded_in_task = ipc_manager->NewTask<chimaera::admin::CreateTask>();
+  loaded_in_task->chimod_name_ = chi::priv::string(alloc, std::string(""));
+  loaded_in_task->pool_name_ = chi::priv::string(alloc, std::string(""));
+  loaded_in_task->chimod_params_ = chi::priv::string(alloc, std::string(""));
+  loaded_in_task->error_message_ = chi::priv::string(alloc, std::string(""));
+  load_in_archive >> *loaded_in_task;
+
+  hipc::FullPtr<chi::Task> loaded_in_task_ptr = loaded_in_task.template Cast<chi::Task>();
 
   REQUIRE(!loaded_in_task_ptr.IsNull());
-  auto loaded_in_task = loaded_in_task_ptr.Cast<chimaera::admin::CreateTask>();
 
   // Step 4: Verify loaded task has same inputs (IN fields and task metadata)
   SECTION("Verify IN parameters after LoadIn") {
@@ -143,26 +154,31 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
   // Step 5: Modify output parameters in loaded task
   loaded_in_task->new_pool_id_ = chi::PoolId(7000, 0);
   loaded_in_task->error_message_ =
-      hipc::string(alloc, "test error message from server");
+      chi::priv::string(alloc, std::string("test error message from server"));
   loaded_in_task->SetReturnCode(42);
 
   // Step 6: SaveOut - serialize OUT/INOUT parameters
   chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
+  hipc::FullPtr<chi::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<chi::Task>();
   container->SaveTask(chimaera::admin::Method::kCreate, save_out_archive,
-                      loaded_in_task.template Cast<chi::Task>());
+                      loaded_in_task_ptr2);
 
   // Step 7: LoadOut - deserialize OUT/INOUT parameters
   std::string save_out_data = save_out_archive.GetData();
   REQUIRE(!save_out_data.empty());
 
   chi::LoadTaskArchive load_out_archive(save_out_data);
-  hipc::FullPtr<chi::Task> loaded_out_task_ptr;
-  container->LoadTask(chimaera::admin::Method::kCreate, load_out_archive,
-                      loaded_out_task_ptr);
+  load_out_archive.msg_type_ = chi::MsgType::kSerializeOut;  // Explicitly set msg_type
 
-  REQUIRE(!loaded_out_task_ptr.IsNull());
-  auto loaded_out_task =
-      loaded_out_task_ptr.Cast<chimaera::admin::CreateTask>();
+  // Create task manually (matching pattern from test_task_archive.cc)
+  auto loaded_out_task = ipc_manager->NewTask<chimaera::admin::CreateTask>();
+  loaded_out_task->chimod_name_ = chi::priv::string(alloc, std::string(""));
+  loaded_out_task->pool_name_ = chi::priv::string(alloc, std::string(""));
+  loaded_out_task->chimod_params_ = chi::priv::string(alloc, std::string(""));
+  loaded_out_task->error_message_ = chi::priv::string(alloc, std::string(""));
+  load_out_archive >> *loaded_out_task;
+
+  REQUIRE(!loaded_out_task.IsNull());
 
   // Step 8: Verify final task has correct outputs and preserved INOUT
   // parameters
@@ -211,18 +227,20 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
 
   // Step 2: SaveIn - FlushTask has no IN parameters beyond base Task
   chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
+  hipc::FullPtr<chi::Task> orig_task_ptr = orig_task.template Cast<chi::Task>();
   container->SaveTask(chimaera::admin::Method::kFlush, save_in_archive,
-                      orig_task.template Cast<chi::Task>());
+                      orig_task_ptr);
 
   // Step 3: LoadIn
   std::string save_in_data = save_in_archive.GetData();
   chi::LoadTaskArchive load_in_archive(save_in_data);
-  hipc::FullPtr<chi::Task> loaded_in_task_ptr;
-  container->LoadTask(chimaera::admin::Method::kFlush, load_in_archive,
-                      loaded_in_task_ptr);
+  load_in_archive.msg_type_ = chi::MsgType::kSerializeIn;  // Explicitly set msg_type
 
-  REQUIRE(!loaded_in_task_ptr.IsNull());
-  auto loaded_in_task = loaded_in_task_ptr.Cast<chimaera::admin::FlushTask>();
+  // Create task manually
+  auto loaded_in_task = ipc_manager->NewTask<chimaera::admin::FlushTask>();
+  load_in_archive >> *loaded_in_task;
+
+  REQUIRE(!loaded_in_task.IsNull());
 
   // Step 4: Verify base Task fields
   SECTION("Verify base Task IN parameters") {
@@ -236,18 +254,20 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
 
   // Step 6: SaveOut
   chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
+  hipc::FullPtr<chi::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<chi::Task>();
   container->SaveTask(chimaera::admin::Method::kFlush, save_out_archive,
-                      loaded_in_task.template Cast<chi::Task>());
+                      loaded_in_task_ptr2);
 
   // Step 7: LoadOut
   std::string save_out_data = save_out_archive.GetData();
   chi::LoadTaskArchive load_out_archive(save_out_data);
-  hipc::FullPtr<chi::Task> loaded_out_task_ptr;
-  container->LoadTask(chimaera::admin::Method::kFlush, load_out_archive,
-                      loaded_out_task_ptr);
+  load_out_archive.msg_type_ = chi::MsgType::kSerializeOut;  // Explicitly set msg_type
 
-  REQUIRE(!loaded_out_task_ptr.IsNull());
-  auto loaded_out_task = loaded_out_task_ptr.Cast<chimaera::admin::FlushTask>();
+  // Create task manually
+  auto loaded_out_task = ipc_manager->NewTask<chimaera::admin::FlushTask>();
+  load_out_archive >> *loaded_out_task;
+
+  REQUIRE(!loaded_out_task.IsNull());
 
   // Step 8: Verify output parameters
   SECTION("Verify OUT parameters") {
@@ -272,86 +292,70 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
   auto *container = pool_manager->GetContainer(chi::kAdminPoolId);
   REQUIRE(container != nullptr);
 
-  // Create a subtask to include in SendTask
-  auto subtask = ipc_manager->NewTask<chi::Task>(
-      chi::TaskId(10, 20, 30, 0, 40), chi::PoolId(100, 0),
-      chi::PoolQuery::Local(), chi::MethodId(50));
-
-  // Step 1: Create original SendTask
-  std::vector<chi::PoolQuery> pool_queries = {chi::PoolQuery::Local(),
-                                              chi::PoolQuery::Local()};
+  // Step 1: Create original SendTask (simplified - only transfer_flags parameter)
   auto orig_task = ipc_manager->NewTask<chimaera::admin::SendTask>(
       chi::TaskId(555, 666, 777, 0, 888), chi::kAdminPoolId,
       chi::PoolQuery::Local(),
-      chi::MsgType::kSerializeIn, // msg_type IN parameter
-      subtask, pool_queries,
       123); // transfer_flags IN parameter
 
   REQUIRE(!orig_task.IsNull());
 
   // Record original values
   chi::TaskId orig_task_id = orig_task->task_id_;
-  chi::MsgType orig_msg_type = orig_task->msg_type_;
   chi::u32 orig_transfer_flags = orig_task->transfer_flags_;
-  size_t orig_pool_queries_size = orig_task->pool_queries_.size();
 
   // Step 2: SaveIn
   chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
+  hipc::FullPtr<chi::Task> orig_task_ptr = orig_task.template Cast<chi::Task>();
   container->SaveTask(chimaera::admin::Method::kSend, save_in_archive,
-                      orig_task.template Cast<chi::Task>());
+                      orig_task_ptr);
 
   // Step 3: LoadIn
   std::string save_in_data = save_in_archive.GetData();
   chi::LoadTaskArchive load_in_archive(save_in_data);
-  hipc::FullPtr<chi::Task> loaded_in_task_ptr;
-  container->LoadTask(chimaera::admin::Method::kSend, load_in_archive,
-                      loaded_in_task_ptr);
+  load_in_archive.msg_type_ = chi::MsgType::kSerializeIn;  // Explicitly set msg_type
 
-  REQUIRE(!loaded_in_task_ptr.IsNull());
-  auto loaded_in_task = loaded_in_task_ptr.Cast<chimaera::admin::SendTask>();
+  // Create task manually (default constructor properly initializes error_message_)
+  auto loaded_in_task = ipc_manager->NewTask<chimaera::admin::SendTask>();
+  load_in_archive >> *loaded_in_task;
+
+  REQUIRE(!loaded_in_task.IsNull());
 
   // Step 4: Verify IN parameters
   SECTION("Verify IN parameters after LoadIn") {
     REQUIRE(loaded_in_task->task_id_ == orig_task_id);
-    REQUIRE(loaded_in_task->msg_type_ == orig_msg_type);
     REQUIRE(loaded_in_task->transfer_flags_ == orig_transfer_flags);
-    REQUIRE(loaded_in_task->pool_queries_.size() == orig_pool_queries_size);
-    REQUIRE(!loaded_in_task->origin_task_.IsNull());
   }
 
   // Step 5: Modify output parameters
   loaded_in_task->error_message_ =
-      hipc::string(alloc, "send completed successfully");
+      chi::priv::string(alloc, std::string("send completed successfully"));
 
   // Step 6: SaveOut
   chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
+  hipc::FullPtr<chi::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<chi::Task>();
   container->SaveTask(chimaera::admin::Method::kSend, save_out_archive,
-                      loaded_in_task.template Cast<chi::Task>());
+                      loaded_in_task_ptr2);
 
   // Step 7: LoadOut
   std::string save_out_data = save_out_archive.GetData();
   chi::LoadTaskArchive load_out_archive(save_out_data);
-  hipc::FullPtr<chi::Task> loaded_out_task_ptr;
-  container->LoadTask(chimaera::admin::Method::kSend, load_out_archive,
-                      loaded_out_task_ptr);
+  load_out_archive.msg_type_ = chi::MsgType::kSerializeOut;  // Explicitly set msg_type
 
-  REQUIRE(!loaded_out_task_ptr.IsNull());
-  auto loaded_out_task = loaded_out_task_ptr.Cast<chimaera::admin::SendTask>();
+  // Create task manually (default constructor properly initializes error_message_)
+  auto loaded_out_task = ipc_manager->NewTask<chimaera::admin::SendTask>();
+  load_out_archive >> *loaded_out_task;
 
-  // Step 8: Verify INOUT and OUT parameters
+  REQUIRE(!loaded_out_task.IsNull());
+
+  // Step 8: Verify OUT parameters
   SECTION("Verify OUT parameters after LoadOut") {
-    // Verify INOUT parameters preserved
-    REQUIRE(loaded_out_task->msg_type_ == orig_msg_type);
-    REQUIRE(loaded_out_task->pool_queries_.size() == orig_pool_queries_size);
-    REQUIRE(!loaded_out_task->origin_task_.IsNull());
-
     // Verify OUT parameters
     REQUIRE(loaded_out_task->error_message_.str() ==
             "send completed successfully");
   }
 
   // Cleanup
-  ipc_manager->DelTask(subtask);
   ipc_manager->DelTask(orig_task);
   ipc_manager->DelTask(loaded_in_task);
   ipc_manager->DelTask(loaded_out_task);
@@ -385,19 +389,20 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
 
   // Step 2: SaveIn
   chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
+  hipc::FullPtr<chi::Task> orig_task_ptr = orig_task.template Cast<chi::Task>();
   container->SaveTask(chimaera::admin::Method::kDestroyPool, save_in_archive,
-                      orig_task.template Cast<chi::Task>());
+                      orig_task_ptr);
 
   // Step 3: LoadIn
   std::string save_in_data = save_in_archive.GetData();
   chi::LoadTaskArchive load_in_archive(save_in_data);
-  hipc::FullPtr<chi::Task> loaded_in_task_ptr;
-  container->LoadTask(chimaera::admin::Method::kDestroyPool, load_in_archive,
-                      loaded_in_task_ptr);
+  load_in_archive.msg_type_ = chi::MsgType::kSerializeIn;  // Explicitly set msg_type
 
-  REQUIRE(!loaded_in_task_ptr.IsNull());
-  auto loaded_in_task =
-      loaded_in_task_ptr.Cast<chimaera::admin::DestroyPoolTask>();
+  // Create task manually (default constructor properly initializes error_message_)
+  auto loaded_in_task = ipc_manager->NewTask<chimaera::admin::DestroyPoolTask>();
+  load_in_archive >> *loaded_in_task;
+
+  REQUIRE(!loaded_in_task.IsNull());
 
   // Step 4: Verify IN parameters
   SECTION("Verify IN parameters after LoadIn") {
@@ -407,23 +412,24 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
   }
 
   // Step 5: Modify output parameters
-  loaded_in_task->error_message_ = hipc::string(alloc, "pool destroyed");
+  loaded_in_task->error_message_ = chi::priv::string(alloc, std::string("pool destroyed"));
 
   // Step 6: SaveOut
   chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
+  hipc::FullPtr<chi::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<chi::Task>();
   container->SaveTask(chimaera::admin::Method::kDestroyPool, save_out_archive,
-                      loaded_in_task.template Cast<chi::Task>());
+                      loaded_in_task_ptr2);
 
   // Step 7: LoadOut
   std::string save_out_data = save_out_archive.GetData();
   chi::LoadTaskArchive load_out_archive(save_out_data);
-  hipc::FullPtr<chi::Task> loaded_out_task_ptr;
-  container->LoadTask(chimaera::admin::Method::kDestroyPool, load_out_archive,
-                      loaded_out_task_ptr);
+  load_out_archive.msg_type_ = chi::MsgType::kSerializeOut;  // Explicitly set msg_type
 
-  REQUIRE(!loaded_out_task_ptr.IsNull());
-  auto loaded_out_task =
-      loaded_out_task_ptr.Cast<chimaera::admin::DestroyPoolTask>();
+  // Create task manually (default constructor properly initializes error_message_)
+  auto loaded_out_task = ipc_manager->NewTask<chimaera::admin::DestroyPoolTask>();
+  load_out_archive >> *loaded_out_task;
+
+  REQUIRE(!loaded_out_task.IsNull());
 
   // Step 8: Verify OUT parameters
   SECTION("Verify OUT parameters after LoadOut") {

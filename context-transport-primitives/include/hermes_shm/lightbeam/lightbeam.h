@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include "hermes_shm/memory/memory_manager.h"
+#include "hermes_shm/memory/allocator/allocator.h"
 #include "hermes_shm/types/bitfield.h"
 
 namespace hshm::lbm {
@@ -25,6 +25,7 @@ struct Bulk {
   hshm::bitfield32_t flags;  // BULK_EXPOSE or BULK_XFER
   void* desc = nullptr;      // For RDMA memory registration
   void* mr = nullptr;        // For RDMA memory region handle (fid_mr*)
+  // Note: Cereal serialization is defined as non-member function in zmq_transport.h
 };
 
 // --- Metadata Base Class ---
@@ -34,19 +35,14 @@ class LbmMeta {
       send;  // Sender's bulk descriptors (can have BULK_EXPOSE or BULK_XFER)
   std::vector<Bulk>
       recv;  // Receiver's bulk descriptors (copy of send with local pointers)
+  size_t send_bulks = 0;  // Count of BULK_XFER entries in send vector
+  size_t recv_bulks = 0;  // Count of BULK_XFER entries in recv vector
 };
 
 // --- Interfaces ---
 class Client {
  public:
   virtual ~Client() = default;
-
-  // Expose from raw pointer
-  virtual Bulk Expose(const char* data, size_t data_size, u32 flags) = 0;
-
-  // Expose from hipc::Pointer
-  virtual Bulk Expose(const hipc::Pointer& ptr, size_t data_size,
-                      u32 flags) = 0;
 
   // Expose from hipc::FullPtr
   virtual Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size,
@@ -60,20 +56,23 @@ class Server {
  public:
   virtual ~Server() = default;
 
-  // Expose from raw pointer
-  virtual Bulk Expose(char* data, size_t data_size, u32 flags) = 0;
-
-  // Expose from hipc::Pointer
-  virtual Bulk Expose(const hipc::Pointer& ptr, size_t data_size,
-                      u32 flags) = 0;
-
   // Expose from hipc::FullPtr
   virtual Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size,
                       u32 flags) = 0;
 
+  /**
+   * Receive and deserialize metadata from the network
+   * @param meta The metadata structure to populate
+   * @return 0 on success, EAGAIN if no message, -1 on deserialization error
+   */
   template <typename MetaT>
   int RecvMetadata(MetaT& meta);
 
+  /**
+   * Receive bulk data into pre-allocated buffers
+   * @param meta The metadata with recv buffers already populated
+   * @return 0 on success, errno on failure
+   */
   template <typename MetaT>
   int RecvBulks(MetaT& meta);
 

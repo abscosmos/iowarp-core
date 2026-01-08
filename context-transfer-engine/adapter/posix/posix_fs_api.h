@@ -53,7 +53,7 @@ public:
       return 0;
     } else {
       errno = EBADF;
-      HELOG(kError, "File with descriptor {} does not exist in Hermes",
+      HLOG(kError, "File with descriptor {} does not exist in Hermes",
             f.hermes_fd_);
       return -1;
     }
@@ -66,7 +66,7 @@ public:
     stat.st_mode_ = 0;
     File f = Open(stat, __filename);
     if (!f.status_) {
-      // HILOG(kInfo, "Failed to stat the file {}", __filename);
+      // HLOG(kInfo, "Failed to stat the file {}", __filename);
       memset(buf, 0, sizeof(StatT));
       return -1;
     }
@@ -202,7 +202,7 @@ public:
     true_size = buf.st_size;
     real_api_->close(fd);
 
-    HILOG(kDebug, "The size of the file {} on disk is {}", filename, true_size);
+    HLOG(kDebug, "The size of the file {} on disk is {}", filename, true_size);
     return true_size;
   }
 
@@ -211,7 +211,7 @@ public:
                  const FsIoOptions &opts, IoStatus &status) override {
     (void)opts;
     status.success_ = true;
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Writing to file: {}"
           " offset: {}"
           " size: {}",
@@ -234,7 +234,7 @@ public:
                 const FsIoOptions &opts, IoStatus &status) override {
     (void)opts;
     status.success_ = true;
-    HILOG(kDebug,
+    HLOG(kDebug,
           "Reading from file: {}"
           " offset: {}"
           " size: {}",

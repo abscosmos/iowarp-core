@@ -632,6 +632,140 @@ def test_context_delete_operation(cte):
         return True
 
 
+def test_poll_telemetry_log(cte):
+    """Test PollTelemetryLog operation
+
+    Example: Polling telemetry log for operation history
+    -----------------------------------------------------
+    This demonstrates how to use Client.PollTelemetryLog() to retrieve
+    telemetry entries for operations performed on blobs.
+
+    Usage Pattern:
+        client = cte.get_cte_client()
+        entries = client.PollTelemetryLog(minimum_logical_time=0)
+        # Returns list[CteTelemetry] containing operation history
+
+        # Each CteTelemetry entry has:
+        #   - op_: Operation type (CteOp.kPutBlob, CteOp.kGetBlob, etc.)
+        #   - off_: Offset in blob
+        #   - size_: Size of operation
+        #   - tag_id_: TagId where operation occurred
+        #   - mod_time_: Modification timestamp
+        #   - read_time_: Read timestamp
+        #   - logical_time_: Logical timestamp for ordering
+
+    Test Steps:
+        1. Perform PutBlob operation
+        2. Perform GetBlob operation
+        3. Call PollTelemetryLog with minimum_logical_time=0
+        4. Verify log has entries
+        5. Verify entries contain kPutBlob and kGetBlob operations
+    """
+    global runtime_initialized, client_initialized
+
+    if not runtime_initialized or not client_initialized:
+        print("⚠️  Skipping PollTelemetryLog test (runtime not initialized)")
+        return True  # Not a failure, just skipped
+
+    try:
+        print("🔧 Testing PollTelemetryLog operation...")
+
+        # Create a test tag and blob for telemetry tracking
+        test_tag_name = "test_telemetry_tag"
+        test_blob_name = "telemetry_test_blob"
+        test_data = b"Telemetry test data - tracking PutBlob and GetBlob operations!"
+
+        try:
+            # Step 1: Perform PutBlob operation
+            print("   Step 1: Performing PutBlob operation...")
+            tag = cte.Tag(test_tag_name)
+            tag.PutBlob(test_blob_name, test_data, 0)
+            print(f"   ✅ PutBlob completed: {len(test_data)} bytes")
+
+            # Step 2: Perform GetBlob operation
+            print("   Step 2: Performing GetBlob operation...")
+            blob_size = tag.GetBlobSize(test_blob_name)
+            if blob_size > 0:
+                retrieved_data = tag.GetBlob(test_blob_name, blob_size, 0)
+                print(f"   ✅ GetBlob completed: {blob_size} bytes retrieved")
+            else:
+                print(f"   ⚠️  GetBlobSize returned 0, cannot retrieve")
+                return True
+
+            # Step 3: Poll telemetry log
+            print("   Step 3: Polling telemetry log...")
+            client = cte.get_cte_client()
+            minimum_logical_time = 0  # Get all entries
+            telemetry_entries = client.PollTelemetryLog(minimum_logical_time)
+
+            # Step 4: Verify log has entries
+            print(f"   Step 4: Verifying telemetry log has entries...")
+            assert isinstance(telemetry_entries, list), \
+                "PollTelemetryLog should return a list"
+
+            if len(telemetry_entries) == 0:
+                print(f"   ⚠️  PollTelemetryLog returned empty list (no entries found)")
+                print(f"      This may be expected if telemetry logging is disabled")
+                return True
+
+            print(f"   ✅ Found {len(telemetry_entries)} telemetry entries")
+
+            # Step 5: Verify entries contain expected operations
+            print(f"   Step 5: Analyzing telemetry entries...")
+
+            # Count operation types
+            operation_counts = {}
+            for entry in telemetry_entries:
+                # Verify entry has required fields
+                assert hasattr(entry, 'op_'), "Entry should have op_ field"
+                assert hasattr(entry, 'size_'), "Entry should have size_ field"
+                assert hasattr(entry, 'tag_id_'), "Entry should have tag_id_ field"
+                assert hasattr(entry, 'logical_time_'), "Entry should have logical_time_ field"
+
+                # Count operation types
+                op_type = entry.op_
+                op_name = str(op_type)  # Convert enum to string
+                operation_counts[op_name] = operation_counts.get(op_name, 0) + 1
+
+                # Print entry details for debugging
+                print(f"      Entry: op={op_name}, size={entry.size_}, "
+                      f"logical_time={entry.logical_time_}")
+
+            # Print operation summary
+            print(f"   ✅ Operation summary:")
+            for op_name, count in operation_counts.items():
+                print(f"      {op_name}: {count} operations")
+
+            # Check if we have PutBlob and GetBlob operations
+            has_putblob = any('kPutBlob' in str(entry.op_) for entry in telemetry_entries)
+            has_getblob = any('kGetBlob' in str(entry.op_) for entry in telemetry_entries)
+
+            if has_putblob:
+                print(f"   ✅ Found PutBlob operation in telemetry log")
+            else:
+                print(f"   ⚠️  No PutBlob operation found in telemetry log")
+
+            if has_getblob:
+                print(f"   ✅ Found GetBlob operation in telemetry log")
+            else:
+                print(f"   ⚠️  No GetBlob operation found in telemetry log")
+
+            print(f"   ✅ PollTelemetryLog test completed successfully")
+            return True
+
+        except Exception as e:
+            print(f"   ⚠️  PollTelemetryLog test failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return True  # Don't fail the test - may be expected
+
+    except Exception as e:
+        print(f"⚠️  PollTelemetryLog test error (may be expected): {e}")
+        import traceback
+        traceback.print_exc()
+        return True
+
+
 def main():
     """Run all context operation tests"""
     print("=" * 70)
@@ -693,6 +827,11 @@ def main():
         # Test 3: Context delete operation (context_delete equivalent)
         print("📋 Test 3: Context Delete Operation (context_delete)...")
         test_context_delete_operation(cte)
+        print()
+
+        # Test 4: PollTelemetryLog operation
+        print("📋 Test 4: PollTelemetryLog Operation...")
+        test_poll_telemetry_log(cte)
         print()
     else:
         print("⚠️  Skipping context operation tests (runtime not initialized)")

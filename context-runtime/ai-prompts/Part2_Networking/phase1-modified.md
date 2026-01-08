@@ -101,7 +101,7 @@ struct NetworkForwardTask : public SerializableTask<NetworkForwardTask> {
   // Network-specific fields
   IN chi::u32 dest_node_rank_;     // Target node in cluster
   IN chi::u64 net_key_;            // Unique network identifier
-  INOUT hipc::string task_data_;   // Serialized task data
+  INOUT chi::priv::string task_data_;   // Serialized task data
   IN chi::u32 original_method_;    // Original task's method ID
   OUT chi::u32 result_code_;       // Execution result
   
@@ -175,7 +175,7 @@ public:
   }
   
   // Bulk transfer support
-  void bulk(hipc::Pointer p, size_t size, u32 flags) {
+  void bulk(hipc::ShmPtr<> p, size_t size, u32 flags) {
     if (flags & CHI_WRITE) {
       // Serialize the data for transfer
       ar_.saveBinary(p.ToPtr(), size);
@@ -209,7 +209,7 @@ public:
     return task;
   }
   
-  void bulk(hipc::Pointer& p, size_t& size, u32& flags) {
+  void bulk(hipc::ShmPtr<>& p, size_t& size, u32& flags) {
     if (flags & CHI_WRITE) {
       // Allocate and deserialize data
       p = CHI_IPC->AllocateBuffer(size);
