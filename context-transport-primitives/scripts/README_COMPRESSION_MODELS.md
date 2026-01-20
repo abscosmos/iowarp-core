@@ -177,6 +177,21 @@ python compare_cnn_vs_xgboost.py \
 - `comparison_output/comparison_metrics.pdf` - Performance metrics bar charts
 - Console output with detailed performance comparison
 
+### 4. Batch Inference Scaling Study
+
+```bash
+cd /workspace/context-transport-primitives/scripts
+
+python batch_inference_study.py \
+  /workspace/build/compression_parameter_study_results.csv
+```
+
+**Output:**
+- `batch_inference_results/xgboost_batch_results.csv` - XGBoost results
+- `batch_inference_results/neural_network_batch_results.csv` - NN results
+- `batch_inference_results/batch_inference_scaling.pdf` - Scaling plots
+- Console output with throughput and latency metrics for batch sizes 1-512
+
 ## Using Trained Models
 
 ### XGBoost Model Inference
@@ -409,6 +424,56 @@ https://github.com/iowarp/iowarp-core
 - `train_cnn_compression_model.py` - Neural network training (optimized hyperparameters)
 - `compare_cnn_vs_xgboost.py` - Model comparison and visualization
 - Model training and validation scripts in `/workspace/context-transport-primitives/scripts/`
+
+## Batch Inference Performance
+
+### Running Batch Inference Study
+
+To measure how models perform with different batch sizes:
+
+```bash
+cd /workspace/context-transport-primitives/scripts
+
+python batch_inference_study.py \
+  /workspace/build/compression_parameter_study_results.csv
+```
+
+**Output:**
+- `batch_inference_results/xgboost_batch_results.csv` - XGBoost performance by batch size
+- `batch_inference_results/neural_network_batch_results.csv` - NN performance by batch size
+- `batch_inference_results/batch_inference_scaling.pdf` - Visualization plots
+
+### Batch Inference Results
+
+| Batch Size | XGBoost Throughput | XGBoost Latency/Sample | NN Throughput | NN Latency/Sample |
+|------------|-------------------|----------------------|---------------|------------------|
+| 1 | 513 pred/s | 1.95 ms | 22 pred/s | 46.18 ms |
+| 16 | 10,605 pred/s | 0.09 ms | 342 pred/s | 2.92 ms |
+| 64 | 42,046 pred/s | 0.02 ms | 1,382 pred/s | 0.72 ms |
+| 256 | 150,043 pred/s | 0.007 ms | 4,958 pred/s | 0.20 ms |
+| 512 | 251,680 pred/s | 0.004 ms | 8,930 pred/s | 0.11 ms |
+
+### Key Findings
+
+**Batch Size 16 (Recommended for Real-time Applications):**
+- **XGBoost**: 10,605 predictions/sec, 0.09 ms/sample
+- **Neural Network**: 342 predictions/sec, 2.92 ms/sample
+- **XGBoost is 31× faster** at batch size 16
+
+**Batching Speedup (vs Single Prediction):**
+- **XGBoost**: 20.7× throughput improvement (batch 16 vs batch 1)
+- **Neural Network**: 15.8× throughput improvement (batch 16 vs batch 1)
+- XGBoost scales better with batch size
+
+**Maximum Throughput (Batch Size 512):**
+- **XGBoost**: 251,680 predictions/sec (28× faster than NN)
+- **Neural Network**: 8,930 predictions/sec
+
+**Recommendation for Production:**
+- Use **batch size 16** for optimal latency/throughput trade-off
+- XGBoost processes 16 predictions in ~1.5 ms
+- Neural Network processes 16 predictions in ~47 ms
+- Both models benefit significantly from batching
 
 ## Performance Benchmarks
 
