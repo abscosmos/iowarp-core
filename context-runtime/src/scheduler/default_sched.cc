@@ -45,6 +45,44 @@ void DefaultScheduler::RebalanceWorker(Worker *worker) {
   (void)worker;
 }
 
+void DefaultScheduler::AdjustPolling(RunContext *run_ctx) {
+  if (!run_ctx) {
+    return;
+  }
+
+  // Maximum polling interval in microseconds (100ms)
+  const double kMaxPollingIntervalUs = 100000.0;
+
+  double old_interval = run_ctx->yield_time_us_;
+
+  if (run_ctx->did_work_) {
+    // Task did work - use the true (responsive) period
+    run_ctx->yield_time_us_ = run_ctx->true_period_ns_ / 1000.0;
+    HLOG(kDebug, "AdjustPolling: task did work, reset to true period: {}us -> {}us",
+         old_interval, run_ctx->yield_time_us_);
+  } else {
+    // Task didn't do work - increase polling interval (exponential backoff)
+    double current_interval = run_ctx->yield_time_us_;
+
+    // If uninitialized, start backoff from the true period
+    if (current_interval <= 0.0) {
+      current_interval = run_ctx->true_period_ns_ / 1000.0;
+    }
+
+    // Exponential backoff: double the interval
+    double new_interval = current_interval * 2.0;
+
+    // Cap at maximum polling interval
+    if (new_interval > kMaxPollingIntervalUs) {
+      new_interval = kMaxPollingIntervalUs;
+    }
+
+    run_ctx->yield_time_us_ = new_interval;
+    HLOG(kDebug, "AdjustPolling: no work, backing off: {}us -> {}us (true_period={}ns)",
+         old_interval, run_ctx->yield_time_us_, run_ctx->true_period_ns_);
+  }
+}
+
 u32 DefaultScheduler::MapByPidTid(u32 num_lanes) {
   // Use HSHM_SYSTEM_INFO to get both PID and TID for lane hashing
   auto *sys_info = HSHM_SYSTEM_INFO;

@@ -42,6 +42,12 @@ class DefaultScheduler : public Scheduler {
    */
   void RebalanceWorker(Worker *worker) override;
 
+  /**
+   * Adjust polling interval for periodic tasks based on work done.
+   * Implements exponential backoff when tasks aren't doing work.
+   */
+  void AdjustPolling(RunContext *run_ctx) override;
+
  private:
   /**
    * Map task to lane by PID+TID hash

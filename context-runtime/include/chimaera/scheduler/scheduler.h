@@ -11,6 +11,7 @@ namespace chi {
 class IpcManager;
 class WorkOrchestrator;
 class Worker;
+struct RunContext;
 
 /**
  * Base class for task scheduling strategies.
@@ -58,6 +59,15 @@ class Scheduler {
    * @param worker Pointer to the worker to rebalance
    */
   virtual void RebalanceWorker(Worker *worker) = 0;
+
+  /**
+   * Adjust polling interval for periodic tasks based on work done.
+   * Implements adaptive polling to reduce CPU utilization when tasks
+   * aren't performing I/O or computation.
+   *
+   * @param run_ctx Pointer to the RunContext for the periodic task
+   */
+  virtual void AdjustPolling(RunContext *run_ctx) = 0;
 };
 
 }  // namespace chi

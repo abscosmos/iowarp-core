@@ -532,6 +532,7 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
                               chi::RunContext &rctx) {
   auto *ipc_manager = CHI_IPC;
   chi::Future<chi::Task> queued_future;
+  bool did_send = false;
 
   // Poll priority 0 (SendIn) queue - tasks waiting to be sent to remote nodes
   while (ipc_manager->TryPopNetTask(chi::NetQueuePriority::kSendIn,
@@ -540,6 +541,7 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
       SendIn(origin_task, rctx);
+      did_send = true;
     }
   }
 
@@ -550,7 +552,15 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
       SendOut(origin_task);
+      did_send = true;
     }
+  }
+
+  // Track whether this execution did actual work
+  if (did_send) {
+    rctx.did_work_ = true;
+  } else {
+    rctx.did_work_ = false;
   }
 
   task->SetReturnCode(0);
@@ -818,6 +828,7 @@ chi::TaskResume Runtime::Recv(hipc::FullPtr<RecvTask> task,
   if (rc == EAGAIN) {
     // No message available - this is normal for polling, mark as no work done
     task->SetReturnCode(0);
+    rctx.did_work_ = false;
     co_return;
   }
 
@@ -827,8 +838,12 @@ chi::TaskResume Runtime::Recv(hipc::FullPtr<RecvTask> task,
            rc);
     }
     task->SetReturnCode(2);
+    rctx.did_work_ = false;
     co_return;
   }
+
+  // Mark that we received data (did work)
+  rctx.did_work_ = true;
 
   // Dispatch based on message type
   chi::MsgType msg_type = archive.GetMsgType();
@@ -848,7 +863,6 @@ chi::TaskResume Runtime::Recv(hipc::FullPtr<RecvTask> task,
       break;
   }
 
-  (void)rctx;
   co_return;
 }
 
@@ -876,13 +890,20 @@ chi::TaskResume Runtime::Heartbeat(hipc::FullPtr<HeartbeatTask> task,
       zmq_send(hb_socket, &response, sizeof(response), 0);
       HLOG(kDebug, "Heartbeat: received request {}, sent response {}", request,
            response);
+      // Mark that we did work (received and responded to heartbeat)
+      rctx.did_work_ = true;
+    } else {
+      // No heartbeat request available (EAGAIN)
+      rctx.did_work_ = false;
     }
+  } else {
+    // No heartbeat socket available
+    rctx.did_work_ = false;
   }
 
   // Set task response to indicate runtime is healthy
   task->response_ = 0;
   task->SetReturnCode(0);
-  (void)rctx;
   co_return;
 }
 

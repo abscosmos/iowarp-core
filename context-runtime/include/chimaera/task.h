@@ -859,6 +859,8 @@ struct RunContext {
                                 in EndTask */
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
                                      queue additions */
+  double true_period_ns_;       /**< Original period from task->period_ns_ */
+  bool did_work_;               /**< Whether task did work in last execution */
 
   RunContext()
       : coro_handle_(nullptr),
@@ -875,7 +877,9 @@ struct RunContext {
         completed_replicas_(0),
         yield_count_(0),
         destroy_in_end_task_(false),
-        is_notified_(false) {}
+        is_notified_(false),
+        true_period_ns_(0.0),
+        did_work_(false) {}
 
   /**
    * Move constructor
@@ -899,7 +903,9 @@ struct RunContext {
         yield_count_(other.yield_count_),
         future_(std::move(other.future_)),
         destroy_in_end_task_(other.destroy_in_end_task_),
-        is_notified_(other.is_notified_.load()) {
+        is_notified_(other.is_notified_.load()),
+        true_period_ns_(other.true_period_ns_),
+        did_work_(other.did_work_) {
     other.coro_handle_ = nullptr;
     other.event_queue_ = nullptr;
   }
@@ -928,6 +934,8 @@ struct RunContext {
       future_ = std::move(other.future_);
       destroy_in_end_task_ = other.destroy_in_end_task_;
       is_notified_.store(other.is_notified_.load());
+      true_period_ns_ = other.true_period_ns_;
+      did_work_ = other.did_work_;
       other.coro_handle_ = nullptr;
       other.event_queue_ = nullptr;
     }
@@ -951,6 +959,8 @@ struct RunContext {
     block_start = hshm::Timepoint();
     yield_count_ = 0;
     is_notified_.store(false);
+    true_period_ns_ = 0.0;
+    did_work_ = false;
   }
 };
 

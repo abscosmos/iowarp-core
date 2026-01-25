@@ -273,11 +273,13 @@ void Worker::Run() {
   // Create signalfd
   int signal_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
   if (signal_fd == -1) {
-    HLOG(kError, "Worker {}: Failed to create signalfd - errno={}", worker_id_, errno);
+    HLOG(kError, "Worker {}: Failed to create signalfd - errno={}", worker_id_,
+         errno);
     is_running_ = false;
     return;
   }
-  HLOG(kInfo, "Worker {}: Created signalfd={}, tid={}", worker_id_, signal_fd, tid);
+  HLOG(kInfo, "Worker {}: Created signalfd={}, tid={}", worker_id_, signal_fd,
+       tid);
 
   // Store signal_fd in TaskLane
   assigned_lane_->SetSignalFd(signal_fd);
@@ -287,19 +289,25 @@ void Worker::Run() {
   ev.events = EPOLLIN;
   ev.data.fd = signal_fd;
   if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, signal_fd, &ev) == -1) {
-    HLOG(kError, "Worker {}: Failed to add signal_fd={} to epoll_fd={} - errno={}",
-          worker_id_, signal_fd, epoll_fd_, errno);
+    HLOG(kError,
+         "Worker {}: Failed to add signal_fd={} to epoll_fd={} - errno={}",
+         worker_id_, signal_fd, epoll_fd_, errno);
     close(signal_fd);
     assigned_lane_->SetSignalFd(-1);
     is_running_ = false;
     return;
   }
   HLOG(kInfo, "Worker {}: Added signalfd={} to epoll_fd={} successfully",
-        worker_id_, signal_fd, epoll_fd_);
+       worker_id_, signal_fd, epoll_fd_);
+
+  // Note: ZMQ socket FD registration is not needed
+  // Workers with periodic tasks (Heartbeat, Recv, etc.) use timeout_ms=0
+  // when tasks are overdue, ensuring they wake up to service network I/O
 
   // Main worker loop - process tasks from assigned lane
   while (is_running_) {
     did_work_ = false;  // Reset work tracker at start of each loop iteration
+    task_did_work_ = false;  // Reset task-level work tracker
 
     // Process tasks from assigned lane
     ProcessNewTasks();
@@ -432,49 +440,39 @@ u32 Worker::ProcessNewTasks() {
 }
 
 double Worker::GetSuspendPeriod() const {
-  // Scan all periodic queues to find the task with shortest remaining time
-  double min_remaining_time_us = 0;
+  // Scan all periodic queues to find the maximum yield_time (polling period)
+  // We use the maximum yield_time directly, not the remaining time, to avoid
+  // desynchronization issues when multiple tasks have the same period but
+  // slightly different block_start timestamps
+  double max_yield_time_us = 0;
   bool found_task = false;
-
-  // Get current time for calculating remaining time
-  hshm::Timepoint current_time;
-  current_time.Now();
 
   // Check all periodic queues (0-3)
   for (u32 queue_idx = 0; queue_idx < NUM_PERIODIC_QUEUES; ++queue_idx) {
     const std::queue<RunContext *> &queue = periodic_queues_[queue_idx];
 
-    // Check if queue has any tasks
     if (queue.empty()) {
       continue;
     }
 
-    // Get the front task (oldest/next to execute)
+    // Check just the front task of each queue (representative of the queue's period)
     RunContext *run_ctx = queue.front();
+
     if (!run_ctx || run_ctx->task.IsNull()) {
       continue;
     }
 
-    // Calculate remaining time until this task should execute
-    // remaining_time = yield_time_us_ - (current_time - block_start)
-    double elapsed_since_block_us =
-        run_ctx->block_start.GetUsecFromStart(current_time);
-    double remaining_time_us = run_ctx->yield_time_us_ - elapsed_since_block_us;
-
-    // Only consider positive remaining times (task not yet ready)
-    if (remaining_time_us <= 0) {
-      continue;
-    }
-
-    // Update minimum remaining time
-    if (!found_task || remaining_time_us < min_remaining_time_us) {
-      min_remaining_time_us = remaining_time_us;
+    // Use the yield_time directly - this is the adaptive polling period
+    // No elapsed time calculation to avoid desynchronization
+    if (!found_task || run_ctx->yield_time_us_ > max_yield_time_us) {
+      max_yield_time_us = run_ctx->yield_time_us_;
       found_task = true;
     }
   }
 
   // Return -1 if no periodic tasks (means wait indefinitely in epoll_wait)
-  return found_task ? min_remaining_time_us : -1;
+  // Otherwise return the maximum yield_time across all periodic queues
+  return found_task ? max_yield_time_us : -1;
 }
 
 void Worker::SuspendMe() {
@@ -514,19 +512,24 @@ void Worker::SuspendMe() {
 
     // Calculate epoll timeout from periodic tasks
     // -1 = no periodic tasks, wait indefinitely
-    // >0 = time until next periodic task should wake
+    // >0 = maximum yield_time (polling period) from periodic tasks
     double suspend_period_us = GetSuspendPeriod();
     int timeout_ms;
     if (suspend_period_us < 0) {
       // No periodic tasks - wait indefinitely (-1)
       timeout_ms = -1;
     } else {
-      // Have periodic tasks - wait until next task should execute
-      timeout_ms = static_cast<int>(suspend_period_us / 1000);
+      // Have periodic tasks - use the maximum yield_time as timeout
+      // Round UP to avoid premature wakeups due to ms/us precision mismatch
+      timeout_ms = static_cast<int>((suspend_period_us + 999) / 1000);
+      if (timeout_ms < 1) {
+        timeout_ms = 1;  // Minimum 1ms to avoid busy-polling
+      }
     }
 
     // Wait for signal using epoll_wait
-    HLOG(kDebug, "Worker {}: Entering epoll_wait (timeout_ms={})", worker_id_, timeout_ms);
+    HLOG(kDebug, "Worker {}: Entering epoll_wait (timeout_ms={})", worker_id_,
+         timeout_ms);
     int nfds =
         epoll_wait(epoll_fd_, epoll_events_, MAX_EPOLL_EVENTS, timeout_ms);
 
@@ -534,14 +537,13 @@ void Worker::SuspendMe() {
     assigned_lane_->SetActive(true);
 
     if (nfds > 0) {
-      // Events received - read and discard all signal info
-      HLOG(kInfo, "Worker {}: epoll_wait returned nfds={} - SIGNAL RECEIVED", worker_id_, nfds);
-      for (int i = 0; i < nfds; ++i) {
-        struct signalfd_siginfo si;
-        ssize_t bytes_read = read(epoll_events_[i].data.fd, &si, sizeof(si));
-        HLOG(kInfo, "Worker {}: Read {} bytes from signalfd, signal={}",
-              worker_id_, bytes_read, si.ssi_signo);
-      }
+      // Events received - should be SIGUSR1 signal on signalfd
+      // Read and discard the signal info from signalfd
+      int signal_fd = assigned_lane_->GetSignalFd();
+      struct signalfd_siginfo si;
+      ssize_t bytes_read = read(signal_fd, &si, sizeof(si));
+      HLOG(kDebug, "Worker {}: Read {} bytes from signalfd, signal={}",
+           worker_id_, bytes_read, si.ssi_signo);
     } else if (nfds == 0) {
       // Timeout occurred
       HLOG(kDebug, "Worker {}: epoll_wait timeout", worker_id_);
@@ -1065,6 +1067,16 @@ void Worker::BeginTask(Future<Task> &future, Container *container,
   run_ctx->destroy_in_end_task_ = destroy_in_end_task;  // Set destroy flag
   run_ctx->future_ = future;        // Store future in RunContext
   run_ctx->coro_handle_ = nullptr;  // Coroutine not started yet
+
+  // Initialize adaptive polling fields for periodic tasks
+  if (task_ptr->IsPeriodic()) {
+    run_ctx->true_period_ns_ = task_ptr->period_ns_;
+    run_ctx->did_work_ = false;  // Initially no work done
+  } else {
+    run_ctx->true_period_ns_ = 0.0;
+    run_ctx->did_work_ = false;
+  }
+
   // Set RunContext pointer in task
   task_ptr->run_ctx_ = run_ctx;
 
@@ -1190,7 +1202,11 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // Set task_did_work_ to true by default (tasks can override via
   // CHI_CUR_WORKER)
   // This comes before the null check since the task was scheduled
-  SetTaskDidWork(true);
+  // Periodic tasks only count as work when first started, not on subsequent
+  // reschedules - this prevents busy polling
+  if (!task_ptr->IsPeriodic() || task_ptr->task_flags_.Any(TASK_STARTED)) {
+    SetTaskDidWork(true);
+  }
 
   // Check if task is null or run context is null
   if (task_ptr.IsNull() || !run_ctx) {
@@ -1390,6 +1406,11 @@ void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
   size_t queue_size = queue.size();
   size_t actual_limit = std::min(queue_size, check_limit);
 
+  // Capture SINGLE timestamp for ALL tasks processed in this batch
+  // This prevents timestamp desynchronization between tasks with same yield_time
+  hshm::Timepoint batch_timestamp;
+  batch_timestamp.Now();
+
   // Get current time for all checks
   for (size_t i = 0; i < actual_limit; i++) {
     if (queue.empty()) {
@@ -1404,9 +1425,11 @@ void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
       continue;
     }
 
-    // Check if the time threshold has been surpassed
-    if (run_ctx->block_start.GetUsecFromStart() >= run_ctx->yield_time_us_) {
-      // Time threshold reached - execute the task
+    // Check if the time threshold has been surpassed using batch timestamp
+    // Add 2ms tolerance to account for timing variance and ms/us precision mismatch
+    double elapsed_us = run_ctx->block_start.GetUsecFromStart(batch_timestamp);
+    if (elapsed_us + 2000.0 >= run_ctx->yield_time_us_) {
+      // Time threshold reached (within tolerance) - execute the task
       bool is_started = run_ctx->task->task_flags_.Any(TASK_STARTED);
 
       // CRITICAL: Clear the is_yielded_ flag before resuming the task
@@ -1416,6 +1439,10 @@ void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
       // For periodic tasks, unmark TASK_ROUTED and route again
       run_ctx->task->ClearFlags(TASK_ROUTED);
       Container *container = run_ctx->container;
+
+      // Use batch timestamp for rescheduling to prevent desynchronization
+      // This ensures all tasks in this batch get the same block_start time
+      run_ctx->block_start = batch_timestamp;
 
       // Route task again - this will handle both local and distributed routing
       if (RouteTask(run_ctx->future_, run_ctx->lane, container)) {
@@ -1565,8 +1592,14 @@ void Worker::AddToBlockedQueue(RunContext *run_ctx, bool wait_for_task) {
     blocked_queues_[queue_idx].push(run_ctx);
   } else {
     // Time-based periodic task - add to periodic queue
-    // Record the time when task was blocked
-    run_ctx->block_start.Now();
+    // Record the time when task was blocked (if not already set recently)
+    // Check if timestamp was set within last 10ms (indicates batch processing)
+    double elapsed_since_block_us = run_ctx->block_start.GetUsecFromStart();
+    if (elapsed_since_block_us > 10000.0 || elapsed_since_block_us < 0) {
+      // Timestamp is stale or uninitialized - set it now
+      run_ctx->block_start.Now();
+    }
+    // else: timestamp is fresh (< 10ms old), keep it to maintain synchronization
 
     // Determine which periodic queue based on yield_time_us_:
     // Queue[0]: yield_time_us_ <= 50us
@@ -1605,8 +1638,18 @@ void Worker::ReschedulePeriodicTask(RunContext *run_ctx,
   // Unset TASK_STARTED flag when rescheduling periodic task
   task_ptr->ClearFlags(TASK_STARTED);
 
+  // Adjust polling rate based on whether task did work
+  if (scheduler_) {
+    scheduler_->AdjustPolling(run_ctx);
+  } else {
+    // Fallback: use the true period if no scheduler available
+    run_ctx->yield_time_us_ = task_ptr->period_ns_ / 1000.0;
+  }
+
+  // Reset did_work_ for the next execution
+  run_ctx->did_work_ = false;
+
   // Add to blocked queue - block count will be incremented automatically
-  run_ctx->yield_time_us_ = task_ptr->period_ns_ / 1000.0;
   AddToBlockedQueue(run_ctx);
 }
 
