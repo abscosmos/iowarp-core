@@ -229,6 +229,31 @@ class Client : public chi::ContainerClient {
     // Submit to runtime and return Future
     return ipc_manager->Send(task);
   }
+
+  /**
+   * Submit a batch of tasks in a single RPC (asynchronous)
+   * Allows efficient submission of multiple tasks with minimal network overhead
+   *
+   * @param pool_query Query for routing this task
+   * @param batch TaskBatch containing the tasks to submit
+   * @return Future for SubmitBatchTask with completion results
+   */
+  chi::Future<SubmitBatchTask> AsyncSubmitBatch(const chi::PoolQuery& pool_query,
+                                                 const TaskBatch& batch) {
+    auto* ipc_manager = CHI_IPC;
+
+    HLOG(kInfo, "AsyncSubmitBatch: Creating SubmitBatchTask with {} tasks",
+         batch.GetTaskCount());
+
+    // Allocate SubmitBatchTask with batch data
+    auto task = ipc_manager->NewTask<SubmitBatchTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, batch);
+
+    HLOG(kInfo, "AsyncSubmitBatch: Task created, sending to runtime");
+
+    // Submit to runtime and return Future
+    return ipc_manager->Send(task);
+  }
 };
 
 }  // namespace chimaera::admin

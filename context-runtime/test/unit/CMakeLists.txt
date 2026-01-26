@@ -390,6 +390,44 @@ set_target_properties(${LOCAL_TASK_ARCHIVE_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# SubmitBatch test executable (test for TaskBatch and SubmitBatch functionality)
+set(SUBMIT_BATCH_TEST_TARGET chimaera_submit_batch_tests)
+set(SUBMIT_BATCH_TEST_SOURCES
+  test_submit_batch.cc
+)
+
+# Create SubmitBatch test executable
+add_executable(${SUBMIT_BATCH_TEST_TARGET} ${SUBMIT_BATCH_TEST_SOURCES})
+
+# Include directories for SubmitBatch tests
+target_include_directories(${SUBMIT_BATCH_TEST_TARGET} PRIVATE
+  ${CHIMAERA_ROOT}/include
+  ${CHIMAERA_ROOT}/test  # For simple_test.h
+  ${CHIMAERA_ROOT}/modules/admin/include  # For admin tasks
+)
+
+# Link against required libraries for SubmitBatch tests
+target_link_libraries(${SUBMIT_BATCH_TEST_TARGET}
+  chimaera_admin_runtime          # Admin module runtime
+  chimaera_admin_client           # Admin module client
+  hshm::cxx                       # HermesShm library
+  ${CMAKE_THREAD_LIBS_INIT}       # Threading support
+)
+
+# Set C++ standard for SubmitBatch tests
+set_target_properties(${SUBMIT_BATCH_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+# Define CHIMAERA_RUNTIME for runtime mode
+target_compile_definitions(${SUBMIT_BATCH_TEST_TARGET} PRIVATE CHIMAERA_RUNTIME=1)
+
+# Copy SubmitBatch test executable to bin directory
+set_target_properties(${SUBMIT_BATCH_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Create test executable
 add_executable(${TEST_TARGET} ${TEST_SOURCES})
 

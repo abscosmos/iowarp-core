@@ -736,6 +736,181 @@ struct MonitorTask : public chi::Task {
   }
 };
 
+/**
+ * TaskBatch - Container for batch task submission
+ * Stores task metadata and serialized task data for efficient batch submission
+ */
+class TaskBatch {
+private:
+  std::vector<chi::LocalTaskInfo> task_infos_;     /**< Task metadata for deserialization */
+  std::vector<char> serialized_data_;              /**< Serialized task data */
+
+public:
+  /**
+   * Default constructor
+   */
+  TaskBatch() = default;
+
+  /**
+   * Add a task to the batch
+   * @tparam TaskT Task type to add
+   * @tparam Args Constructor argument types
+   * @param args Arguments to pass to task constructor
+   */
+  template <typename TaskT, typename... Args>
+  void Add(Args &&...args) {
+    // Create new task in IPC
+    auto task = CHI_IPC->NewTask<TaskT>(std::forward<Args>(args)...);
+
+    // Serialize task inputs using LocalSaveTaskArchive
+    chi::LocalSaveTaskArchive archive(chi::LocalMsgType::kSerializeIn);
+    archive << (*task);
+
+    // Record task info
+    const auto& task_infos = archive.GetTaskInfos();
+    if (!task_infos.empty()) {
+      task_infos_.insert(task_infos_.end(), task_infos.begin(), task_infos.end());
+    }
+
+    // Append serialized data
+    const auto& data = archive.GetData();
+    serialized_data_.insert(serialized_data_.end(), data.begin(), data.end());
+  }
+
+  /**
+   * Get task infos
+   * @return Vector of task information
+   */
+  const std::vector<chi::LocalTaskInfo> &GetTaskInfos() const {
+    return task_infos_;
+  }
+
+  /**
+   * Get serialized data
+   * @return Vector of serialized task data
+   */
+  const std::vector<char> &GetSerializedData() const {
+    return serialized_data_;
+  }
+
+  /**
+   * Get number of tasks in batch
+   * @return Number of tasks
+   */
+  size_t GetTaskCount() const {
+    return task_infos_.size();
+  }
+
+  /**
+   * Serialize for cereal
+   * @tparam Archive Archive type
+   * @param ar Archive instance
+   */
+  template <typename Archive>
+  void serialize(Archive &ar) {
+    ar(task_infos_, serialized_data_);
+  }
+};
+
+/**
+ * SubmitBatchTask - Submit a batch of tasks in a single RPC
+ * Allows efficient submission of multiple tasks with minimal network overhead
+ */
+struct SubmitBatchTask : public chi::Task {
+  // Batch task data
+  IN std::vector<chi::LocalTaskInfo> task_infos_;    ///< Task metadata
+  IN std::vector<char> serialized_data_;             ///< Serialized task data
+
+  // Results
+  OUT chi::u32 tasks_completed_;                     ///< Number of tasks completed
+  OUT chi::priv::string error_message_;              ///< Error description if failed
+
+  /**
+   * SHM default constructor
+   */
+  SubmitBatchTask()
+      : chi::Task(), task_infos_(), serialized_data_(),
+        tasks_completed_(0), error_message_(CHI_IPC->GetMainAlloc()) {}
+
+  /**
+   * Emplace constructor
+   */
+  explicit SubmitBatchTask(const chi::TaskId &task_node,
+                           const chi::PoolId &pool_id,
+                           const chi::PoolQuery &pool_query)
+      : chi::Task(task_node, pool_id, pool_query, Method::kSubmitBatch),
+        task_infos_(), serialized_data_(),
+        tasks_completed_(0), error_message_(CHI_IPC->GetMainAlloc()) {
+    // Initialize task
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kSubmitBatch;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /**
+   * Constructor with batch data
+   */
+  explicit SubmitBatchTask(const chi::TaskId &task_node,
+                           const chi::PoolId &pool_id,
+                           const chi::PoolQuery &pool_query,
+                           const TaskBatch &batch)
+      : chi::Task(task_node, pool_id, pool_query, Method::kSubmitBatch),
+        task_infos_(batch.GetTaskInfos()),
+        serialized_data_(batch.GetSerializedData()),
+        tasks_completed_(0), error_message_(CHI_IPC->GetMainAlloc()) {
+    // Initialize task
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kSubmitBatch;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /**
+   * Serialize IN and INOUT parameters for network transfer
+   * This includes: task_infos_, serialized_data_
+   */
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(task_infos_, serialized_data_);
+  }
+
+  /**
+   * Serialize OUT and INOUT parameters for network transfer
+   * This includes: tasks_completed_, error_message_
+   */
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(tasks_completed_, error_message_);
+  }
+
+  /**
+   * Copy from another SubmitBatchTask
+   * @param other Pointer to the source task to copy from
+   */
+  void Copy(const hipc::FullPtr<SubmitBatchTask> &other) {
+    // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
+    // Copy SubmitBatchTask-specific fields
+    task_infos_ = other->task_infos_;
+    serialized_data_ = other->serialized_data_;
+    tasks_completed_ = other->tasks_completed_;
+    error_message_ = other->error_message_;
+  }
+
+  /**
+   * Aggregate replica results into this task
+   */
+  void Aggregate(const hipc::FullPtr<SubmitBatchTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
 } // namespace chimaera::admin
 
 #endif // ADMIN_TASKS_H_

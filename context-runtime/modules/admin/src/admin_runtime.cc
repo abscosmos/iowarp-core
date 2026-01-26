@@ -954,6 +954,85 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
   co_return;
 }
 
+chi::TaskResume Runtime::SubmitBatch(hipc::FullPtr<SubmitBatchTask> task,
+                                     chi::RunContext &rctx) {
+  HLOG(kInfo, "Admin: Executing SubmitBatch task with {} tasks",
+       task->task_infos_.size());
+
+  auto *ipc_manager = CHI_IPC;
+  auto *pool_manager = CHI_POOL_MANAGER;
+
+  // Initialize output values
+  task->tasks_completed_ = 0;
+  task->error_message_ = "";
+
+  // If no tasks to submit
+  if (task->task_infos_.empty()) {
+    task->SetReturnCode(0);
+    HLOG(kInfo, "SubmitBatch: No tasks to submit");
+    co_return;
+  }
+
+  // Create LocalLoadTaskArchive from the serialized data
+  chi::LocalLoadTaskArchive archive(task->serialized_data_);
+
+  // Process tasks in batches of 32
+  constexpr size_t kMaxParallelTasks = 32;
+  std::vector<chi::Future<chi::Task>> pending_futures;
+  pending_futures.reserve(kMaxParallelTasks);
+
+  size_t task_idx = 0;
+  size_t total_tasks = task->task_infos_.size();
+
+  while (task_idx < total_tasks) {
+    // Submit up to kMaxParallelTasks tasks
+    pending_futures.clear();
+
+    for (size_t i = 0; i < kMaxParallelTasks && task_idx < total_tasks;
+         ++i, ++task_idx) {
+      const chi::LocalTaskInfo &task_info = task->task_infos_[task_idx];
+
+      // Get the container for this task's pool
+      chi::Container *container =
+          pool_manager->GetContainer(task_info.pool_id_);
+      if (!container) {
+        HLOG(kError, "SubmitBatch: Container not found for pool_id {}",
+             task_info.pool_id_);
+        continue;
+      }
+
+      // Deserialize and allocate the task
+      hipc::FullPtr<chi::Task> sub_task_ptr =
+          container->LocalAllocLoadTask(task_info.method_id_, archive);
+
+      if (sub_task_ptr.IsNull()) {
+        HLOG(kError, "SubmitBatch: Failed to load task at index {}", task_idx);
+        continue;
+      }
+
+      // Submit task and collect future
+      chi::Future<chi::Task> future = ipc_manager->Send(sub_task_ptr);
+      pending_futures.push_back(std::move(future));
+    }
+
+    // co_await all pending futures in this batch
+    for (auto &future : pending_futures) {
+      co_await future;
+      task->tasks_completed_++;
+    }
+
+    HLOG(kDebug, "SubmitBatch: Completed batch, total completed: {}",
+         task->tasks_completed_);
+  }
+
+  task->SetReturnCode(0);
+  HLOG(kInfo, "SubmitBatch: Completed {} of {} tasks",
+       task->tasks_completed_, total_tasks);
+
+  (void)rctx;
+  co_return;
+}
+
 chi::u64 Runtime::GetWorkRemaining() const {
   // Note: No lock needed - single net worker processes all Send/Recv tasks
   return send_map_.size() + recv_map_.size();
