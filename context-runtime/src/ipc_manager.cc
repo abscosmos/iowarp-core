@@ -747,8 +747,11 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     HLOG(kDebug, "Main server successfully bound to {}:{}", hostname, port);
 
     // Create heartbeat server on port+2 for client connection verification
+    // Heartbeat server binds to loopback (127.0.0.1) since it's only used
+    // for local client verification, not distributed communication
     u32 heartbeat_port = port + 2;
-    HLOG(kDebug, "Starting heartbeat server on {}:{}", hostname, heartbeat_port);
+    std::string heartbeat_host = "127.0.0.1";
+    HLOG(kDebug, "Starting heartbeat server on {}:{}", heartbeat_host, heartbeat_port);
 
     // Create raw ZMQ context and REP socket for heartbeat
     heartbeat_ctx_ = zmq_ctx_new();
@@ -766,7 +769,7 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     }
 
     std::string heartbeat_url =
-        protocol + "://" + hostname + ":" + std::to_string(heartbeat_port);
+        protocol + "://" + heartbeat_host + ":" + std::to_string(heartbeat_port);
     int rc = zmq_bind(heartbeat_socket_, heartbeat_url.c_str());
     if (rc == -1) {
       HLOG(kError, "Failed to bind heartbeat server to {}: {}",
