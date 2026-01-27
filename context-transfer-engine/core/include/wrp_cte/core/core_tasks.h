@@ -486,16 +486,19 @@ struct BlobInfo {
   float score_;             // 0-1 score for reorganization
   Timestamp last_modified_; // Last modification time
   Timestamp last_read_;     // Last read time
+  int compress_lib_;        // Compression library ID used for this blob (0 = no compression)
 
   BlobInfo()
       : blob_name_(), blocks_(), score_(0.0f),
         last_modified_(std::chrono::steady_clock::now()),
-        last_read_(std::chrono::steady_clock::now()) {}
+        last_read_(std::chrono::steady_clock::now()),
+        compress_lib_(0) {}
 
   explicit BlobInfo(CHI_MAIN_ALLOC_T *alloc)
       : blob_name_(), blocks_(), score_(0.0f),
         last_modified_(std::chrono::steady_clock::now()),
-        last_read_(std::chrono::steady_clock::now()) {
+        last_read_(std::chrono::steady_clock::now()),
+        compress_lib_(0) {
     (void)alloc; // Suppress unused parameter warning
   }
 
@@ -503,7 +506,8 @@ struct BlobInfo {
            const std::string &blob_name, float score)
       : blob_name_(blob_name), blocks_(), score_(score),
         last_modified_(std::chrono::steady_clock::now()),
-        last_read_(std::chrono::steady_clock::now()) {
+        last_read_(std::chrono::steady_clock::now()),
+        compress_lib_(0) {
     (void)alloc; // Suppress unused parameter warning
   }
 
@@ -516,6 +520,38 @@ struct BlobInfo {
       total += blocks_[i].size_;
     }
     return total;
+  }
+};
+
+/**
+ * Context structure for workflow-aware compression
+ * Provides metadata for compression decision-making
+ */
+struct Context {
+  int dynamic_compress_;   // 0 - skip, 1 - static, 2 - dynamic
+  int compress_lib_;       // The compression library to apply
+  chi::u32 target_psnr_;   // The acceptable PSNR for lossy compression (0 means infinity)
+  int psnr_chance_;        // The chance PSNR will be validated (default 100%)
+  bool max_performance_;   // Compression objective (performance vs ratio)
+  int consumer_node_;      // The node where consumer will access data (-1 for unknown)
+  int data_type_;          // The type of data (e.g., float, char, int, double)
+
+  Context()
+      : dynamic_compress_(0), compress_lib_(0), target_psnr_(0),
+        psnr_chance_(100), max_performance_(false),
+        consumer_node_(-1), data_type_(0) {}
+
+  explicit Context(CHI_MAIN_ALLOC_T *alloc)
+      : dynamic_compress_(0), compress_lib_(0), target_psnr_(0),
+        psnr_chance_(100), max_performance_(false),
+        consumer_node_(-1), data_type_(0) {
+    (void)alloc;
+  }
+
+  // Serialization support for cereal
+  template <class Archive> void serialize(Archive &ar) {
+    ar(dynamic_compress_, compress_lib_, target_psnr_, psnr_chance_,
+       max_performance_, consumer_node_, data_type_);
   }
 };
 
@@ -635,7 +671,7 @@ struct GetOrCreateTagTask : public chi::Task {
 };
 
 /**
- * PutBlob task - Store a blob (unimplemented for now)
+ * PutBlob task - Store a blob with optional compression context
  */
 struct PutBlobTask : public chi::Task {
   IN TagId tag_id_;              // Tag ID for blob grouping
@@ -644,24 +680,26 @@ struct PutBlobTask : public chi::Task {
   IN chi::u64 size_;             // Size of blob data
   IN hipc::ShmPtr<> blob_data_;   // Blob data (shared memory pointer)
   IN float score_;               // Score 0-1 for placement decisions
+  IN Context context_;           // Context for compression control (NEW)
   IN chi::u32 flags_;            // Operation flags
 
   // SHM constructor
   PutBlobTask()
       : chi::Task(), tag_id_(TagId::GetNull()), blob_name_(CHI_IPC->GetMainAlloc()),
         offset_(0), size_(0),
-        blob_data_(hipc::ShmPtr<>::GetNull()), score_(0.5f), flags_(0) {}
+        blob_data_(hipc::ShmPtr<>::GetNull()), score_(0.5f), context_(),
+        flags_(0) {}
 
   // Emplace constructor
   explicit PutBlobTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
                        const chi::PoolQuery &pool_query, const TagId &tag_id,
                        const std::string &blob_name,
                        chi::u64 offset, chi::u64 size, hipc::ShmPtr<> blob_data,
-                       float score, chi::u32 flags)
+                       float score, const Context &context, chi::u32 flags)
       : chi::Task(task_id, pool_id, pool_query, Method::kPutBlob),
         tag_id_(tag_id), blob_name_(CHI_IPC->GetMainAlloc(), blob_name),
         offset_(offset), size_(size), blob_data_(blob_data), score_(score),
-        flags_(flags) {
+        context_(context), flags_(flags) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kPutBlob;
@@ -674,7 +712,7 @@ struct PutBlobTask : public chi::Task {
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_, offset_, size_, score_, flags_);
+    ar(tag_id_, blob_name_, offset_, size_, score_, context_, flags_);
     // Use BULK_XFER to transfer blob data from client to runtime
     ar.bulk(blob_data_, size_, BULK_XFER);
   }
@@ -700,6 +738,7 @@ struct PutBlobTask : public chi::Task {
     size_ = other->size_;
     blob_data_ = other->blob_data_;
     score_ = other->score_;
+    context_ = other->context_;
     flags_ = other->flags_;
   }
 

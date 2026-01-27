@@ -5,9 +5,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <regex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <wrp_cte/core/core_config.h>
 #include <wrp_cte/core/core_dpe.h>
@@ -835,7 +837,7 @@ chi::TaskResume Runtime::ReorganizeBlob(hipc::FullPtr<ReorganizeBlobTask> task,
           blob_name, new_score);
     auto put_task =
         client_.AsyncPutBlob(tag_id, blob_name, 0,
-                             blob_size, blob_data_buffer.shm_.template Cast<void>(), new_score, 0);
+                             blob_size, blob_data_buffer.shm_.template Cast<void>(), new_score, Context(), 0);
     co_await put_task;
 
     if (put_task->return_code_ != 0) {
@@ -2115,6 +2117,205 @@ chi::PoolQuery Runtime::HashBlobToContainer(const TagId &tag_id,
 
   return chi::PoolQuery::DirectHash(hash_value);
 }
+
+// ==============================================================================
+// Compression Support Methods
+// ==============================================================================
+
+#ifdef WRP_CORE_ENABLE_COMPRESS
+std::vector<CompressionStats> Runtime::EstCompressionStats(
+    const void* chunk, chi::u64 chunk_size, const Context& context) {
+  std::vector<CompressionStats> results;
+
+  // Lazy initialization of neural network predictor
+  if (!nn_predictor_) {
+    nn_predictor_ = std::make_unique<hshm::compress::DenseNNPredictor>();
+    // TODO: Load pre-trained model from config path
+    // For now, predictor will return default predictions
+  }
+
+  // Calculate compression features from chunk
+  hshm::compress::CompressionFeatures features;
+  features.chunk_size_bytes = static_cast<double>(chunk_size);
+  features.target_cpu_util = 50.0;  // TODO: Get actual CPU utilization
+
+  // Calculate Shannon entropy
+  std::vector<int> histogram(256, 0);
+  const auto* data = static_cast<const uint8_t*>(chunk);
+  for (chi::u64 i = 0; i < chunk_size && i < 65536; ++i) {  // Sample first 64KB
+    histogram[data[i]]++;
+  }
+
+  double entropy = 0.0;
+  chi::u64 sample_size = std::min(chunk_size, static_cast<chi::u64>(65536));
+  for (int count : histogram) {
+    if (count > 0) {
+      double prob = static_cast<double>(count) / static_cast<double>(sample_size);
+      entropy -= prob * std::log2(prob);
+    }
+  }
+  features.shannon_entropy = entropy;
+
+  // Calculate MAD (Mean Absolute Deviation)
+  double mean = 0.0;
+  for (chi::u64 i = 0; i < sample_size; ++i) {
+    mean += data[i];
+  }
+  mean /= static_cast<double>(sample_size);
+
+  double mad = 0.0;
+  for (chi::u64 i = 0; i < sample_size; ++i) {
+    mad += std::abs(static_cast<double>(data[i]) - mean);
+  }
+  features.mad = mad / static_cast<double>(sample_size);
+
+  // Calculate second derivative mean (curvature)
+  double second_deriv_sum = 0.0;
+  for (chi::u64 i = 2; i < sample_size && i < 1000; ++i) {
+    double second_deriv = static_cast<double>(data[i]) -
+                          2.0 * static_cast<double>(data[i-1]) +
+                          static_cast<double>(data[i-2]);
+    second_deriv_sum += std::abs(second_deriv);
+  }
+  chi::u64 deriv_count = std::min(sample_size - 2, static_cast<chi::u64>(998));
+  features.second_derivative_mean = (deriv_count > 0) ?
+                                    (second_deriv_sum / static_cast<double>(deriv_count)) : 0.0;
+
+  // Set data type based on context
+  features.data_type_char = (context.data_type_ == 0) ? 1 : 0;
+  features.data_type_float = (context.data_type_ == 1) ? 1 : 0;
+
+  // Determine candidate compression libraries
+  std::vector<int> candidate_libs;
+  if (context.dynamic_compress_ == 1) {
+    // Static mode: use specified library only
+    candidate_libs.push_back(context.compress_lib_);
+  } else {
+    // Dynamic mode: test all available libraries
+    candidate_libs = {1, 2, 3};  // Example: BZIP2=1, ZFP_0.01=2, ZFP_0.1=3
+  }
+
+  // Run predictions for each candidate library
+  for (int lib_id : candidate_libs) {
+    // Set one-hot encoding for this library
+    features.library_bzip2 = (lib_id == 1) ? 1 : 0;
+    features.library_zfp_tol_0_01 = (lib_id == 2) ? 1 : 0;
+    features.library_zfp_tol_0_1 = (lib_id == 3) ? 1 : 0;
+
+    // Predict using neural network
+    hshm::compress::CompressionPrediction pred;
+    if (nn_predictor_ && nn_predictor_->IsReady()) {
+      pred = nn_predictor_->Predict(features);
+    } else {
+      // Default predictions if model not loaded
+      pred.compression_ratio = 2.0;  // Assume 2x compression
+      pred.psnr_db = (lib_id >= 2) ? 40.0 : 0.0;  // Lossy if ZFP
+      pred.compression_time_ms = chunk_size / 100000.0;  // Rough estimate
+    }
+
+    // Filter out compressions below PSNR threshold
+    if (context.target_psnr_ > 0 && pred.psnr_db > 0 && pred.psnr_db < context.target_psnr_) {
+      continue;  // Skip this library, quality too low
+    }
+
+    // Add to results (estimate decompress time = compress time for now)
+    results.emplace_back(lib_id, pred.compression_ratio,
+                         pred.compression_time_ms, pred.compression_time_ms,
+                         pred.psnr_db);
+  }
+
+  return results;
+}
+
+double Runtime::EstWorkflowCompressTime(
+    chi::u64 chunk_size, double tier_bw, const CompressionStats& stats,
+    const Context& context) {
+
+  double compressed_size = chunk_size / stats.compression_ratio_;
+  double transfer_time_ms = (compressed_size / tier_bw) * 1000.0;
+
+  if (stats.psnr_db_ == 0.0) {
+    // Lossless compression
+    return stats.compress_time_ms_ + stats.decompress_time_ms_ + transfer_time_ms;
+  } else {
+    // Lossy compression - may need verification decompression
+    double psnr_check_prob = static_cast<double>(context.psnr_chance_) / 100.0;
+    return stats.compress_time_ms_ +
+           (1.0 + psnr_check_prob) * stats.decompress_time_ms_ +
+           transfer_time_ms;
+  }
+}
+
+std::tuple<int, int, double> Runtime::BestCompressRatio(
+    const void* chunk, chi::u64 chunk_size, int container_id,
+    const std::vector<CompressionStats>& stats, const Context& context) {
+
+  // Find the fastest tier where the compressed data will fit
+  // For now, use a simplified tier selection (tier 0 = fastest)
+  int best_tier = 0;
+  int best_lib = 0;
+  double best_time = std::numeric_limits<double>::max();
+  double best_ratio = 1.0;
+
+  // Assume tier bandwidth (TODO: get from target info)
+  double tier_bw = 1e9;  // 1 GB/s for tier 0
+
+  for (const auto& stat : stats) {
+    // Calculate workflow time for this compression
+    double est_time = EstWorkflowCompressTime(chunk_size, tier_bw, stat, context);
+
+    // Choose compression with best ratio that meets time constraints
+    if (stat.compression_ratio_ > best_ratio) {
+      best_ratio = stat.compression_ratio_;
+      best_lib = stat.compress_lib_;
+      best_time = est_time;
+      best_tier = 0;  // Simplified: always use fastest tier
+    }
+  }
+
+  return std::make_tuple(best_tier, best_lib, best_time);
+}
+
+std::tuple<int, int, double> Runtime::BestCompressTime(
+    const void* chunk, chi::u64 chunk_size, int container_id,
+    const std::vector<CompressionStats>& stats, const Context& context) {
+
+  int best_tier = 0;
+  int best_lib = 0;
+  double best_time = std::numeric_limits<double>::max();
+
+  // Assume tier bandwidth (TODO: get from target info based on container_id)
+  double tier_bw = 1e9;  // 1 GB/s for tier 0
+
+  // For each compression library and tier, calculate workflow time
+  for (const auto& stat : stats) {
+    double est_time = EstWorkflowCompressTime(chunk_size, tier_bw, stat, context);
+
+    // Choose combination with best performance
+    if (est_time < best_time) {
+      best_time = est_time;
+      best_lib = stat.compress_lib_;
+      best_tier = 0;  // Simplified: always use fastest tier
+    }
+  }
+
+  return std::make_tuple(best_tier, best_lib, best_time);
+}
+
+std::tuple<int, int, double> Runtime::BestCompressForNode(
+    const Context& context, const void* chunk, chi::u64 chunk_size,
+    int container_id, const std::vector<CompressionStats>& stats) {
+
+  // Choose strategy based on context objective
+  if (context.max_performance_) {
+    // Objective: minimize time
+    return BestCompressTime(chunk, chunk_size, container_id, stats, context);
+  } else {
+    // Objective: maximize compression ratio
+    return BestCompressRatio(chunk, chunk_size, container_id, stats, context);
+  }
+}
+#endif  // WRP_CORE_ENABLE_COMPRESS
 
 } // namespace wrp_cte::core
 

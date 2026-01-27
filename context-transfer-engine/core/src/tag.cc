@@ -44,8 +44,9 @@ void Tag::PutBlob(const std::string &blob_name, const char *data, size_t data_si
 void Tag::PutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data, size_t data_size,
                   size_t off, float score) {
   auto *cte_client = WRP_CTE_CLIENT;
+  // Use default Context() for backwards compatibility
   auto task = cte_client->AsyncPutBlob(tag_id_, blob_name,
-                                       off, data_size, data, score, 0);
+                                       off, data_size, data, score, Context());
   task.Wait();
 
   if (task->GetReturnCode() != 0) {
@@ -64,8 +65,9 @@ void Tag::PutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data, size
 chi::Future<PutBlobTask> Tag::AsyncPutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data,
                                              size_t data_size, size_t off, float score) {
   auto *cte_client = WRP_CTE_CLIENT;
+  // Use default Context() for backwards compatibility
   return cte_client->AsyncPutBlob(tag_id_, blob_name,
-                                  off, data_size, data, score, 0);
+                                  off, data_size, data, score, Context());
 }
 
 void Tag::GetBlob(const std::string &blob_name, char *data, size_t data_size, size_t off) {

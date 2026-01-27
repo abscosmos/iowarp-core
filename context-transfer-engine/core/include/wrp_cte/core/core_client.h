@@ -109,18 +109,19 @@ class Client : public chi::ContainerClient {
   }
 
   /**
-   * Asynchronous put blob - returns immediately
+   * Asynchronous put blob with optional compression context - returns immediately
    */
   chi::Future<PutBlobTask> AsyncPutBlob(const TagId &tag_id,
                                         const std::string &blob_name,
                                         chi::u64 offset, chi::u64 size,
                                         hipc::ShmPtr<> blob_data, float score,
-                                        chi::u32 flags) {
+                                        const Context &context = Context(),
+                                        chi::u32 flags = 0) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<PutBlobTask>(
         chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_id,
-        blob_name, offset, size, blob_data, score, flags);
+        blob_name, offset, size, blob_data, score, context, flags);
 
     return ipc_manager->Send(task);
   }
