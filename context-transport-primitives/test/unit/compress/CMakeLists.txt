@@ -16,20 +16,10 @@ add_executable(test_compress_exec
 #         test_init.cc
 #         test_compress_libpressio.cc)
 
-add_executable(benchmark_compress_exec
+add_executable(benchmark_compression_unified_exec
         ${TEST_MAIN}/main.cc
         test_init.cc
-        test_compress_benchmark.cc)
-
-add_executable(benchmark_compress_parameter_study_exec
-        ${TEST_MAIN}/main.cc
-        test_init.cc
-        test_compress_parameter_study.cc)
-
-add_executable(benchmark_compress_lossy_parameter_study_exec
-        ${TEST_MAIN}/main.cc
-        test_init.cc
-        test_compress_lossy_parameter_study.cc)
+        test_compression_benchmark.cc)
 
 # Compression predictor tests (C++ ML models)
 add_executable(test_xgboost_predictor
@@ -50,19 +40,7 @@ target_compile_definitions(test_compress_exec
 # target_compile_definitions(test_compress_libpressio_exec
 #         PRIVATE HSHM_ENABLE_COMPRESS=1)
 
-add_dependencies(benchmark_compress_exec hermes_shm_host)
-target_link_libraries(benchmark_compress_exec
-        hermes_shm_host hshm::compress Catch2::Catch2)
-target_compile_definitions(benchmark_compress_exec
-        PRIVATE HSHM_ENABLE_COMPRESS=1)
-
-add_dependencies(benchmark_compress_parameter_study_exec hermes_shm_host)
-target_link_libraries(benchmark_compress_parameter_study_exec
-        hermes_shm_host hshm::compress Catch2::Catch2)
-target_compile_definitions(benchmark_compress_parameter_study_exec
-        PRIVATE HSHM_ENABLE_COMPRESS=1)
-
-add_dependencies(benchmark_compress_lossy_parameter_study_exec hermes_shm_host)
+add_dependencies(benchmark_compression_unified_exec hermes_shm_host)
 # Link lossy compression libraries directly
 find_library(ZFP_LIBRARY NAMES zfp PATHS /usr/local/lib)
 find_library(SZ3_LIBRARY NAMES SZ3c PATHS /usr/local/lib)
@@ -87,9 +65,9 @@ if(FPZIP_LIBRARY)
     message(STATUS "Found FPZIP library: ${FPZIP_LIBRARY}")
 endif()
 
-target_link_libraries(benchmark_compress_lossy_parameter_study_exec
+target_link_libraries(benchmark_compression_unified_exec
         hermes_shm_host hshm::compress Catch2::Catch2 ${LOSSY_LIBS})
-target_compile_definitions(benchmark_compress_lossy_parameter_study_exec
+target_compile_definitions(benchmark_compression_unified_exec
         PRIVATE HSHM_ENABLE_COMPRESS=1)
 
 # Link XGBoost predictor test
@@ -136,6 +114,7 @@ add_test(NAME ctp_compress COMMAND
 #------------------------------------------------------------------------------
 install(TARGETS
         test_compress_exec
+        benchmark_compression_unified_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)

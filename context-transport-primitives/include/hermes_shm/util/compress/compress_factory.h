@@ -24,7 +24,7 @@
 #include "snappy.h"
 #include "zlib.h"
 #include "zstd.h"
-#if HSHM_HAS_LIBPRESSIO
+#if HSHM_ENABLE_LIBPRESSIO
 #include "libpressio.h"
 #endif
 
