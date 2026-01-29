@@ -143,7 +143,7 @@ chi::TaskResume Runtime::GetOrCreatePool(
     auto alloc = CHI_IPC->GetMainAlloc();
     std::string error_msg =
         std::string("Exception during pool creation: ") + e.what();
-    task->error_message_ = chi::priv::string(alloc, error_msg);
+    task->error_message_ = chi::priv::string(HSHM_MALLOC, error_msg);
     HLOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
   }
   co_return;
@@ -194,7 +194,7 @@ chi::TaskResume Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
     auto alloc = CHI_IPC->GetMainAlloc();
     std::string error_msg =
         std::string("Exception during pool destruction: ") + e.what();
-    task->error_message_ = chi::priv::string(alloc, error_msg);
+    task->error_message_ = chi::priv::string(HSHM_MALLOC, error_msg);
     HLOG(kError, "Admin: Pool destruction failed with exception: {}", e.what());
   }
   co_return;
@@ -226,7 +226,7 @@ chi::TaskResume Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
     auto *alloc = CHI_IPC->GetMainAlloc();
     std::string error_msg =
         std::string("Exception during runtime shutdown: ") + e.what();
-    task->error_message_ = chi::priv::string(alloc, error_msg);
+    task->error_message_ = chi::priv::string(HSHM_MALLOC, error_msg);
     HLOG(kError, "Admin: Runtime shutdown failed with exception: {}", e.what());
   }
   (void)rctx;
@@ -1055,7 +1055,7 @@ chi::TaskResume Runtime::RegisterMemory(hipc::FullPtr<RegisterMemoryTask> task,
       std::string shm_name = "chimaera_" + std::to_string(task->alloc_major_) +
                              "_" + std::to_string(task->alloc_minor_);
       task->error_message_ = chi::priv::string(
-          alloc, "Failed to register shared memory: " + shm_name);
+          HSHM_MALLOC, "Failed to register shared memory: " + shm_name);
       HLOG(kError, "Admin: RegisterMemory failed for {}", shm_name);
       co_return;
     }
@@ -1071,7 +1071,7 @@ chi::TaskResume Runtime::RegisterMemory(hipc::FullPtr<RegisterMemoryTask> task,
     auto *alloc = ipc_manager->GetMainAlloc();
     std::string error_msg =
         std::string("Exception during memory registration: ") + e.what();
-    task->error_message_ = chi::priv::string(alloc, error_msg);
+    task->error_message_ = chi::priv::string(HSHM_MALLOC, error_msg);
     HLOG(kError, "Admin: RegisterMemory failed with exception: {}", e.what());
   }
 

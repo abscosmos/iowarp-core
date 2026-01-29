@@ -73,13 +73,12 @@ bool Worker::Init() {
   // Note: assigned_lane_ will be set by WorkOrchestrator during external queue
   // initialization
 
-  // Allocate and initialize event queue from main allocator
-  auto *alloc = CHI_IPC->GetMainAlloc();
+  // Allocate and initialize event queue from malloc allocator (temporary runtime data)
   event_queue_ =
-      alloc
+      HSHM_MALLOC
           ->template NewObj<
-              hipc::mpsc_ring_buffer<RunContext *, CHI_MAIN_ALLOC_T>>(
-              alloc, EVENT_QUEUE_DEPTH)
+              hshm::ipc::mpsc_ring_buffer<RunContext *, hshm::ipc::MallocAllocator>>(
+              HSHM_MALLOC, EVENT_QUEUE_DEPTH)
           .ptr_;
 
   // Create epoll file descriptor for efficient worker suspension

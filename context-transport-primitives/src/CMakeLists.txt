@@ -8,6 +8,7 @@ set(HSHM_LIBS "")
 # BUILD HSHM FOR HOST ONLY
 set(SRC_FILES
     system_info.cc
+    malloc_allocator.cc
     # memory_manager.cc  # NOTE: Deleted during hard refactoring
 )
 

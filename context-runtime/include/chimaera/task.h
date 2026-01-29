@@ -199,13 +199,13 @@ class Task {
   HSHM_CROSS_FUN void ClearFlags(u32 flags) { task_flags_.UnsetBits(flags); }
 
   /**
-   * Serialize data structures to chi::ipc::string using cereal
-   * @param alloc Context allocator for memory management
+   * Serialize data structures to chi::priv::string using cereal
+   * @param alloc Malloc allocator for memory management (private data)
    * @param output_str The string to store serialized data
    * @param args The arguments to serialize
    */
   template <typename... Args>
-  static void Serialize(AllocT* alloc, chi::priv::string& output_str,
+  static void Serialize(hipc::MallocAllocator* alloc, chi::priv::string& output_str,
                         const Args&... args) {
     std::ostringstream os;
     cereal::BinaryOutputArchive archive(os);
