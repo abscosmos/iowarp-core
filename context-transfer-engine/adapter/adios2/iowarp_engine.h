@@ -125,8 +125,23 @@ class IowarpEngine : public adios2::plugin::PluginEngineInterface {
   /** Vector of deferred put tasks for current step */
   std::vector<DeferredTask> deferred_tasks_;
 
+  /** Compression mode from environment: 0=none, 1=static, 2=dynamic */
+  int compress_mode_;
+
+  /** Compression library ID for static mode */
+  int compress_lib_;
+
+  /** Enable compression tracing */
+  bool compress_trace_;
+
   /** Increment the current step */
   void IncrementCurrentStep() { current_step_++; }
+
+  /** Read compression environment variables */
+  void ReadCompressionEnvVars();
+
+  /** Create Context object for Put operations based on environment settings */
+  wrp_cte::core::Context CreateCompressionContext();
 };
 
 }  // namespace coeus

@@ -487,18 +487,19 @@ struct BlobInfo {
   Timestamp last_modified_; // Last modification time
   Timestamp last_read_;     // Last read time
   int compress_lib_;        // Compression library ID used for this blob (0 = no compression)
+  chi::u64 trace_key_;      // Unique trace ID for linking to trace logs (0 = not traced)
 
   BlobInfo()
       : blob_name_(), blocks_(), score_(0.0f),
         last_modified_(std::chrono::steady_clock::now()),
         last_read_(std::chrono::steady_clock::now()),
-        compress_lib_(0) {}
+        compress_lib_(0), trace_key_(0) {}
 
   explicit BlobInfo(CHI_MAIN_ALLOC_T *alloc)
       : blob_name_(), blocks_(), score_(0.0f),
         last_modified_(std::chrono::steady_clock::now()),
         last_read_(std::chrono::steady_clock::now()),
-        compress_lib_(0) {
+        compress_lib_(0), trace_key_(0) {
     (void)alloc; // Suppress unused parameter warning
   }
 
@@ -507,7 +508,7 @@ struct BlobInfo {
       : blob_name_(blob_name), blocks_(), score_(score),
         last_modified_(std::chrono::steady_clock::now()),
         last_read_(std::chrono::steady_clock::now()),
-        compress_lib_(0) {
+        compress_lib_(0), trace_key_(0) {
     (void)alloc; // Suppress unused parameter warning
   }
 
@@ -535,23 +536,28 @@ struct Context {
   bool max_performance_;   // Compression objective (performance vs ratio)
   int consumer_node_;      // The node where consumer will access data (-1 for unknown)
   int data_type_;          // The type of data (e.g., float, char, int, double)
+  bool trace_;             // Enable tracing for this operation
+  chi::u64 trace_key_;     // Unique trace ID for this Put operation
+  int trace_node_;         // Node ID where trace was initiated
 
   Context()
       : dynamic_compress_(0), compress_lib_(0), target_psnr_(0),
         psnr_chance_(100), max_performance_(false),
-        consumer_node_(-1), data_type_(0) {}
+        consumer_node_(-1), data_type_(0), trace_(false),
+        trace_key_(0), trace_node_(-1) {}
 
   explicit Context(CHI_MAIN_ALLOC_T *alloc)
       : dynamic_compress_(0), compress_lib_(0), target_psnr_(0),
         psnr_chance_(100), max_performance_(false),
-        consumer_node_(-1), data_type_(0) {
+        consumer_node_(-1), data_type_(0), trace_(false),
+        trace_key_(0), trace_node_(-1) {
     (void)alloc;
   }
 
   // Serialization support for cereal
   template <class Archive> void serialize(Archive &ar) {
     ar(dynamic_compress_, compress_lib_, target_psnr_, psnr_chance_,
-       max_performance_, consumer_node_, data_type_);
+       max_performance_, consumer_node_, data_type_, trace_, trace_key_, trace_node_);
   }
 };
 

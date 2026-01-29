@@ -1,0 +1,26 @@
+{
+  "model_type": "qtable",
+  "version": "1.0",
+  "created": "2026-01-28 17:05:33",
+  "training_samples": 148608,
+  "test_samples": 37152,
+  "n_bins": 15,
+  "n_states": 58387,
+  "overall_r2": 0.7402264240378966,
+  "unknown_rate": 0.191349052540913,
+  "features": [
+    "library_id",
+    "config_id",
+    "datatype_id",
+    "data_size",
+    "shannon_entropy",
+    "mean_absolute_deviation",
+    "second_order_derivative"
+  ],
+  "targets": [
+    "compression_ratio",
+    "compress_time_ms",
+    "decompress_time_ms",
+    "psnr_db"
+  ]
+}

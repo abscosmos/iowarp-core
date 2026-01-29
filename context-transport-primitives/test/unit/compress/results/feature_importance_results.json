@@ -1,0 +1,55 @@
+{
+  "feature_importance_by_target": {
+    "compression_ratio": {
+      "library_id": 11.11372556122049,
+      "config_id": 3.670234090114492,
+      "datatype_id": 10.563667808720558,
+      "data_size": 3.3493885183109104,
+      "shannon_entropy": 11.51973627383966,
+      "mean_absolute_deviation": 10.741561243679785,
+      "second_order_derivative": 49.041686504114104
+    },
+    "compress_time_ms": {
+      "library_id": 9.371329445729186,
+      "config_id": 55.50018442016659,
+      "datatype_id": 7.164978477547276,
+      "data_size": 14.158278611973993,
+      "shannon_entropy": 7.030301364417231,
+      "mean_absolute_deviation": 2.402318893302642,
+      "second_order_derivative": 4.372608786863084
+    },
+    "decompress_time_ms": {
+      "library_id": 44.601777118024614,
+      "config_id": 2.030901861650443,
+      "datatype_id": 10.406467856542893,
+      "data_size": 22.098640832815843,
+      "shannon_entropy": 13.140677244943966,
+      "mean_absolute_deviation": 2.761189113290915,
+      "second_order_derivative": 4.960345972731329
+    },
+    "psnr_db": {
+      "library_id": 70.83766400426003,
+      "config_id": 10.626677768108783,
+      "datatype_id": 17.374399437745435,
+      "data_size": 0.045935631020866,
+      "shannon_entropy": 0.6391171162525506,
+      "mean_absolute_deviation": 0.32038885178407145,
+      "second_order_derivative": 0.1558171908282589
+    }
+  },
+  "feature_names": [
+    "library_id",
+    "config_id",
+    "datatype_id",
+    "data_size",
+    "shannon_entropy",
+    "mean_absolute_deviation",
+    "second_order_derivative"
+  ],
+  "target_names": [
+    "compression_ratio",
+    "compress_time_ms",
+    "decompress_time_ms",
+    "psnr_db"
+  ]
+}

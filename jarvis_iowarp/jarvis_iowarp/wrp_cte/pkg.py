@@ -81,6 +81,53 @@ class WrpCte(Service):
                 'msg': 'Period at which targets should be rescanned for statistics (capacity, bandwidth, etc.) in milliseconds',
                 'type': int,
                 'default': 5000
+            },
+            {
+                'name': 'monitor_interval_ms',
+                'msg': 'Compression monitor interval for collecting target capacities and stats (milliseconds)',
+                'type': int,
+                'default': 5
+            },
+            {
+                'name': 'dnn_model_weights_path',
+                'msg': 'Path to DNN model weights JSON file for compression prediction (empty = disabled)',
+                'type': str,
+                'default': ''
+            },
+            {
+                'name': 'dnn_samples_before_reinforce',
+                'msg': 'Number of samples to collect before reinforcing DNN model',
+                'type': int,
+                'default': 1000
+            },
+            {
+                'name': 'trace_folder_path',
+                'msg': 'Path to folder for CTE trace logs (empty = disabled)',
+                'type': str,
+                'default': ''
+            },
+            {
+                'name': 'compress_mode',
+                'msg': 'Compression mode for IOWarp Engine',
+                'type': str,
+                'choices': ['none', 'static', 'dynamic'],
+                'default': 'none',
+                'help': 'Environment variable COMPRESS_MODE: none (no compression), static (fixed library), dynamic (adaptive)'
+            },
+            {
+                'name': 'compress_lib',
+                'msg': 'Compression library ID for static mode (used when compress_mode=static)',
+                'type': int,
+                'default': 0,
+                'help': 'Environment variable COMPRESS_LIB: library ID (e.g., 1=ZSTD, 2=LZ4, etc.)'
+            },
+            {
+                'name': 'compress_trace',
+                'msg': 'Enable compression tracing',
+                'type': str,
+                'choices': ['on', 'off'],
+                'default': 'off',
+                'help': 'Environment variable COMPRESS_TRACE: on (enable tracing), off (disable)'
             }
         ]
 
@@ -391,6 +438,12 @@ class WrpCte(Service):
             'storage': storage_config,
             'dpe': {
                 'dpe_type': self.config.get('dpe_type', 'max_bw')
+            },
+            'compression': {
+                'monitor_interval_ms': self.config.get('monitor_interval_ms', 5),
+                'dnn_model_weights_path': self.config.get('dnn_model_weights_path', ''),
+                'dnn_samples_before_reinforce': self.config.get('dnn_samples_before_reinforce', 1000),
+                'trace_folder_path': self.config.get('trace_folder_path', '')
             }
         }
 
@@ -428,10 +481,18 @@ class WrpCte(Service):
         self.log(f"  Config: {self.compose_config_path}")
         self.log(f"  Nodes: {len(self.jarvis.hostfile)}")
 
+        # Prepare environment with compression settings for IOWarp Engine
+        env = self.env.copy() if self.env else {}
+        env['COMPRESS_MODE'] = self.config.get('compress_mode', 'none')
+        env['COMPRESS_LIB'] = str(self.config.get('compress_lib', 0))
+        env['COMPRESS_TRACE'] = self.config.get('compress_trace', 'off')
+
+        self.log(f"  Compression environment: MODE={env['COMPRESS_MODE']}, LIB={env['COMPRESS_LIB']}, TRACE={env['COMPRESS_TRACE']}")
+
         try:
             # Execute chimaera_compose on all nodes using PsshExecInfo
             Exec(cmd, PsshExecInfo(
-                env=self.env,
+                env=env,
                 hostfile=self.jarvis.hostfile
             )).run()
 

@@ -13,9 +13,10 @@
 
 #ifdef WRP_CORE_ENABLE_COMPRESS
 #ifdef HSHM_ENABLE_DENSE_NN
-#include <context-transport-primitives/compression/dense_nn_predictor.h>
+#include <hermes_shm/util/compress/dynamic/compression/dense_nn_predictor.h>
 #endif
-#include <context-transport-primitives/compression/compression_features.h>
+#include <hermes_shm/util/compress/dynamic/compression/compression_features.h>
+#include <hermes_shm/util/compress/dynamic/compression/qtable_predictor.h>
 #include <hermes_shm/util/compress/compress_factory.h>
 #endif
 
@@ -216,6 +217,9 @@ private:
   // Neural network predictor for compression (initialized on demand)
   std::unique_ptr<hshm::compress::DenseNNPredictor> nn_predictor_;
 #endif
+
+  // Q-table predictor for compression (primary prediction method)
+  std::unique_ptr<hshm::compress::QTablePredictor> qtable_predictor_;
 
   // Compression telemetry ring buffer (similar to telemetry_log_)
   using CompressionTelemetryLog = hipc::ring_buffer<CompressionTelemetry, CHI_MAIN_ALLOC_T>;

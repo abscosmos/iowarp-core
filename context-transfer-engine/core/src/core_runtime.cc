@@ -1,13 +1,16 @@
 #include "chimaera/worker.h"
 #include "hermes_shm/util/logging.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -191,6 +194,49 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
   // Queue management has been removed - queues are now managed by Chimaera
   // runtime Local queues (kTargetManagementQueue, kTagManagementQueue,
   // kBlobOperationsQueue, kStatsQueue) are no longer created explicitly
+
+#ifdef WRP_CORE_ENABLE_COMPRESS
+  // Load Q-table model if configured (primary prediction method)
+  if (!config_.compression_.qtable_model_path_.empty()) {
+    try {
+      HLOG(kInfo, "Loading Q-table model from: {}", config_.compression_.qtable_model_path_);
+      qtable_predictor_ = std::make_unique<hshm::compress::QTablePredictor>();
+      if (qtable_predictor_->Load(config_.compression_.qtable_model_path_)) {
+        HLOG(kInfo, "Q-table model loaded successfully with {} states",
+             qtable_predictor_->GetNumStates());
+      } else {
+        HLOG(kWarning, "Failed to load Q-table model from: {}", config_.compression_.qtable_model_path_);
+        qtable_predictor_.reset();
+      }
+    } catch (const std::exception& e) {
+      HLOG(kError, "Exception while loading Q-table model: {}", e.what());
+      qtable_predictor_.reset();
+    }
+  }
+
+#ifdef HSHM_ENABLE_DENSE_NN
+  // Load DNN model weights as fallback if Q-table not available
+  if (!qtable_predictor_ && !config_.compression_.dnn_model_weights_path_.empty()) {
+    try {
+      HLOG(kInfo, "Loading DNN model weights from: {}", config_.compression_.dnn_model_weights_path_);
+      nn_predictor_ = std::make_unique<hshm::compress::DenseNNPredictor>();
+      if (nn_predictor_->LoadWeights(config_.compression_.dnn_model_weights_path_)) {
+        HLOG(kInfo, "DNN model loaded successfully");
+      } else {
+        HLOG(kWarning, "Failed to load DNN model weights from: {}", config_.compression_.dnn_model_weights_path_);
+        nn_predictor_.reset();
+      }
+    } catch (const std::exception& e) {
+      HLOG(kError, "Exception while loading DNN model: {}", e.what());
+      nn_predictor_.reset();
+    }
+  }
+#endif  // HSHM_ENABLE_DENSE_NN
+
+  if (!qtable_predictor_) {
+    HLOG(kDebug, "No compression predictor configured, dynamic compression prediction disabled");
+  }
+#endif  // WRP_CORE_ENABLE_COMPRESS
 
   HLOG(kInfo,
         "CTE Core container created and initialized for pool: {} (ID: {})",
@@ -2137,35 +2183,22 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void* chunk, chi::u64 chunk_size, const Context& context) {
   std::vector<CompressionStats> results;
 
-#ifdef HSHM_ENABLE_DENSE_NN
-  // Lazy initialization of neural network predictor
-  if (!nn_predictor_) {
-    nn_predictor_ = std::make_unique<hshm::compress::DenseNNPredictor>();
-    // TODO: Load pre-trained model from config path
-    // For now, predictor will return default predictions
-  }
-
-  // Calculate compression features from chunk
-  hshm::compress::CompressionFeatures features;
-  features.chunk_size_bytes = static_cast<double>(chunk_size);
-  features.target_cpu_util = 50.0;  // TODO: Get actual CPU utilization
+  // Calculate compression features from chunk data
+  const auto* data = static_cast<const uint8_t*>(chunk);
+  chi::u64 sample_size = std::min(chunk_size, static_cast<chi::u64>(65536));
 
   // Calculate Shannon entropy
   std::vector<int> histogram(256, 0);
-  const auto* data = static_cast<const uint8_t*>(chunk);
-  for (chi::u64 i = 0; i < chunk_size && i < 65536; ++i) {  // Sample first 64KB
+  for (chi::u64 i = 0; i < sample_size; ++i) {
     histogram[data[i]]++;
   }
-
   double entropy = 0.0;
-  chi::u64 sample_size = std::min(chunk_size, static_cast<chi::u64>(65536));
   for (int count : histogram) {
     if (count > 0) {
       double prob = static_cast<double>(count) / static_cast<double>(sample_size);
       entropy -= prob * std::log2(prob);
     }
   }
-  features.shannon_entropy = entropy;
 
   // Calculate MAD (Mean Absolute Deviation)
   double mean = 0.0;
@@ -2173,72 +2206,96 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     mean += data[i];
   }
   mean /= static_cast<double>(sample_size);
-
   double mad = 0.0;
   for (chi::u64 i = 0; i < sample_size; ++i) {
     mad += std::abs(static_cast<double>(data[i]) - mean);
   }
-  features.mad = mad / static_cast<double>(sample_size);
+  mad /= static_cast<double>(sample_size);
 
   // Calculate second derivative mean (curvature)
   double second_deriv_sum = 0.0;
-  for (chi::u64 i = 2; i < sample_size && i < 1000; ++i) {
-    double second_deriv = static_cast<double>(data[i]) -
-                          2.0 * static_cast<double>(data[i-1]) +
-                          static_cast<double>(data[i-2]);
+  chi::u64 deriv_count = 0;
+  for (chi::u64 i = 1; i < sample_size - 1 && i < 999; ++i) {
+    double second_deriv = static_cast<double>(data[i + 1]) -
+                          2.0 * static_cast<double>(data[i]) +
+                          static_cast<double>(data[i - 1]);
     second_deriv_sum += std::abs(second_deriv);
+    deriv_count++;
   }
-  chi::u64 deriv_count = std::min(sample_size - 2, static_cast<chi::u64>(998));
-  features.second_derivative_mean = (deriv_count > 0) ?
-                                    (second_deriv_sum / static_cast<double>(deriv_count)) : 0.0;
+  double second_derivative_mean = (deriv_count > 0) ?
+      (second_deriv_sum / static_cast<double>(deriv_count)) : 0.0;
 
-  // Set data type based on context
-  features.data_type_char = (context.data_type_ == 0) ? 1 : 0;
-  features.data_type_float = (context.data_type_ == 1) ? 1 : 0;
-#endif  // HSHM_ENABLE_DENSE_NN
-
-  // Determine candidate compression libraries
-  std::vector<int> candidate_libs;
+  // Determine candidate compression libraries and configs
+  // Library IDs: BROTLI=0, BZIP2=1, Blosc2=2, FPZIP=3, LZ4=4, LZMA=5,
+  //              SNAPPY=6, SZ3=7, ZFP=8, ZLIB=9, ZSTD=10
+  // Config IDs: balanced=0, best=1, default=2, fast=3
+  std::vector<std::pair<int, int>> candidate_lib_configs;
   if (context.dynamic_compress_ == 1) {
-    // Static mode: use specified library only
-    candidate_libs.push_back(context.compress_lib_);
+    // Static mode: use specified library with default config
+    candidate_lib_configs.push_back({context.compress_lib_, 2});
   } else {
-    // Dynamic mode: test all available libraries
-    candidate_libs = {1, 2, 3};  // Example: BZIP2=1, ZFP_0.01=2, ZFP_0.1=3
+    // Dynamic mode: test common library/config combinations
+    candidate_lib_configs = {
+      {10, 0},  // ZSTD balanced
+      {10, 3},  // ZSTD fast
+      {4, 3},   // LZ4 fast
+      {1, 1},   // BZIP2 best
+      {9, 0},   // ZLIB balanced
+    };
   }
 
-  // Run predictions for each candidate library
-  for (int lib_id : candidate_libs) {
-#ifdef HSHM_ENABLE_DENSE_NN
-    // Set one-hot encoding for this library
-    features.library_bzip2 = (lib_id == 1) ? 1 : 0;
-    features.library_zfp_tol_0_01 = (lib_id == 2) ? 1 : 0;
-    features.library_zfp_tol_0_1 = (lib_id == 3) ? 1 : 0;
+  // Run predictions for each candidate library/config
+  for (const auto& [lib_id, config_id] : candidate_lib_configs) {
+    hshm::compress::CompressionPrediction pred;
 
-    // Predict using neural network
-    hshm::compress::CompressionPrediction pred;
-    if (nn_predictor_ && nn_predictor_->IsReady()) {
-      pred = nn_predictor_->Predict(features);
-    } else {
-      // Default predictions if model not loaded
-      pred.compression_ratio = 2.0;  // Assume 2x compression
-      pred.psnr_db = (lib_id >= 2) ? 40.0 : 0.0;  // Lossy if ZFP
-      pred.compression_time_ms = chunk_size / 100000.0;  // Rough estimate
+    // Use Q-table predictor if available (primary method)
+    if (qtable_predictor_ && qtable_predictor_->IsReady()) {
+      hshm::compress::CompressionFeatures features;
+      features.library_config_id = static_cast<double>(lib_id);
+      features.chunk_size_bytes = static_cast<double>(chunk_size);
+      features.shannon_entropy = entropy;
+      features.mad = mad;
+      features.second_derivative_mean = second_derivative_mean;
+      // Set config encoding
+      features.config_fast = (config_id == 3) ? 1 : 0;
+      features.config_balanced = (config_id == 0) ? 1 : 0;
+      features.config_best = (config_id == 1) ? 1 : 0;
+      // Set data type encoding
+      features.data_type_char = (context.data_type_ == 0) ? 1 : 0;
+      features.data_type_float = (context.data_type_ == 1) ? 1 : 0;
+
+      pred = qtable_predictor_->Predict(features);
     }
-#else
-    // Fallback: Use simple heuristic predictions without neural network
-    hshm::compress::CompressionPrediction pred;
-    pred.compression_ratio = 2.0;  // Assume 2x compression
-    pred.psnr_db = (lib_id >= 2) ? 40.0 : 0.0;  // Lossy if ZFP
-    pred.compression_time_ms = chunk_size / 100000.0;  // Rough estimate: ~100 MB/s
+#ifdef HSHM_ENABLE_DENSE_NN
+    // Fallback to DNN if Q-table not available
+    else if (nn_predictor_ && nn_predictor_->IsReady()) {
+      hshm::compress::CompressionFeatures features;
+      features.library_config_id = static_cast<double>(lib_id);
+      features.chunk_size_bytes = static_cast<double>(chunk_size);
+      features.shannon_entropy = entropy;
+      features.mad = mad;
+      features.second_derivative_mean = second_derivative_mean;
+      features.config_fast = (config_id == 3) ? 1 : 0;
+      features.config_balanced = (config_id == 0) ? 1 : 0;
+      features.config_best = (config_id == 1) ? 1 : 0;
+      features.data_type_char = (context.data_type_ == 0) ? 1 : 0;
+      features.data_type_float = (context.data_type_ == 1) ? 1 : 0;
+      pred = nn_predictor_->Predict(features);
+    }
 #endif  // HSHM_ENABLE_DENSE_NN
+    else {
+      // Heuristic fallback if no predictor available
+      pred.compression_ratio = 2.0;
+      pred.psnr_db = 0.0;
+      pred.compression_time_ms = static_cast<double>(chunk_size) / 100000.0;
+    }
 
     // Filter out compressions below PSNR threshold
     if (context.target_psnr_ > 0 && pred.psnr_db > 0 && pred.psnr_db < context.target_psnr_) {
-      continue;  // Skip this library, quality too low
+      continue;
     }
 
-    // Add to results (estimate decompress time = compress time for now)
+    // Add to results
     results.emplace_back(lib_id, pred.compression_ratio,
                          pred.compression_time_ms, pred.compression_time_ms,
                          pred.psnr_db);
@@ -2336,6 +2393,26 @@ std::tuple<int, int, double> Runtime::BestCompressForNode(
   }
 }
 
+// Static atomic trace key counter for generating unique trace IDs
+static std::atomic<chi::u64> g_trace_key_counter{1};
+
+// Helper function to write trace log entry
+static void WriteTraceLog(const std::string& trace_folder, const std::string& log_name,
+                          chi::u32 container_id, const std::string& entry) {
+  if (trace_folder.empty()) return;
+
+  try {
+    std::string log_path = trace_folder + "/" + log_name + "." + std::to_string(container_id);
+    std::ofstream log_file(log_path, std::ios::app);
+    if (log_file.is_open()) {
+      log_file << entry << std::endl;
+      log_file.close();
+    }
+  } catch (const std::exception& e) {
+    HLOG(kWarning, "Failed to write trace log: {}", e.what());
+  }
+}
+
 chi::TaskResume Runtime::DynamicPutSchedule(
     hipc::FullPtr<PutBlobTask> task, chi::RunContext& ctx) {
 
@@ -2348,11 +2425,37 @@ chi::TaskResume Runtime::DynamicPutSchedule(
   chi::u64 chunk_size = task->size_;
   Context& context = task->context_;
 
+  // Initialize tracing if enabled
+  auto start_time = std::chrono::high_resolution_clock::now();
+  if (context.trace_) {
+    context.trace_key_ = g_trace_key_counter.fetch_add(1);
+    context.trace_node_ = static_cast<int>(CHI_IPC->GetNodeId());
+  }
+
   // For now, use simple size-based heuristics without actual data sampling
   // Proper implementation requires safe ShmPtr dereferencing mechanism
   // Disable dynamic compression until proper shared memory access is available
   context.compress_lib_ = 0;
   context.dynamic_compress_ = 0;
+
+  // Log scheduling decision time if tracing enabled
+  if (context.trace_) {
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+
+    // Log to sched_decision.log.container_id
+    std::ostringstream log_entry;
+    log_entry << context.trace_key_ << "," << duration_ms;
+    WriteTraceLog(config_.compression_.trace_folder_path_, "sched_decision.log",
+                  pool_id_.major_, log_entry.str());
+  }
+
+  // TODO: When compression/decompression is implemented, add tracing:
+  // - In ModifyExistingData (or compression wrapper): Log to compress_stats.log.container_id
+  //   Format: trace_key,compress_lib,compress_time_ms,compression_ratio,psnr_db
+  // - In ReadData (or decompression wrapper): Log to decompress_stats.log.container_id
+  //   Format: trace_key,decompress_time_ms
+  // - Store trace_key in BlobInfo when blob is created/updated (already added to BlobInfo struct)
 
   (void)ctx;
   co_return;
@@ -2370,6 +2473,21 @@ chi::TaskResume Runtime::DynamicPutSchedule(
     context.compress_lib_ = 0;
     context.dynamic_compress_ = 0;
     co_return;
+  }
+
+  // Log predicted compression stats if tracing enabled
+  if (context.trace_ && !stats.empty()) {
+    for (const auto& stat : stats) {
+      std::ostringstream log_entry;
+      log_entry << context.trace_key_ << ","
+                << stat.compress_lib_ << ","
+                << stat.compression_ratio_ << ","
+                << stat.compress_time_ms_ << ","
+                << stat.decompress_time_ms_ << ","
+                << stat.psnr_db_;
+      WriteTraceLog(config_.compression_.trace_folder_path_, "predicted_stats.log",
+                    pool_id_.major_, log_entry.str());
+    }
   }
 
   // Call BestCompressForNode only 3 times (once per tier: 0, 1, 2)

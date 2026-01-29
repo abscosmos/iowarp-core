@@ -1,0 +1,61 @@
+{
+  "xgboost": {
+    "cv_scores": {
+      "compression_ratio": {
+        "mean": 0.8115172975585466,
+        "std": 0.021736460218587016
+      },
+      "compress_time_ms": {
+        "mean": 0.5326593490463434,
+        "std": 0.054177869058911664
+      },
+      "decompress_time_ms": {
+        "mean": 0.6386873957600281,
+        "std": 0.0708407168202082
+      },
+      "psnr_db": {
+        "mean": 0.9836163055163795,
+        "std": 0.0015627641646512214
+      }
+    },
+    "test_scores": {
+      "compression_ratio": 0.8471856166603914,
+      "compress_time_ms": 0.6296046354281349,
+      "decompress_time_ms": 0.7810472342233922,
+      "psnr_db": 0.9863344282255154
+    },
+    "overall_cv": 0.7416200869703244,
+    "overall_test": 0.8110429786343585
+  },
+  "qtable": {
+    "cv_scores": {
+      "compression_ratio": {
+        "mean": 0.8705868364272314,
+        "std": 0.0619558183742848
+      },
+      "compress_time_ms": {
+        "mean": 0.5485226536400435,
+        "std": 0.09455603550311541
+      },
+      "decompress_time_ms": {
+        "mean": 0.4989040492545098,
+        "std": 0.057429689274383924
+      },
+      "psnr_db": {
+        "mean": 0.7819934339422938,
+        "std": 0.01415207168421281
+      }
+    },
+    "test_scores": {
+      "compression_ratio": 0.9121206038201554,
+      "compress_time_ms": 0.5629073097611945,
+      "decompress_time_ms": 0.5105823645385353,
+      "psnr_db": 0.8149656839684947
+    },
+    "overall_cv": 0.6750017433160196,
+    "overall_test": 0.700143990522095,
+    "unknown_rate_cv": 8.93173550750989,
+    "unknown_rate_test": 6.764917723973627,
+    "unique_states": 17156
+  }
+}

@@ -147,6 +147,40 @@ RUN cd /tmp \
     && ldconfig \
     && cd /tmp && rm -rf sz3_src
 
+# Install std_compat (required dependency for LibPressio)
+RUN cd /tmp \
+    && git clone https://github.com/robertu94/std_compat.git std_compat_src \
+    && cd std_compat_src \
+    && mkdir -p ~/builds/std_compat && cd ~/builds/std_compat \
+    && cmake /tmp/std_compat_src \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DBUILD_TESTING=OFF \
+    && make -j$(nproc) \
+    && make install \
+    && ldconfig \
+    && rm -rf /tmp/std_compat_src ~/builds/std_compat
+
+# Install LibPressio (meta-compressor library for lossy compression)
+# Provides unified interface to ZFP, SZ3, FPZIP and other lossy compressors
+RUN cd /tmp \
+    && git clone https://github.com/robertu94/libpressio.git libpressio_src \
+    && cd libpressio_src \
+    && mkdir -p ~/builds/libpressio && cd ~/builds/libpressio \
+    && export CMAKE_PREFIX_PATH="/usr/local:/home/iowarp/miniconda3:${CMAKE_PREFIX_PATH}" \
+    && cmake /tmp/libpressio_src \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DLIBPRESSIO_HAS_ZFP=ON \
+    -DLIBPRESSIO_HAS_SZ3=ON \
+    -DLIBPRESSIO_HAS_FPZIP=ON \
+    -DBUILD_SHARED_LIBS=ON \
+    -DBUILD_TESTING=OFF \
+    && make -j$(nproc) \
+    && make install \
+    && ldconfig \
+    && rm -rf /tmp/libpressio_src ~/builds/libpressio
+
 # Install ADIOS2 from source with HDF5 and ZeroMQ support
 # Uses conda's HDF5 and ZeroMQ libraries (CMAKE_PREFIX_PATH points to conda)
 # RPATH configuration ensures gray-scott binaries work without wrapper scripts
@@ -172,13 +206,10 @@ RUN cd /tmp \
 # Switch back to iowarp user
 USER iowarp
 
-# Note: LibPressio is not installed by default due to dependency issues (requires std_compat)
-# It can be installed separately if needed for advanced compression plugin support
-
 # Add conda activation to bashrc
 # Conda base environment is auto-activated to ensure all conda dependencies are available
 RUN echo '' >> /home/iowarp/.bashrc \
-    && echo 'export LD_LIBRARY_PATH=/home/iowarp/miniconda3/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> /home/iowarp/.bashrc
+    && echo 'export LD_LIBRARY_PATH=/usr/local/lib:/home/iowarp/miniconda3/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> /home/iowarp/.bashrc
 
 # Install libaio for Linux AIO support (required by bdev ChiMod)
 SHELL ["/bin/bash", "-c"]
@@ -203,7 +234,7 @@ RUN echo '' >> /home/iowarp/.bashrc \
     && echo '# Conda base environment is auto-activated with all dev dependencies' >> /home/iowarp/.bashrc \
     && echo '# This includes: boost, hdf5, yaml-cpp, zeromq, cereal, catch2, pytest, etc.' >> /home/iowarp/.bashrc \
     && echo '# Compression libraries: zlib, bzip2, lzo, zstd, lz4, xz, brotli, snappy, c-blosc2 (via conda)' >> /home/iowarp/.bashrc \
-    && echo '# Lossy compression: ZFP (via conda), SZ3, FPZIP (built from source)' >> /home/iowarp/.bashrc \
+    && echo '# Lossy compression: ZFP (via conda), SZ3, FPZIP, LibPressio (built from source)' >> /home/iowarp/.bashrc \
     && echo '# ADIOS2: Built from source (installed in /usr/local)' >> /home/iowarp/.bashrc \
     && echo '# Create custom environments if needed: conda create -n myenv' >> /home/iowarp/.bashrc \
     && echo 'eval "$(/home/iowarp/miniconda3/bin/conda shell.bash hook)"' >> /home/iowarp/.bashrc \

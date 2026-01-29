@@ -12,6 +12,7 @@
 
 #include "iowarp_engine.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -31,9 +32,15 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
       current_tag_(nullptr),
       current_step_(0),
       rank_(m_Comm.Rank()),
-      open_(false) {
+      open_(false),
+      compress_mode_(0),
+      compress_lib_(0),
+      compress_trace_(false) {
   // CTE client will be accessed via WRP_CTE_CLIENT singleton when needed
   wrp_cte::core::WRP_CTE_CLIENT_INIT("", chi::PoolQuery::Local());
+
+  // Read compression environment variables
+  ReadCompressionEnvVars();
 }
 
 /**
@@ -134,6 +141,58 @@ void IowarpEngine::DoClose(const int transportIndex) {
 }
 
 /**
+ * Read compression environment variables
+ */
+void IowarpEngine::ReadCompressionEnvVars() {
+  // Read COMPRESS_MODE: none (0), static (1), dynamic (2)
+  const char* mode_env = std::getenv("COMPRESS_MODE");
+  if (mode_env != nullptr) {
+    std::string mode_str(mode_env);
+    if (mode_str == "none") {
+      compress_mode_ = 0;
+    } else if (mode_str == "static") {
+      compress_mode_ = 1;
+    } else if (mode_str == "dynamic") {
+      compress_mode_ = 2;
+    }
+  }
+
+  // Read COMPRESS_LIB: library ID for static compression
+  const char* lib_env = std::getenv("COMPRESS_LIB");
+  if (lib_env != nullptr) {
+    compress_lib_ = std::atoi(lib_env);
+  }
+
+  // Read COMPRESS_TRACE: on (true) or off (false)
+  const char* trace_env = std::getenv("COMPRESS_TRACE");
+  if (trace_env != nullptr) {
+    std::string trace_str(trace_env);
+    compress_trace_ = (trace_str == "on" || trace_str == "1" || trace_str == "true");
+  }
+}
+
+/**
+ * Create Context object for Put operations based on environment settings
+ * @return Context object configured from environment variables
+ */
+wrp_cte::core::Context IowarpEngine::CreateCompressionContext() {
+  wrp_cte::core::Context context;
+
+  context.dynamic_compress_ = compress_mode_;
+  context.compress_lib_ = compress_lib_;
+  context.trace_ = compress_trace_;
+
+  // Set other context fields as needed
+  context.target_psnr_ = 0;          // No PSNR requirement by default
+  context.psnr_chance_ = 100;        // Always validate PSNR if required
+  context.max_performance_ = false;  // Optimize for ratio by default
+  context.consumer_node_ = -1;       // Unknown consumer node
+  context.data_type_ = 0;            // Unknown data type
+
+  return context;
+}
+
+/**
  * Put data synchronously
  * @tparam T Data type
  * @param variable ADIOS2 variable
@@ -169,10 +228,13 @@ void IowarpEngine::DoPutSync_(const adios2::core::Variable<T> &variable,
   }
   size_t data_size = element_count * sizeof(T);
 
+  // Create compression context from environment variables
+  auto context = CreateCompressionContext();
+
   // Put blob to CTE synchronously
   try {
     current_tag_->PutBlob(blob_name, reinterpret_cast<const char *>(values),
-                          data_size, 0);
+                          data_size, 0, 1.0F, context);
   } catch (const std::exception &e) {
     throw std::runtime_error(
         std::string("IowarpEngine::DoPutSync_: Failed to put blob: ") +
@@ -242,8 +304,11 @@ void IowarpEngine::DoPutDeferred_(const adios2::core::Variable<T> &variable,
 
     std::memcpy(buffer.ptr_, values, data_size);
 
+    // Create compression context from environment variables
+    auto context = CreateCompressionContext();
+
     auto task = current_tag_->AsyncPutBlob(
-        blob_name, buffer.shm_.template Cast<void>(), data_size, 0, 1.0F);
+        blob_name, buffer.shm_.template Cast<void>(), data_size, 0, 1.0F, context);
 
     // Store task and buffer in deferred_tasks_ vector
     // Buffer will be kept alive until EndStep processes the task

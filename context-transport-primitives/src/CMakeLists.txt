@@ -75,6 +75,29 @@ elseif(NOT MINIDNN_FOUND)
 elseif(NOT nlohmann_json_FOUND)
     message(STATUS "nlohmann_json not found - Dense NN predictor will not be built")
 endif()
+
+# Q-Table Predictor Library (requires nlohmann_json only)
+find_package(nlohmann_json QUIET)
+if(nlohmann_json_FOUND)
+    add_library(qtable_predictor
+        compression/qtable_predictor.cc
+    )
+    target_include_directories(qtable_predictor PUBLIC
+        $<BUILD_INTERFACE:${HSHM_ROOT}/include>
+        $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(qtable_predictor PUBLIC
+        nlohmann_json::nlohmann_json
+    )
+    target_compile_definitions(qtable_predictor PUBLIC HSHM_ENABLE_QTABLE)
+    set_property(TARGET qtable_predictor PROPERTY CXX_STANDARD 17)
+    list(APPEND HSHM_LIBS qtable_predictor)
+    message(STATUS "Building Q-Table predictor library")
+elseif(NOT nlohmann_json_FOUND)
+    message(STATUS "nlohmann_json not found - Q-Table predictor will not be built")
+endif()
+
 target_link_libraries(hermes_shm_host PUBLIC
     ${REAL_TIME_FLAGS}
     configure
