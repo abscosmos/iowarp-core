@@ -159,7 +159,7 @@ struct BaseCreateTask : public chi::Task {
    * LoadConfig
    */
   CreateParamsT
-  GetParams(AllocT* alloc) const {
+  GetParams() const {
     if (do_compose_) {
       // Compose mode: deserialize PoolConfig and load into CreateParams
       chi::PoolConfig pool_config =

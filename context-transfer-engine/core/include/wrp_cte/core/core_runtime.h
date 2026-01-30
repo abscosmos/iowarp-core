@@ -7,6 +7,7 @@
 #include <chimaera/corwlock.h>
 #include <chimaera/unordered_map_ll.h>
 #include <hermes_shm/data_structures/ipc/ring_buffer.h>
+#include <hermes_shm/memory/allocator/malloc_allocator.h>
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/core/core_config.h>
 #include <wrp_cte/core/core_tasks.h>
@@ -208,7 +209,7 @@ private:
 
   // Telemetry ring buffer for performance monitoring
   static inline constexpr size_t kTelemetryRingSize = 1024; // Ring buffer size
-  std::unique_ptr<hipc::circular_mpsc_ring_buffer<CteTelemetry, CHI_MAIN_ALLOC_T>> telemetry_log_;
+  std::unique_ptr<hipc::circular_mpsc_ring_buffer<CteTelemetry, hipc::MallocAllocator>> telemetry_log_;
   std::atomic<std::uint64_t>
       telemetry_counter_; // Atomic counter for logical time
 

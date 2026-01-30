@@ -195,17 +195,9 @@ if(TARGET cereal AND NOT TARGET cereal::cereal)
     set(_CEREAL_TARGET cereal)
 endif()
 
+# Install compiled libraries (interface libraries are installed in parent CMakeLists.txt)
 install(TARGETS
     ${HSHM_LIBS}
-    configure
-    serialize
-    interceptor
-    lightbeam
-    thread_all
-    mpi
-    compress
-    encrypt
-    host_deps
     ${_CEREAL_TARGET}
     EXPORT
     ${HSHM_EXPORTED_TARGETS}

@@ -140,6 +140,9 @@ class IowarpEngine : public adios2::plugin::PluginEngineInterface {
   /** Read compression environment variables */
   void ReadCompressionEnvVars();
 
+  /** Parse compression library name to ID */
+  int ParseCompressionLib(const std::string &lib_str);
+
   /** Create Context object for Put operations based on environment settings */
   wrp_cte::core::Context CreateCompressionContext();
 };

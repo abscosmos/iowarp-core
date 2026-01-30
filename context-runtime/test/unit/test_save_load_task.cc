@@ -41,9 +41,9 @@
 using namespace chi;
 
 namespace {
-// Helper allocator for tests
-hipc::MultiProcessAllocator* GetTestAllocator() {
-  return CHI_IPC->GetMainAlloc();
+// Helper allocator for tests - uses HSHM_MALLOC for non-IPC allocations
+hipc::MallocAllocator* GetTestAllocator() {
+  return HSHM_MALLOC;
 }
 
 // Initialize Chimaera runtime for tests

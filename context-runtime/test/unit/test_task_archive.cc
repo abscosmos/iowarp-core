@@ -41,9 +41,9 @@ using namespace chi;
 constexpr chi::u32 kTestWriteFlag = 0x1;  // BULK_XFER
 constexpr chi::u32 kTestExposeFlag = 0x2; // BULK_EXPOSE
 
-// Helper allocator for tests - returns main allocator for task construction
-Task::AllocT* GetTestAllocator() {
-  return CHI_IPC->GetMainAlloc();
+// Helper allocator for tests - uses HSHM_MALLOC for non-IPC allocations
+hipc::MallocAllocator* GetTestAllocator() {
+  return HSHM_MALLOC;
 }
 
 // Helper to create test task with sample data

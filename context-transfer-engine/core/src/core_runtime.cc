@@ -89,13 +89,12 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
     tag_locks_.emplace_back(std::make_unique<chi::CoRwLock>());
   }
 
-  // Get main allocator from IPC manager
+  // Get IPC manager for later use
   auto *ipc_manager = CHI_IPC;
-  auto *main_allocator = ipc_manager->GetMainAlloc();
 
-  // Initialize telemetry ring buffer using unique_ptr
-  telemetry_log_ = std::make_unique<hipc::circular_mpsc_ring_buffer<CteTelemetry, CHI_MAIN_ALLOC_T>>(
-      main_allocator, kTelemetryRingSize);
+  // Initialize telemetry ring buffer using unique_ptr with HSHM_MALLOC
+  telemetry_log_ = std::make_unique<hipc::circular_mpsc_ring_buffer<CteTelemetry, hipc::MallocAllocator>>(
+      HSHM_MALLOC, kTelemetryRingSize);
 
   // Initialize atomic counters
   next_tag_id_minor_ = 1;
@@ -104,7 +103,7 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
   // Get configuration from params (loaded from pool_config.config_ via
   // LoadConfig)
   HLOG(kDebug, "CTE Create: About to call GetParams(), do_compose_={}", task->do_compose_);
-  auto params = task->GetParams(main_allocator);
+  auto params = task->GetParams();
   config_ = params.config_;
   HLOG(kDebug, "CTE Create: GetParams() returned, storage devices in config: {}", config_.storage_.devices_.size());
 
@@ -344,9 +343,8 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
     remaining_size = stats_task->remaining_size_;
 
     // Create target info with bdev client and performance stats
-    auto *ipc_manager = CHI_IPC;
-    auto *main_allocator = ipc_manager->GetMainAlloc();
-    TargetInfo target_info(main_allocator);
+    // Use default constructor (allocator not used in struct)
+    TargetInfo target_info;
     HLOG(kDebug, "RegisterTarget: Before move, bdev_client.pool_id_=({},{})",
           bdev_client.pool_id_.major_, bdev_client.pool_id_.minor_);
     target_info.target_name_ = target_name;
@@ -1231,10 +1229,8 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
     tag_id = GenerateNewTagId();
   }
 
-  // Create tag info
-  auto *ipc_manager = CHI_IPC;
-  auto *main_allocator = ipc_manager->GetMainAlloc();
-  TagInfo tag_info(main_allocator);
+  // Create tag info (use default constructor, allocator not used in struct)
+  TagInfo tag_info;
   tag_info.tag_name_ = tag_name;
   tag_info.tag_id_ = tag_id;
 
@@ -1319,9 +1315,8 @@ BlobInfo *Runtime::CreateNewBlob(const std::string &blob_name,
   }
 
   // Prepare blob info structure BEFORE acquiring lock
-  auto *ipc_manager = CHI_IPC;
-  auto *main_allocator = ipc_manager->GetMainAlloc();
-  BlobInfo new_blob_info(main_allocator);
+  // Use default constructor (allocator not used in struct)
+  BlobInfo new_blob_info;
   new_blob_info.blob_name_ = blob_name;
   new_blob_info.score_ = blob_score;
 

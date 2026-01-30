@@ -61,7 +61,12 @@ bool IpcManager::ClientInit() {
   }
 
   // Create per-process shared memory for client allocations
-  if (!IncreaseMemory(kDefaultClientShmSize)) {
+  // Use configured client_data_segment_size from config
+  auto *config = CHI_CONFIG_MANAGER;
+  size_t initial_size = config && config->IsValid()
+      ? config->GetMemorySegmentSize(kClientDataSegment)
+      : hshm::Unit<size_t>::Megabytes(256);  // Default 256MB
+  if (!IncreaseMemory(initial_size)) {
     HLOG(kError, "IpcManager::ClientInit: Failed to create per-process shared memory");
     return false;
   }
@@ -88,18 +93,10 @@ bool IpcManager::ClientInit() {
                             static_cast<Worker *>(nullptr));
 
   // Create scheduler using factory
-  auto *config = CHI_CONFIG_MANAGER;
   if (config && config->IsValid()) {
     std::string sched_name = config->GetLocalSched();
     scheduler_ = SchedulerFactory::Get(sched_name);
     HLOG(kDebug, "Scheduler initialized: {}", sched_name);
-  }
-
-  // Initialize per-process shared memory for this client
-  // Allocate initial 1GB segment
-  if (!IncreaseMemory(kDefaultClientShmSize)) {
-    HLOG(kWarning, "Failed to create initial per-process shared memory");
-    // Continue anyway - legacy shared memory segments may still work
   }
 
   is_initialized_ = true;
@@ -151,7 +148,11 @@ bool IpcManager::ServerInit() {
   }
 
   // Create per-process shared memory for runtime allocations
-  if (!IncreaseMemory(kDefaultClientShmSize)) {
+  // Use configured client_data_segment_size from config
+  size_t initial_size = config && config->IsValid()
+      ? config->GetMemorySegmentSize(kClientDataSegment)
+      : hshm::Unit<size_t>::Megabytes(256);  // Default 256MB
+  if (!IncreaseMemory(initial_size)) {
     HLOG(kError, "IpcManager::ServerInit: Failed to create per-process shared memory");
     return false;
   }
@@ -802,8 +803,9 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
   }
 
   // 3. All existing allocators are full - create new shared memory segment
-  // Allocate at least the requested size or 1GB, whichever is larger
-  size_t new_size = std::max(size, kDefaultClientShmSize);
+  // Calculate segment size: (requested_size + 32MB metadata) * 1.2 multiplier
+  size_t new_size = static_cast<size_t>(
+      (size + kShmMetadataOverhead) * kShmAllocationMultiplier);
   if (!IncreaseMemory(new_size)) {
     HLOG(kError, "AllocateBuffer: Failed to increase memory for {} bytes", size);
     return FullPtr<char>::GetNull();

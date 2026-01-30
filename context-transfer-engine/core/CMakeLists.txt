@@ -25,19 +25,12 @@ add_chimod_client(
 )
 
 # Add compression compile definitions and link libraries if enabled
+# Note: hshm::compress includes qtable_predictor and dense_nn_predictor if available
 if(WRP_CORE_ENABLE_COMPRESS)
     target_compile_definitions(wrp_cte_core_runtime PRIVATE WRP_CORE_ENABLE_COMPRESS)
     target_compile_definitions(wrp_cte_core_client PRIVATE WRP_CORE_ENABLE_COMPRESS)
     target_link_libraries(wrp_cte_core_runtime PRIVATE hshm::compress)
     target_link_libraries(wrp_cte_core_client PRIVATE hshm::compress)
-
-    # Link dense_nn_predictor only if it was built (when Eigen3 is available)
-    if(TARGET dense_nn_predictor)
-        target_link_libraries(wrp_cte_core_runtime PRIVATE dense_nn_predictor)
-        message(STATUS "CTE Core: Linking dense_nn_predictor (HSHM_ENABLE_DENSE_NN will be defined)")
-    else()
-        message(STATUS "CTE Core: dense_nn_predictor not available, using fallback compression estimation")
-    endif()
 endif()
 
 # Note: Cross-namespace dependencies (chimaera admin and bdev) are automatically

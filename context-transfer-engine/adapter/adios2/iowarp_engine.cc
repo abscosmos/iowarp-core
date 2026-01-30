@@ -12,8 +12,10 @@
 
 #include "iowarp_engine.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -36,7 +38,7 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
       compress_mode_(0),
       compress_lib_(0),
       compress_trace_(false) {
-  // CTE client will be accessed via WRP_CTE_CLIENT singleton when needed
+  // Initialize CTE client - assumes Chimaera runtime is already running
   wrp_cte::core::WRP_CTE_CLIENT_INIT("", chi::PoolQuery::Local());
 
   // Read compression environment variables
@@ -141,32 +143,112 @@ void IowarpEngine::DoClose(const int transportIndex) {
 }
 
 /**
+ * Parse compression library name to ID
+ * @param lib_str Library name string
+ * @return Library ID or -1 if unknown
+ */
+int IowarpEngine::ParseCompressionLib(const std::string &lib_str) {
+  std::string lower = lib_str;
+  std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+  // Compression library IDs (from core_runtime.cc)
+  if (lower == "brotli") return 0;
+  if (lower == "bzip2") return 1;
+  if (lower == "blosc2") return 2;
+  if (lower == "fpzip") return 3;
+  if (lower == "lz4") return 4;
+  if (lower == "lzma") return 5;
+  if (lower == "snappy") return 6;
+  if (lower == "sz3") return 7;
+  if (lower == "zfp") return 8;
+  if (lower == "zlib") return 9;
+  if (lower == "zstd") return 10;
+
+  // Try parsing as integer
+  try {
+    return std::stoi(lib_str);
+  } catch (...) {
+    return 10;  // Default to ZSTD
+  }
+}
+
+/**
  * Read compression environment variables
+ *
+ * Environment variables:
+ *   IOWARP_COMPRESS: Compression type
+ *     - "none": No compression
+ *     - "dynamic": Dynamic compression (system chooses algorithm)
+ *     - "<library>": Static compression with named library
+ *       (zstd, lz4, zlib, snappy, brotli, blosc2, bzip2, lzma, fpzip, sz3, zfp)
+ *
+ *   IOWARP_COMPRESS_TRACE: Enable compression tracing
+ *     - "on", "1", "true": Enable tracing
+ *     - Otherwise: Disable tracing
+ *
+ * Legacy environment variables (for backward compatibility):
+ *   COMPRESS_MODE: none (0), static (1), dynamic (2)
+ *   COMPRESS_LIB: library ID for static compression
+ *   COMPRESS_TRACE: on (true) or off (false)
  */
 void IowarpEngine::ReadCompressionEnvVars() {
-  // Read COMPRESS_MODE: none (0), static (1), dynamic (2)
-  const char* mode_env = std::getenv("COMPRESS_MODE");
-  if (mode_env != nullptr) {
-    std::string mode_str(mode_env);
-    if (mode_str == "none") {
-      compress_mode_ = 0;
-    } else if (mode_str == "static") {
-      compress_mode_ = 1;
-    } else if (mode_str == "dynamic") {
-      compress_mode_ = 2;
+  // First check for new unified IOWARP_COMPRESS variable
+  const char* compress_env = std::getenv("IOWARP_COMPRESS");
+  if (compress_env != nullptr) {
+    std::string compress_str(compress_env);
+    std::string lower = compress_str;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    if (lower == "none" || lower == "off" || lower == "0") {
+      compress_mode_ = 0;  // No compression
+      compress_lib_ = 0;
+    } else if (lower == "dynamic" || lower == "auto") {
+      compress_mode_ = 2;  // Dynamic compression
+      compress_lib_ = 10;  // Default to ZSTD for dynamic
+    } else {
+      // Treat as specific compression library name
+      compress_mode_ = 1;  // Static compression
+      compress_lib_ = ParseCompressionLib(compress_str);
+    }
+
+    // Log the compression configuration
+    if (rank_ == 0) {
+      const char* lib_names[] = {"brotli", "bzip2", "blosc2", "fpzip", "lz4",
+                                  "lzma", "snappy", "sz3", "zfp", "zlib", "zstd"};
+      std::string mode_name = (compress_mode_ == 0) ? "none" :
+                              (compress_mode_ == 2) ? "dynamic" :
+                              (compress_lib_ >= 0 && compress_lib_ <= 10) ?
+                                lib_names[compress_lib_] : "unknown";
+      std::cerr << "[IowarpEngine] Compression: " << mode_name << std::endl;
+    }
+  } else {
+    // Fall back to legacy environment variables
+    const char* mode_env = std::getenv("COMPRESS_MODE");
+    if (mode_env != nullptr) {
+      std::string mode_str(mode_env);
+      if (mode_str == "none") {
+        compress_mode_ = 0;
+      } else if (mode_str == "static") {
+        compress_mode_ = 1;
+      } else if (mode_str == "dynamic") {
+        compress_mode_ = 2;
+      }
+    }
+
+    const char* lib_env = std::getenv("COMPRESS_LIB");
+    if (lib_env != nullptr) {
+      compress_lib_ = ParseCompressionLib(lib_env);
     }
   }
 
-  // Read COMPRESS_LIB: library ID for static compression
-  const char* lib_env = std::getenv("COMPRESS_LIB");
-  if (lib_env != nullptr) {
-    compress_lib_ = std::atoi(lib_env);
+  // Read trace setting (check both new and legacy)
+  const char* trace_env = std::getenv("IOWARP_COMPRESS_TRACE");
+  if (trace_env == nullptr) {
+    trace_env = std::getenv("COMPRESS_TRACE");
   }
-
-  // Read COMPRESS_TRACE: on (true) or off (false)
-  const char* trace_env = std::getenv("COMPRESS_TRACE");
   if (trace_env != nullptr) {
     std::string trace_str(trace_env);
+    std::transform(trace_str.begin(), trace_str.end(), trace_str.begin(), ::tolower);
     compress_trace_ = (trace_str == "on" || trace_str == "1" || trace_str == "true");
   }
 }

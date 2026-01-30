@@ -107,27 +107,19 @@ class WrpCte(Service):
                 'default': ''
             },
             {
-                'name': 'compress_mode',
+                'name': 'iowarp_compress',
                 'msg': 'Compression mode for IOWarp Engine',
                 'type': str,
-                'choices': ['none', 'static', 'dynamic'],
                 'default': 'none',
-                'help': 'Environment variable COMPRESS_MODE: none (no compression), static (fixed library), dynamic (adaptive)'
+                'help': 'Environment variable IOWARP_COMPRESS: none/off (no compression), dynamic/auto (adaptive), or library name (zstd, lz4, brotli, bzip2, blosc2, fpzip, lzma, snappy, sz3, zfp, zlib)'
             },
             {
-                'name': 'compress_lib',
-                'msg': 'Compression library ID for static mode (used when compress_mode=static)',
-                'type': int,
-                'default': 0,
-                'help': 'Environment variable COMPRESS_LIB: library ID (e.g., 1=ZSTD, 2=LZ4, etc.)'
-            },
-            {
-                'name': 'compress_trace',
+                'name': 'iowarp_compress_trace',
                 'msg': 'Enable compression tracing',
                 'type': str,
                 'choices': ['on', 'off'],
                 'default': 'off',
-                'help': 'Environment variable COMPRESS_TRACE: on (enable tracing), off (disable)'
+                'help': 'Environment variable IOWARP_COMPRESS_TRACE: on/1/true (enable tracing), off (disable)'
             }
         ]
 
@@ -483,11 +475,13 @@ class WrpCte(Service):
 
         # Prepare environment with compression settings for IOWarp Engine
         env = self.env.copy() if self.env else {}
-        env['COMPRESS_MODE'] = self.config.get('compress_mode', 'none')
-        env['COMPRESS_LIB'] = str(self.config.get('compress_lib', 0))
-        env['COMPRESS_TRACE'] = self.config.get('compress_trace', 'off')
+        iowarp_compress = self.config.get('iowarp_compress', 'none')
+        iowarp_compress_trace = self.config.get('iowarp_compress_trace', 'off')
 
-        self.log(f"  Compression environment: MODE={env['COMPRESS_MODE']}, LIB={env['COMPRESS_LIB']}, TRACE={env['COMPRESS_TRACE']}")
+        env['IOWARP_COMPRESS'] = iowarp_compress
+        env['IOWARP_COMPRESS_TRACE'] = iowarp_compress_trace
+
+        self.log(f"  Compression environment: IOWARP_COMPRESS={iowarp_compress}, IOWARP_COMPRESS_TRACE={iowarp_compress_trace}")
 
         try:
             # Execute chimaera_compose on all nodes using PsshExecInfo

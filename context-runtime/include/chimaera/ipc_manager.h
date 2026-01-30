@@ -416,13 +416,6 @@ class IpcManager {
   bool IsInitialized() const;
 
   /**
-   * Get main allocator (alias for GetMainAlloc)
-   * @return Pointer to main allocator or nullptr if not available
-   */
-  CHI_MAIN_ALLOC_T *GetMainAlloc() { return main_allocator_; }
-
-
-  /**
    * Get number of workers from shared memory header
    * @return Number of workers, 0 if not initialized
    */
@@ -848,11 +841,11 @@ class IpcManager {
   /** Mutex for thread-safe access to shared memory structures */
   mutable std::mutex shm_mutex_;
 
-  /** Default initial client shared memory size: 1GB */
-  static constexpr size_t kDefaultClientShmSize = 1ULL * 1024 * 1024 * 1024;
-
   /** Metadata overhead to add to each shared memory segment: 32MB */
   static constexpr size_t kShmMetadataOverhead = 32ULL * 1024 * 1024;
+
+  /** Multiplier for shared memory allocation to ensure space for metadata */
+  static constexpr float kShmAllocationMultiplier = 1.2f;
 };
 
 }  // namespace chi

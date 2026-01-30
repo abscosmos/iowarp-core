@@ -266,13 +266,11 @@ constexpr PoolId kAdminPoolId =
 // Allocator type aliases using HSHM conventions
 #define CHI_MAIN_ALLOC_T hipc::MultiProcessAllocator
 #define CHI_CDATA_ALLOC_T hipc::MultiProcessAllocator
-#define CHI_RDATA_ALLOC_T CHI_CDATA_ALLOC_T  // Runtime data uses same allocator as client data
 
 // Memory segment identifiers
 enum MemorySegment {
   kMainSegment = 0,
-  kClientDataSegment = 1,
-  kRuntimeDataSegment = 2
+  kClientDataSegment = 1
 };
 
 // Input/Output parameter macros
