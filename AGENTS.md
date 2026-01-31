@@ -11,7 +11,8 @@ This repository contains the unified IOWarp Core framework, integrating multiple
 
 When building chimods, make sure to edit chimaera_mod.yaml and chimaera_repo.yaml.
 
-If you add new methods to a chimod, please use chi_refresh_repo to autogenerate the relevant selection files.
+If you add new methods to a chimod, please edit chimaera_mod.yaml and use the chi_refresh_repo binary to autogenerate the relevant autogen files.
+
 
 ## ⚠️ CRITICAL BUILD RULE ⚠️
 
