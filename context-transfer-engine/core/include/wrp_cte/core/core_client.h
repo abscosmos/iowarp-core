@@ -14,9 +14,10 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous container creation - returns immediately
-   * After Wait(), caller should:
-   *   1. Update client pool_id_: client.Init(task->new_pool_id_)
-   * Note: Task is automatically freed when Future goes out of scope
+   * @param pool_query Pool query for task routing
+   * @param pool_name Name of the pool
+   * @param custom_pool_id Explicit pool ID
+   * @param params Create parameters
    */
   chi::Future<CreateTask> AsyncCreate(
       const chi::PoolQuery &pool_query, const std::string &pool_name,
@@ -42,16 +43,23 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous target registration - returns immediately
+   * @param target_name Name of the target to register
+   * @param bdev_type Block device type
+   * @param total_size Total size of the target
+   * @param target_query Pool query for target routing
+   * @param bdev_id Block device ID
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
   chi::Future<RegisterTargetTask> AsyncRegisterTarget(
       const std::string &target_name, chimaera::bdev::BdevType bdev_type,
       chi::u64 total_size,
       const chi::PoolQuery &target_query = chi::PoolQuery::Local(),
-      const chi::PoolId &bdev_id = chi::PoolId::GetNull()) {
+      const chi::PoolId &bdev_id = chi::PoolId::GetNull(),
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<RegisterTargetTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), target_name,
+        chi::CreateTaskId(), pool_id_, pool_query, target_name,
         bdev_type, total_size, target_query, bdev_id);
 
     return ipc_manager->Send(task);
@@ -59,62 +67,78 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous target unregistration - returns immediately
+   * @param target_name Name of the target to unregister
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
   chi::Future<UnregisterTargetTask> AsyncUnregisterTarget(
-      const std::string &target_name) {
+      const std::string &target_name,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<UnregisterTargetTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), target_name);
+        chi::CreateTaskId(), pool_id_, pool_query, target_name);
 
     return ipc_manager->Send(task);
   }
 
   /**
    * Asynchronous target listing - returns immediately
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  chi::Future<ListTargetsTask> AsyncListTargets() {
+  chi::Future<ListTargetsTask> AsyncListTargets(
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<ListTargetsTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic());
+        chi::CreateTaskId(), pool_id_, pool_query);
 
     return ipc_manager->Send(task);
   }
 
   /**
    * Asynchronous target stats update - returns immediately
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  chi::Future<StatTargetsTask> AsyncStatTargets() {
+  chi::Future<StatTargetsTask> AsyncStatTargets(
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<StatTargetsTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic());
+        chi::CreateTaskId(), pool_id_, pool_query);
 
     return ipc_manager->Send(task);
   }
 
   /**
    * Asynchronous get target info - returns target score, capacity, and stats
+   * @param target_name Name of the target
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  chi::Future<GetTargetInfoTask> AsyncGetTargetInfo(const std::string &target_name) {
+  chi::Future<GetTargetInfoTask> AsyncGetTargetInfo(
+      const std::string &target_name,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<GetTargetInfoTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), target_name);
+        chi::CreateTaskId(), pool_id_, pool_query, target_name);
 
     return ipc_manager->Send(task);
   }
 
   /**
    * Asynchronous get or create tag - returns immediately
+   * @param tag_name Name of the tag
+   * @param tag_id Optional tag ID
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
   chi::Future<GetOrCreateTagTask<CreateParams>> AsyncGetOrCreateTag(
-      const std::string &tag_name, const TagId &tag_id = TagId::GetNull()) {
+      const std::string &tag_name,
+      const TagId &tag_id = TagId::GetNull(),
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<GetOrCreateTagTask<CreateParams>>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_name,
+        chi::CreateTaskId(), pool_id_, pool_query, tag_name,
         tag_id);
 
     return ipc_manager->Send(task);
@@ -122,17 +146,28 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous put blob with optional compression context - returns immediately
+   * @param tag_id Tag ID
+   * @param blob_name Name of the blob
+   * @param offset Offset within blob
+   * @param size Size of data
+   * @param blob_data Shared memory pointer to data
+   * @param score Blob score for placement
+   * @param context Compression context
+   * @param flags Operation flags
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  chi::Future<PutBlobTask> AsyncPutBlob(const TagId &tag_id,
-                                        const std::string &blob_name,
-                                        chi::u64 offset, chi::u64 size,
-                                        hipc::ShmPtr<> blob_data, float score,
-                                        const Context &context = Context(),
-                                        chi::u32 flags = 0) {
+  chi::Future<PutBlobTask> AsyncPutBlob(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      chi::u64 offset, chi::u64 size,
+      hipc::ShmPtr<> blob_data, float score,
+      const Context &context = Context(),
+      chi::u32 flags = 0,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<PutBlobTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_id,
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name, offset, size, blob_data, score, context, flags);
 
     return ipc_manager->Send(task);
@@ -140,16 +175,25 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous get blob - returns immediately
+   * @param tag_id Tag ID
+   * @param blob_name Name of the blob
+   * @param offset Offset within blob
+   * @param size Size of data
+   * @param flags Operation flags
+   * @param blob_data Shared memory pointer for output
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  chi::Future<GetBlobTask> AsyncGetBlob(const TagId &tag_id,
-                                        const std::string &blob_name,
-                                        chi::u64 offset, chi::u64 size,
-                                        chi::u32 flags,
-                                        hipc::ShmPtr<> blob_data) {
+  chi::Future<GetBlobTask> AsyncGetBlob(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      chi::u64 offset, chi::u64 size,
+      chi::u32 flags,
+      hipc::ShmPtr<> blob_data,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<GetBlobTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_id,
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name, offset, size, flags, blob_data);
 
     return ipc_manager->Send(task);
@@ -157,13 +201,18 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous reorganize blob - returns immediately
+   * @param tag_id Tag ID
+   * @param blob_name Name of the blob
+   * @param new_score New placement score
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
   chi::Future<ReorganizeBlobTask> AsyncReorganizeBlob(
-      const TagId &tag_id, const std::string &blob_name, float new_score) {
+      const TagId &tag_id, const std::string &blob_name, float new_score,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<ReorganizeBlobTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_id,
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name, new_score);
 
     return ipc_manager->Send(task);
@@ -171,13 +220,18 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous delete blob - returns immediately
+   * @param tag_id Tag ID
+   * @param blob_name Name of the blob
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  chi::Future<DelBlobTask> AsyncDelBlob(const TagId &tag_id,
-                                        const std::string &blob_name) {
+  chi::Future<DelBlobTask> AsyncDelBlob(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<DelBlobTask>(chi::CreateTaskId(), pool_id_,
-                                                  chi::PoolQuery::Dynamic(),
+                                                  pool_query,
                                                   tag_id, blob_name);
 
     return ipc_manager->Send(task);
@@ -185,49 +239,64 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous delete tag by tag ID - returns immediately
+   * @param tag_id Tag ID to delete
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  chi::Future<DelTagTask> AsyncDelTag(const TagId &tag_id) {
+  chi::Future<DelTagTask> AsyncDelTag(
+      const TagId &tag_id,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<DelTagTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_id);
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id);
 
     return ipc_manager->Send(task);
   }
 
   /**
    * Asynchronous delete tag by tag name - returns immediately
+   * @param tag_name Tag name to delete
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  chi::Future<DelTagTask> AsyncDelTag(const std::string &tag_name) {
+  chi::Future<DelTagTask> AsyncDelTag(
+      const std::string &tag_name,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<DelTagTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_name);
+        chi::CreateTaskId(), pool_id_, pool_query, tag_name);
 
     return ipc_manager->Send(task);
   }
 
   /**
    * Asynchronous get tag size - returns immediately
+   * @param tag_id Tag ID
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  chi::Future<GetTagSizeTask> AsyncGetTagSize(const TagId &tag_id) {
+  chi::Future<GetTagSizeTask> AsyncGetTagSize(
+      const TagId &tag_id,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<GetTagSizeTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_id);
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id);
 
     return ipc_manager->Send(task);
   }
 
   /**
    * Asynchronous poll telemetry log - returns immediately
+   * @param minimum_logical_time Minimum logical time filter
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
   chi::Future<PollTelemetryLogTask> AsyncPollTelemetryLog(
-      std::uint64_t minimum_logical_time) {
+      std::uint64_t minimum_logical_time,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<PollTelemetryLogTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(),
+        chi::CreateTaskId(), pool_id_, pool_query,
         minimum_logical_time);
 
     return ipc_manager->Send(task);
@@ -235,13 +304,17 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous get blob score - returns immediately
+   * @param tag_id Tag ID
+   * @param blob_name Name of the blob
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
   chi::Future<GetBlobScoreTask> AsyncGetBlobScore(
-      const TagId &tag_id, const std::string &blob_name) {
+      const TagId &tag_id, const std::string &blob_name,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<GetBlobScoreTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_id,
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name);
 
     return ipc_manager->Send(task);
@@ -249,13 +322,18 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous get blob size - returns immediately
+   * @param tag_id Tag ID
+   * @param blob_name Name of the blob
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
-  chi::Future<GetBlobSizeTask> AsyncGetBlobSize(const TagId &tag_id,
-                                                const std::string &blob_name) {
+  chi::Future<GetBlobSizeTask> AsyncGetBlobSize(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<GetBlobSizeTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_id,
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name);
 
     return ipc_manager->Send(task);
@@ -263,13 +341,16 @@ class Client : public chi::ContainerClient {
 
   /**
    * Asynchronous get contained blobs - returns immediately
+   * @param tag_id Tag ID
+   * @param pool_query Pool query for task routing (default: Dynamic)
    */
   chi::Future<GetContainedBlobsTask> AsyncGetContainedBlobs(
-      const TagId &tag_id) {
+      const TagId &tag_id,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<GetContainedBlobsTask>(
-        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Dynamic(), tag_id);
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id);
 
     return ipc_manager->Send(task);
   }

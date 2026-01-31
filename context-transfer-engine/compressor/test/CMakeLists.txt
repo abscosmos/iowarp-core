@@ -37,17 +37,8 @@ target_link_libraries(test_qtable_predictor_exec
 )
 add_test(NAME test_qtable_predictor COMMAND test_qtable_predictor_exec)
 
-# Test compression contention/dynamic selection
-# Temporarily disabled due to Singleton dependency issues
-# add_executable(test_compression_contention_exec
-#   test_compression_contention.cc
-# )
-# target_link_libraries(test_compression_contention_exec
-#   wrp_cte::compressor_runtime
-#   hshm::compress
-#   Catch2::Catch2WithMain
-# )
-# add_test(NAME test_compression_contention COMMAND test_compression_contention_exec)
+# NOTE: test_compression_contention has been moved to the end of this file
+# as a standalone benchmark without ChiMod runtime dependency
 
 #------------------------------------------------------------------------------
 # Compressor functional tests - test actual chimod functionality
@@ -118,5 +109,52 @@ set_tests_properties(
 install(TARGETS test_compressor_functional
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
+#------------------------------------------------------------------------------
+# CTE Compression Benchmark
+#------------------------------------------------------------------------------
+
+# Create wrp_cte_compress_bench executable
+add_executable(wrp_cte_compress_bench
+    wrp_cte_compress_bench.cc
+)
+
+# Add compression compile definition
+target_compile_definitions(wrp_cte_compress_bench PRIVATE WRP_CORE_ENABLE_COMPRESS)
+
+# Link required libraries
+target_link_libraries(wrp_cte_compress_bench
+    wrp_cte::core_client          # CTE core client library
+    wrp_cte::core_runtime         # CTE core runtime (for compression context)
+    chimaera::cxx                 # Core Chimaera library
+    hshm::compress                # Compression library
+    ${CMAKE_THREAD_LIBS_INIT}     # Threading support (for pthread_setaffinity_np)
+)
+
+# Set C++ standard
+target_compile_features(wrp_cte_compress_bench PRIVATE cxx_std_17)
+
+# Install the compression benchmark executable
+install(TARGETS wrp_cte_compress_bench
+    RUNTIME DESTINATION bin
+)
+
+#------------------------------------------------------------------------------
+# Compression Contention Benchmark (standalone, no ChiMod runtime dependency)
+#------------------------------------------------------------------------------
+
+# Enable the contention benchmark (no longer has Singleton issues)
+add_executable(test_compression_contention_exec
+    test_compression_contention.cc
+)
+target_link_libraries(test_compression_contention_exec
+    hshm::compress
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+target_compile_features(test_compression_contention_exec PRIVATE cxx_std_17)
+add_test(NAME test_compression_contention COMMAND test_compression_contention_exec)
+install(TARGETS test_compression_contention_exec
     RUNTIME DESTINATION bin
 )

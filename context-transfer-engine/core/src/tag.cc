@@ -45,7 +45,7 @@ void Tag::PutBlob(const std::string &blob_name, const char *data, size_t data_si
 void Tag::PutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data, size_t data_size,
                   size_t off, float score, const Context &context) {
   auto *cte_client = WRP_CTE_CLIENT;
-  auto task = cte_client->AsyncPutBlob(tag_id_, blob_name,
+  auto task = cte_client->AsyncPutBlob(chi::PoolQuery::Dynamic(), tag_id_, blob_name,
                                        off, data_size, data, score, context);
   task.Wait();
 
