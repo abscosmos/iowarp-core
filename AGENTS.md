@@ -91,6 +91,12 @@ NEVER DO MOCK CODE OR STUB CODE UNLESS SPECIFICALLY STATED OTHERWISE. ALWAYS IMP
 - Option 2: Run `install.sh` to build dependencies from source
 - Option 3: Use system packages at your own risk (may cause library conflicts)
 
+**ADIOS2 Exception:**
+- ADIOS2 is built from source (not from conda) to ensure C++20 compatibility
+- Uses ADIOS2 v2.11.0 which supports both x86_64 and ARM64 architectures
+- Built with MPI, HDF5, and ZeroMQ support (using conda's HDF5 and ZeroMQ libraries)
+- SST is disabled due to ARM64 Linux compatibility issues in the DILL library
+
 ### Component Build Options
 The unified IOWarp Core build system provides options to enable/disable components:
 - `WRP_CORE_ENABLE_RUNTIME`: Enable runtime component (default: ON)
