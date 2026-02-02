@@ -155,19 +155,14 @@ chi::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx, int& e
     std::vector<chi::Future<ProcessHdf5DatasetTask>> futures;
     futures.reserve(filtered_paths.size());
 
-    // Get current node ID for return routing
-    chi::u32 current_node = static_cast<chi::u32>(CHI_IPC->GetNodeId());
-
     for (size_t i = 0; i < filtered_paths.size(); ++i) {
       const auto& dataset_path = filtered_paths[i];
-      // Round-robin distribution to nodes
+      // Round-robin distribution to nodes using direct hash
       chi::u32 target_node = static_cast<chi::u32>(i % num_nodes);
-      auto pool_query = chi::PoolQuery::Physical(target_node);
-      // Set return node so remote nodes know where to send responses
-      pool_query.SetReturnNode(current_node);
+      auto pool_query = chi::PoolQuery::DirectHash(target_node);
 
-      HLOG(kInfo, "Hdf5FileAssimilator: Routing dataset {}/{} '{}' to node {} (return to {})",
-            i + 1, filtered_paths.size(), dataset_path, target_node, current_node);
+      HLOG(kInfo, "Hdf5FileAssimilator: Routing dataset {}/{} '{}' to node {}",
+            i + 1, filtered_paths.size(), dataset_path, target_node);
 
       HLOG(kInfo, "Hdf5FileAssimilator: Calling AsyncProcessHdf5Dataset for pool_id={}",
             kCaePoolId);
