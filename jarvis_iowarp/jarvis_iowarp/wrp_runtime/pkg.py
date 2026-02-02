@@ -31,10 +31,10 @@ class WrpRuntime(Service):
         """Define configuration options for IOWarp runtime"""
         return [
             {
-                'name': 'sched_workers',
-                'msg': 'Number of unified scheduler worker threads',
+                'name': 'num_threads',
+                'msg': 'Number of worker threads for task execution',
                 'type': int,
-                'default': 8
+                'default': 4
             },
             {
                 'name': 'process_reaper_workers',
@@ -44,9 +44,9 @@ class WrpRuntime(Service):
             },
             {
                 'name': 'main_segment_size',
-                'msg': 'Main memory segment size (e.g., 1G, 512M)',
+                'msg': 'Main memory segment size (e.g., 1G, 512M, or "auto")',
                 'type': str,
-                'default': '1G'
+                'default': 'auto'
             },
             {
                 'name': 'client_data_segment_size',
@@ -68,16 +68,10 @@ class WrpRuntime(Service):
                 'default': 'info'
             },
             {
-                'name': 'stack_size',
-                'msg': 'Stack size per task (bytes)',
-                'type': int,
-                'default': 65536
-            },
-            {
                 'name': 'queue_depth',
-                'msg': 'Task queue depth',
+                'msg': 'Task queue depth per worker',
                 'type': int,
-                'default': 10000
+                'default': 1024
             },
             {
                 'name': 'local_sched',
@@ -127,8 +121,11 @@ class WrpRuntime(Service):
 
     def _generate_config(self):
         """Generate Chimaera runtime configuration file"""
-        # Parse size strings to bytes
-        main_size = SizeType(self.config['main_segment_size']).bytes
+        # Parse size strings to bytes (handle "auto" for main_segment_size)
+        if self.config['main_segment_size'] == 'auto':
+            main_size = 'auto'
+        else:
+            main_size = SizeType(self.config['main_segment_size']).bytes
         client_size = SizeType(self.config['client_data_segment_size']).bytes
 
         # Build configuration dictionary matching chimaera_default.yaml format
@@ -148,10 +145,9 @@ class WrpRuntime(Service):
             },
             'runtime': {
                 # Worker thread configuration
-                'sched_threads': self.config['sched_workers'],
+                'num_threads': self.config['num_threads'],
                 'process_reaper_threads': self.config['process_reaper_workers'],
                 # Task execution configuration
-                'stack_size': self.config['stack_size'],
                 'queue_depth': self.config['queue_depth'],
                 'local_sched': self.config['local_sched'],
                 'heartbeat_interval': self.config['heartbeat_interval'],

@@ -45,10 +45,18 @@ bool WorkOrchestrator::Init() {
   }
 
   // Get total worker count from configuration
-  u32 sched_count = config->GetSchedulerWorkerCount();
-  u32 slow_count = config->GetSlowWorkerCount();
-  u32 net_count = 1;  // Hardcoded to 1 network worker for now
-  u32 total_workers = sched_count + slow_count + net_count;
+  // Note: max(1, num_threads-1) are task workers, last worker is dedicated network worker
+  // Exception: If num_threads=1, that single worker serves both roles
+  u32 num_threads = config->GetNumThreads();
+  u32 total_workers = num_threads;
+  u32 num_task_workers = (num_threads > 1) ? (num_threads - 1) : 1;
+
+  if (num_threads == 1) {
+    HLOG(kInfo, "Creating 1 worker (serves both task and network roles)");
+  } else {
+    HLOG(kInfo, "Creating {} workers ({} task + 1 dedicated network)",
+         total_workers, num_task_workers);
+  }
 
   // Create all workers as generic type (kSchedWorker)
   // The scheduler will partition them into groups via DivideWorkers()
@@ -57,6 +65,9 @@ bool WorkOrchestrator::Init() {
       return false;
     }
   }
+
+  // Mark as initialized so GetWorker() works during DivideWorkers
+  is_initialized_ = true;
 
   // Get scheduler from IpcManager (IpcManager is the single owner)
   scheduler_ = CHI_IPC->GetScheduler();
@@ -69,7 +80,6 @@ bool WorkOrchestrator::Init() {
     HLOG(kDebug, "WorkOrchestrator: Scheduler DivideWorkers completed");
   }
 
-  is_initialized_ = true;
   return true;
 }
 
@@ -92,7 +102,7 @@ void WorkOrchestrator::Finalize() {
 
   // Clear worker containers
   all_workers_.clear();
-  sched_workers_.clear();
+  workers_.clear();
 
   is_initialized_ = false;
 }
@@ -206,21 +216,29 @@ bool WorkOrchestrator::SpawnWorkerThreads() {
     return false;
   }
 
-  // Map lanes to sched workers (only sched workers process tasks from worker
-  // queues)
-  u32 num_sched_workers = static_cast<u32>(sched_workers_.size());
-  HLOG(kInfo, "WorkOrchestrator: num_sched_workers={}, num_lanes={}",
-        num_sched_workers, num_lanes);
-  if (num_sched_workers == 0) {
-    HLOG(kError,
-          "WorkOrchestrator: No sched workers available for lane mapping");
+  // Get workers that should process tasks from scheduler
+  // The scheduler decides which workers are task-processing workers
+  std::vector<Worker*> task_workers;
+  if (scheduler_) {
+    task_workers = scheduler_->GetTaskProcessingWorkers();
+  } else {
+    HLOG(kError, "WorkOrchestrator: No scheduler available");
     return false;
   }
 
-  // Number of lanes should equal number of sched workers (configured in
-  // IpcManager) Each worker gets exactly one lane for 1:1 mapping
-  for (u32 worker_idx = 0; worker_idx < num_sched_workers; ++worker_idx) {
-    Worker *worker = sched_workers_[worker_idx].get();
+  u32 num_task_workers = static_cast<u32>(task_workers.size());
+  HLOG(kInfo, "WorkOrchestrator: num_task_workers={}, num_lanes={}",
+        num_task_workers, num_lanes);
+
+  if (num_task_workers == 0) {
+    HLOG(kError, "WorkOrchestrator: No task workers available for lane mapping");
+    return false;
+  }
+
+  // Map lanes to task workers using 1:1 mapping
+  // Each task worker gets exactly one lane
+  for (u32 worker_idx = 0; worker_idx < num_task_workers; ++worker_idx) {
+    Worker *worker = task_workers[worker_idx];
     if (worker) {
       // Direct 1:1 mapping: worker i gets lane i
       u32 lane_id = worker_idx;
@@ -232,8 +250,7 @@ bool WorkOrchestrator::SpawnWorkerThreads() {
       // Mark the lane with the assigned worker ID
       lane->SetAssignedWorkerId(worker->GetId());
 
-      HLOG(kInfo,
-            "WorkOrchestrator: Mapped worker {} (ID {}) to lane {}",
+      HLOG(kInfo, "WorkOrchestrator: Mapped worker {} (ID {}) to lane {}",
             worker_idx, worker->GetId(), lane_id);
     } else {
       HLOG(kWarning, "WorkOrchestrator: Worker at index {} is null", worker_idx);
@@ -276,10 +293,8 @@ bool WorkOrchestrator::CreateWorker(ThreadType thread_type) {
   Worker *worker_ptr = worker.get();
   all_workers_.push_back(worker_ptr);
 
-  // Add to ownership container (sched_workers_ owns all workers)
-  // The scheduler's DivideWorkers() will partition workers into
-  // scheduler_workers_, slow_workers_, and net_worker_ groups
-  sched_workers_.push_back(std::move(worker));
+  // Add to ownership container (workers_ owns all worker unique_ptrs)
+  workers_.push_back(std::move(worker));
 
   return true;
 }

@@ -22,70 +22,68 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
     return;
   }
 
-  u32 sched_count = config->GetSchedulerWorkerCount();
-  u32 slow_count = config->GetSlowWorkerCount();
-  u32 net_count = 1;  // Hardcoded to 1 network worker for now
-
+  u32 thread_count = config->GetNumThreads();
   u32 total_workers = work_orch->GetTotalWorkerCount();
-  u32 expected_workers = sched_count + slow_count + net_count;
-
-  if (total_workers != expected_workers) {
-    HLOG(kWarning,
-         "DefaultScheduler::DivideWorkers: Worker count mismatch. "
-         "Expected {}, got {}",
-         expected_workers, total_workers);
-  }
+  u32 worker_idx = 0;
 
   // Clear any existing worker group assignments
   scheduler_workers_.clear();
   slow_workers_.clear();
   net_worker_ = nullptr;
 
-  // Assign workers to groups based on configuration
-  // Order: first sched_count workers -> scheduler_workers_
-  //        next slow_count workers -> slow_workers_
-  //        last worker -> net_worker_
-  u32 worker_idx = 0;
+  // Calculate scheduler workers: max(1, num_threads - 1)
+  // If num_threads = 1: worker 0 is both task and network worker
+  // If num_threads > 1: workers 0..(n-2) are task workers, worker (n-1) is dedicated network worker
+  u32 num_sched_workers = (thread_count > 1) ? (thread_count - 1) : 1;
 
-  // Assign scheduler workers (fast tasks)
-  for (u32 i = 0; i < sched_count && worker_idx < total_workers; ++i) {
+  // Assign scheduler workers
+  for (u32 i = 0; i < num_sched_workers && worker_idx < total_workers; ++i) {
     Worker *worker = work_orch->GetWorker(worker_idx);
     if (worker) {
       worker->SetThreadType(kSchedWorker);
       scheduler_workers_.push_back(worker);
-      HLOG(kDebug, "DefaultScheduler: Worker {} assigned as kSchedWorker",
-           worker_idx);
+      HLOG(kDebug, "DefaultScheduler: Added worker {} to scheduler_workers (now size={})",
+           worker_idx, scheduler_workers_.size());
+    } else {
+      HLOG(kWarning, "DefaultScheduler: Worker {} is null", worker_idx);
     }
     ++worker_idx;
   }
 
-  // Assign slow workers (long-running tasks)
-  for (u32 i = 0; i < slow_count && worker_idx < total_workers; ++i) {
-    Worker *worker = work_orch->GetWorker(worker_idx);
-    if (worker) {
-      worker->SetThreadType(kSlow);
-      slow_workers_.push_back(worker);
-      HLOG(kDebug, "DefaultScheduler: Worker {} assigned as kSlow", worker_idx);
+  // Assign network worker
+  if (thread_count == 1) {
+    // Single thread: worker 0 serves both roles
+    net_worker_ = work_orch->GetWorker(0);
+    HLOG(kDebug, "DefaultScheduler: Worker 0 serves dual role (task + network)");
+  } else {
+    // Multiple threads: last worker is dedicated network worker
+    Worker *net_worker = work_orch->GetWorker(worker_idx);
+    if (net_worker) {
+      net_worker->SetThreadType(kNetWorker);
+      net_worker_ = net_worker;
+      HLOG(kDebug, "DefaultScheduler: Worker {} is dedicated network worker", worker_idx);
     }
     ++worker_idx;
   }
 
-  // Assign network worker (last worker)
-  for (u32 i = 0; i < net_count && worker_idx < total_workers; ++i) {
-    Worker *worker = work_orch->GetWorker(worker_idx);
-    if (worker) {
-      worker->SetThreadType(kNetWorker);
-      net_worker_ = worker;
-      HLOG(kDebug, "DefaultScheduler: Worker {} assigned as kNetWorker",
-           worker_idx);
-    }
-    ++worker_idx;
+  // Update IpcManager with actual number of scheduler workers
+  // This ensures clients map tasks to the correct number of lanes
+  IpcManager *ipc = CHI_IPC;
+  u32 num_scheduler_workers = static_cast<u32>(scheduler_workers_.size());
+  if (ipc) {
+    ipc->SetNumSchedQueues(num_scheduler_workers);
   }
 
-  HLOG(kInfo,
-       "DefaultScheduler::DivideWorkers: Partitioned {} workers "
-       "(sched={}, slow={}, net={})",
-       total_workers, sched_count, slow_count, net_count);
+  if (thread_count == 1) {
+    HLOG(kInfo, "DefaultScheduler: 1 worker (serves both task and network roles)");
+  } else {
+    HLOG(kInfo, "DefaultScheduler: {} task workers, 1 dedicated network worker",
+         num_scheduler_workers);
+  }
+}
+
+std::vector<Worker*> DefaultScheduler::GetTaskProcessingWorkers() {
+  return scheduler_workers_;
 }
 
 u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
@@ -104,9 +102,23 @@ u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
 }
 
 u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
-  // Return current worker - no migration in default scheduler
-  // The task will execute on whichever worker picked it up
-  (void)task;  // Unused in default scheduler
+  // Check if this is a periodic Send or Recv task from admin pool
+  Task *task_ptr = task.get();
+  if (task_ptr != nullptr && task_ptr->IsPeriodic()) {
+    // Check if this is from admin pool (kAdminPoolId)
+    if (task_ptr->pool_id_ == chi::kAdminPoolId) {
+      // Check if this is Send (14) or Recv (15) method
+      u32 method_id = task_ptr->method_;
+      if (method_id == 14 || method_id == 15) {  // kSend or kRecv
+        // Schedule on network worker
+        if (net_worker_ != nullptr) {
+          return net_worker_->GetId();
+        }
+      }
+    }
+  }
+
+  // For all other tasks, return current worker - no migration in default scheduler
   if (worker != nullptr) {
     return worker->GetId();
   }

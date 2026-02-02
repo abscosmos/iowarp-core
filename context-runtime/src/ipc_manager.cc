@@ -13,12 +13,14 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <endian.h>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <netdb.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -107,6 +109,9 @@ bool IpcManager::ServerInit() {
   if (is_initialized_) {
     return true;
   }
+
+  // Clear leftover shared memory segments from previous runs
+  ClearUserIpcs();
 
   // Initialize memory segments for server
   if (!ServerInitShm()) {
@@ -214,6 +219,15 @@ u32 IpcManager::GetNumSchedQueues() const {
   return shared_header_->num_sched_queues;
 }
 
+void IpcManager::SetNumSchedQueues(u32 num_sched_queues) {
+  if (!shared_header_) {
+    HLOG(kError, "IpcManager::SetNumSchedQueues: shared_header_ is null");
+    return;
+  }
+  shared_header_->num_sched_queues = num_sched_queues;
+  HLOG(kInfo, "IpcManager: Updated num_sched_queues to {}", num_sched_queues);
+}
+
 void IpcManager::AwakenWorker(TaskLane* lane) {
   if (!lane) {
     HLOG(kWarning, "AwakenWorker: lane is null");
@@ -253,10 +267,16 @@ bool IpcManager::ServerInitShm() {
     std::string main_segment_name =
         config->GetSharedMemorySegmentName(kMainSegment);
 
+    // Use calculated or explicit main_segment_size
+    size_t main_segment_size = config->CalculateMainSegmentSize();
+
+    HLOG(kInfo, "Initializing main shared memory segment: {} bytes ({} MB)",
+          main_segment_size, main_segment_size / (1024 * 1024));
+
     // Initialize main backend with custom header size
     if (!main_backend_.shm_init(
             main_allocator_id_,
-            hshm::Unit<size_t>::Bytes(config->GetMemorySegmentSize(kMainSegment)),
+            hshm::Unit<size_t>::Bytes(main_segment_size),
             main_segment_name)) {
       return false;
     }
@@ -331,25 +351,27 @@ bool IpcManager::ServerInitQueues() {
 
     // Get worker counts from ConfigManager
     ConfigManager *config = CHI_CONFIG_MANAGER;
-    u32 sched_count = config->GetSchedulerWorkerCount();
-    u32 slow_count = config->GetSlowWorkerCount();
-    u32 net_worker_count = 1;  // Dedicated network worker (hardcoded to 1)
-    u32 total_workers = sched_count + slow_count + net_worker_count;
-
-    // Number of scheduling queues equals number of sched workers
-    u32 num_sched_queues = sched_count;
+    u32 thread_count = config->GetNumThreads();
+    // Note: Last worker serves dual roles as both task worker and network worker
+    u32 total_workers = thread_count;
 
     // Store worker count and scheduling queue count
     shared_header_->num_workers = total_workers;
-    shared_header_->num_sched_queues = num_sched_queues;
+    shared_header_->num_sched_queues = thread_count;
+
+    // Get configured queue depth (no longer hardcoded)
+    u32 queue_depth = config->GetQueueDepth();
+
+    HLOG(kInfo, "Initializing {} worker queues with depth {} (last worker serves dual role)",
+         total_workers, queue_depth);
 
     // Initialize TaskQueue in shared header
-    // Number of lanes equals total worker count (including net worker)
+    // Number of lanes equals total worker count
     new (&shared_header_->worker_queues) TaskQueue(
         main_allocator_,
         total_workers,  // num_lanes equals total worker count
-        2,      // num_priorities (2 priorities: 0=normal, 1=resumed tasks)
-        1024);  // depth_per_queue
+        2,              // num_priorities (2 priorities: 0=normal, 1=resumed tasks)
+        queue_depth);   // Use configured depth instead of hardcoded 1024
 
     // Create FullPtr reference to the shared TaskQueue
     worker_queues_ = hipc::FullPtr<TaskQueue>(main_allocator_,
@@ -359,9 +381,9 @@ bool IpcManager::ServerInitQueues() {
     // One lane with two priorities (SendIn and SendOut)
     net_queue_ = main_allocator_->NewObj<NetQueue>(
         main_allocator_,
-        1,     // num_lanes: single lane for network operations
-        2,     // num_priorities: 0=SendIn, 1=SendOut
-        1024); // depth_per_queue
+        1,           // num_lanes: single lane for network operations
+        2,           // num_priorities: 0=SendIn, 1=SendOut
+        queue_depth); // Use configured depth instead of hardcoded 1024
 
     return !worker_queues_.IsNull() && !net_queue_.IsNull();
   } catch (const std::exception &e) {
@@ -1250,6 +1272,60 @@ size_t IpcManager::WreapAllIpcs() {
   HLOG(kInfo, "WreapAllIpcs: Reaped {} shared memory segments", reaped_count);
 
   return reaped_count;
+}
+
+size_t IpcManager::ClearUserIpcs() {
+  size_t removed_count = 0;
+  const char *shm_dir = "/dev/shm";
+  const char *prefix = "chimaera_";
+  size_t prefix_len = strlen(prefix);
+
+  // Open /dev/shm directory
+  DIR *dir = opendir(shm_dir);
+  if (dir == nullptr) {
+    HLOG(kWarning, "ClearUserIpcs: Failed to open {}: {}", shm_dir, strerror(errno));
+    return 0;
+  }
+
+  // Iterate through directory entries
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != nullptr) {
+    // Skip "." and ".."
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+
+    // Check if filename starts with "chimaera_"
+    if (strncmp(entry->d_name, prefix, prefix_len) != 0) {
+      continue;
+    }
+
+    // Construct full path
+    std::string full_path = std::string(shm_dir) + "/" + entry->d_name;
+
+    // Attempt to remove the file
+    // Use shm_unlink for proper shared memory cleanup
+    if (shm_unlink(entry->d_name) == 0) {
+      HLOG(kDebug, "ClearUserIpcs: Removed shared memory segment: {}", entry->d_name);
+      removed_count++;
+    } else {
+      // Permission denied or other error - silently ignore
+      // This allows other users to have their own chimaera_* segments
+      if (errno != EACCES && errno != EPERM && errno != ENOENT) {
+        HLOG(kDebug, "ClearUserIpcs: Could not remove {} ({}): {}",
+             entry->d_name, errno, strerror(errno));
+      }
+    }
+  }
+
+  closedir(dir);
+
+  if (removed_count > 0) {
+    HLOG(kInfo, "ClearUserIpcs: Removed {} shared memory segments from previous runs",
+         removed_count);
+  }
+
+  return removed_count;
 }
 
 } // namespace chi

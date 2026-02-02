@@ -171,6 +171,23 @@ class ring_buffer : public ShmContainer<AllocT> {
 
  public:
   /**
+   * Calculate exact size needed for a ring_buffer with given depth
+   *
+   * @param depth The queue depth (number of usable entries)
+   * @return Exact size in bytes needed to allocate this ring_buffer
+   */
+  static size_t CalculateSize(size_t depth) {
+    // Base size includes all member variables
+    size_t base_size = sizeof(ring_buffer);
+
+    // Vector entries: (depth + 1) entries, each is RingBufferEntry<T>
+    size_t entry_size = sizeof(entry_type);
+    size_t entries_size = (depth + 1) * entry_size;
+
+    return base_size + entries_size;
+  }
+
+  /**
    * Constructor
    *
    * @param alloc The allocator to use for memory allocation

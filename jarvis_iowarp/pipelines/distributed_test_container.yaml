@@ -13,15 +13,13 @@ pkgs:
   # Stage 1: Launch IOWarp runtime on all nodes
   - pkg_type: jarvis_iowarp.wrp_runtime
     pkg_name: runtime
-    sched_workers: 8
+    num_threads: 8
     process_reaper_workers: 1
-    main_segment_size: "4G"
+    main_segment_size: "auto"
     client_data_segment_size: "2G"
-    runtime_data_segment_size: "2G"
     port: 5555
     log_level: "info"
-    stack_size: 65536
-    queue_depth: 10000
+    queue_depth: 1024
     local_sched: "default"
     heartbeat_interval: 1000
     sleep: 5

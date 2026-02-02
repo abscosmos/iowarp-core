@@ -153,10 +153,10 @@ class WorkOrchestrator {
   bool is_initialized_ = false;
   bool workers_running_ = false;
 
-  // Worker containers organized by type
-  std::vector<std::unique_ptr<Worker>> sched_workers_;
+  // Worker ownership container (owns all worker unique_ptrs)
+  std::vector<std::unique_ptr<Worker>> workers_;
 
-  // All workers for easy access
+  // All workers for easy access (raw pointers to owned workers)
   std::vector<Worker*> all_workers_;
 
   // Active lanes pointer to IPC Manager worker queues

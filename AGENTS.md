@@ -55,6 +55,22 @@ Local QueueId should be named. NEVER use raw integers. This is the same for prio
 
 All timing prints MUST include units of measurement in milliseconds (ms). Always print timing values in the order of milliseconds.
 
+## Shared Memory Cleanup
+
+### Automatic IPC Cleanup on RuntimeInit
+
+When Chimaera RuntimeInit is called (via `IpcManager::ServerInit()`), it automatically cleans up leftover shared memory segments from previous runs or crashed processes by calling `IpcManager::ClearUserIpcs()`.
+
+**ClearUserIpcs() Behavior:**
+- Scans `/dev/shm` directory for all files matching the pattern `chimaera_*`
+- Attempts to remove each matching shared memory segment using `shm_unlink()`
+- Silently ignores permission errors (EACCES, EPERM) to support multi-user systems
+- Other users' active Chimaera processes are not affected
+- Logs successfully removed segments at kInfo level
+- Returns the count of segments removed
+
+This ensures a clean state for each runtime initialization without requiring manual cleanup scripts.
+
 ## Workflow
 
 Use the incremental logic builder agent when making code changes.

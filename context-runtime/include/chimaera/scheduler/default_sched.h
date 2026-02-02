@@ -37,6 +37,13 @@ class DefaultScheduler : public Scheduler {
   void DivideWorkers(WorkOrchestrator *work_orch) override;
 
   /**
+   * Get the list of workers that should process tasks from worker queues.
+   * Returns scheduler_workers_ which are assigned to process tasks.
+   * @return Vector of scheduler workers
+   */
+  std::vector<Worker*> GetTaskProcessingWorkers() override;
+
+  /**
    * Map task to lane using PID+TID hash.
    */
   u32 ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task) override;

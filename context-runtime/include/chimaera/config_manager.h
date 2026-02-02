@@ -102,16 +102,22 @@ class ConfigManager : public hshm::BaseConfig {
   u32 GetWorkerThreadCount(ThreadType thread_type) const;
 
   /**
-   * Get number of scheduler worker threads
-   * @return Number of scheduler worker threads
+   * Get number of worker threads
+   * @return Number of worker threads for task execution
    */
-  u32 GetSchedulerWorkerCount() const { return sched_workers_; }
+  u32 GetNumThreads() const { return num_threads_; }
 
   /**
-   * Get number of slow worker threads
-   * @return Number of slow worker threads
+   * Get task queue depth per worker
+   * @return Queue depth (number of tasks per worker queue)
    */
-  u32 GetSlowWorkerCount() const { return slow_threads_; }
+  u32 GetQueueDepth() const { return queue_depth_; }
+
+  /**
+   * Calculate main segment size based on queue_depth and num_threads
+   * @return Calculated size in bytes, or explicit size if main_segment_size_ > 0
+   */
+  size_t CalculateMainSegmentSize() const;
 
   /**
    * Get memory segment size
@@ -202,8 +208,8 @@ class ConfigManager : public hshm::BaseConfig {
   std::string config_file_path_;
 
   // Configuration parameters
-  u32 sched_workers_ = 4;
-  u32 slow_threads_ = 4;
+  u32 num_threads_ = 4;
+  u32 queue_depth_ = 1024;
   u32 process_reaper_workers_ = 1;
 
   size_t main_segment_size_ = hshm::Unit<size_t>::Gigabytes(1);

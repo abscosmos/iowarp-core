@@ -64,6 +64,27 @@ class multi_ring_buffer : public ShmContainer<AllocT> {
 
  public:
   /**
+   * Calculate exact size needed for a multi_ring_buffer with given parameters
+   *
+   * @param num_lanes The number of lanes
+   * @param num_prios The number of priority levels per lane
+   * @param depth The queue depth per ring buffer
+   * @return Exact size in bytes needed to allocate this multi_ring_buffer
+   */
+  static size_t CalculateSize(size_t num_lanes, size_t num_prios, size_t depth) {
+    // Base size includes all member variables
+    size_t base_size = sizeof(multi_ring_buffer);
+
+    // Each ring buffer's size
+    size_t per_ring_buffer_size = ring_buffer_type::CalculateSize(depth);
+
+    // Total ring buffers = num_lanes * num_prios
+    size_t total_ring_buffers = num_lanes * num_prios;
+
+    return base_size + (total_ring_buffers * per_ring_buffer_size);
+  }
+
+  /**
    * Constructor
    *
    * Initializes a multi-lane ring buffer with the specified number of lanes,

@@ -57,17 +57,21 @@ struct IpcSharedHeader {
  * Used for registering client memory with the runtime
  */
 struct ClientShmInfo {
-  std::string shm_name;       // Shared memory name (chimaera_{pid}_{count})
-  pid_t owner_pid;            // PID of the owning process
-  u32 shm_index;              // Index within the owner's shm segments
-  size_t size;                // Size of the shared memory segment
-  hipc::AllocatorId alloc_id; // Allocator ID for this segment
+  std::string shm_name;        // Shared memory name (chimaera_{pid}_{count})
+  pid_t owner_pid;             // PID of the owning process
+  u32 shm_index;               // Index within the owner's shm segments
+  size_t size;                 // Size of the shared memory segment
+  hipc::AllocatorId alloc_id;  // Allocator ID for this segment
 
   ClientShmInfo() : owner_pid(0), shm_index(0), size(0) {}
 
   ClientShmInfo(const std::string &name, pid_t pid, u32 idx, size_t sz,
                 const hipc::AllocatorId &id)
-      : shm_name(name), owner_pid(pid), shm_index(idx), size(sz), alloc_id(id) {}
+      : shm_name(name),
+        owner_pid(pid),
+        shm_index(idx),
+        size(sz),
+        alloc_id(id) {}
 
   /**
    * Serialization support for cereal
@@ -233,7 +237,8 @@ class IpcManager {
       return;
     }
 
-    HLOG(kWarning, "FreeFutureShm: Could not find allocator for alloc_id ({}.{})",
+    HLOG(kWarning,
+         "FreeFutureShm: Could not find allocator for alloc_id ({}.{})",
          alloc_id.major_, alloc_id.minor_);
   }
 
@@ -257,7 +262,8 @@ class IpcManager {
       // - One for the queue (with null task pointer)
       // - One for the user (with task pointer set)
 
-      // 1. Get allocator from per-process shared memory (created during ClientInit)
+      // 1. Get allocator from per-process shared memory (created during
+      // ClientInit)
       CHI_MAIN_ALLOC_T *alloc = last_alloc_;
       size_t shm_size = 0;
       if (alloc != nullptr) {
@@ -315,17 +321,10 @@ class IpcManager {
       // RUNTIME PATH: Create Future with task pointer directly (no
       // serialization copy)
 
-      // 1. Get allocator from per-process shared memory (created during ServerInit)
-      // ServerInit calls IncreaseMemory() which sets last_alloc_ for runtime use
+      // 1. Get allocator from per-process shared memory (created during
+      // ServerInit) ServerInit calls IncreaseMemory() which sets last_alloc_
+      // for runtime use
       CHI_MAIN_ALLOC_T *alloc = last_alloc_;
-      if (alloc == nullptr) {
-        // Fall back to main_allocator_ if last_alloc_ is not set
-        alloc = main_allocator_;
-        if (alloc == nullptr) {
-          HLOG(kError, "Send: No allocator available in runtime path");
-          return Future<TaskT>();  // Return null Future
-        }
-      }
 
       // 2. Create Future with allocator and task_ptr (task pointer is set)
       Future<TaskT> future(alloc, task_ptr);
@@ -428,6 +427,14 @@ class IpcManager {
   u32 GetNumSchedQueues() const;
 
   /**
+   * Set number of scheduling queues in shared memory header
+   * Called by scheduler after DivideWorkers to inform IpcManager of actual
+   * scheduler worker count
+   * @param num_sched_queues Number of scheduler workers that process tasks
+   */
+  void SetNumSchedQueues(u32 num_sched_queues);
+
+  /**
    * Awaken a worker by sending a signal to its thread
    * Sends SIGUSR1 to the worker's thread ID stored in the TaskLane
    * Only sends signal if the worker is inactive (blocked in epoll_wait)
@@ -527,7 +534,8 @@ class IpcManager {
   /**
    * Convert ShmPtr to FullPtr by checking allocator IDs
    * Handles three cases:
-   * 1. AllocatorId::GetNull() - offset is the actual memory address (raw pointer)
+   * 1. AllocatorId::GetNull() - offset is the actual memory address (raw
+   * pointer)
    * 2. Main allocator - runtime shared memory for queues/futures
    * 3. Per-process shared memory allocators via alloc_map_
    * @param shm_ptr The ShmPtr to convert
@@ -693,6 +701,20 @@ class IpcManager {
    */
   size_t WreapAllIpcs();
 
+  /**
+   * Clear all chimaera_* shared memory segments from /dev/shm
+   *
+   * Called during RuntimeInit to clean up leftover shared memory segments
+   * from previous runs or crashed processes. Attempts to remove all files
+   * matching "chimaera_*" pattern in /dev/shm directory.
+   *
+   * Permission errors are silently ignored to allow multi-user systems where
+   * other users may have active Chimaera processes.
+   *
+   * @return Number of shared memory segments successfully removed
+   */
+  size_t ClearUserIpcs();
+
  private:
   /**
    * Check if task is a network task (Send or Recv)
@@ -756,7 +778,8 @@ class IpcManager {
 
   bool is_initialized_ = false;
 
-  // Shared memory backend for main segment (contains IpcSharedHeader, TaskQueue)
+  // Shared memory backend for main segment (contains IpcSharedHeader,
+  // TaskQueue)
   hipc::PosixShmMmap main_backend_;
 
   // Allocator ID for main segment
@@ -810,7 +833,8 @@ class IpcManager {
   // Per-Process Shared Memory Management
   //============================================================================
 
-  /** Counter for shared memory segments created by this process (starts at 0) */
+  /** Counter for shared memory segments created by this process (starts at 0)
+   */
   std::atomic<u32> shm_count_{0};
 
   /**
@@ -882,7 +906,8 @@ void Future<TaskT, AllocT>::Wait() {
     task_ptr_->PostWait();
 
     // Free the FutureShm object using the correct allocator
-    // FutureShm is allocated from per-process shared memory, look up by alloc_id
+    // FutureShm is allocated from per-process shared memory, look up by
+    // alloc_id
     CHI_IPC->FreeFutureShm(future_shm_);
     future_shm_.SetNull();
   }
