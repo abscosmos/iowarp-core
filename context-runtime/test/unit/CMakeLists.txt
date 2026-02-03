@@ -225,7 +225,7 @@ if(CHIMAERA_ENABLE_TESTS)
   # Core Runtime Tests
   add_test(
     NAME cr_runtime_initialization_tests
-    COMMAND ${TEST_TARGET} "[runtime][initialization]"
+    COMMAND ${TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_runtime_initialization_tests PROPERTIES
@@ -234,7 +234,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_client_initialization_tests
-    COMMAND ${TEST_TARGET} "[client][initialization]"
+    COMMAND ${TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_client_initialization_tests PROPERTIES
@@ -243,7 +243,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_mod_name_task_tests
-    COMMAND ${TEST_TARGET} "[task][mod_name]"
+    COMMAND ${TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_mod_name_task_tests PROPERTIES
@@ -252,7 +252,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_error_handling_tests
-    COMMAND ${TEST_TARGET} "[error][edge_cases]"
+    COMMAND ${TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_error_handling_tests PROPERTIES
@@ -261,7 +261,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_concurrent_tests
-    COMMAND ${TEST_TARGET} "[concurrent][stress]"
+    COMMAND ${TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_concurrent_tests PROPERTIES
@@ -270,7 +270,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_memory_tests
-    COMMAND ${TEST_TARGET} "[memory][cleanup]"
+    COMMAND ${TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_memory_tests PROPERTIES
@@ -279,7 +279,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_performance_tests
-    COMMAND ${TEST_TARGET} "[performance][timing]"
+    COMMAND ${TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_performance_tests PROPERTIES
@@ -299,7 +299,7 @@ if(CHIMAERA_ENABLE_TESTS)
   # IPC AllocateBuffer Tests
   add_test(
     NAME cr_ipc_allocate_buffer_basic_tests
-    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET} "[ipc][allocate_buffer][basic]"
+    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_ipc_allocate_buffer_basic_tests PROPERTIES
@@ -308,7 +308,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_ipc_allocate_buffer_types_tests
-    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET} "[ipc][allocate_buffer][types]"
+    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_ipc_allocate_buffer_types_tests PROPERTIES
@@ -317,7 +317,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_ipc_allocate_buffer_sizes_tests
-    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET} "[ipc][allocate_buffer][sizes]"
+    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_ipc_allocate_buffer_sizes_tests PROPERTIES
@@ -326,7 +326,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_ipc_allocate_buffer_multiple_tests
-    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET} "[ipc][allocate_buffer][multiple]"
+    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_ipc_allocate_buffer_multiple_tests PROPERTIES
@@ -335,7 +335,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_ipc_allocate_buffer_client_runtime_tests
-    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET} "[ipc][allocate_buffer][client_runtime]"
+    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_ipc_allocate_buffer_client_runtime_tests PROPERTIES
@@ -344,7 +344,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_ipc_allocate_buffer_error_tests
-    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET} "[ipc][allocate_buffer][error]"
+    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_ipc_allocate_buffer_error_tests PROPERTIES
@@ -353,7 +353,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_ipc_allocate_buffer_alignment_tests
-    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET} "[ipc][allocate_buffer][alignment]"
+    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_ipc_allocate_buffer_alignment_tests PROPERTIES
@@ -362,7 +362,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_ipc_allocate_buffer_documentation_tests
-    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET} "[ipc][allocate_buffer][documentation]"
+    COMMAND ${IPC_ALLOCATE_BUFFER_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_ipc_allocate_buffer_documentation_tests PROPERTIES
@@ -372,7 +372,7 @@ if(CHIMAERA_ENABLE_TESTS)
   # Per-Process Shared Memory Tests
   add_test(
     NAME cr_per_process_shm_increase_memory_tests
-    COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][increase_memory]"
+    COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_per_process_shm_increase_memory_tests PROPERTIES
@@ -381,7 +381,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_per_process_shm_medium_alloc_tests
-    COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][allocate][medium]"
+    COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_per_process_shm_medium_alloc_tests PROPERTIES
@@ -390,7 +390,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_per_process_shm_large_alloc_tests
-    COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][allocate][large]"
+    COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_per_process_shm_large_alloc_tests PROPERTIES
@@ -400,7 +400,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_per_process_shm_multiple_large_tests
-    COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][allocate][multiple_large]"
+    COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_per_process_shm_multiple_large_tests PROPERTIES
@@ -410,7 +410,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_per_process_shm_patterns_tests
-    COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][allocate][patterns]"
+    COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_per_process_shm_patterns_tests PROPERTIES
@@ -420,7 +420,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_per_process_shm_free_tests
-    COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][free]"
+    COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_per_process_shm_free_tests PROPERTIES
@@ -429,7 +429,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_per_process_shm_tofullptr_tests
-    COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][tofullptr]"
+    COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_per_process_shm_tofullptr_tests PROPERTIES
@@ -438,7 +438,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_per_process_shm_stress_tests
-    COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][stress]"
+    COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_per_process_shm_stress_tests PROPERTIES
@@ -448,7 +448,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_per_process_shm_info_tests
-    COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][shm_info]"
+    COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_per_process_shm_info_tests PROPERTIES
@@ -458,7 +458,7 @@ if(CHIMAERA_ENABLE_TESTS)
   # Streaming Tests
   add_test(
     NAME cr_streaming_small_output_tests
-    COMMAND ${STREAMING_TEST_TARGET} "[streaming][small]"
+    COMMAND ${STREAMING_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_streaming_small_output_tests PROPERTIES
@@ -468,7 +468,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_streaming_large_output_tests
-    COMMAND ${STREAMING_TEST_TARGET} "[streaming][large]"
+    COMMAND ${STREAMING_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_streaming_large_output_tests PROPERTIES
@@ -478,7 +478,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_streaming_bitfield_tests
-    COMMAND ${STREAMING_TEST_TARGET} "[streaming][bitfield]"
+    COMMAND ${STREAMING_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_streaming_bitfield_tests PROPERTIES
@@ -510,39 +510,50 @@ if(CHIMAERA_ENABLE_TESTS)
       TIMEOUT 180
       ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CHIMAERA_TEST_MODE=1"
   )
+
+  # Unordered Map LL Tests (standalone test with custom main)
+  add_test(
+    NAME cr_unordered_map_ll_tests
+    COMMAND ${UNORDERED_MAP_LL_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_unordered_map_ll_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 180
+  )
 endif()
 
 # Custom targets for running specific test categories
 add_custom_target(test_runtime
-  COMMAND ${TEST_TARGET} "[runtime]"
+  COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera runtime tests"
 )
 
 add_custom_target(test_client
-  COMMAND ${TEST_TARGET} "[client]"
+  COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera client tests"
 )
 
 add_custom_target(test_tasks
-  COMMAND ${TEST_TARGET} "[task]"
+  COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera task tests"
 )
 
 add_custom_target(test_errors
-  COMMAND ${TEST_TARGET} "[error]"
+  COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera error handling tests"
 )
 
 add_custom_target(test_performance
-  COMMAND ${TEST_TARGET} "[performance]"
+  COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera performance tests"
@@ -557,14 +568,14 @@ add_custom_target(test_per_process_shm
 )
 
 add_custom_target(test_per_process_shm_large
-  COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][allocate][large]"
+  COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
   DEPENDS ${PER_PROCESS_SHM_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera per-process shared memory large allocation tests (>1GB)"
 )
 
 add_custom_target(test_per_process_shm_stress
-  COMMAND ${PER_PROCESS_SHM_TEST_TARGET} "[ipc][per_process_shm][stress]"
+  COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
   DEPENDS ${PER_PROCESS_SHM_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera per-process shared memory stress tests"

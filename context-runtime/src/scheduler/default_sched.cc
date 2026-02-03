@@ -18,7 +18,8 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
   // Get worker counts from configuration
   ConfigManager *config = CHI_CONFIG_MANAGER;
   if (!config) {
-    HLOG(kError, "DefaultScheduler::DivideWorkers: ConfigManager not available");
+    HLOG(kError,
+         "DefaultScheduler::DivideWorkers: ConfigManager not available");
     return;
   }
 
@@ -32,7 +33,8 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
   // Network worker is always the last worker
   net_worker_ = work_orch->GetWorker(total_workers - 1);
 
-  // Scheduler workers are all workers except the last one (unless only 1 worker)
+  // Scheduler workers are all workers except the last one (unless only 1
+  // worker)
   u32 num_sched_workers = (total_workers == 1) ? 1 : (total_workers - 1);
   for (u32 i = 0; i < num_sched_workers; ++i) {
     Worker *worker = work_orch->GetWorker(i);
@@ -47,12 +49,13 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
     ipc->SetNumSchedQueues(total_workers);
   }
 
-  HLOG(kInfo, "DefaultScheduler: {} scheduler workers, 1 network worker (worker {})",
+  HLOG(kInfo,
+       "DefaultScheduler: {} scheduler workers, 1 network worker (worker {})",
        scheduler_workers_.size(), total_workers - 1);
 }
 
 u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
-                                     const Future<Task> &task) {
+                                    const Future<Task> &task) {
   // Get number of scheduling queues
   u32 num_lanes = ipc_manager->GetNumSchedQueues();
   if (num_lanes == 0) {
@@ -71,7 +74,8 @@ u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
   u32 lane = MapByPidTid(num_lanes);
 
   if (is_network_task) {
-    HLOG(kInfo, "ClientMapTask: Network task (pool={}, method={}) mapped to lane {}",
+    HLOG(kInfo,
+         "ClientMapTask: Network task (pool={}, method={}) mapped to lane {}",
          task_ptr->pool_id_.major_, task_ptr->method_, lane);
   }
 
@@ -90,15 +94,14 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
         // Schedule on network worker
         if (net_worker_ != nullptr) {
           u32 net_worker_id = net_worker_->GetId();
-          HLOG(kInfo, "RuntimeMapTask: Routing network task (pool={}, method={}) to net_worker_id={}",
-               task_ptr->pool_id_.major_, method_id, net_worker_id);
           return net_worker_id;
         }
       }
     }
   }
 
-  // For all other tasks, return current worker - no migration in default scheduler
+  // For all other tasks, return current worker - no migration in default
+  // scheduler
   if (worker != nullptr) {
     return worker->GetId();
   }
@@ -116,7 +119,8 @@ void DefaultScheduler::AdjustPolling(RunContext *run_ctx) {
   }
 
   // TEMPORARY: Disable adaptive polling to test if it resolves hanging issues
-  // Just return early without adjusting - tasks will use their configured period
+  // Just return early without adjusting - tasks will use their configured
+  // period
   return;
 
   // Maximum polling interval in microseconds (100ms)

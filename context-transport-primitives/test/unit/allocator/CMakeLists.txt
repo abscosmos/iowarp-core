@@ -45,20 +45,20 @@ target_link_libraries(test_buddy_allocator_multiprocess_exec_2
 #------------------------------------------------------------------------------
 
 add_test(NAME ctp_sub_alloc COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_sub_alloc_exec "[SubAllocator]~[nested]")
+        ${CMAKE_BINARY_DIR}/bin/test_sub_alloc_exec)
 add_test(NAME ctp_sub_alloc_nested COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_sub_alloc_exec "[SubAllocator][nested]")
+        ${CMAKE_BINARY_DIR}/bin/test_sub_alloc_exec)
 
 add_test(NAME ctp_arena_alloc COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_arena_alloc_exec "[ArenaAllocator<false>]")
+        ${CMAKE_BINARY_DIR}/bin/test_arena_alloc_exec)
 
 add_test(NAME ctp_buddy_allocator COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_buddy_allocator_exec "[BuddyAllocator]")
+        ${CMAKE_BINARY_DIR}/bin/test_buddy_allocator_exec)
 
 add_test(NAME ctp_mp_allocator COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_mp_allocator_exec "[MultiProcessAllocator]~[multithread]")
+        ${CMAKE_BINARY_DIR}/bin/test_mp_allocator_exec)
 add_test(NAME ctp_mp_allocator_multithread COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_mp_allocator_exec "[MultiProcessAllocator][multithread]")
+        ${CMAKE_BINARY_DIR}/bin/test_mp_allocator_exec)
 
 add_test(NAME ctp_mp_allocator_multiprocess
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_mp_allocator_multiprocess_test.sh
@@ -66,6 +66,13 @@ add_test(NAME ctp_mp_allocator_multiprocess
 
 add_test(NAME ctp_buddy_allocator_multiprocess COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_buddy_allocator_multiprocess_exec_2 0 5)
+
+# Set timeouts for multiprocess tests (they need more than 1 second)
+set_tests_properties(
+  ctp_mp_allocator_multiprocess
+  ctp_buddy_allocator_multiprocess
+  PROPERTIES TIMEOUT 15
+)
 
 #------------------------------------------------------------------------------
 # Install Targets

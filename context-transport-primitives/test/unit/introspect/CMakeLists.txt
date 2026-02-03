@@ -14,3 +14,9 @@ add_test(
   COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_mixed_mapping_test.sh
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
+
+# Set timeout for mixed mapping test (multi-process, needs more time)
+set_tests_properties(
+  ctp_mixed_mapping
+  PROPERTIES TIMEOUT 15
+)

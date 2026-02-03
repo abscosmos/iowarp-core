@@ -1780,8 +1780,7 @@ vector<T, AllocT>::operator=(const vector &other) {
   // Clear current contents
   clear();
 
-  // Set allocator from other
-  this->this_ = other.this_;
+  // Note: this_ is not copied - it's position-dependent and set during construction
 
   // Copy elements from other
   if (other.size_ > 0) {
@@ -1816,7 +1815,7 @@ vector<T, AllocT>::operator=(vector &&other) noexcept {
   DeallocateStorage();
 
   // Move data from other
-  this->this_ = other.this_;
+  // Note: this_ is not copied - it's position-dependent and set during construction
   size_ = other.size_;
   capacity_ = other.capacity_;
   data_ = other.data_;

@@ -82,71 +82,71 @@ target_link_libraries(test_query
 
 # Manual test registration for specific test cases
 add_test(NAME cte_core_pool_creation
-    COMMAND cte_core_unit_tests "[core][cte][pool]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_target_registration
-    COMMAND cte_core_unit_tests "[core][cte][target]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_blob_put
-    COMMAND cte_core_unit_tests "[core][cte][putblob]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_blob_get
-    COMMAND cte_core_unit_tests "[core][cte][getblob]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_integration
-    COMMAND cte_core_unit_tests "[core][cte][integration]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_client_creation
-    COMMAND cte_core_unit_tests "[client][core][creation][cte]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_params
-    COMMAND cte_core_unit_tests "[core][cte][params]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_target_config
-    COMMAND cte_core_unit_tests "[config][core][cte][target]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_tag_info
-    COMMAND cte_core_unit_tests "[core][cte][info][tag]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_blob_info
-    COMMAND cte_core_unit_tests "[blob][core][cte][info]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_tasks
-    COMMAND cte_core_unit_tests "[core][cte][tasks]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_helpers
-    COMMAND cte_core_unit_tests "[core][cte][helpers]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_workflow
-    COMMAND cte_core_unit_tests "[core][cte][workflow]")
+    COMMAND cte_core_unit_tests)
 
 add_test(NAME cte_core_performance
-    COMMAND cte_core_unit_tests "[core][cte][performance]")
+    COMMAND cte_core_unit_tests)
 
 # Add test_core_functionality tests
 add_test(NAME cte_functional_pool_creation
-    COMMAND test_core_functionality "[core][creation][cte][pool]")
+    COMMAND test_core_functionality)
 
 add_test(NAME cte_functional_target_registration
-    COMMAND test_core_functionality "[core][cte][registration][target]")
+    COMMAND test_core_functionality)
 
 add_test(NAME cte_functional_putblob
-    COMMAND test_core_functionality "[blob][core][cte][functional][put]")
+    COMMAND test_core_functionality)
 
 add_test(NAME cte_functional_getblob
-    COMMAND test_core_functionality "[blob][core][cte][functional][get]")
+    COMMAND test_core_functionality)
 
 add_test(NAME cte_functional_putget_integration
-    COMMAND test_core_functionality "[blob][core][cte][integration][put-get]")
+    COMMAND test_core_functionality)
 
 add_test(NAME cte_functional_putget_comprehensive
-    COMMAND test_core_functionality "[blob][comprehensive][core][cte][integration][put-get]")
+    COMMAND test_core_functionality)
 
 add_test(NAME cte_functional_reorganize
-    COMMAND test_core_functionality "[blob][core][cte][functional][reorganize]")
+    COMMAND test_core_functionality)
 
 add_test(NAME cte_functional_e2e_workflow
-    COMMAND test_core_functionality "[core][cte][integration]")
+    COMMAND test_core_functionality)
 
 # Add test_query tests - use test names for filtering (simple_test.h filters by name, not tags)
 add_test(NAME cte_query_tag_exact

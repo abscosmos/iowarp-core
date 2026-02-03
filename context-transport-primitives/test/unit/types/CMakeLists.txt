@@ -18,7 +18,7 @@ if(NOT WIN32)
 #         ${CMAKE_BINARY_DIR}/bin/test_types_exec "~[error=FatalError]")
 endif()
 add_test(NAME ctp_fatal_logger
-        COMMAND ${CMAKE_BINARY_DIR}/bin/test_types_exec "[error=FatalError]")
+        COMMAND ${CMAKE_BINARY_DIR}/bin/test_types_exec)
 
 set_tests_properties(
         ctp_fatal_logger PROPERTIES

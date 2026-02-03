@@ -57,37 +57,43 @@ target_link_libraries(test_multi_ring_buffer_exec
 #------------------------------------------------------------------------------
 
 add_test(NAME ctp_slist_pre COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_slist_pre_exec "[slist_pre]~[atomic]")
+        ${CMAKE_BINARY_DIR}/bin/test_slist_pre_exec)
 add_test(NAME ctp_slist_pre_atomic COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_slist_pre_exec "[slist_pre][atomic]")
+        ${CMAKE_BINARY_DIR}/bin/test_slist_pre_exec)
 
 add_test(NAME ctp_rb_tree_pre COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_rb_tree_pre_exec "[rb_tree_pre]~[atomic]")
+        ${CMAKE_BINARY_DIR}/bin/test_rb_tree_pre_exec)
 add_test(NAME ctp_rb_tree_pre_atomic COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_rb_tree_pre_exec "[rb_tree_pre][atomic]")
+        ${CMAKE_BINARY_DIR}/bin/test_rb_tree_pre_exec)
 
 add_test(NAME ctp_vector COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_vector_exec "[vector]")
+        ${CMAKE_BINARY_DIR}/bin/test_vector_exec)
 add_test(NAME ctp_vector_pod COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_vector_exec "[vector][pod]")
+        ${CMAKE_BINARY_DIR}/bin/test_vector_exec)
 add_test(NAME ctp_vector_non_pod COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_vector_exec "[vector][non-pod]")
+        ${CMAKE_BINARY_DIR}/bin/test_vector_exec)
 add_test(NAME ctp_vector_edge COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_vector_exec "[vector][edge]")
+        ${CMAKE_BINARY_DIR}/bin/test_vector_exec)
 add_test(NAME ctp_vector_stress COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_vector_exec "[vector][stress]")
+        ${CMAKE_BINARY_DIR}/bin/test_vector_exec)
 
 add_test(NAME ctp_ring_buffer COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_exec "[ring_buffer]")
+        ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_exec)
 add_test(NAME ctp_ring_buffer_spsc COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_spsc_exec "[ring_buffer][spsc]")
+        ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_spsc_exec)
 add_test(NAME ctp_ring_buffer_ext COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_ext_exec "[ring_buffer][ext]")
+        ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_ext_exec)
 add_test(NAME ctp_ring_buffer_mpsc COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_mpsc_exec "[ring_buffer][mpsc]")
+        ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_mpsc_exec)
 
 add_test(NAME ctp_multi_ring_buffer COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_multi_ring_buffer_exec "[multi_ring_buffer]")
+        ${CMAKE_BINARY_DIR}/bin/test_multi_ring_buffer_exec)
+
+# Set timeout for MPSC ring buffer test (multi-threaded, needs more time)
+set_tests_properties(
+  ctp_ring_buffer_mpsc
+  PROPERTIES TIMEOUT 15
+)
 
 #------------------------------------------------------------------------------
 # Install Targets
