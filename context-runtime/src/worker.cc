@@ -395,34 +395,10 @@ hipc::FullPtr<Task> Worker::GetOrCopyTaskFromFuture(Future<Task> &future,
     std::atomic_thread_fence(std::memory_order_acquire);
 
     size_t input_size = future_shm->input_size_.load();
-    HLOG(kInfo,
-         "Worker::GetOrCopyTaskFromFuture: Deserializing task from copy_space, "
-         "input_size={}, future_shm.ptr_={}, copy_space={}",
-         input_size, (void *)future_shm.ptr_, (void *)future_shm->copy_space);
     std::vector<char> serialized_data(future_shm->copy_space,
                                       future_shm->copy_space + input_size);
-    HLOG(kInfo,
-         "Worker::GetOrCopyTaskFromFuture: Created serialized_data vector with "
-         "{} bytes",
-         serialized_data.size());
-    if (serialized_data.size() >= 8) {
-      HLOG(kInfo,
-           "Worker::GetOrCopyTaskFromFuture: First 8 bytes of serialized data: "
-           "{} {} {} {} {} {} {} {}",
-           (unsigned int)(unsigned char)serialized_data[0],
-           (unsigned int)(unsigned char)serialized_data[1],
-           (unsigned int)(unsigned char)serialized_data[2],
-           (unsigned int)(unsigned char)serialized_data[3],
-           (unsigned int)(unsigned char)serialized_data[4],
-           (unsigned int)(unsigned char)serialized_data[5],
-           (unsigned int)(unsigned char)serialized_data[6],
-           (unsigned int)(unsigned char)serialized_data[7]);
-    }
     LocalLoadTaskArchive archive(serialized_data);
-    HLOG(kInfo,
-         "Worker::GetOrCopyTaskFromFuture: Calling LocalAllocLoadTask...");
     task_full_ptr = container->LocalAllocLoadTask(method_id, archive);
-    HLOG(kInfo, "Worker::GetOrCopyTaskFromFuture: LocalAllocLoadTask returned");
 
     // Update the Future's task pointer
     future.GetTaskPtr() = task_full_ptr;
@@ -1276,8 +1252,8 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
 }
 
 void Worker::EndTaskBeginClientTransfer(const FullPtr<Task> &task_ptr,
-                                         RunContext *run_ctx,
-                                         Container *container) {
+                                        RunContext *run_ctx,
+                                        Container *container) {
   auto future_shm = run_ctx->future_.GetFutureShm();
 
   // Serialize task outputs
@@ -1287,8 +1263,8 @@ void Worker::EndTaskBeginClientTransfer(const FullPtr<Task> &task_ptr,
   // Create LocalTransfer sender (sets output_size_ in FutureShm)
   // Move serialized data directly into LocalTransfer
   // Pass container info so LocalTransfer can delete task on completion
-  LocalTransfer transfer(archive.MoveData(), future_shm,
-                         task_ptr, task_ptr->method_, container);
+  LocalTransfer transfer(archive.MoveData(), future_shm, task_ptr,
+                         task_ptr->method_, container);
 
   // Try initial send with 50 microsecond budget
   bool complete = transfer.Send(50);
@@ -1732,13 +1708,9 @@ void Worker::CopyTaskOutputToClient() {
 
     if (send_complete) {
       // Transfer complete - remove from queue
-      HLOG(kDebug, "CopyTaskOutputToClient: Task streaming complete ({} bytes)",
-           transfer.GetTotalSize());
       client_copy_.pop();
     } else {
       // Transfer not complete - move to back of queue for fairness
-      HLOG(kDebug, "CopyTaskOutputToClient: Sent {}/{} bytes, continuing later",
-           transfer.GetBytesTransferred(), transfer.GetTotalSize());
       LocalTransfer t = std::move(client_copy_.front());
       client_copy_.pop();
       client_copy_.push(std::move(t));

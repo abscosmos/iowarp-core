@@ -251,8 +251,6 @@ class IpcManager {
       return Future<TaskT>();
     }
 
-    HLOG(kInfo, "MakeFuture: called with valid task_ptr");
-
     bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
     Worker *worker = CHI_CUR_WORKER;
 
@@ -261,13 +259,7 @@ class IpcManager {
 
     if (!use_runtime_path) {
       // CLIENT PATH: Serialize the task into Future
-      HLOG(kInfo, "MakeFuture: CLIENT PATH (is_runtime={}, worker={})",
-           is_runtime, (void *)worker);
-
-      // Serialize task FIRST to determine actual size needed
       LocalSaveTaskArchive archive(LocalMsgType::kSerializeIn);
-      HLOG(kInfo, "MakeFuture: CLIENT PATH - About to serialize task_ptr={}",
-           (void *)task_ptr.ptr_);
       archive << (*task_ptr.ptr_);
 
       // Get serialized data
@@ -278,11 +270,6 @@ class IpcManager {
       // larger
       size_t recommended_size = task_ptr->GetCopySpaceSize();
       size_t copy_space_size = std::max(recommended_size, serialized_size);
-
-      HLOG(kInfo,
-           "MakeFuture: CLIENT PATH - Serialized {} bytes, recommended={}, "
-           "using copy_space_size={}",
-           serialized_size, recommended_size, copy_space_size);
 
       // Allocate and construct FutureShm with appropriately sized copy_space
       size_t alloc_size = sizeof(FutureShm) + copy_space_size;
@@ -312,35 +299,18 @@ class IpcManager {
       // copy_space
       future_shm_ptr->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
 
-      HLOG(kInfo,
-           "MakeFuture: CLIENT PATH - Copied {} bytes to copy_space at offset "
-           "{}",
-           serialized_size, offsetof(FutureShm, copy_space));
-
       // Keep the original task_ptr alive
       // The worker will deserialize and execute a copy, but caller keeps the
       // original
       hipc::ShmPtr<FutureShm> future_shm_shmptr =
           buffer.shm_.template Cast<FutureShm>();
 
-      HLOG(kInfo,
-           "MakeFuture: CLIENT PATH - Created ShmPtr: alloc_id=({}.{}), "
-           "off_={}, buffer.ptr_={}",
-           future_shm_shmptr.alloc_id_.major_,
-           future_shm_shmptr.alloc_id_.minor_, future_shm_shmptr.off_.load(),
-           (void *)buffer.ptr_);
-
       // CLIENT PATH: Preserve the original task_ptr
-      HLOG(kInfo, "MakeFuture: CLIENT PATH - preserving original task_ptr");
       Future<TaskT> future(future_shm_shmptr, task_ptr);
-      HLOG(kInfo,
-           "MakeFuture: CLIENT PATH complete, returning future with "
-           "task_ptr preserved");
       return future;
     } else {
       // RUNTIME PATH: Create Future with task pointer directly (no
       // serialization) Runtime doesn't copy/serialize, so no copy_space needed
-      HLOG(kInfo, "MakeFuture: RUNTIME PATH");
 
       // Allocate and construct FutureShm using NewObj (no copy_space for
       // runtime)
@@ -438,13 +408,9 @@ class IpcManager {
     // Runtime path requires BOTH IsRuntime AND worker to be non-null
     bool use_runtime_path = is_runtime && worker != nullptr;
 
-    HLOG(kInfo, "Recv: ENTRY, IsRuntime()={}, worker={}, task_ptr={}",
-         is_runtime, (void *)worker, (void *)future.get());
-
     if (!use_runtime_path) {
       // CLIENT PATH: Deserialize task outputs from FutureShm using
       // LocalTransfer
-      HLOG(kInfo, "Recv: Taking CLIENT PATH - will deserialize");
       auto future_shm = future.GetFutureShm();
       TaskT *task_ptr = future.get();
 
@@ -461,8 +427,6 @@ class IpcManager {
 
       // Get output size from FutureShm (now valid)
       size_t output_size = future_shm->output_size_.load();
-
-      HLOG(kInfo, "Recv: CLIENT PATH - output_size={}", output_size);
 
       // Use LocalTransfer to receive all data
       LocalTransfer receiver(future_shm, output_size);
@@ -484,16 +448,10 @@ class IpcManager {
       archive.SetMsgType(LocalMsgType::kSerializeOut);
 
       // Deserialize task outputs into the Future's task pointer
-      HLOG(kInfo, "Recv: About to deserialize into task_ptr={}",
-           (void *)task_ptr);
       archive >> (*task_ptr);
-      HLOG(kInfo, "Recv: Deserialization complete");
-    } else {
-      // RUNTIME PATH: No deserialization needed - task already has correct
-      // outputs
-      HLOG(kInfo, "Recv: RUNTIME PATH - skipping deserialization");
     }
-    HLOG(kInfo, "Recv: EXIT");
+    // RUNTIME PATH: No deserialization needed - task already has correct
+    // outputs
   }
 
   /**

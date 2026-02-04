@@ -128,9 +128,9 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     // Copy all header fields to backend header (file offset 0)
     (*header_) = (const MemoryBackendHeader &)*this;
 
-    HLOG(kInfo, "shm_init: Initialized with backend_size={}, data_capacity={}",
+    HLOG(kDebug, "shm_init: Initialized with backend_size={}, data_capacity={}",
          backend_size_, data_capacity_);
-    HLOG(kInfo, "shm_init: header_={}, region_={}, data_={}", (void *)header_,
+    HLOG(kDebug, "shm_init: header_={}, region_={}, data_={}", (void *)header_,
          (void *)region_, (void *)data_);
 
     // Mark this process as the owner of the backend
@@ -170,9 +170,9 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     // Read backend_size from backend header
     size_t backend_size = header_->backend_size_;
 
-    HLOG(kInfo, "shm_attach: Read backend_size={} from backend header at {}",
+    HLOG(kDebug, "shm_attach: Read backend_size={} from backend header at {}",
          backend_size, (void *)header_);
-    HLOG(kInfo,
+    HLOG(kDebug,
          "shm_attach: Header fields: id_=({},{}), data_capacity_={}, "
          "priv_header_off_={}",
          header_->id_.major_, header_->id_.minor_, header_->data_capacity_,

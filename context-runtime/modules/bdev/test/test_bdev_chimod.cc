@@ -46,8 +46,8 @@ constexpr chi::u32 kRetryDelayMs = 50;
 
 // Test file configurations
 const std::string kTestFilePrefix = "/tmp/test_bdev_";
-const chi::u64 kDefaultFileSize = 10 * 1024 * 1024; // 10MB
-const chi::u64 kLargeFileSize = 100 * 1024 * 1024;  // 100MB
+const chi::u64 kDefaultFileSize = 10 * 1024 * 1024;  // 10MB
+const chi::u64 kLargeFileSize = 100 * 1024 * 1024;   // 100MB
 
 // Block size constants for testing
 const chi::u64 k4KB = 4096;
@@ -90,7 +90,7 @@ inline chi::priv::vector<chimaera::bdev::Block> ConvertBlocks(
  * Handles setup and teardown of runtime, client, and test files
  */
 class BdevChimodFixture {
-public:
+ public:
   BdevChimodFixture() : current_test_file_("") {
     // Initialize Chimaera once per test suite
     if (!g_initialized) {
@@ -151,7 +151,7 @@ public:
   /**
    * Get the current test file path
    */
-  const std::string &getTestFile() const { return current_test_file_; }
+  const std::string& getTestFile() const { return current_test_file_; }
 
   /**
    * Generate test data with specified pattern
@@ -178,13 +178,15 @@ public:
     if (num_containers_env) {
       chi::u32 num_containers = std::atoi(num_containers_env);
       if (num_containers > 0) {
-        HLOG(kInfo, "Using CHI_NUM_CONTAINERS={} from environment", num_containers);
+        HLOG(kInfo, "Using CHI_NUM_CONTAINERS={} from environment",
+             num_containers);
         return num_containers;
       }
     }
 
     // Default to 1 for local/non-distributed tests
-    HLOG(kInfo, "CHI_NUM_CONTAINERS not set, defaulting to 1 container (local test)");
+    HLOG(kInfo,
+         "CHI_NUM_CONTAINERS not set, defaulting to 1 container (local test)");
     return 1;
   }
 
@@ -194,14 +196,14 @@ public:
    * @param requested_size The originally requested allocation size
    * @return true if sum of block sizes >= requested_size
    */
-  bool validateBlockAllocation(const std::vector<chimaera::bdev::Block> &blocks,
-                                chi::u64 requested_size) const {
+  bool validateBlockAllocation(const std::vector<chimaera::bdev::Block>& blocks,
+                               chi::u64 requested_size) const {
     if (blocks.empty()) {
       return false;
     }
 
     chi::u64 total_size = 0;
-    for (const auto &block : blocks) {
+    for (const auto& block : blocks) {
       total_size += block.size_;
     }
 
@@ -219,13 +221,13 @@ public:
    * @return true if creation succeeded
    */
   static bool CreateBdevAsync(chimaera::bdev::Client& client,
-                               const chi::PoolQuery& pool_query,
-                               const std::string& pool_name,
-                               const chi::PoolId& pool_id,
-                               chimaera::bdev::BdevType bdev_type,
-                               chi::u64 total_size = 0) {
+                              const chi::PoolQuery& pool_query,
+                              const std::string& pool_name,
+                              const chi::PoolId& pool_id,
+                              chimaera::bdev::BdevType bdev_type,
+                              chi::u64 total_size = 0) {
     auto create_task = client.AsyncCreate(pool_query, pool_name, pool_id,
-                                           bdev_type, total_size);
+                                          bdev_type, total_size);
     create_task.Wait();
 
     client.pool_id_ = create_task->new_pool_id_;
@@ -242,8 +244,7 @@ public:
    * @return Vector of allocated blocks
    */
   static std::vector<chimaera::bdev::Block> AllocateBlocksAsync(
-      chimaera::bdev::Client& client,
-      const chi::PoolQuery& pool_query,
+      chimaera::bdev::Client& client, const chi::PoolQuery& pool_query,
       chi::u64 size) {
     auto alloc_task = client.AsyncAllocateBlocks(pool_query, size);
     alloc_task.Wait();
@@ -262,8 +263,7 @@ public:
    * @return Performance metrics
    */
   static chimaera::bdev::PerfMetrics GetStatsAsync(
-      chimaera::bdev::Client& client,
-      chi::u64& remaining_size) {
+      chimaera::bdev::Client& client, chi::u64& remaining_size) {
     auto stats_task = client.AsyncGetStats();
     stats_task.Wait();
 
@@ -285,11 +285,11 @@ public:
     }
   }
 
-private:
+ private:
   std::string current_test_file_;
 };
 
-} // end anonymous namespace
+}  // end anonymous namespace
 
 //==============================================================================
 // BASIC FUNCTIONALITY TESTS
@@ -298,16 +298,14 @@ private:
 TEST_CASE("bdev_container_creation", "[bdev][create]") {
   BdevChimodFixture fixture;
 
-  SECTION("Initialize runtime and client") {
-    REQUIRE(g_initialized);
-  }
+  SECTION("Initialize runtime and client") { REQUIRE(g_initialized); }
 
   SECTION("Create test file") {
     REQUIRE(fixture.createTestFile(kDefaultFileSize));
   }
 
   SECTION("Create bdev container with default parameters") {
-    chi::PoolId custom_pool_id(100, 0); // Custom pool ID for this container
+    chi::PoolId custom_pool_id(100, 0);  // Custom pool ID for this container
     chimaera::bdev::Client client(custom_pool_id);
 
     bool success = BdevChimodFixture::CreateBdevAsync(
@@ -351,27 +349,32 @@ TEST_CASE("bdev_block_allocation_4kb", "[bdev][allocate][4kb]") {
 
       chimaera::bdev::Block block = alloc_task->blocks_[0];
       REQUIRE(block.size_ >= k4KB);
-      REQUIRE(block.block_type_ == 0);    // 4KB category
-      REQUIRE(block.offset_ % 4096 == 0); // Aligned
+      REQUIRE(block.block_type_ == 0);     // 4KB category
+      REQUIRE(block.offset_ % 4096 == 0);  // Aligned
 
       // Verify that completer matches expected value based on DirectHash
       // Formula: expected_container_id = hash_value % num_containers
-      chi::ContainerId expected_completer = static_cast<chi::ContainerId>(i % num_containers);
+      chi::ContainerId expected_completer =
+          static_cast<chi::ContainerId>(i % num_containers);
       chi::ContainerId actual_completer = alloc_task->GetCompleter();
 
-      HLOG(kInfo, "Iteration {}: DirectHash({}) -> completer={}, expected={} (num_containers={})",
-            i, i, actual_completer, expected_completer, num_containers);
+      HLOG(kInfo,
+           "Iteration {}: DirectHash({}) -> completer={}, expected={} "
+           "(num_containers={})",
+           i, i, actual_completer, expected_completer, num_containers);
       REQUIRE(actual_completer == expected_completer);
-      HLOG(kInfo, "Allocated 4KB block {}: offset={}, size={}, completer={} (expected={})",
-            i, block.offset_, block.size_, actual_completer, expected_completer);
+      HLOG(kInfo,
+           "Allocated 4KB block {}: offset={}, size={}, completer={} "
+           "(expected={})",
+           i, block.offset_, block.size_, actual_completer, expected_completer);
 
       blocks.push_back(block);
     }
 
-    // Note: We don't check if blocks overlap because blocks come from different nodes
-    // in distributed execution, and each node has its own independent storage space.
-    // Blocks from different nodes can have overlapping offsets within their respective
-    // storage backends.
+    // Note: We don't check if blocks overlap because blocks come from different
+    // nodes in distributed execution, and each node has its own independent
+    // storage space. Blocks from different nodes can have overlapping offsets
+    // within their respective storage backends.
   }
 }
 
@@ -401,7 +404,8 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
       auto pool_query = chi::PoolQuery::DirectHash(i);
 
       // Expected container ID based on DirectHash formula
-      chi::ContainerId expected_completer = static_cast<chi::ContainerId>(i % num_containers);
+      chi::ContainerId expected_completer =
+          static_cast<chi::ContainerId>(i % num_containers);
 
       // Allocate a block
       auto alloc_task = client.AsyncAllocateBlocks(pool_query, k4KB);
@@ -411,8 +415,11 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
       chimaera::bdev::Block block = alloc_task->blocks_[0];
 
       // Verify allocate task completer
-      HLOG(kInfo, "Iteration {}: DirectHash({}) Allocate -> completer={}, expected={} (num_containers={})",
-            i, i, alloc_task->GetCompleter(), expected_completer, num_containers);
+      HLOG(kInfo,
+           "Iteration {}: DirectHash({}) Allocate -> completer={}, expected={} "
+           "(num_containers={})",
+           i, i, alloc_task->GetCompleter(), expected_completer,
+           num_containers);
       REQUIRE(alloc_task->GetCompleter() == expected_completer);
 
       // Generate test data
@@ -424,8 +431,10 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
       REQUIRE_FALSE(write_buffer.IsNull());
       memcpy(write_buffer.ptr_, write_data.data(), write_data.size());
 
-      auto write_task = client.AsyncWrite(pool_query, WrapBlock(block),
-                                          write_buffer.shm_.template Cast<void>().template Cast<void>(), write_data.size());
+      auto write_task = client.AsyncWrite(
+          pool_query, WrapBlock(block),
+          write_buffer.shm_.template Cast<void>().template Cast<void>(),
+          write_data.size());
       write_task.Wait();
       REQUIRE(write_task->return_code_ == 0);
       REQUIRE(write_task->bytes_written_ == write_data.size());
@@ -433,14 +442,15 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
       // Verify write task completer
       REQUIRE(write_task->GetCompleter() == expected_completer);
       HLOG(kInfo, "Iteration {}: Write completed by container {} (expected={})",
-            i, write_task->GetCompleter(), expected_completer);
+           i, write_task->GetCompleter(), expected_completer);
 
       // Read data back - allocate buffer for reading
       auto read_buffer = CHI_IPC->AllocateBuffer(k4KB);
       REQUIRE_FALSE(read_buffer.IsNull());
 
-      auto read_task =
-          client.AsyncRead(pool_query, WrapBlock(block), read_buffer.shm_.template Cast<void>().template Cast<void>(), k4KB);
+      auto read_task = client.AsyncRead(
+          pool_query, WrapBlock(block),
+          read_buffer.shm_.template Cast<void>().template Cast<void>(), k4KB);
       read_task.Wait();
       REQUIRE(read_task->return_code_ == 0);
       REQUIRE(read_task->bytes_read_ == write_data.size());
@@ -448,7 +458,7 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
       // Verify read task completer
       REQUIRE(read_task->GetCompleter() == expected_completer);
       HLOG(kInfo, "Iteration {}: Read completed by container {} (expected={})",
-            i, read_task->GetCompleter(), expected_completer);
+           i, read_task->GetCompleter(), expected_completer);
 
       // Convert read data back to vector for verification
       std::vector<hshm::u8> read_data(read_task->bytes_read_);
@@ -464,7 +474,7 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
       CHI_IPC->FreeBuffer(read_buffer);
 
       HLOG(kInfo, "Iteration {}: Successfully wrote and read {} bytes", i,
-            write_data.size());
+           write_data.size());
     }
   }
 }
@@ -507,7 +517,9 @@ TEST_CASE("bdev_async_operations", "[bdev][async][io]") {
       memcpy(async_write_buffer.ptr_, write_data.data(), write_data.size());
 
       auto write_task = client.AsyncWrite(
-          pool_query, WrapBlock(block), async_write_buffer.shm_.template Cast<void>().template Cast<void>(), write_data.size());
+          pool_query, WrapBlock(block),
+          async_write_buffer.shm_.template Cast<void>().template Cast<void>(),
+          write_data.size());
       write_task.Wait();
       REQUIRE(write_task->return_code_ == 0);
       REQUIRE(write_task->bytes_written_ == write_data.size());
@@ -516,8 +528,10 @@ TEST_CASE("bdev_async_operations", "[bdev][async][io]") {
       auto async_read_buffer = CHI_IPC->AllocateBuffer(k64KB);
       REQUIRE_FALSE(async_read_buffer.IsNull());
 
-      auto read_task = client.AsyncRead(pool_query, WrapBlock(block),
-                                        async_read_buffer.shm_.template Cast<void>().template Cast<void>(), k64KB);
+      auto read_task = client.AsyncRead(
+          pool_query, WrapBlock(block),
+          async_read_buffer.shm_.template Cast<void>().template Cast<void>(),
+          k64KB);
       read_task.Wait();
       REQUIRE(read_task->return_code_ == 0);
       REQUIRE(read_task->bytes_read_ == write_data.size());
@@ -537,9 +551,9 @@ TEST_CASE("bdev_async_operations", "[bdev][async][io]") {
       CHI_IPC->FreeBuffer(async_read_buffer);
 
       HLOG(kInfo,
-            "Iteration {}: Successfully completed async allocate/write/read "
-            "cycle",
-            i);
+           "Iteration {}: Successfully completed async allocate/write/read "
+           "cycle",
+           i);
     }
   }
 }
@@ -570,7 +584,7 @@ TEST_CASE("bdev_performance_metrics", "[bdev][performance][metrics]") {
     auto stats_task = client.AsyncGetStats();
     stats_task.Wait();
     HLOG(kInfo, "Test: GetStats return_code={}, remaining_size={}",
-          stats_task->GetReturnCode(), stats_task->remaining_size_);
+         stats_task->GetReturnCode(), stats_task->remaining_size_);
     chimaera::bdev::PerfMetrics initial_metrics = stats_task->metrics_;
     initial_remaining = stats_task->remaining_size_;
 
@@ -605,7 +619,9 @@ TEST_CASE("bdev_performance_metrics", "[bdev][performance][metrics]") {
       memcpy(data1_write_buffer.ptr_, data1.data(), data1.size());
 
       auto write_task1 = client.AsyncWrite(
-          pool_query, WrapBlock(block1), data1_write_buffer.shm_.template Cast<void>().template Cast<void>(), data1.size());
+          pool_query, WrapBlock(block1),
+          data1_write_buffer.shm_.template Cast<void>().template Cast<void>(),
+          data1.size());
       write_task1.Wait();
       REQUIRE(write_task1->return_code_ == 0);
 
@@ -615,7 +631,9 @@ TEST_CASE("bdev_performance_metrics", "[bdev][performance][metrics]") {
       memcpy(data2_write_buffer.ptr_, data2.data(), data2.size());
 
       auto write_task2 = client.AsyncWrite(
-          pool_query, WrapBlock(block2), data2_write_buffer.shm_.template Cast<void>().template Cast<void>(), data2.size());
+          pool_query, WrapBlock(block2),
+          data2_write_buffer.shm_.template Cast<void>().template Cast<void>(),
+          data2.size());
       write_task2.Wait();
       REQUIRE(write_task2->return_code_ == 0);
 
@@ -623,16 +641,20 @@ TEST_CASE("bdev_performance_metrics", "[bdev][performance][metrics]") {
       auto data1_read_buffer = CHI_IPC->AllocateBuffer(k1MB);
       REQUIRE_FALSE(data1_read_buffer.IsNull());
 
-      auto read_task1 = client.AsyncRead(pool_query, WrapBlock(block1),
-                                         data1_read_buffer.shm_.template Cast<void>().template Cast<void>(), k1MB);
+      auto read_task1 = client.AsyncRead(
+          pool_query, WrapBlock(block1),
+          data1_read_buffer.shm_.template Cast<void>().template Cast<void>(),
+          k1MB);
       read_task1.Wait();
       REQUIRE(read_task1->return_code_ == 0);
 
       auto data2_read_buffer = CHI_IPC->AllocateBuffer(k256KB);
       REQUIRE_FALSE(data2_read_buffer.IsNull());
 
-      auto read_task2 = client.AsyncRead(pool_query, WrapBlock(block2),
-                                         data2_read_buffer.shm_.template Cast<void>().template Cast<void>(), k256KB);
+      auto read_task2 = client.AsyncRead(
+          pool_query, WrapBlock(block2),
+          data2_read_buffer.shm_.template Cast<void>().template Cast<void>(),
+          k256KB);
       read_task2.Wait();
       REQUIRE(read_task2->return_code_ == 0);
 
@@ -660,7 +682,7 @@ TEST_CASE("bdev_performance_metrics", "[bdev][performance][metrics]") {
     REQUIRE(final_metrics.iops_ >= 0.0);
 
     HLOG(kInfo, "Initial remaining: {} bytes, Final remaining: {} bytes",
-          initial_remaining, final_remaining);
+         initial_remaining, final_remaining);
     HLOG(kInfo, "Read BW: {} MB/s", final_metrics.read_bandwidth_mbps_);
     HLOG(kInfo, "Write BW: {} MB/s", final_metrics.write_bandwidth_mbps_);
     HLOG(kInfo, "IOPS: {}", final_metrics.iops_);
@@ -684,7 +706,7 @@ TEST_CASE("bdev_error_conditions", "[bdev][error][edge_cases]") {
         chi::PoolQuery::Broadcast(), "/nonexistent/path/file.dat",
         custom_pool_id, chimaera::bdev::BdevType::kFile);
     create_task.Wait();
-    REQUIRE(create_task->return_code_ != 0); // Should fail
+    REQUIRE(create_task->return_code_ != 0);  // Should fail
 
     HLOG(kInfo, "Correctly handled invalid file path");
   }
@@ -717,7 +739,7 @@ TEST_CASE("bdev_ram_container_creation", "[bdev][ram][create]") {
   std::this_thread::sleep_for(100ms);
 
   HLOG(kInfo, "RAM backend container created successfully with size: {} bytes",
-        ram_size);
+       ram_size);
 }
 
 TEST_CASE("bdev_ram_allocation_and_io", "[bdev][ram][io]") {
@@ -746,8 +768,7 @@ TEST_CASE("bdev_ram_allocation_and_io", "[bdev][ram][io]") {
     auto pool_query = chi::PoolQuery::DirectHash(i);
 
     // Allocate a 4KB block
-    auto alloc_task =
-        bdev_client.AsyncAllocateBlocks(pool_query, k4KB);
+    auto alloc_task = bdev_client.AsyncAllocateBlocks(pool_query, k4KB);
     alloc_task.Wait();
     REQUIRE(alloc_task->return_code_ == 0);
     REQUIRE(alloc_task->blocks_.size() > 0);
@@ -758,7 +779,6 @@ TEST_CASE("bdev_ram_allocation_and_io", "[bdev][ram][io]") {
     // Verify that completer_ is set (can be 0, which is a valid container ID)
     chi::ContainerId completer = alloc_task->GetCompleter();
     HLOG(kInfo, "Iteration {}: Task completed by container {}", i, completer);
-
 
     // Prepare test data with pattern
     std::vector<hshm::u8> write_data(k4KB);
@@ -771,7 +791,10 @@ TEST_CASE("bdev_ram_allocation_and_io", "[bdev][ram][io]") {
     REQUIRE_FALSE(write_buffer.IsNull());
     memcpy(write_buffer.ptr_, write_data.data(), write_data.size());
 
-    auto write_task = bdev_client.AsyncWrite(pool_query, WrapBlock(block), write_buffer.shm_.template Cast<void>().template Cast<void>(), write_data.size());
+    auto write_task = bdev_client.AsyncWrite(
+        pool_query, WrapBlock(block),
+        write_buffer.shm_.template Cast<void>().template Cast<void>(),
+        write_data.size());
     write_task.Wait();
     REQUIRE(write_task->return_code_ == 0);
     REQUIRE(write_task->bytes_written_ == k4KB);
@@ -780,8 +803,9 @@ TEST_CASE("bdev_ram_allocation_and_io", "[bdev][ram][io]") {
     auto read_buffer = CHI_IPC->AllocateBuffer(k4KB);
     REQUIRE_FALSE(read_buffer.IsNull());
 
-    auto read_task = bdev_client.AsyncRead(pool_query, WrapBlock(block),
-                                           read_buffer.shm_.template Cast<void>().template Cast<void>(), k4KB);
+    auto read_task = bdev_client.AsyncRead(
+        pool_query, WrapBlock(block),
+        read_buffer.shm_.template Cast<void>().template Cast<void>(), k4KB);
     read_task.Wait();
     REQUIRE(read_task->return_code_ == 0);
     REQUIRE(read_task->bytes_read_ == k4KB);
@@ -802,13 +826,12 @@ TEST_CASE("bdev_ram_allocation_and_io", "[bdev][ram][io]") {
     // Free the block
     std::vector<chimaera::bdev::Block> free_blocks;
     free_blocks.push_back(block);
-    auto free_task =
-        bdev_client.AsyncFreeBlocks(pool_query, free_blocks);
+    auto free_task = bdev_client.AsyncFreeBlocks(pool_query, free_blocks);
     free_task.Wait();
     REQUIRE(free_task->return_code_ == 0);
 
     HLOG(kInfo,
-          "Iteration {}: RAM backend I/O operations completed successfully", i);
+         "Iteration {}: RAM backend I/O operations completed successfully", i);
   }
 }
 
@@ -823,7 +846,8 @@ TEST_CASE("bdev_ram_large_blocks", "[bdev][ram][large]") {
   chi::PoolId custom_pool_id(8003, 0);
   chimaera::bdev::Client bdev_client(custom_pool_id);
 
-  // Create RAM-based bdev container (32MB to accommodate multiple 1MB allocations)
+  // Create RAM-based bdev container (32MB to accommodate multiple 1MB
+  // allocations)
   const chi::u64 ram_size = 32 * 1024 * 1024;
   std::string pool_name =
       "ram_test_" + std::to_string(getpid()) + "_" + std::to_string(8003);
@@ -843,8 +867,7 @@ TEST_CASE("bdev_ram_large_blocks", "[bdev][ram][large]") {
       auto pool_query = chi::PoolQuery::DirectHash(i);
 
       // Allocate block
-      auto alloc_task =
-          bdev_client.AsyncAllocateBlocks(pool_query, block_size);
+      auto alloc_task = bdev_client.AsyncAllocateBlocks(pool_query, block_size);
       alloc_task.Wait();
       REQUIRE(alloc_task->return_code_ == 0);
       REQUIRE(alloc_task->blocks_.size() > 0);
@@ -856,8 +879,8 @@ TEST_CASE("bdev_ram_large_blocks", "[bdev][ram][large]") {
       }
 
       REQUIRE(fixture.validateBlockAllocation(blocks, block_size));
-      HLOG(kInfo, "Allocated {} blocks for requested size = {}",
-            blocks.size(), block_size);
+      HLOG(kInfo, "Allocated {} blocks for requested size = {}", blocks.size(),
+           block_size);
 
       // Create test pattern
       std::vector<hshm::u8> test_data(block_size);
@@ -871,9 +894,10 @@ TEST_CASE("bdev_ram_large_blocks", "[bdev][ram][large]") {
       memcpy(test_write_buffer.ptr_, test_data.data(), test_data.size());
 
       // Pass all allocated blocks to Write
-      auto write_task =
-          bdev_client.AsyncWrite(pool_query, ConvertBlocks(blocks),
-                                 test_write_buffer.shm_.template Cast<void>().template Cast<void>(), test_data.size());
+      auto write_task = bdev_client.AsyncWrite(
+          pool_query, ConvertBlocks(blocks),
+          test_write_buffer.shm_.template Cast<void>().template Cast<void>(),
+          test_data.size());
       write_task.Wait();
       REQUIRE(write_task->return_code_ == 0);
       REQUIRE(write_task->bytes_written_ == block_size);
@@ -882,8 +906,10 @@ TEST_CASE("bdev_ram_large_blocks", "[bdev][ram][large]") {
       REQUIRE_FALSE(test_read_buffer.IsNull());
 
       // Pass all allocated blocks to Read
-      auto read_task = bdev_client.AsyncRead(pool_query, ConvertBlocks(blocks),
-                                             test_read_buffer.shm_.template Cast<void>().template Cast<void>(), block_size);
+      auto read_task = bdev_client.AsyncRead(
+          pool_query, ConvertBlocks(blocks),
+          test_read_buffer.shm_.template Cast<void>().template Cast<void>(),
+          block_size);
       read_task.Wait();
       REQUIRE(read_task->return_code_ == 0);
       REQUIRE(read_task->bytes_read_ == block_size);
@@ -902,8 +928,7 @@ TEST_CASE("bdev_ram_large_blocks", "[bdev][ram][large]") {
       CHI_IPC->FreeBuffer(test_read_buffer);
 
       // Free all allocated blocks
-      auto free_task =
-          bdev_client.AsyncFreeBlocks(pool_query, blocks);
+      auto free_task = bdev_client.AsyncFreeBlocks(pool_query, blocks);
       free_task.Wait();
       REQUIRE(free_task->return_code_ == 0);
     }
@@ -939,8 +964,8 @@ TEST_CASE("bdev_ram_bounds_checking", "[bdev][ram][bounds]") {
 
     // Create a block that would go beyond bounds
     chimaera::bdev::Block out_of_bounds_block;
-    out_of_bounds_block.offset_ = ram_size - 1024; // Near end of buffer
-    out_of_bounds_block.size_ = 2048;              // Extends beyond buffer
+    out_of_bounds_block.offset_ = ram_size - 1024;  // Near end of buffer
+    out_of_bounds_block.size_ = 2048;               // Extends beyond buffer
     out_of_bounds_block.block_type_ = 0;
 
     // Prepare test data
@@ -951,35 +976,37 @@ TEST_CASE("bdev_ram_bounds_checking", "[bdev][ram][bounds]") {
     REQUIRE_FALSE(error_write_buffer.IsNull());
     memcpy(error_write_buffer.ptr_, test_data.data(), test_data.size());
 
-    auto write_task =
-        bdev_client.AsyncWrite(pool_query, WrapBlock(out_of_bounds_block),
-                               error_write_buffer.shm_.template Cast<void>().template Cast<void>(), test_data.size());
+    auto write_task = bdev_client.AsyncWrite(
+        pool_query, WrapBlock(out_of_bounds_block),
+        error_write_buffer.shm_.template Cast<void>().template Cast<void>(),
+        test_data.size());
     write_task.Wait();
-    REQUIRE(write_task->bytes_written_ == 0); // Should fail
+    REQUIRE(write_task->bytes_written_ == 0);  // Should fail
 
     // Read should also fail with bounds check - allocate buffer
     auto error_read_buffer = CHI_IPC->AllocateBuffer(2048);
     REQUIRE_FALSE(error_read_buffer.IsNull());
 
-    auto read_task =
-        bdev_client.AsyncRead(pool_query, WrapBlock(out_of_bounds_block),
-                              error_read_buffer.shm_.template Cast<void>().template Cast<void>(), 2048);
+    auto read_task = bdev_client.AsyncRead(
+        pool_query, WrapBlock(out_of_bounds_block),
+        error_read_buffer.shm_.template Cast<void>().template Cast<void>(),
+        2048);
     read_task.Wait();
-    REQUIRE(read_task->bytes_read_ == 0); // Should fail
+    REQUIRE(read_task->bytes_read_ == 0);  // Should fail
 
     // Convert read data back to vector (should be empty due to error)
     std::vector<hshm::u8> read_data(read_task->bytes_read_);
     if (read_task->bytes_read_ > 0) {
       memcpy(read_data.data(), error_read_buffer.ptr_, read_task->bytes_read_);
     }
-    REQUIRE(read_data.empty()); // Should fail
+    REQUIRE(read_data.empty());  // Should fail
 
     // Free buffers
     CHI_IPC->FreeBuffer(error_write_buffer);
     CHI_IPC->FreeBuffer(error_read_buffer);
 
     HLOG(kInfo, "Iteration {}: RAM backend bounds checking working correctly",
-          i);
+         i);
   }
 }
 
@@ -1003,9 +1030,8 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
 
   // Create file-based container
   bool file_success = BdevChimodFixture::CreateBdevAsync(
-      file_client, chi::PoolQuery::Dynamic(),
-      fixture.getTestFile(), file_pool_id,
-      chimaera::bdev::BdevType::kFile);
+      file_client, chi::PoolQuery::Dynamic(), fixture.getTestFile(),
+      file_pool_id, chimaera::bdev::BdevType::kFile);
   REQUIRE(file_success);
   std::this_thread::sleep_for(100ms);
 
@@ -1033,8 +1059,7 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
     REQUIRE(file_alloc_task->blocks_.size() > 0);
     chimaera::bdev::Block file_block = file_alloc_task->blocks_[0];
 
-    auto ram_alloc_task =
-        ram_client.AsyncAllocateBlocks(pool_query, test_size);
+    auto ram_alloc_task = ram_client.AsyncAllocateBlocks(pool_query, test_size);
     ram_alloc_task.Wait();
     REQUIRE(ram_alloc_task->return_code_ == 0);
     REQUIRE(ram_alloc_task->blocks_.size() > 0);
@@ -1060,9 +1085,10 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
 
     // Write to file backend and measure time
     auto file_write_start = std::chrono::high_resolution_clock::now();
-    auto file_write_task =
-        file_client.AsyncWrite(pool_query, WrapBlock(file_block),
-                               file_write_buffer.shm_.template Cast<void>().template Cast<void>(), test_data.size());
+    auto file_write_task = file_client.AsyncWrite(
+        pool_query, WrapBlock(file_block),
+        file_write_buffer.shm_.template Cast<void>().template Cast<void>(),
+        test_data.size());
     file_write_task.Wait();
     auto file_write_end = std::chrono::high_resolution_clock::now();
 
@@ -1075,9 +1101,10 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
     memcpy(ram_write_buffer.ptr_, test_data.data(), test_data.size());
 
     auto ram_write_start = std::chrono::high_resolution_clock::now();
-    auto ram_write_task =
-        ram_client.AsyncWrite(pool_query, WrapBlock(ram_block),
-                              ram_write_buffer.shm_.template Cast<void>().template Cast<void>(), test_data.size());
+    auto ram_write_task = ram_client.AsyncWrite(
+        pool_query, WrapBlock(ram_block),
+        ram_write_buffer.shm_.template Cast<void>().template Cast<void>(),
+        test_data.size());
     ram_write_task.Wait();
     auto ram_write_end = std::chrono::high_resolution_clock::now();
 
@@ -1090,7 +1117,10 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
 
     // Read from file backend and measure time
     auto file_read_start = std::chrono::high_resolution_clock::now();
-    auto file_read_task = file_client.AsyncRead(pool_query, WrapBlock(file_block), file_read_buffer.shm_.template Cast<void>().template Cast<void>(), test_size);
+    auto file_read_task = file_client.AsyncRead(
+        pool_query, WrapBlock(file_block),
+        file_read_buffer.shm_.template Cast<void>().template Cast<void>(),
+        test_size);
     file_read_task.Wait();
     auto file_read_end = std::chrono::high_resolution_clock::now();
 
@@ -1107,8 +1137,10 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
     REQUIRE_FALSE(ram_read_buffer.IsNull());
 
     auto ram_read_start = std::chrono::high_resolution_clock::now();
-    auto ram_read_task = ram_client.AsyncRead(pool_query, WrapBlock(ram_block),
-                                              ram_read_buffer.shm_.template Cast<void>().template Cast<void>(), test_size);
+    auto ram_read_task = ram_client.AsyncRead(
+        pool_query, WrapBlock(ram_block),
+        ram_read_buffer.shm_.template Cast<void>().template Cast<void>(),
+        test_size);
     ram_read_task.Wait();
     auto ram_read_end = std::chrono::high_resolution_clock::now();
 
@@ -1148,9 +1180,10 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
     HLOG(kInfo, "  File Read:  {} μs", file_read_time.count());
     HLOG(kInfo, "  RAM Read:   {} μs", ram_read_time.count());
 
-    // Note: In distributed mode with network overhead, RAM may not always be faster
-    // than file due to serialization/network costs. We verify operations complete
-    // successfully but don't enforce strict performance requirements in distributed tests.
+    // Note: In distributed mode with network overhead, RAM may not always be
+    // faster than file due to serialization/network costs. We verify operations
+    // complete successfully but don't enforce strict performance requirements
+    // in distributed tests.
 
     // Free buffers
     CHI_IPC->FreeBuffer(file_write_buffer);
@@ -1178,33 +1211,43 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
 TEST_CASE("bdev_file_explicit_backend", "[bdev][file][explicit]") {
   HLOG(kInfo, "[bdev_file_explicit_backend] TEST START");
   BdevChimodFixture fixture;
-  HLOG(kInfo, "[bdev_file_explicit_backend] Checking g_initialized={}", g_initialized);
+  HLOG(kInfo, "[bdev_file_explicit_backend] Checking g_initialized={}",
+       g_initialized);
   REQUIRE(g_initialized);
   HLOG(kInfo, "[bdev_file_explicit_backend] Creating test file...");
   REQUIRE(fixture.createTestFile(kDefaultFileSize));
-  HLOG(kInfo, "[bdev_file_explicit_backend] Test file created: {}", fixture.getTestFile());
+  HLOG(kInfo, "[bdev_file_explicit_backend] Test file created: {}",
+       fixture.getTestFile());
 
   // Admin client is automatically initialized via CHI_ADMIN singleton
-  HLOG(kInfo, "[bdev_file_explicit_backend] Sleeping 100ms for admin client init...");
+  HLOG(kInfo,
+       "[bdev_file_explicit_backend] Sleeping 100ms for admin client init...");
   std::this_thread::sleep_for(100ms);
   HLOG(kInfo, "[bdev_file_explicit_backend] Done sleeping");
 
   // Create bdev client with explicit file backend
   chi::PoolId custom_pool_id(8008, 0);
-  HLOG(kInfo, "[bdev_file_explicit_backend] Creating bdev client with pool_id=(major:{}, minor:{})",
-        custom_pool_id.major_, custom_pool_id.minor_);
+  HLOG(kInfo,
+       "[bdev_file_explicit_backend] Creating bdev client with "
+       "pool_id=(major:{}, minor:{})",
+       custom_pool_id.major_, custom_pool_id.minor_);
   chimaera::bdev::Client bdev_client(custom_pool_id);
   HLOG(kInfo, "[bdev_file_explicit_backend] Bdev client created");
 
   // Create file-based container using explicit backend type
-  HLOG(kInfo, "[bdev_file_explicit_backend] Calling AsyncCreate() with Dynamic pool query...");
-  auto create_task = bdev_client.AsyncCreate(chi::PoolQuery::Dynamic(), fixture.getTestFile(),
-      custom_pool_id, chimaera::bdev::BdevType::kFile, 0, 32, 4096);
+  HLOG(kInfo,
+       "[bdev_file_explicit_backend] Calling AsyncCreate() with Dynamic pool "
+       "query...");
+  auto create_task = bdev_client.AsyncCreate(
+      chi::PoolQuery::Dynamic(), fixture.getTestFile(), custom_pool_id,
+      chimaera::bdev::BdevType::kFile, 0, 32, 4096);
   create_task.Wait();
   bdev_client.pool_id_ = create_task->new_pool_id_;
   bdev_client.return_code_ = create_task->return_code_;
   bool bdev_success = create_task->GetReturnCode() == 0;
-  HLOG(kInfo, "[bdev_file_explicit_backend] AsyncCreate() returned bdev_success={}", bdev_success);
+  HLOG(kInfo,
+       "[bdev_file_explicit_backend] AsyncCreate() returned bdev_success={}",
+       bdev_success);
   REQUIRE(bdev_success);
   HLOG(kInfo, "[bdev_file_explicit_backend] Sleeping 100ms after Create...");
   std::this_thread::sleep_for(100ms);
@@ -1218,97 +1261,158 @@ TEST_CASE("bdev_file_explicit_backend", "[bdev][file][explicit]") {
   for (int i = 0; i < 16; ++i) {
     HLOG(kInfo, "[bdev_file_explicit_backend] === ITERATION {} START ===", i);
     auto pool_query = chi::PoolQuery::DirectHash(i);
-    chi::ContainerId expected_container = static_cast<chi::ContainerId>(i % num_containers);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: DirectHash({}) -> expected_container={}",
-          i, i, expected_container);
+    chi::ContainerId expected_container =
+        static_cast<chi::ContainerId>(i % num_containers);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: DirectHash({}) -> "
+         "expected_container={}",
+         i, i, expected_container);
 
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Calling AsyncAllocateBlocks(k4KB)...", i);
-    auto alloc_task =
-        bdev_client.AsyncAllocateBlocks(pool_query, k4KB);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: AsyncAllocateBlocks returned, calling Wait()...", i);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Calling "
+         "AsyncAllocateBlocks(k4KB)...",
+         i);
+    auto alloc_task = bdev_client.AsyncAllocateBlocks(pool_query, k4KB);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: AsyncAllocateBlocks "
+         "returned, calling Wait()...",
+         i);
     alloc_task.Wait();
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: AllocateBlocks Wait() returned, return_code={}, blocks.size()={}",
-          i, alloc_task->return_code_, alloc_task->blocks_.size());
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: AllocateBlocks Wait() "
+         "returned, return_code={}, blocks.size()={}",
+         i, alloc_task->return_code_, alloc_task->blocks_.size());
     REQUIRE(alloc_task->return_code_ == 0);
     REQUIRE(alloc_task->blocks_.size() > 0);
     chimaera::bdev::Block block = alloc_task->blocks_[0];
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Allocated block: offset={}, size={}, completer={}",
-          i, block.offset_, block.size_, alloc_task->GetCompleter());
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Allocated block: "
+         "offset={}, size={}, completer={}",
+         i, block.offset_, block.size_, alloc_task->GetCompleter());
     REQUIRE(block.size_ == k4KB);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Deleted alloc_task", i);
+    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Deleted alloc_task",
+         i);
 
     std::vector<hshm::u8> test_data(k4KB, 0x42 + i);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Generated test_data of size {}", i, test_data.size());
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Generated test_data of "
+         "size {}",
+         i, test_data.size());
 
     // Allocate buffers for Write/Read operations
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Allocating write buffer...", i);
+    HLOG(
+        kInfo,
+        "[bdev_file_explicit_backend] Iteration {}: Allocating write buffer...",
+        i);
     auto final_write_buffer = CHI_IPC->AllocateBuffer(test_data.size());
     REQUIRE_FALSE(final_write_buffer.IsNull());
     memcpy(final_write_buffer.ptr_, test_data.data(), test_data.size());
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Write buffer allocated and filled", i);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Write buffer allocated "
+         "and filled",
+         i);
 
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Calling AsyncWrite...", i);
-    auto write_task =
-        bdev_client.AsyncWrite(pool_query, WrapBlock(block),
-                               final_write_buffer.shm_.template Cast<void>().template Cast<void>(), test_data.size());
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: AsyncWrite returned, calling Wait()...", i);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Calling AsyncWrite...", i);
+    auto write_task = bdev_client.AsyncWrite(
+        pool_query, WrapBlock(block),
+        final_write_buffer.shm_.template Cast<void>().template Cast<void>(),
+        test_data.size());
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: AsyncWrite returned, "
+         "calling Wait()...",
+         i);
     write_task.Wait();
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Write Wait() returned, return_code={}, bytes_written={}, completer={}",
-          i, write_task->return_code_, write_task->bytes_written_, write_task->GetCompleter());
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Write Wait() returned, "
+         "return_code={}, bytes_written={}, completer={}",
+         i, write_task->return_code_, write_task->bytes_written_,
+         write_task->GetCompleter());
     REQUIRE(write_task->return_code_ == 0);
     REQUIRE(write_task->bytes_written_ == k4KB);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Deleted write_task", i);
+    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Deleted write_task",
+         i);
 
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Allocating read buffer...", i);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Allocating read buffer...",
+         i);
     auto final_read_buffer = CHI_IPC->AllocateBuffer(k4KB);
     REQUIRE_FALSE(final_read_buffer.IsNull());
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Read buffer allocated", i);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Read buffer allocated", i);
 
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Calling AsyncRead...", i);
-    auto read_task = bdev_client.AsyncRead(pool_query, WrapBlock(block),
-                                           final_read_buffer.shm_.template Cast<void>().template Cast<void>(), k4KB);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: AsyncRead returned, calling Wait()...", i);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Calling AsyncRead...", i);
+    auto read_task = bdev_client.AsyncRead(
+        pool_query, WrapBlock(block),
+        final_read_buffer.shm_.template Cast<void>().template Cast<void>(),
+        k4KB);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: AsyncRead returned, "
+         "calling Wait()...",
+         i);
     read_task.Wait();
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Read Wait() returned, return_code={}, bytes_read={}, completer={}",
-          i, read_task->return_code_, read_task->bytes_read_, read_task->GetCompleter());
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Read Wait() returned, "
+         "return_code={}, bytes_read={}, completer={}",
+         i, read_task->return_code_, read_task->bytes_read_,
+         read_task->GetCompleter());
     REQUIRE(read_task->return_code_ == 0);
     REQUIRE(read_task->bytes_read_ == k4KB);
 
     // Convert read data back to vector for verification
     std::vector<hshm::u8> read_data(read_task->bytes_read_);
     memcpy(read_data.data(), final_read_buffer.ptr_, read_task->bytes_read_);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Deleted read_task", i);
+    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Deleted read_task",
+         i);
 
     bool data_ok =
         std::equal(test_data.begin(), test_data.end(), read_data.begin());
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Data verification: data_ok={}", i, data_ok);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Data verification: "
+         "data_ok={}",
+         i, data_ok);
     REQUIRE(data_ok);
 
     // Free buffers
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Freeing write buffer...", i);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Freeing write buffer...",
+         i);
     CHI_IPC->FreeBuffer(final_write_buffer);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Freeing read buffer...", i);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: Freeing read buffer...",
+         i);
     CHI_IPC->FreeBuffer(final_read_buffer);
     HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Buffers freed", i);
 
     std::vector<chimaera::bdev::Block> free_blocks;
     free_blocks.push_back(block);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Calling AsyncFreeBlocks...", i);
-    auto free_task =
-        bdev_client.AsyncFreeBlocks(pool_query, free_blocks);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: AsyncFreeBlocks returned, calling Wait()...", i);
+    HLOG(
+        kInfo,
+        "[bdev_file_explicit_backend] Iteration {}: Calling AsyncFreeBlocks...",
+        i);
+    auto free_task = bdev_client.AsyncFreeBlocks(pool_query, free_blocks);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: AsyncFreeBlocks returned, "
+         "calling Wait()...",
+         i);
     free_task.Wait();
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: FreeBlocks Wait() returned, return_code={}",
-          i, free_task->return_code_);
+    HLOG(kInfo,
+         "[bdev_file_explicit_backend] Iteration {}: FreeBlocks Wait() "
+         "returned, return_code={}",
+         i, free_task->return_code_);
     REQUIRE(free_task->return_code_ == 0);
-    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Deleted free_task", i);
+    HLOG(kInfo, "[bdev_file_explicit_backend] Iteration {}: Deleted free_task",
+         i);
 
     HLOG(kInfo,
-          "[bdev_file_explicit_backend] === ITERATION {} COMPLETE - File backend with explicit type specification working "
-          "correctly ===",
-          i);
+         "[bdev_file_explicit_backend] === ITERATION {} COMPLETE - File "
+         "backend with explicit type specification working "
+         "correctly ===",
+         i);
   }
-  HLOG(kInfo, "[bdev_file_explicit_backend] TEST COMPLETE - All 16 iterations passed");
+  HLOG(kInfo,
+       "[bdev_file_explicit_backend] TEST COMPLETE - All 16 iterations passed");
 }
 
 TEST_CASE("bdev_error_conditions_enhanced", "[bdev][error][enhanced]") {
@@ -1326,9 +1430,9 @@ TEST_CASE("bdev_error_conditions_enhanced", "[bdev][error][enhanced]") {
     // This should fail because RAM backend requires explicit size
     std::string pool_name = "ram_fail_test_" + std::to_string(getpid());
     bool creation_success = BdevChimodFixture::CreateBdevAsync(
-        ram_client_no_size, chi::PoolQuery::Dynamic(), pool_name, custom_pool_id,
-        chimaera::bdev::BdevType::kRam,
-        0); // Size 0 should fail
+        ram_client_no_size, chi::PoolQuery::Dynamic(), pool_name,
+        custom_pool_id, chimaera::bdev::BdevType::kRam,
+        0);  // Size 0 should fail
     std::this_thread::sleep_for(100ms);
 
     // Creation should fail for RAM backend with zero size
@@ -1338,13 +1442,13 @@ TEST_CASE("bdev_error_conditions_enhanced", "[bdev][error][enhanced]") {
     // the container is invalid
     if (!creation_failed) {
       std::vector<chimaera::bdev::Block> blocks =
-          BdevChimodFixture::AllocateBlocksAsync(ram_client_no_size, chi::PoolQuery::Local(),
-                                                  k4KB);
-      creation_failed = (blocks.size() == 0); // Should be invalid block list
+          BdevChimodFixture::AllocateBlocksAsync(ram_client_no_size,
+                                                 chi::PoolQuery::Local(), k4KB);
+      creation_failed = (blocks.size() == 0);  // Should be invalid block list
     }
 
     HLOG(kInfo, "RAM backend properly rejects zero size: {}",
-          creation_failed ? "YES" : "NO");
+         creation_failed ? "YES" : "NO");
   }
 
   // Test 2: File backend with non-existent file
@@ -1354,8 +1458,9 @@ TEST_CASE("bdev_error_conditions_enhanced", "[bdev][error][enhanced]") {
 
     // This should fail because the file path doesn't exist
     bool creation_success = BdevChimodFixture::CreateBdevAsync(
-        file_client_bad_path, chi::PoolQuery::Dynamic(), "/nonexistent/path/file.dat",
-        custom_pool_id, chimaera::bdev::BdevType::kFile);
+        file_client_bad_path, chi::PoolQuery::Dynamic(),
+        "/nonexistent/path/file.dat", custom_pool_id,
+        chimaera::bdev::BdevType::kFile);
     std::this_thread::sleep_for(100ms);
 
     // Creation should fail for non-existent file path
@@ -1365,12 +1470,13 @@ TEST_CASE("bdev_error_conditions_enhanced", "[bdev][error][enhanced]") {
     // the container is invalid
     if (!creation_failed) {
       std::vector<chimaera::bdev::Block> blocks =
-          BdevChimodFixture::AllocateBlocksAsync(file_client_bad_path, chi::PoolQuery::Local(), k4KB);
+          BdevChimodFixture::AllocateBlocksAsync(file_client_bad_path,
+                                                 chi::PoolQuery::Local(), k4KB);
       creation_failed = (blocks.size() == 0);
     }
 
     HLOG(kInfo, "File backend properly handles bad path: {}",
-          creation_failed ? "YES" : "NO");
+         creation_failed ? "YES" : "NO");
   }
 }
 
@@ -1384,14 +1490,14 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
   SECTION("Setup") {
     REQUIRE(g_initialized);
     REQUIRE(
-        fixture.createTestFile(100 * 1024 * 1024)); // 100MB for parallel ops
+        fixture.createTestFile(100 * 1024 * 1024));  // 100MB for parallel ops
   }
 
   SECTION("Parallel allocate/write/free operations") {
     // Test configuration
     const size_t num_threads = 4;
     const size_t ops_per_thread = 100;
-    const size_t io_size = 4096; // 4KB I/O size
+    const size_t io_size = 4096;  // 4KB I/O size
 
     // Create BDev container
     chi::PoolId custom_pool_id(200, 0);
@@ -1438,15 +1544,17 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
 
         // Write data
         auto write_task = thread_client.AsyncWrite(
-            pool_query, WrapBlock(blocks[0]), write_buffer.shm_.template Cast<void>().template Cast<void>(), io_size);
+            pool_query, WrapBlock(blocks[0]),
+            write_buffer.shm_.template Cast<void>().template Cast<void>(),
+            io_size);
         write_task.Wait();
-        HLOG(kInfo, "Write task: return code = {}, bytes written = {}", write_task->return_code_, write_task->bytes_written_);
+        HLOG(kInfo, "Write task: return code = {}, bytes written = {}",
+             write_task->return_code_, write_task->bytes_written_);
         REQUIRE(write_task->return_code_ == 0);
         REQUIRE(write_task->bytes_written_ == io_size);
 
         // Free block
-        auto free_task =
-            thread_client.AsyncFreeBlocks(pool_query, blocks);
+        auto free_task = thread_client.AsyncFreeBlocks(pool_query, blocks);
         free_task.Wait();
         REQUIRE(free_task->return_code_ == 0);
       }
@@ -1466,7 +1574,7 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
     }
 
     // Wait for all threads to complete
-    for (auto &thread : threads) {
+    for (auto& thread : threads) {
       thread.join();
     }
 
@@ -1485,7 +1593,7 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
     HLOG(kInfo, "  IOPS: {:.0f} ops/sec", ops_per_sec);
     HLOG(kInfo, "  Bandwidth: {:.2f} MB/s", bandwidth_mbps);
     HLOG(kInfo, "  Avg latency: {:.3f} us/op",
-          (elapsed.count() * 1000.0) / total_ops);
+         (elapsed.count() * 1000.0) / total_ops);
 
     // Verify all operations completed successfully
     REQUIRE(elapsed.count() > 0);
@@ -1506,30 +1614,40 @@ TEST_CASE("bdev_force_net_flag", "[bdev][network][force_net]") {
   BdevChimodFixture fixture;
 
   SECTION("Setup") {
-    HLOG(kInfo, "[bdev_force_net_flag] Setup section: g_initialized={}", g_initialized);
+    HLOG(kInfo, "[bdev_force_net_flag] Setup section: g_initialized={}",
+         g_initialized);
     REQUIRE(g_initialized);
     HLOG(kInfo, "[bdev_force_net_flag] Creating test file...");
     REQUIRE(fixture.createTestFile(kDefaultFileSize));
-    HLOG(kInfo, "[bdev_force_net_flag] Test file created: {}", fixture.getTestFile());
+    HLOG(kInfo, "[bdev_force_net_flag] Test file created: {}",
+         fixture.getTestFile());
   }
 
   SECTION("Write and Read with TASK_FORCE_NET") {
     HLOG(kInfo, "[bdev_force_net_flag] Write/Read section starting");
     chi::PoolId custom_pool_id(105, 0);
-    HLOG(kInfo, "[bdev_force_net_flag] Creating bdev client with pool_id=(major:{}, minor:{})",
-          custom_pool_id.major_, custom_pool_id.minor_);
+    HLOG(kInfo,
+         "[bdev_force_net_flag] Creating bdev client with pool_id=(major:{}, "
+         "minor:{})",
+         custom_pool_id.major_, custom_pool_id.minor_);
     chimaera::bdev::Client client(custom_pool_id);
 
-    HLOG(kInfo, "[bdev_force_net_flag] Calling AsyncCreate() with Dynamic pool query...");
+    HLOG(kInfo,
+         "[bdev_force_net_flag] Calling AsyncCreate() with Dynamic pool "
+         "query...");
     bool success = BdevChimodFixture::CreateBdevAsync(
         client, chi::PoolQuery::Dynamic(), fixture.getTestFile(),
         custom_pool_id, chimaera::bdev::BdevType::kFile);
-    HLOG(kInfo, "[bdev_force_net_flag] AsyncCreate() returned success={}, return_code={}",
-          success, client.GetReturnCode());
+    HLOG(kInfo,
+         "[bdev_force_net_flag] AsyncCreate() returned success={}, "
+         "return_code={}",
+         success, client.GetReturnCode());
     REQUIRE(success);
     REQUIRE(client.GetReturnCode() == 0);
 
-    HLOG(kInfo, "[bdev_force_net_flag] Created BDev container for TASK_FORCE_NET test");
+    HLOG(
+        kInfo,
+        "[bdev_force_net_flag] Created BDev container for TASK_FORCE_NET test");
 
     // Get number of containers for logging
     const chi::u32 num_containers = fixture.getNumContainers();
@@ -1539,107 +1657,164 @@ TEST_CASE("bdev_force_net_flag", "[bdev][network][force_net]") {
     for (int i = 0; i < 16; ++i) {
       HLOG(kInfo, "[bdev_force_net_flag] === ITERATION {} START ===", i);
       auto pool_query = chi::PoolQuery::DirectHash(i);
-      chi::ContainerId expected_container = static_cast<chi::ContainerId>(i % num_containers);
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: DirectHash({}) -> expected_container={}",
-            i, i, expected_container);
+      chi::ContainerId expected_container =
+          static_cast<chi::ContainerId>(i % num_containers);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: DirectHash({}) -> "
+           "expected_container={}",
+           i, i, expected_container);
 
       // Allocate a block
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Calling AsyncAllocateBlocks(k64KB)...", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Calling "
+           "AsyncAllocateBlocks(k64KB)...",
+           i);
       auto alloc_task = client.AsyncAllocateBlocks(pool_query, k64KB);
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: AsyncAllocateBlocks returned, calling Wait()...", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: AsyncAllocateBlocks returned, "
+           "calling Wait()...",
+           i);
       alloc_task.Wait();
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: AllocateBlocks Wait() returned, return_code={}, blocks.size()={}",
-            i, alloc_task->return_code_, alloc_task->blocks_.size());
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: AllocateBlocks Wait() "
+           "returned, return_code={}, blocks.size()={}",
+           i, alloc_task->return_code_, alloc_task->blocks_.size());
       REQUIRE(alloc_task->return_code_ == 0);
       REQUIRE(alloc_task->blocks_.size() > 0);
 
       chimaera::bdev::Block block = alloc_task->blocks_[0];
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Allocated block: offset={}, size={}, completer={}",
-            i, block.offset_, block.size_, alloc_task->GetCompleter());
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Allocated block: offset={}, "
+           "size={}, completer={}",
+           i, block.offset_, block.size_, alloc_task->GetCompleter());
       HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Deleted alloc_task", i);
 
       // Prepare test data
       std::vector<hshm::u8> write_data =
           fixture.generateTestData(k64KB, 0xAB + i);
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Generated test_data of size {}", i, write_data.size());
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Generated test_data of size {}",
+           i, write_data.size());
 
       // Create write task with TASK_FORCE_NET flag
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Allocating write buffer...", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Allocating write buffer...", i);
       auto write_buffer = CHI_IPC->AllocateBuffer(write_data.size());
       REQUIRE_FALSE(write_buffer.IsNull());
       memcpy(write_buffer.ptr_, write_data.data(), write_data.size());
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Write buffer allocated and filled", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Write buffer allocated and "
+           "filled",
+           i);
 
       // Use NewTask directly to create write task
-      auto *ipc_manager = CHI_IPC;
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Creating WriteTask with NewTask...", i);
+      auto* ipc_manager = CHI_IPC;
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Creating WriteTask with "
+           "NewTask...",
+           i);
       auto write_task_ptr = ipc_manager->NewTask<chimaera::bdev::WriteTask>(
           chi::CreateTaskId(), client.pool_id_, pool_query, WrapBlock(block),
-          write_buffer.shm_.template Cast<void>().template Cast<void>(), write_data.size());
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: WriteTask created, task_id=(pid:{}, tid:{}, major:{}), pool_id=({}, {}), method={}",
-            i, write_task_ptr->task_id_.pid_, write_task_ptr->task_id_.tid_, write_task_ptr->task_id_.major_,
-            write_task_ptr->pool_id_.major_, write_task_ptr->pool_id_.minor_,
-            write_task_ptr->method_);
+          write_buffer.shm_.template Cast<void>().template Cast<void>(),
+          write_data.size());
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: WriteTask created, "
+           "task_id=(pid:{}, tid:{}, major:{}), pool_id=({}, {}), method={}",
+           i, write_task_ptr->task_id_.pid_, write_task_ptr->task_id_.tid_,
+           write_task_ptr->task_id_.major_, write_task_ptr->pool_id_.major_,
+           write_task_ptr->pool_id_.minor_, write_task_ptr->method_);
 
       // Set TASK_FORCE_NET flag BEFORE enqueueing
       write_task_ptr->SetFlags(TASK_FORCE_NET);
       REQUIRE(write_task_ptr->task_flags_.Any(TASK_FORCE_NET));
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Write task TASK_FORCE_NET flag set, has_flag={}",
-            i, write_task_ptr->task_flags_.Any(TASK_FORCE_NET));
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Write task TASK_FORCE_NET flag "
+           "set, has_flag={}",
+           i, write_task_ptr->task_flags_.Any(TASK_FORCE_NET));
 
       // Enqueue the task
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Calling ipc_manager->Send() for write task...", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Calling ipc_manager->Send() "
+           "for write task...",
+           i);
       auto write_task = ipc_manager->Send(write_task_ptr);
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Send() returned, calling Wait()...", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Send() returned, calling "
+           "Wait()...",
+           i);
 
       // Wait for write to complete
       write_task.Wait();
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Write Wait() returned, return_code={}, bytes_written={}, completer={}",
-            i, write_task->return_code_, write_task->bytes_written_, write_task->GetCompleter());
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Write Wait() returned, "
+           "return_code={}, bytes_written={}, completer={}",
+           i, write_task->return_code_, write_task->bytes_written_,
+           write_task->GetCompleter());
       REQUIRE(write_task->return_code_ == 0);
       REQUIRE(write_task->bytes_written_ == write_data.size());
       HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Deleted write_task", i);
 
       HLOG(kInfo,
-            "[bdev_force_net_flag] Iteration {}: Write with TASK_FORCE_NET completed successfully",
-            i);
+           "[bdev_force_net_flag] Iteration {}: Write with TASK_FORCE_NET "
+           "completed successfully",
+           i);
 
       // Create read task with TASK_FORCE_NET flag
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Allocating read buffer...", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Allocating read buffer...", i);
       auto read_buffer = CHI_IPC->AllocateBuffer(k64KB);
       REQUIRE_FALSE(read_buffer.IsNull());
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Read buffer allocated", i);
+      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Read buffer allocated",
+           i);
 
       // Use NewTask directly to create read task
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Creating ReadTask with NewTask...", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Creating ReadTask with "
+           "NewTask...",
+           i);
       auto read_task_ptr = ipc_manager->NewTask<chimaera::bdev::ReadTask>(
           chi::CreateTaskId(), client.pool_id_, pool_query, WrapBlock(block),
           read_buffer.shm_.template Cast<void>().template Cast<void>(), k64KB);
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: ReadTask created, task_id=(pid:{}, tid:{}, major:{}), pool_id=({}, {}), method={}",
-            i, read_task_ptr->task_id_.pid_, read_task_ptr->task_id_.tid_, read_task_ptr->task_id_.major_,
-            read_task_ptr->pool_id_.major_, read_task_ptr->pool_id_.minor_,
-            read_task_ptr->method_);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: ReadTask created, "
+           "task_id=(pid:{}, tid:{}, major:{}), pool_id=({}, {}), method={}",
+           i, read_task_ptr->task_id_.pid_, read_task_ptr->task_id_.tid_,
+           read_task_ptr->task_id_.major_, read_task_ptr->pool_id_.major_,
+           read_task_ptr->pool_id_.minor_, read_task_ptr->method_);
 
       // Set TASK_FORCE_NET flag BEFORE enqueueing
       read_task_ptr->SetFlags(TASK_FORCE_NET);
       REQUIRE(read_task_ptr->task_flags_.Any(TASK_FORCE_NET));
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Read task TASK_FORCE_NET flag set, has_flag={}",
-            i, read_task_ptr->task_flags_.Any(TASK_FORCE_NET));
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Read task TASK_FORCE_NET flag "
+           "set, has_flag={}",
+           i, read_task_ptr->task_flags_.Any(TASK_FORCE_NET));
 
       // Enqueue the task
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Calling ipc_manager->Send() for read task...", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Calling ipc_manager->Send() "
+           "for read task...",
+           i);
       auto read_task = ipc_manager->Send(read_task_ptr);
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Send() returned, calling Wait()...", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Send() returned, calling "
+           "Wait()...",
+           i);
 
       // Wait for read to complete
       read_task.Wait();
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Read Wait() returned, return_code={}, bytes_read={}, completer={}",
-            i, read_task->return_code_, read_task->bytes_read_, read_task->GetCompleter());
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Read Wait() returned, "
+           "return_code={}, bytes_read={}, completer={}",
+           i, read_task->return_code_, read_task->bytes_read_,
+           read_task->GetCompleter());
       REQUIRE(read_task->return_code_ == 0);
       REQUIRE(read_task->bytes_read_ == write_data.size());
 
       HLOG(kInfo,
-            "[bdev_force_net_flag] Iteration {}: Read with TASK_FORCE_NET completed successfully", i);
+           "[bdev_force_net_flag] Iteration {}: Read with TASK_FORCE_NET "
+           "completed successfully",
+           i);
 
       // Verify data integrity
       std::vector<hshm::u8> read_data(read_task->bytes_read_);
@@ -1649,21 +1824,24 @@ TEST_CASE("bdev_force_net_flag", "[bdev][network][force_net]") {
       for (size_t j = 0; j < write_data.size(); ++j) {
         REQUIRE(read_data[j] == write_data[j]);
       }
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Data verification passed", i);
+      HLOG(kInfo,
+           "[bdev_force_net_flag] Iteration {}: Data verification passed", i);
 
       HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Deleted read_task", i);
 
       // Free buffers
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Freeing write buffer...", i);
+      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Freeing write buffer...",
+           i);
       CHI_IPC->FreeBuffer(write_buffer);
-      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Freeing read buffer...", i);
+      HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Freeing read buffer...",
+           i);
       CHI_IPC->FreeBuffer(read_buffer);
       HLOG(kInfo, "[bdev_force_net_flag] Iteration {}: Buffers freed", i);
 
       HLOG(kInfo,
-            "[bdev_force_net_flag] === ITERATION {} COMPLETE - data verified "
-            "successfully ===",
-            i);
+           "[bdev_force_net_flag] === ITERATION {} COMPLETE - data verified "
+           "successfully ===",
+           i);
     }
     HLOG(kInfo, "[bdev_force_net_flag] All 16 iterations passed");
   }

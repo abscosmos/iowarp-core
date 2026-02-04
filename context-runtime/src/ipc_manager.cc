@@ -875,20 +875,11 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
     return;
   }
 
-  HLOG(kInfo, "FreeBuffer: alloc_id=({}.{}), ptr_={}",
-       buffer_ptr.shm_.alloc_id_.major_, buffer_ptr.shm_.alloc_id_.minor_,
-       (void *)buffer_ptr.ptr_);
-
   // Check if allocator ID is null (private memory allocated with HSHM_MALLOC)
   if (buffer_ptr.shm_.alloc_id_ == hipc::AllocatorId::GetNull()) {
     // Private memory - use HSHM_MALLOC->Free() for RUNTIME-allocated buffers
     // In RUNTIME mode, AllocateBuffer uses HSHM_MALLOC which adds MallocPage
     // header
-    HLOG(kInfo,
-         "FreeBuffer: Freeing NULL allocator ID buffer - ptr_={}, off_={}",
-         (void *)buffer_ptr.ptr_, buffer_ptr.shm_.off_.load());
-
-    // HSHM_MALLOC->Free() expects a FullPtr and will handle MallocPage header
     HSHM_MALLOC->Free(buffer_ptr);
     return;
   }

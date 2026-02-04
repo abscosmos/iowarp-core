@@ -73,12 +73,6 @@ u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
   // Always use PID+TID hash-based mapping
   u32 lane = MapByPidTid(num_lanes);
 
-  if (is_network_task) {
-    HLOG(kInfo,
-         "ClientMapTask: Network task (pool={}, method={}) mapped to lane {}",
-         task_ptr->pool_id_.major_, task_ptr->method_, lane);
-  }
-
   return lane;
 }
 

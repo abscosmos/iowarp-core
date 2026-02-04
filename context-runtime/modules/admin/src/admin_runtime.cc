@@ -541,8 +541,6 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
     // Get the original task from the Future
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
-      HLOG(kInfo, "Send: Popped SendIn task {} from net queue",
-           origin_task->task_id_);
       SendIn(origin_task, rctx);
       did_send = true;
     }
@@ -554,8 +552,6 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
     // Get the original task from the Future
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
-      HLOG(kInfo, "Send: Popped SendOut task {} from net queue",
-           origin_task->task_id_);
       SendOut(origin_task);
       did_send = true;
     }
@@ -858,19 +854,14 @@ chi::TaskResume Runtime::Recv(hipc::FullPtr<RecvTask> task,
 
   // Dispatch based on message type
   chi::MsgType msg_type = archive.GetMsgType();
-  HLOG(kInfo, "Recv: Received message with type {}",
-       static_cast<int>(msg_type));
   switch (msg_type) {
     case chi::MsgType::kSerializeIn:
-      HLOG(kInfo, "Recv: Processing SerializeIn message");
       RecvIn(task, archive, lbm_server);
       break;
     case chi::MsgType::kSerializeOut:
-      HLOG(kInfo, "Recv: Processing SerializeOut message");
       RecvOut(task, archive, lbm_server);
       break;
     case chi::MsgType::kHeartbeat:
-      HLOG(kInfo, "Recv: Processing Heartbeat message");
       task->SetReturnCode(0);
       break;
     default:
@@ -925,8 +916,6 @@ chi::TaskResume Runtime::Heartbeat(hipc::FullPtr<HeartbeatTask> task,
 
 chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
                                  chi::RunContext &rctx) {
-  HLOG(kInfo, "Admin: Executing Monitor task - START");
-
   // Get work orchestrator to access all workers
   auto *work_orchestrator = CHI_WORK_ORCHESTRATOR;
   if (!work_orchestrator) {
@@ -956,9 +945,6 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
   }
 
   task->SetReturnCode(0);
-  HLOG(kInfo, "Monitor: Collected stats from {} workers - COMPLETE",
-       task->info_.size());
-
   (void)rctx;
   co_return;
 }

@@ -162,17 +162,10 @@ bool LocalTransfer::Send(u32 max_xfer_time_us) {
     future_shm_->flags_.SetBits(FutureShm::FUTURE_NEW_DATA);
 
     bytes_transferred_ += chunk_size;
-
-    HLOG(kDebug,
-         "LocalTransfer::Send: Sent chunk of {} bytes, "
-         "total {}/{} bytes",
-         chunk_size, bytes_transferred_, total_size_);
   }
 
   // All data sent - mark complete
   SetComplete();
-
-  HLOG(kDebug, "LocalTransfer::Send: Transfer complete, {} bytes", total_size_);
   return true;
 }
 
@@ -233,15 +226,9 @@ bool LocalTransfer::Recv() {
 
     // Unset FUTURE_NEW_DATA to signal we consumed the data
     future_shm_->flags_.UnsetBits(FutureShm::FUTURE_NEW_DATA);
-
-    HLOG(kDebug,
-         "LocalTransfer::Recv: Received chunk of {} bytes, "
-         "total {}/{} bytes",
-         bytes_to_copy, bytes_transferred_, total_size_);
   }
 
   // All data received
-  HLOG(kDebug, "LocalTransfer::Recv: Transfer complete, {} bytes", total_size_);
   return true;
 }
 
