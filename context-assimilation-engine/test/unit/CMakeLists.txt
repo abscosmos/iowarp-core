@@ -134,7 +134,74 @@ add_cae_unit_test(cae_error_handling
 )
 
 #------------------------------------------------------------------------------
-# Test 4: HDF5 Format Assimilation (Conditional)
+# Test 4: CAE Comprehensive Coverage Tests
+#------------------------------------------------------------------------------
+# Comprehensive tests for CAE Core APIs to improve code coverage
+# - CAE client initialization and pool creation
+# - AssimilationCtx constructors and serialization
+# - ParseOmni API (binary files, ranges, multiple contexts, error cases)
+# - HDF5 dataset processing (basic and error cases)
+# - URL parsing and format detection
+# - Integration with CTE blob storage
+#------------------------------------------------------------------------------
+add_executable(test_cae_comprehensive
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_comprehensive.cc
+)
+
+target_include_directories(test_cae_comprehensive
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/test  # For simple_test.h
+)
+
+target_link_libraries(test_cae_comprehensive
+  PRIVATE
+    wrp_cae_core_client
+    wrp_cte_core_client
+    chimaera::admin_runtime
+    chimaera::bdev_runtime
+    hshm::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# Install test binary
+install(TARGETS test_cae_comprehensive DESTINATION bin)
+
+# Register individual test cases with CTest
+add_test(NAME CAE_ClientInit COMMAND test_cae_comprehensive "[cae][core][init]")
+add_test(NAME CAE_AssimilationCtx_Default COMMAND test_cae_comprehensive "[cae][ctx]")
+add_test(NAME CAE_AssimilationCtx_Full COMMAND test_cae_comprehensive "[cae][ctx]")
+add_test(NAME CAE_AssimilationCtx_Patterns COMMAND test_cae_comprehensive "[cae][ctx]")
+add_test(NAME CAE_ParseOmni_Binary COMMAND test_cae_comprehensive "[cae][parseomni][binary]")
+add_test(NAME CAE_ParseOmni_BinaryRange COMMAND test_cae_comprehensive "[cae][parseomni][binary][range]")
+add_test(NAME CAE_ParseOmni_Multi COMMAND test_cae_comprehensive "[cae][parseomni][multi]")
+add_test(NAME CAE_ParseOmni_Empty COMMAND test_cae_comprehensive "[cae][parseomni][error]")
+add_test(NAME CAE_ProcessHdf5_Basic COMMAND test_cae_comprehensive "[cae][hdf5]")
+add_test(NAME CAE_ProcessHdf5_NonExistent COMMAND test_cae_comprehensive "[cae][hdf5][error]")
+add_test(NAME CAE_ProcessHdf5_EmptyPath COMMAND test_cae_comprehensive "[cae][hdf5][error]")
+add_test(NAME CAE_Serialization COMMAND test_cae_comprehensive "[cae][ctx][serialization]")
+add_test(NAME CAE_VerifyBinaryData COMMAND test_cae_comprehensive "[cae][integration][binary]")
+add_test(NAME CAE_FileURL COMMAND test_cae_comprehensive "[cae][url]")
+add_test(NAME CAE_IOWarpURL COMMAND test_cae_comprehensive "[cae][url]")
+add_test(NAME CAE_BinaryFormat COMMAND test_cae_comprehensive "[cae][format]")
+add_test(NAME CAE_HDF5Format COMMAND test_cae_comprehensive "[cae][format]")
+add_test(NAME CAE_UnknownFormat COMMAND test_cae_comprehensive "[cae][format]")
+
+# Set test properties
+set_tests_properties(
+  CAE_ClientInit CAE_AssimilationCtx_Default CAE_AssimilationCtx_Full
+  CAE_AssimilationCtx_Patterns CAE_ParseOmni_Binary CAE_ParseOmni_BinaryRange
+  CAE_ParseOmni_Multi CAE_ParseOmni_Empty CAE_ProcessHdf5_Basic
+  CAE_ProcessHdf5_NonExistent CAE_ProcessHdf5_EmptyPath CAE_Serialization
+  CAE_VerifyBinaryData CAE_FileURL CAE_IOWarpURL CAE_BinaryFormat
+  CAE_HDF5Format CAE_UnknownFormat
+  PROPERTIES
+    TIMEOUT 120
+    LABELS "coverage;comprehensive"
+)
+
+#------------------------------------------------------------------------------
+# Test 5: HDF5 Format Assimilation (Conditional)
 #------------------------------------------------------------------------------
 # Tests HDF5 hierarchical data format support
 # - Creates HDF5 file with multiple datasets
