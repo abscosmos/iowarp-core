@@ -124,37 +124,22 @@ public:
 
   /**
    * Wait for multiple tasks to complete
+   * Calls Wait() on each task sequentially to properly handle streaming
    */
   template <typename TaskT>
   int waitForMultipleTaskCompletion(
-      const std::vector<chi::Future<TaskT>> &tasks,
+      std::vector<chi::Future<TaskT>> &tasks,
       chi::u32 timeout_ms = kTestTimeoutMs) {
-    auto start_time = std::chrono::steady_clock::now();
-    auto timeout_duration = std::chrono::duration<int, std::milli>(timeout_ms);
+    (void)timeout_ms;  // Timeout not used with Wait() approach
 
     size_t completed_count = 0;
-    std::vector<bool> completed(tasks.size(), false);
 
-    while (completed_count < tasks.size()) {
-      auto current_time = std::chrono::steady_clock::now();
-      if (current_time - start_time > timeout_duration) {
-        INFO("Multiple task completion timeout after "
-             << timeout_ms << "ms, " << completed_count << "/" << tasks.size()
-             << " completed");
-        break;
-      }
-
-      for (size_t i = 0; i < tasks.size(); ++i) {
-        if (!completed[i] && !tasks[i].IsNull() &&
-            tasks[i].IsComplete()) {
-          completed[i] = true;
-          completed_count++;
-        }
-      }
-
-      // Yield to allow tasks to progress
-      if (completed_count < tasks.size()) {
-        std::this_thread::sleep_for(10ms);
+    // Wait for each task sequentially
+    // Tasks still execute concurrently on worker side, we just wait for each
+    for (size_t i = 0; i < tasks.size(); ++i) {
+      if (!tasks[i].IsNull()) {
+        tasks[i].Wait();  // Wait() handles streaming properly
+        completed_count++;
       }
     }
 
