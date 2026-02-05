@@ -502,15 +502,19 @@ TEST_CASE("Tag - ReorganizeBlob Basic", "[cte][tag][reorganize]") {
   wrp_cte::core::Tag tag("reorg_basic");
   auto data = fixture.CreateTestData(fixture.kSmallDataSize, 'R');
 
-  // Put blob with initial score
-  tag.PutBlob("reorg_blob", data.data(), data.size(), 0, 2.0f);
+  // Put blob with initial score (valid range: 0.0-1.0)
+  tag.PutBlob("reorg_blob", data.data(), data.size(), 0, 0.2f);
+
+  // Verify blob exists and has correct initial score
+  float initial_score = tag.GetBlobScore("reorg_blob");
+  REQUIRE(initial_score == 0.2f);
 
   // Reorganize with new score
-  tag.ReorganizeBlob("reorg_blob", 8.0f);
+  tag.ReorganizeBlob("reorg_blob", 0.8f);
 
   // Verify new score
   float new_score = tag.GetBlobScore("reorg_blob");
-  REQUIRE(new_score == 8.0f);
+  REQUIRE(new_score == 0.8f);
 }
 
 TEST_CASE("Tag - ReorganizeBlob Multiple Times", "[cte][tag][reorganize]") {
@@ -520,16 +524,22 @@ TEST_CASE("Tag - ReorganizeBlob Multiple Times", "[cte][tag][reorganize]") {
   wrp_cte::core::Tag tag("reorg_multi");
   auto data = fixture.CreateTestData(fixture.kSmallDataSize, 'Q');
 
-  tag.PutBlob("multi_reorg", data.data(), data.size(), 0, 1.0f);
+  tag.PutBlob("multi_reorg", data.data(), data.size(), 0, 0.1f);
 
-  // Reorganize multiple times
-  for (float score = 2.0f; score <= 10.0f; score += 1.0f) {
+  // Verify initial score
+  float initial_score = tag.GetBlobScore("multi_reorg");
+  REQUIRE(initial_score == 0.1f);
+
+  // Reorganize multiple times (valid range: 0.0-1.0)
+  // Using explicit values to avoid floating point accumulation errors
+  std::vector<float> scores = {0.2f, 0.3f, 0.5f, 0.7f, 0.9f, 1.0f};
+  for (float score : scores) {
     tag.ReorganizeBlob("multi_reorg", score);
   }
 
-  // Verify final score
+  // Verify final score is 1.0
   float final_score = tag.GetBlobScore("multi_reorg");
-  REQUIRE(final_score == 10.0f);
+  REQUIRE(final_score == 1.0f);
 }
 
 // ============================================================================
