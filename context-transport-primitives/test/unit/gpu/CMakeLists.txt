@@ -2,7 +2,7 @@
 # GPU Unit Tests
 #------------------------------------------------------------------------------
 
-if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
+if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   message(STATUS "Building GPU unit tests")
 
   # GpuShmMmap test
@@ -22,5 +22,5 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
   add_test(NAME test_gpu_malloc COMMAND test_gpu_malloc)
 
 else()
-  message(STATUS "GPU tests disabled (HSHM_ENABLE_CUDA and HSHM_ENABLE_ROCM are both OFF)")
+  message(STATUS "GPU tests disabled (WRP_CORE_ENABLE_CUDA and WRP_CORE_ENABLE_ROCM are both OFF)")
 endif()

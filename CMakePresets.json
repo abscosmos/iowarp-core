@@ -19,7 +19,7 @@
                 "WRP_CORE_ENABLE_CEE": "ON",
                 "WRP_CORE_ENABLE_TESTS": "ON",
                 "WRP_CORE_ENABLE_ELF": "OFF",
-                "WRP_CORE_ENABLE_COMPRESS": "ON",
+                "WRP_CTE_ENABLE_COMPRESS": "ON",
                 "WRP_CTE_ENABLE_ADIOS2_ADAPTER": "ON",
                 "WRP_CORE_ENABLE_GRAY_SCOTT": "ON",
                 "WRP_CORE_ENABLE_CONDA": "ON",
@@ -28,9 +28,8 @@
                 "WRP_CORE_ENABLE_RPATH": "ON",
                 "WRP_CORE_ENABLE_PYTHON": "ON",
                 "WRP_CORE_ENABLE_COVERAGE": "ON",
-                "HSHM_ENABLE_LIBPRESSIO": "ON",
-                "HSHM_ENABLE_ZMQ": "ON",
-                "HSHM_ENABLE_CEREAL": "ON",
+                "WRP_CORE_ENABLE_ZMQ": "ON",
+                "WRP_CORE_ENABLE_CEREAL": "ON",
                 "HSHM_LOG_LEVEL": "0"
             }
         },
@@ -86,7 +85,7 @@
                 "WRP_CORE_ENABLE_CEE": "ON",
                 "WRP_CORE_ENABLE_TESTS": "ON",
                 "WRP_CORE_ENABLE_ELF": "OFF",
-                "WRP_CORE_ENABLE_COMPRESS": "OFF",
+                "WRP_CTE_ENABLE_COMPRESS": "OFF",
                 "WRP_CORE_ENABLE_GRAY_SCOTT": "OFF",
                 "WRP_CORE_ENABLE_CONDA": "ON",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
@@ -108,7 +107,7 @@
                 "WRP_CORE_ENABLE_CEE": "ON",
                 "WRP_CORE_ENABLE_TESTS": "ON",
                 "WRP_CORE_ENABLE_ELF": "OFF",
-                "WRP_CORE_ENABLE_COMPRESS": "ON",
+                "WRP_CTE_ENABLE_COMPRESS": "ON",
                 "WRP_CTE_ENABLE_ADIOS2_ADAPTER": "ON",
                 "WRP_CORE_ENABLE_GRAY_SCOTT": "ON",
                 "WRP_CORE_ENABLE_CONDA": "ON",
@@ -116,9 +115,8 @@
                 "WRP_CORE_ENABLE_ASAN": "OFF",
                 "WRP_CORE_ENABLE_RPATH": "ON",
                 "WRP_CORE_ENABLE_PYTHON": "ON",
-                "HSHM_ENABLE_LIBPRESSIO": "ON",
-                "HSHM_ENABLE_ZMQ": "ON",
-                "HSHM_ENABLE_CEREAL": "ON",
+                "WRP_CORE_ENABLE_ZMQ": "ON",
+                "WRP_CORE_ENABLE_CEREAL": "ON",
                 "HSHM_LOG_LEVEL": "1"
             }
         }

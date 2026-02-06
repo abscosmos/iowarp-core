@@ -70,8 +70,8 @@ add_subdirectory(core)
 # Build Benchmarks
 # -----------------------------------------------------------------------------
 # Add benchmarks if enabled (currently CAE has no benchmark directory)
-# WRP_CAE_ENABLE_BENCHMARKS is set by root CMakeLists.txt
-# if(WRP_CAE_ENABLE_BENCHMARKS)
+# Benchmarks are controlled by WRP_CORE_ENABLE_BENCHMARKS
+# if(WRP_CORE_ENABLE_BENCHMARKS)
 #   add_subdirectory(benchmark)
 #   message(STATUS "CAE benchmarks enabled - added benchmark subdirectory")
 # endif()

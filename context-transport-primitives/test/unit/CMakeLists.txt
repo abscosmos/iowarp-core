@@ -21,19 +21,19 @@ if(NOT HSHM_COMPILER_MSVC)
     add_subdirectory(interceptor)
 endif()
 
-if(HSHM_ENABLE_COMPRESS)
+if(WRP_CTE_ENABLE_COMPRESS)
     add_subdirectory(compress)
 endif()
 
-if(HSHM_ENABLE_ENCRYPT)
+if(WRP_CORE_ENABLE_ENCRYPT)
     add_subdirectory(encrypt)
 endif()
 
-if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
+if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
     add_subdirectory(gpu)
 endif()
 
 # Lightbeam tests disabled - depend on deleted code
-# if(HSHM_ENABLE_ZMQ)
+# if(WRP_CORE_ENABLE_ZMQ)
 #     add_subdirectory(lightbeam)
 # endif()

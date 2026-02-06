@@ -28,7 +28,7 @@ set(INSTALLS ${INSTALLS} test_types_exec)
 #------------------------------------------------------------------------------
 # Build Timer Tests
 #------------------------------------------------------------------------------
-if (HSHM_ENABLE_MPI AND HSHM_ENABLE_OPENMP)
+if (WRP_CORE_ENABLE_MPI AND WRP_CORE_ENABLE_OPENMP)
     add_executable(test_timers_exec
             ${TEST_MAIN}/main_mpi.cc
             test_init.cc
