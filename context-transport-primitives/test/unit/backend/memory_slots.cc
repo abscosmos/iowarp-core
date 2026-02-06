@@ -31,13 +31,13 @@ TEST_CASE("MemorySlot") {
   if (rank == 0) {
     {
       std::cout << "Creating SHMEM (rank 0)" << std::endl;
-      if (!backend.shm_init(hipc::MemoryBackendId::Get(0),
+      if (!backend.shm_init(hipc::MemoryBackendId::GetRoot(),
                             hshm::Unit<size_t>::Megabytes(1), shm_url)) {
         throw std::runtime_error("Couldn't create backend");
       }
       std::cout << "Backend data: " << (void *)backend.data_ << std::endl;
-      std::cout << "Backend sz: " << backend.data_size_ << std::endl;
-      memset(backend.data_, nonce, backend.data_size_);
+      std::cout << "Backend sz: " << backend.data_capacity_ << std::endl;
+      memset(backend.data_, nonce, backend.data_capacity_);
       std::cout << "Wrote backend data" << std::endl;
     }
   }
@@ -47,7 +47,7 @@ TEST_CASE("MemorySlot") {
       std::cout << "Attaching SHMEM (rank 1)" << std::endl;
       backend.shm_attach(shm_url);
       char *ptr = backend.data_;
-      REQUIRE(VerifyBuffer(ptr, backend.data_size_, nonce));
+      REQUIRE(VerifyBuffer(ptr, backend.data_capacity_, nonce));
     }
   }
   MPI_Barrier(MPI_COMM_WORLD);

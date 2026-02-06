@@ -388,6 +388,14 @@ private:
    */
   chi::TaskResume BlobQuery(hipc::FullPtr<BlobQueryTask> task, chi::RunContext &ctx);
 
+  /**
+   * Get comprehensive blob metadata (Method::kGetBlobInfo)
+   * Returns score, total size, and block placement information
+   * @param task GetBlobInfo task containing blob lookup parameters and results
+   * @param ctx Runtime context for task execution
+   */
+  chi::TaskResume GetBlobInfo(hipc::FullPtr<GetBlobInfoTask> task, chi::RunContext &ctx);
+
 private:
   /**
    * Helper function to compute hash-based pool query for blob operations

@@ -429,11 +429,12 @@ int main(int argc, char* argv[]) {
     "LZMA",
     "BZIP2",
     "Blosc2",
-#ifdef HSHM_ENABLE_LIBPRESSIO
-    "ZFP",
-    "SZ3",
-    "FPZIP",
-#endif
+// Libpressio compressors disabled due to memory issues
+// #ifdef HSHM_ENABLE_LIBPRESSIO
+//     "ZFP",
+//     "SZ3",
+//     "FPZIP",
+// #endif
   };
 
   std::vector<BenchmarkResult> results;
@@ -448,7 +449,7 @@ int main(int argc, char* argv[]) {
   }
 
   // Write results to CSV
-  std::string output_file = "results/paper/compression_contention_results.csv";
+  std::string output_file = "/workspace/context-transfer-engine/compressor/results/motivation/compression_contention_results.csv";
   std::ofstream csv(output_file);
   csv << "library_name,preset,sim_threads,compress_threads,queue_depth,"
       << "output_size_kb,busy_time_sec,target_cpu_time_sec,wall_clock_sec,"

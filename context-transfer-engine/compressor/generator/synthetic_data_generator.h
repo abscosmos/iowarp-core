@@ -34,11 +34,301 @@ enum class PatternType {
 };
 
 /**
+ * Base distribution types for feature-targeted generation
+ */
+enum class BaseDistribution {
+  kNormal,       ///< Normal/Gaussian distribution
+  kGamma,        ///< Gamma distribution
+  kExponential,  ///< Exponential distribution
+  kUniform       ///< Uniform distribution
+};
+
+/**
+ * Feature target ranges for synthetic data generation
+ */
+struct FeatureTargets {
+  double shannon_entropy_min;      ///< Target minimum Shannon entropy (bits)
+  double shannon_entropy_max;      ///< Target maximum Shannon entropy (bits)
+  double mad_min;                  ///< Target minimum Mean Absolute Deviation
+  double mad_max;                  ///< Target maximum Mean Absolute Deviation
+  double second_deriv_min;         ///< Target minimum 2nd derivative
+  double second_deriv_max;         ///< Target maximum 2nd derivative
+
+  FeatureTargets()
+      : shannon_entropy_min(6.5), shannon_entropy_max(7.6),
+        mad_min(0.07), mad_max(0.16),
+        second_deriv_min(0.05), second_deriv_max(0.32) {}
+
+  FeatureTargets(double entropy_min, double entropy_max,
+                 double mad_min_, double mad_max_,
+                 double deriv_min, double deriv_max)
+      : shannon_entropy_min(entropy_min), shannon_entropy_max(entropy_max),
+        mad_min(mad_min_), mad_max(mad_max_),
+        second_deriv_min(deriv_min), second_deriv_max(deriv_max) {}
+
+  // Gray-Scott pattern-influenced targets with wider margins for 80% coverage
+  // These are wider than exact pattern ranges but narrower than generic targets
+  static FeatureTargets GrayscottLowEntropy() {
+    // Covers Spots pattern area with margin
+    return FeatureTargets(6.50, 7.20, 0.065, 0.090, 0.075, 0.130);
+  }
+
+  static FeatureTargets GrayscottHighEntropySmooth() {
+    // Covers Stripes pattern area with margin
+    return FeatureTargets(7.20, 7.70, 0.075, 0.100, 0.050, 0.080);
+  }
+
+  static FeatureTargets GrayscottMediumEntropyRough() {
+    // Covers Coral pattern area with margin
+    return FeatureTargets(6.70, 7.40, 0.105, 0.145, 0.070, 0.100);
+  }
+
+  static FeatureTargets GrayscottHighEntropySharp() {
+    // Covers Mitosis pattern area with margin
+    return FeatureTargets(7.30, 7.70, 0.130, 0.175, 0.250, 0.350);
+  }
+
+  // Comprehensive Gray-Scott target covering all patterns
+  static FeatureTargets GrayscottComprehensive() {
+    return FeatureTargets(6.60, 7.65, 0.065, 0.170, 0.050, 0.320);
+  }
+
+  // Tight Gray-Scott target for 80% coverage (tighter Shannon range)
+  static FeatureTargets GrayscottTight() {
+    return FeatureTargets(6.70, 7.60, 0.065, 0.165, 0.055, 0.320);
+  }
+};
+
+/**
  * Pattern specification with percentage
  */
 struct PatternSpec {
   PatternType type;
   double percentage;  ///< 0.0 - 1.0, fraction of data with this pattern
+};
+
+/**
+ * Feature-targeted data generator
+ *
+ * Generates data from base distributions (normal, gamma, exponential)
+ * and transforms it to achieve target Shannon entropy, MAD, and 2nd derivative ranges.
+ */
+class FeatureTargetedGenerator {
+ public:
+  /**
+   * Generate data targeting specific feature ranges
+   * @param data Output buffer (float array)
+   * @param num_elements Number of elements to generate
+   * @param base_dist Base distribution type (normal, gamma, exponential, uniform)
+   * @param targets Target feature ranges
+   * @param seed Random seed
+   * @param max_iterations Maximum refinement iterations (default: 5)
+   * @return True if targets were achieved within tolerance
+   */
+  static bool GenerateWithTargets(float* data, size_t num_elements,
+                                   BaseDistribution base_dist,
+                                   const FeatureTargets& targets,
+                                   unsigned int seed = 42,
+                                   int max_iterations = 5) {
+    std::mt19937 gen(seed);
+
+    // Step 1: Generate base distribution
+    GenerateBaseDistribution(data, num_elements, base_dist, gen);
+
+    // Step 2: Target MAD (most critical for Gray-Scott match)
+    double target_mad = targets.mad_min +
+        (targets.mad_max - targets.mad_min) * UniformRandom(gen);
+    AdjustMAD(data, num_elements, target_mad);
+
+    // Step 3: Target Shannon entropy
+    double target_entropy = targets.shannon_entropy_min +
+        (targets.shannon_entropy_max - targets.shannon_entropy_min) * UniformRandom(gen);
+    AdjustEntropy(data, num_elements, target_entropy, gen, max_iterations);
+
+    // Step 4: Target 2nd derivative
+    double target_deriv = targets.second_deriv_min +
+        (targets.second_deriv_max - targets.second_deriv_min) * UniformRandom(gen);
+    AdjustSecondDerivative(data, num_elements, target_deriv, gen);
+
+    // Verify targets were achieved (within 20% tolerance)
+    double actual_mad = ComputeMAD(data, num_elements);
+    double actual_entropy = ComputeEntropy(data, num_elements);
+    double actual_deriv = ComputeSecondDerivative(data, num_elements);
+
+    bool mad_ok = (actual_mad >= targets.mad_min * 0.8) &&
+                  (actual_mad <= targets.mad_max * 1.2);
+    bool entropy_ok = (actual_entropy >= targets.shannon_entropy_min * 0.9) &&
+                      (actual_entropy <= targets.shannon_entropy_max * 1.1);
+    bool deriv_ok = (actual_deriv >= targets.second_deriv_min * 0.8) &&
+                    (actual_deriv <= targets.second_deriv_max * 1.2);
+
+    return mad_ok && entropy_ok && deriv_ok;
+  }
+
+ private:
+  static double UniformRandom(std::mt19937& gen) {
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    return dist(gen);
+  }
+
+  static void GenerateBaseDistribution(float* data, size_t n,
+                                        BaseDistribution dist_type,
+                                        std::mt19937& gen) {
+    switch (dist_type) {
+      case BaseDistribution::kNormal: {
+        std::normal_distribution<float> dist(0.5f, 0.2f);
+        for (size_t i = 0; i < n; i++) {
+          data[i] = std::clamp(dist(gen), 0.0f, 1.0f);
+        }
+        break;
+      }
+      case BaseDistribution::kGamma: {
+        std::gamma_distribution<float> dist(2.0f, 0.3f);
+        for (size_t i = 0; i < n; i++) {
+          data[i] = std::clamp(dist(gen), 0.0f, 1.0f);
+        }
+        break;
+      }
+      case BaseDistribution::kExponential: {
+        std::exponential_distribution<float> dist(3.0f);
+        for (size_t i = 0; i < n; i++) {
+          data[i] = std::clamp(dist(gen), 0.0f, 1.0f);
+        }
+        break;
+      }
+      case BaseDistribution::kUniform: {
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        for (size_t i = 0; i < n; i++) {
+          data[i] = dist(gen);
+        }
+        break;
+      }
+    }
+  }
+
+  static double ComputeMean(const float* data, size_t n) {
+    double sum = 0.0;
+    for (size_t i = 0; i < n; i++) {
+      sum += data[i];
+    }
+    return sum / n;
+  }
+
+  static double ComputeMAD(const float* data, size_t n) {
+    double mean = ComputeMean(data, n);
+    double mad = 0.0;
+    for (size_t i = 0; i < n; i++) {
+      mad += std::abs(data[i] - mean);
+    }
+    return mad / n;
+  }
+
+  static double ComputeEntropy(const float* data, size_t n, int bins = 256) {
+    // Build histogram
+    std::vector<int> hist(bins, 0);
+    for (size_t i = 0; i < n; i++) {
+      int bin = static_cast<int>(data[i] * (bins - 1));
+      bin = std::clamp(bin, 0, bins - 1);
+      hist[bin]++;
+    }
+
+    // Compute entropy in bits
+    double entropy = 0.0;
+    for (int count : hist) {
+      if (count > 0) {
+        double prob = static_cast<double>(count) / n;
+        entropy -= prob * std::log2(prob);
+      }
+    }
+    return entropy;
+  }
+
+  static double ComputeSecondDerivative(const float* data, size_t n) {
+    if (n < 3) return 0.0;
+
+    double sum = 0.0;
+    for (size_t i = 1; i < n - 1; i++) {
+      double second_deriv = std::abs(data[i+1] - 2*data[i] + data[i-1]);
+      sum += second_deriv;
+    }
+    return sum / (n - 2);
+  }
+
+  static void AdjustMAD(float* data, size_t n, double target_mad) {
+    double current_mean = ComputeMean(data, n);
+    double current_mad = ComputeMAD(data, n);
+
+    if (current_mad < 1e-6) {
+      // Data is too uniform, can't scale meaningfully
+      return;
+    }
+
+    // Scale factor to achieve target MAD
+    double scale = target_mad / current_mad;
+
+    // Center data around mean, scale, and shift back
+    for (size_t i = 0; i < n; i++) {
+      data[i] = current_mean + (data[i] - current_mean) * scale;
+      data[i] = std::clamp(data[i], 0.0f, 1.0f);
+    }
+  }
+
+  static void AdjustEntropy(float* data, size_t n, double target_entropy,
+                            std::mt19937& gen, int max_iterations) {
+    // Entropy adjustment through noise addition or smoothing
+    double current_entropy = ComputeEntropy(data, n);
+
+    for (int iter = 0; iter < max_iterations; iter++) {
+      if (std::abs(current_entropy - target_entropy) < 0.3) {
+        break;  // Close enough
+      }
+
+      if (current_entropy < target_entropy) {
+        // Add noise to increase entropy
+        std::normal_distribution<float> noise(0.0f, 0.03f);
+        for (size_t i = 0; i < n; i++) {
+          data[i] = std::clamp(data[i] + noise(gen), 0.0f, 1.0f);
+        }
+      } else {
+        // Apply slight smoothing to reduce entropy
+        std::vector<float> temp(n);
+        for (size_t i = 1; i < n - 1; i++) {
+          temp[i] = 0.25f * data[i-1] + 0.5f * data[i] + 0.25f * data[i+1];
+        }
+        temp[0] = data[0];
+        temp[n-1] = data[n-1];
+        for (size_t i = 0; i < n; i++) {
+          data[i] = temp[i];
+        }
+      }
+
+      current_entropy = ComputeEntropy(data, n);
+    }
+  }
+
+  static void AdjustSecondDerivative(float* data, size_t n, double target_deriv,
+                                     std::mt19937& gen) {
+    double current_deriv = ComputeSecondDerivative(data, n);
+
+    if (current_deriv < target_deriv) {
+      // Add high-frequency noise to increase curvature
+      std::normal_distribution<float> noise(0.0f, 0.05f);
+      for (size_t i = 0; i < n; i++) {
+        data[i] = std::clamp(data[i] + noise(gen), 0.0f, 1.0f);
+      }
+    } else if (current_deriv > target_deriv * 1.5) {
+      // Apply smoothing to reduce curvature
+      std::vector<float> temp(n);
+      for (size_t i = 1; i < n - 1; i++) {
+        temp[i] = 0.25f * data[i-1] + 0.5f * data[i] + 0.25f * data[i+1];
+      }
+      temp[0] = data[0];
+      temp[n-1] = data[n-1];
+      for (size_t i = 0; i < n; i++) {
+        data[i] = temp[i];
+      }
+    }
+  }
 };
 
 /**

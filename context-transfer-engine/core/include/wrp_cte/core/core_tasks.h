@@ -776,15 +776,17 @@ struct PutBlobTask : public chi::Task {
   IN chi::u64 offset_;           // Offset within blob
   IN chi::u64 size_;             // Size of blob data
   IN hipc::ShmPtr<> blob_data_;   // Blob data (shared memory pointer)
-  IN float score_;               // Score 0-1 for placement decisions
+  IN float score_;               // Score for placement: -1.0=unknown (use defaults), 0.0-1.0=explicit
   INOUT Context context_;        // Context for compression control and statistics
   IN chi::u32 flags_;            // Operation flags
 
   // SHM constructor
+  // Default score -1.0f means "unknown" - runtime will use 1.0 for new blobs
+  // or preserve existing score for modifications
   PutBlobTask()
       : chi::Task(), tag_id_(TagId::GetNull()), blob_name_(HSHM_MALLOC),
         offset_(0), size_(0),
-        blob_data_(hipc::ShmPtr<>::GetNull()), score_(0.5f), context_(),
+        blob_data_(hipc::ShmPtr<>::GetNull()), score_(-1.0f), context_(),
         flags_(0) {}
 
   // Emplace constructor
@@ -1375,6 +1377,97 @@ struct GetBlobSizeTask : public chi::Task {
    * @param other Pointer to the replica task to aggregate from
    */
   void Aggregate(const hipc::FullPtr<GetBlobSizeTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
+/**
+ * Block information for GetBlobInfo response
+ * Contains the target pool ID and size for each block
+ */
+struct BlobBlockInfo {
+  chi::PoolId target_pool_id_;  // Pool ID of the target (bdev) storing this block
+  chi::u64 block_size_;         // Size of this block in bytes
+  chi::u64 block_offset_;       // Offset within target where block is stored
+
+  BlobBlockInfo() : target_pool_id_(), block_size_(0), block_offset_(0) {}
+  BlobBlockInfo(const chi::PoolId &pool_id, chi::u64 size, chi::u64 offset)
+      : target_pool_id_(pool_id), block_size_(size), block_offset_(offset) {}
+
+  template <typename Archive>
+  void serialize(Archive &ar) {
+    chi::u64 pool_id_u64 = target_pool_id_.IsNull() ? 0 : target_pool_id_.ToU64();
+    ar(pool_id_u64, block_size_, block_offset_);
+    // Restore PoolId from u64 when deserializing
+    target_pool_id_ = chi::PoolId::FromU64(pool_id_u64);
+  }
+};
+
+/**
+ * GetBlobInfo task - Get comprehensive blob metadata
+ * Returns score, size, and block placement information
+ */
+struct GetBlobInfoTask : public chi::Task {
+  IN TagId tag_id_;                        // Tag ID for blob lookup
+  IN chi::priv::string blob_name_;         // Blob name (required)
+  OUT float score_;                        // Blob score (0.0-1.0)
+  OUT chi::u64 total_size_;                // Total blob size in bytes
+  OUT std::vector<BlobBlockInfo> blocks_;  // Block placement info
+
+  // SHM constructor
+  GetBlobInfoTask()
+      : chi::Task(), tag_id_(TagId::GetNull()), blob_name_(HSHM_MALLOC),
+        score_(0.0f), total_size_(0), blocks_() {}
+
+  // Emplace constructor
+  explicit GetBlobInfoTask(const chi::TaskId &task_id,
+                           const chi::PoolId &pool_id,
+                           const chi::PoolQuery &pool_query,
+                           const TagId &tag_id, const std::string &blob_name)
+      : chi::Task(task_id, pool_id, pool_query, Method::kGetBlobInfo),
+        tag_id_(tag_id), blob_name_(HSHM_MALLOC, blob_name),
+        score_(0.0f), total_size_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kGetBlobInfo;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /**
+   * Serialize IN and INOUT parameters
+   */
+  template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_);
+  }
+
+  /**
+   * Serialize OUT and INOUT parameters
+   */
+  template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(score_, total_size_);
+    // NOTE: blocks_ temporarily removed from serialization for debugging
+  }
+
+  /**
+   * Copy from another GetBlobInfoTask
+   */
+  void Copy(const hipc::FullPtr<GetBlobInfoTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    score_ = other->score_;
+    total_size_ = other->total_size_;
+    blocks_ = other->blocks_;
+  }
+
+  /**
+   * Aggregate replica results into this task
+   */
+  void Aggregate(const hipc::FullPtr<GetBlobInfoTask> &other) {
     Task::Aggregate(other.template Cast<Task>());
     Copy(other);
   }

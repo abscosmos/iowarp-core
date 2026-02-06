@@ -98,13 +98,21 @@ class Client : public chi::ContainerClient {
   /**
    * Asynchronous target stats update - returns immediately
    * @param pool_query Pool query for task routing (default: Dynamic)
+   * @param period_ms Period for periodic execution in milliseconds (0 = one-shot)
    */
   chi::Future<StatTargetsTask> AsyncStatTargets(
-      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic(),
+      chi::u32 period_ms = 0) {
     auto *ipc_manager = CHI_IPC;
 
     auto task = ipc_manager->NewTask<StatTargetsTask>(
         chi::CreateTaskId(), pool_id_, pool_query);
+
+    // Set task as periodic if period is specified
+    if (period_ms > 0) {
+      task->SetPeriod(static_cast<double>(period_ms), chi::kMilli);
+      task->SetFlags(TASK_PERIODIC);
+    }
 
     return ipc_manager->Send(task);
   }
@@ -151,7 +159,7 @@ class Client : public chi::ContainerClient {
    * @param offset Offset within blob
    * @param size Size of data
    * @param blob_data Shared memory pointer to data
-   * @param score Blob score for placement
+   * @param score Blob score for placement: -1.0=unknown (auto), 0.0-1.0=explicit tier
    * @param context Compression context
    * @param flags Operation flags
    * @param pool_query Pool query for task routing (default: Dynamic)
@@ -160,7 +168,7 @@ class Client : public chi::ContainerClient {
       const TagId &tag_id,
       const std::string &blob_name,
       chi::u64 offset, chi::u64 size,
-      hipc::ShmPtr<> blob_data, float score,
+      hipc::ShmPtr<> blob_data, float score = -1.0f,
       const Context &context = Context(),
       chi::u32 flags = 0,
       const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
@@ -340,6 +348,27 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * Asynchronous get blob info - returns immediately
+   * Gets comprehensive blob metadata including score and block placement
+   * @param tag_id Tag ID for blob lookup
+   * @param blob_name Name of the blob
+   * @param pool_query Pool query for task routing (default: Dynamic)
+   * @return Future containing score, size, and block placement info
+   */
+  chi::Future<GetBlobInfoTask> AsyncGetBlobInfo(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CHI_IPC;
+
+    auto task = ipc_manager->NewTask<GetBlobInfoTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id,
+        blob_name);
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous get contained blobs - returns immediately
    * @param tag_id Tag ID
    * @param pool_query Pool query for task routing (default: Dynamic)
@@ -449,11 +478,11 @@ class Tag {
    * @param data Shared memory pointer to data
    * @param data_size Size of data
    * @param off Offset within blob (default 0)
-   * @param score Blob score for placement decisions (default 1.0)
+   * @param score Blob score for placement: -1.0=unknown (auto), 0.0-1.0=explicit tier
    * @param context Compression context for workflow-aware decisions (default empty)
    */
   void PutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data,
-               size_t data_size, size_t off = 0, float score = 1.0f,
+               size_t data_size, size_t off = 0, float score = -1.0f,
                const Context &context = Context());
 
   /**
@@ -463,7 +492,7 @@ class Tag {
    * completes)
    * @param data_size Size of data
    * @param off Offset within blob (default 0)
-   * @param score Blob score for placement decisions (default 1.0)
+   * @param score Blob score for placement: -1.0=unknown (auto), 0.0-1.0=explicit tier
    * @param context Compression context for workflow-aware decisions (default empty)
    * @return Task pointer for async operation
    * @note For raw data, caller must allocate shared memory using
@@ -473,7 +502,7 @@ class Tag {
   chi::Future<PutBlobTask> AsyncPutBlob(const std::string &blob_name,
                                         const hipc::ShmPtr<> &data,
                                         size_t data_size, size_t off = 0,
-                                        float score = 1.0f,
+                                        float score = -1.0f,
                                         const Context &context = Context());
 
   /**

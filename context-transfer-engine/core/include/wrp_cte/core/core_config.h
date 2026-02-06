@@ -13,13 +13,15 @@ namespace wrp_cte::core {
  * Performance configuration for CTE Core operations
  */
 struct PerformanceConfig {
-  chi::u32 target_stat_interval_ms_;    // Interval for updating target stats
+  chi::u32 target_stat_interval_ms_;    // Interval for updating target stats (legacy)
+  chi::u32 stat_targets_period_ms_;     // Period for periodic StatTargets calls (default 50ms)
   chi::u32 max_concurrent_operations_;  // Max concurrent I/O operations
   float score_threshold_;               // Threshold for blob reorganization
   float score_difference_threshold_;    // Minimum score difference for reorganization
 
   PerformanceConfig()
       : target_stat_interval_ms_(5000),
+        stat_targets_period_ms_(50),
         max_concurrent_operations_(64),
         score_threshold_(0.7f),
         score_difference_threshold_(0.05f) {}

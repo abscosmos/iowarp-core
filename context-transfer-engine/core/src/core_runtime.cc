@@ -208,8 +208,16 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
        "CTE Core container created and initialized for pool: {} (ID: {})",
        pool_name_, task->new_pool_id_);
 
-  HLOG(kInfo, "Configuration: neighborhood={}, poll_period_ms={}",
-       config_.targets_.neighborhood_, config_.targets_.poll_period_ms_);
+  HLOG(kInfo, "Configuration: neighborhood={}, poll_period_ms={}, stat_targets_period_ms={}",
+       config_.targets_.neighborhood_, config_.targets_.poll_period_ms_,
+       config_.performance_.stat_targets_period_ms_);
+
+  // Start periodic StatTargets task to keep target stats updated
+  chi::u32 stat_period_ms = config_.performance_.stat_targets_period_ms_;
+  if (stat_period_ms > 0) {
+    HLOG(kInfo, "Starting periodic StatTargets task with period {} ms", stat_period_ms);
+    client_.AsyncStatTargets(chi::PoolQuery::Local(), stat_period_ms);
+  }
   co_return;
 }
 
@@ -471,12 +479,21 @@ chi::TaskResume Runtime::StatTargets(hipc::FullPtr<StatTargetsTask> task,
         std::hash<std::string>{}("stat_targets") % target_locks_.size();
     chi::ScopedCoRwReadLock read_lock(*target_locks_[lock_index]);
 
-    // Update stats for all targets - read lock is sufficient since we're only
-    // updating values, not modifying map structure
+    // Collect all target IDs first (can't co_await inside for_each lambda)
+    std::vector<chi::PoolId> target_ids;
     registered_targets_.for_each(
-        [this](const chi::PoolId &target_id, TargetInfo &target_info) {
-          UpdateTargetStats(target_id, target_info);
+        [&target_ids](const chi::PoolId &target_id, TargetInfo &target_info) {
+          (void)target_info;
+          target_ids.push_back(target_id);
         });
+
+    // Now iterate and co_await each UpdateTargetStats call
+    for (const auto &target_id : target_ids) {
+      TargetInfo *target_info = registered_targets_.find(target_id);
+      if (target_info != nullptr) {
+        co_await UpdateTargetStats(target_id, *target_info);
+      }
+    }
 
     task->return_code_ = 0;  // Success
 
@@ -652,6 +669,63 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task,
     BlobInfo *blob_info_ptr = CheckBlobExists(blob_name, tag_id);
     bool blob_found = (blob_info_ptr != nullptr);
 
+    // Step 1.5: Resolve score based on blob existence
+    // -1.0 means "unknown" - use defaults based on context
+    if (blob_score < 0.0f) {
+      if (blob_found) {
+        // Existing blob: preserve current score
+        blob_score = blob_info_ptr->score_;
+      } else {
+        // New blob: use high priority (fast tier)
+        blob_score = 1.0f;
+      }
+    }
+
+    // Step 1.6: Handle explicit score change for entire blob replacement
+    // If score is explicit (0.0-1.0) and we're replacing the entire blob,
+    // free existing blocks so new allocation goes to appropriate tier
+    chi::u64 old_blob_size = 0;
+    if (blob_found && blob_score >= 0.0f && blob_score <= 1.0f) {
+      chi::u64 current_blob_size = blob_info_ptr->GetTotalSize();
+      bool is_entire_blob_replacement = (offset == 0 && size >= current_blob_size);
+
+      if (is_entire_blob_replacement && current_blob_size > 0) {
+        // Check if score is actually changing to a different tier
+        float current_score = blob_info_ptr->score_;
+        const Config &config = GetConfig();
+        float score_diff_threshold = config.performance_.score_difference_threshold_;
+
+        if (std::abs(blob_score - current_score) >= score_diff_threshold) {
+          HLOG(kDebug,
+               "PutBlob: Score change detected for entire blob replacement. "
+               "blob={}, old_score={}, new_score={}, freeing old blocks",
+               blob_name, current_score, blob_score);
+
+          // Free all existing blocks (updates target capacities)
+          chi::u32 free_result = 0;
+          co_await FreeAllBlobBlocks(*blob_info_ptr, free_result);
+
+          if (free_result != 0) {
+            HLOG(kWarning,
+                 "PutBlob: Failed to free old blocks during score change, "
+                 "continuing with overwrite. blob={}, error={}",
+                 blob_name, free_result);
+          }
+          // Blob metadata remains intact, blocks are now empty
+          // old_blob_size stays 0 since blocks were freed
+        } else {
+          // Score not changing significantly, track existing size
+          old_blob_size = current_blob_size;
+        }
+      } else {
+        // Not entire blob replacement, track existing size
+        old_blob_size = current_blob_size;
+      }
+    } else if (blob_found) {
+      // Score is unknown (-1), track existing size
+      old_blob_size = blob_info_ptr->GetTotalSize();
+    }
+
     // Step 2: Create blob if it doesn't exist
     if (!blob_found) {
       blob_info_ptr = CreateNewBlob(blob_name, tag_id, blob_score);
@@ -660,10 +734,6 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task,
         co_return;
       }
     }
-
-    // Step 2.5: Track blob size before modification for tag total_size_
-    // accounting (no lock needed - blob_info_ptr is already obtained)
-    chi::u64 old_blob_size = blob_info_ptr->GetTotalSize();
 
     // Step 3: Allocate additional space if needed for blob extension
     // (no lock held during expensive bdev allocation)
@@ -875,12 +945,11 @@ chi::TaskResume Runtime::ReorganizeBlob(hipc::FullPtr<ReorganizeBlobTask> task,
       co_return;
     }
 
-    // Step 3: Update blob score
+    // Step 3: Get blob info (don't update score yet - PutBlob will handle it)
     BlobInfo &blob_info = *blob_info_ptr;
 
-    HLOG(kDebug, "UPDATING SCORE: blob={}, old_score={}, new_score={}",
+    HLOG(kDebug, "ReorganizeBlob: blob={}, current_score={}, target_score={}",
          blob_name, blob_info.score_, new_score);
-    blob_info.score_ = new_score;
 
     // Step 4: Get blob size from blob_info
     chi::u64 blob_size = blob_info.GetTotalSize();
@@ -1230,12 +1299,22 @@ float Runtime::GetManualScoreForTarget(const std::string &target_name) {
     // Create the expected target name based on how targets are registered
     std::string expected_target_name = "storage_device_" + std::to_string(i);
 
-    // Also check if target name matches the device path directly
-    if (target_name == expected_target_name || target_name == device.path_) {
+    // Check if target name matches:
+    // 1. Exact match with "storage_device_N"
+    // 2. Exact match with device path
+    // 3. Starts with device path (to handle "_nodeX" suffix added during registration)
+    if (target_name == expected_target_name ||
+        target_name == device.path_ ||
+        (target_name.rfind(device.path_, 0) == 0 &&
+         (target_name.size() == device.path_.size() ||
+          target_name[device.path_.size()] == '_'))) {
+      HLOG(kDebug, "GetManualScoreForTarget: target '{}' matched device path '{}', score={}",
+           target_name, device.path_, device.score_);
       return device.score_;  // Return configured score (-1.0f if not set)
     }
   }
 
+  HLOG(kDebug, "GetManualScoreForTarget: target '{}' has no manual score configured", target_name);
   return -1.0f;  // No manual score configured for this target
 }
 
@@ -1826,11 +1905,18 @@ chi::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
     blocks_by_pool[pool_id].second.push_back(block);
   }
 
-  // Call FreeBlocks once per PoolId
+  // Call FreeBlocks once per PoolId and update target capacities
   for (const auto &pool_entry : blocks_by_pool) {
     const chi::PoolId &pool_id = pool_entry.first;
     const chi::PoolQuery &target_query = pool_entry.second.first;
     const std::vector<chimaera::bdev::Block> &blocks = pool_entry.second.second;
+
+    // Calculate total bytes to be freed for this pool
+    chi::u64 bytes_freed = 0;
+    for (const auto &block : blocks) {
+      bytes_freed += block.size_;
+    }
+
     // Get bdev client for this pool from first blob block
     chimaera::bdev::Client bdev_client(pool_id);
     auto free_task = bdev_client.AsyncFreeBlocks(target_query, blocks);
@@ -1838,6 +1924,18 @@ chi::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
     chi::u32 free_result = free_task->GetReturnCode();
     if (free_result != 0) {
       HLOG(kWarning, "Failed to free blocks from pool {}", pool_id.major_);
+    } else {
+      // Successfully freed blocks - update target's remaining_space_
+      size_t lock_index =
+          std::hash<std::string>{}("free_blocks") % target_locks_.size();
+      chi::ScopedCoRwWriteLock write_lock(*target_locks_[lock_index]);
+
+      TargetInfo *target_info = registered_targets_.find(pool_id);
+      if (target_info != nullptr) {
+        target_info->remaining_space_ += bytes_freed;
+        HLOG(kDebug, "Updated target {} remaining_space_ by +{} bytes (now {})",
+             pool_id.major_, bytes_freed, target_info->remaining_space_);
+      }
     }
   }
 
@@ -2025,6 +2123,64 @@ chi::TaskResume Runtime::GetBlobSize(hipc::FullPtr<GetBlobSizeTask> task,
          task->size_);
 
   } catch (const std::exception &e) {
+    task->return_code_ = 1;
+  }
+  co_return;
+}
+
+chi::TaskResume Runtime::GetBlobInfo(hipc::FullPtr<GetBlobInfoTask> task,
+                                     chi::RunContext &ctx) {
+  // Dynamic scheduling phase - determine routing
+  if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
+    task->pool_query_ =
+        HashBlobToContainer(task->tag_id_, task->blob_name_.str());
+    co_return;
+  }
+
+  try {
+    // Extract input parameters
+    TagId tag_id = task->tag_id_;
+    std::string blob_name = task->blob_name_.str();
+
+    // Validate that blob_name is provided
+    if (blob_name.empty()) {
+      task->return_code_ = 1;  // Error: empty blob name
+      co_return;
+    }
+
+    // Step 1: Check if blob exists
+    BlobInfo *blob_info_ptr = CheckBlobExists(blob_name, tag_id);
+    if (blob_info_ptr == nullptr) {
+      task->return_code_ = 2;  // Blob not found
+      co_return;
+    }
+
+    // Step 2: Populate output fields
+    task->score_ = blob_info_ptr->score_;
+    task->total_size_ = blob_info_ptr->GetTotalSize();
+
+    // Step 3: Populate block information
+    // NOTE: Temporarily disabled to debug serialization issue
+    task->blocks_.clear();
+    // task->blocks_.reserve(blob_info_ptr->blocks_.size());
+    // for (const auto &block : blob_info_ptr->blocks_) {
+    //   task->blocks_.emplace_back(
+    //       block.bdev_client_.pool_id_,
+    //       block.size_,
+    //       block.target_offset_);
+    // }
+
+    // Step 4: Update timestamps
+    auto now = std::chrono::steady_clock::now();
+    blob_info_ptr->last_read_ = now;
+
+    // Success
+    task->return_code_ = 0;
+    HLOG(kDebug, "GetBlobInfo successful: name={}, score={}, size={}, blocks={}",
+         blob_name, task->score_, task->total_size_, task->blocks_.size());
+
+  } catch (const std::exception &e) {
+    HLOG(kError, "GetBlobInfo failed: {}", e.what());
     task->return_code_ = 1;
   }
   co_return;

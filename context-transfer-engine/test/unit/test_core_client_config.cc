@@ -19,15 +19,6 @@
  * - core_config.cc: 17% → 80%
  */
 
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <filesystem>
-#include <fstream>
-#include <memory>
-
-#include "simple_test.h"
-
 #include <chimaera/admin/admin_tasks.h>
 #include <chimaera/bdev/bdev_client.h>
 #include <chimaera/bdev/bdev_tasks.h>
@@ -37,6 +28,15 @@
 #include <wrp_cte/core/core_runtime.h>
 #include <wrp_cte/core/core_tasks.h>
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+
+#include "simple_test.h"
+
 namespace fs = std::filesystem;
 
 /**
@@ -45,7 +45,7 @@ namespace fs = std::filesystem;
 class CoreClientConfigFixture {
  public:
   static constexpr chi::u64 kTestTargetSize = 1024 * 1024 * 10;  // 10MB
-  static constexpr size_t kTestDataSize = 4096;                   // 4KB
+  static constexpr size_t kTestDataSize = 4096;                  // 4KB
 
   std::string test_storage_path_;
   std::string test_config_path_;
@@ -87,10 +87,8 @@ class CoreClientConfigFixture {
       // Create CTE core pool
       wrp_cte::core::CreateParams params;
       auto create_task = cte_client->AsyncCreate(
-          chi::PoolQuery::Dynamic(),
-          wrp_cte::core::kCtePoolName,
-          wrp_cte::core::kCtePoolId,
-          params);
+          chi::PoolQuery::Dynamic(), wrp_cte::core::kCtePoolName,
+          wrp_cte::core::kCtePoolId, params);
       create_task.Wait();
       REQUIRE(create_task->GetReturnCode() == 0);
 
@@ -124,17 +122,17 @@ class CoreClientConfigFixture {
     // Create bdev pool
     chi::PoolId bdev_pool_id(900, 0);
     chimaera::bdev::Client bdev_client(bdev_pool_id);
-    auto create_task = bdev_client.AsyncCreate(
-        chi::PoolQuery::Dynamic(), test_storage_path_,
-        bdev_pool_id, chimaera::bdev::BdevType::kFile);
+    auto create_task =
+        bdev_client.AsyncCreate(chi::PoolQuery::Dynamic(), test_storage_path_,
+                                bdev_pool_id, chimaera::bdev::BdevType::kFile);
     create_task.Wait();
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // Register target
     auto reg_task = cte_client->AsyncRegisterTarget(
-        test_storage_path_, chimaera::bdev::BdevType::kFile,
-        kTestTargetSize, chi::PoolQuery::Local(), bdev_pool_id);
+        test_storage_path_, chimaera::bdev::BdevType::kFile, kTestTargetSize,
+        chi::PoolQuery::Local(), bdev_pool_id);
     reg_task.Wait();
     REQUIRE(reg_task->GetReturnCode() == 0);
 
@@ -272,7 +270,8 @@ TEST_CASE("Client - AsyncListTargets", "[core][client][target]") {
 
   REQUIRE(task->GetReturnCode() == 0);
   REQUIRE(task->target_names_.size() > 0);
-  INFO("AsyncListTargets returned " << task->target_names_.size() << " targets");
+  INFO("AsyncListTargets returned " << task->target_names_.size()
+                                    << " targets");
 }
 
 TEST_CASE("Client - AsyncStatTargets", "[core][client][target]") {
@@ -366,7 +365,8 @@ TEST_CASE("Client - AsyncDelTag by Name", "[core][client][tag]") {
   auto del_task = client->AsyncDelTag("tag_to_delete_by_name");
   del_task.Wait();
 
-  INFO("AsyncDelTag by name completed with code: " << del_task->GetReturnCode());
+  INFO(
+      "AsyncDelTag by name completed with code: " << del_task->GetReturnCode());
 }
 
 TEST_CASE("Client - AsyncGetTagSize", "[core][client][tag]") {
@@ -412,8 +412,8 @@ TEST_CASE("Client - AsyncPutBlob Direct", "[core][client][blob]") {
 
   // Put blob
   hipc::ShmPtr<> shm_ref(shm_ptr.shm_);
-  auto put_task = client->AsyncPutBlob(
-      tag_task->tag_id_, "test_blob", 0, data.size(), shm_ref, 1.0f);
+  auto put_task = client->AsyncPutBlob(tag_task->tag_id_, "test_blob", 0,
+                                       data.size(), shm_ref, 1.0f);
   put_task.Wait();
 
   ipc->FreeBuffer(shm_ptr);
@@ -439,8 +439,8 @@ TEST_CASE("Client - AsyncGetBlob Direct", "[core][client][blob]") {
   memcpy(put_ptr.ptr_, data.data(), data.size());
   hipc::ShmPtr<> put_ref(put_ptr.shm_);
 
-  auto put_task = client->AsyncPutBlob(
-      tag_task->tag_id_, "get_test_blob", 0, data.size(), put_ref, 1.0f);
+  auto put_task = client->AsyncPutBlob(tag_task->tag_id_, "get_test_blob", 0,
+                                       data.size(), put_ref, 1.0f);
   put_task.Wait();
   REQUIRE(put_task->GetReturnCode() == 0);
 
@@ -450,8 +450,8 @@ TEST_CASE("Client - AsyncGetBlob Direct", "[core][client][blob]") {
   hipc::FullPtr<char> get_ptr = ipc->AllocateBuffer(data.size());
   hipc::ShmPtr<> get_ref(get_ptr.shm_);
 
-  auto get_task = client->AsyncGetBlob(
-      tag_task->tag_id_, "get_test_blob", 0, data.size(), 0, get_ref);
+  auto get_task = client->AsyncGetBlob(tag_task->tag_id_, "get_test_blob", 0,
+                                       data.size(), 0, get_ref);
   get_task.Wait();
 
   ipc->FreeBuffer(get_ptr);
@@ -477,8 +477,8 @@ TEST_CASE("Client - AsyncDelBlob", "[core][client][blob]") {
   memcpy(shm_ptr.ptr_, data.data(), data.size());
   hipc::ShmPtr<> shm_ref(shm_ptr.shm_);
 
-  auto put_task = client->AsyncPutBlob(
-      tag_task->tag_id_, "blob_to_delete", 0, data.size(), shm_ref, 1.0f);
+  auto put_task = client->AsyncPutBlob(tag_task->tag_id_, "blob_to_delete", 0,
+                                       data.size(), shm_ref, 1.0f);
   put_task.Wait();
   REQUIRE(put_task->GetReturnCode() == 0);
 
@@ -508,19 +508,20 @@ TEST_CASE("Client - AsyncReorganizeBlob Direct", "[core][client][blob]") {
   memcpy(shm_ptr.ptr_, data.data(), data.size());
   hipc::ShmPtr<> shm_ref(shm_ptr.shm_);
 
-  auto put_task = client->AsyncPutBlob(
-      tag_task->tag_id_, "reorg_blob", 0, data.size(), shm_ref, 2.0f);
+  auto put_task = client->AsyncPutBlob(tag_task->tag_id_, "reorg_blob", 0,
+                                       data.size(), shm_ref, 2.0f);
   put_task.Wait();
   REQUIRE(put_task->GetReturnCode() == 0);
 
   ipc->FreeBuffer(shm_ptr);
 
   // Reorganize blob
-  auto reorg_task = client->AsyncReorganizeBlob(
-      tag_task->tag_id_, "reorg_blob", 5.0f);
+  auto reorg_task =
+      client->AsyncReorganizeBlob(tag_task->tag_id_, "reorg_blob", 5.0f);
   reorg_task.Wait();
 
-  INFO("AsyncReorganizeBlob completed with code: " << reorg_task->GetReturnCode());
+  INFO("AsyncReorganizeBlob completed with code: "
+       << reorg_task->GetReturnCode());
 }
 
 TEST_CASE("Client - AsyncGetBlobScore Direct", "[core][client][blob]") {
@@ -541,8 +542,8 @@ TEST_CASE("Client - AsyncGetBlobScore Direct", "[core][client][blob]") {
   hipc::ShmPtr<> shm_ref(shm_ptr.shm_);
 
   float expected_score = 3.5f;
-  auto put_task = client->AsyncPutBlob(
-      tag_task->tag_id_, "scored_blob", 0, data.size(), shm_ref, expected_score);
+  auto put_task = client->AsyncPutBlob(tag_task->tag_id_, "scored_blob", 0,
+                                       data.size(), shm_ref, expected_score);
   put_task.Wait();
   REQUIRE(put_task->GetReturnCode() == 0);
 
@@ -574,8 +575,8 @@ TEST_CASE("Client - AsyncGetBlobSize Direct", "[core][client][blob]") {
   memcpy(shm_ptr.ptr_, data.data(), data.size());
   hipc::ShmPtr<> shm_ref(shm_ptr.shm_);
 
-  auto put_task = client->AsyncPutBlob(
-      tag_task->tag_id_, "sized_blob", 0, data.size(), shm_ref, 1.0f);
+  auto put_task = client->AsyncPutBlob(tag_task->tag_id_, "sized_blob", 0,
+                                       data.size(), shm_ref, 1.0f);
   put_task.Wait();
   REQUIRE(put_task->GetReturnCode() == 0);
 
@@ -610,8 +611,8 @@ TEST_CASE("Client - AsyncGetContainedBlobs Direct", "[core][client][blob]") {
     hipc::ShmPtr<> shm_ref(shm_ptr.shm_);
 
     std::string blob_name = "blob_" + std::to_string(i);
-    auto put_task = client->AsyncPutBlob(
-        tag_task->tag_id_, blob_name, 0, data.size(), shm_ref, 1.0f);
+    auto put_task = client->AsyncPutBlob(tag_task->tag_id_, blob_name, 0,
+                                         data.size(), shm_ref, 1.0f);
     put_task.Wait();
     REQUIRE(put_task->GetReturnCode() == 0);
 
@@ -624,7 +625,8 @@ TEST_CASE("Client - AsyncGetContainedBlobs Direct", "[core][client][blob]") {
 
   REQUIRE(blobs_task->GetReturnCode() == 0);
   REQUIRE(blobs_task->blob_names_.size() >= 3);
-  INFO("AsyncGetContainedBlobs returned " << blobs_task->blob_names_.size() << " blobs");
+  INFO("AsyncGetContainedBlobs returned " << blobs_task->blob_names_.size()
+                                          << " blobs");
 }
 
 // ============================================================================
@@ -668,8 +670,8 @@ TEST_CASE("Client - AsyncBlobQuery", "[core][client][query]") {
   memcpy(shm_ptr.ptr_, data.data(), data.size());
   hipc::ShmPtr<> shm_ref(shm_ptr.shm_);
 
-  auto put_task = client->AsyncPutBlob(
-      tag_task->tag_id_, "queryable_blob", 0, data.size(), shm_ref, 1.0f);
+  auto put_task = client->AsyncPutBlob(tag_task->tag_id_, "queryable_blob", 0,
+                                       data.size(), shm_ref, 1.0f);
   put_task.Wait();
   REQUIRE(put_task->GetReturnCode() == 0);
 
@@ -680,7 +682,8 @@ TEST_CASE("Client - AsyncBlobQuery", "[core][client][query]") {
   query_task.Wait();
 
   REQUIRE(query_task->GetReturnCode() == 0);
-  INFO("AsyncBlobQuery returned " << query_task->blob_names_.size() << " blobs");
+  INFO("AsyncBlobQuery returned " << query_task->blob_names_.size()
+                                  << " blobs");
 }
 
 // ============================================================================
@@ -698,8 +701,8 @@ TEST_CASE("Client - AsyncPollTelemetryLog", "[core][client][telemetry]") {
   telemetry_task.Wait();
 
   REQUIRE(telemetry_task->GetReturnCode() == 0);
-  INFO("AsyncPollTelemetryLog returned "
-       << telemetry_task->entries_.size() << " entries");
+  INFO("AsyncPollTelemetryLog returned " << telemetry_task->entries_.size()
+                                         << " entries");
 }
 
 SIMPLE_TEST_MAIN()

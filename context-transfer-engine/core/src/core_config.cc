@@ -140,6 +140,11 @@ bool Config::Validate() const {
     return false;
   }
 
+  if (performance_.stat_targets_period_ms_ == 0 || performance_.stat_targets_period_ms_ > 60000) {
+    HLOG(kError, "Config validation error: Invalid stat_targets_period_ms {} (must be 1-60000)", performance_.stat_targets_period_ms_);
+    return false;
+  }
+
   // Validate target configuration
   if (targets_.neighborhood_ == 0 || targets_.neighborhood_ > 1024) {
     HLOG(kError, "Config validation error: Invalid neighborhood {} (must be 1-1024)", targets_.neighborhood_);
@@ -351,6 +356,10 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
 bool Config::ParsePerformanceConfig(const YAML::Node &node) {
   if (node["target_stat_interval_ms"]) {
     performance_.target_stat_interval_ms_ = node["target_stat_interval_ms"].as<chi::u32>();
+  }
+
+  if (node["stat_targets_period_ms"]) {
+    performance_.stat_targets_period_ms_ = node["stat_targets_period_ms"].as<chi::u32>();
   }
 
   if (node["max_concurrent_operations"]) {

@@ -5,6 +5,8 @@
 #ifndef WRP_CTE_COMPRESSOR_MODELS_DATA_STATS_H_
 #define WRP_CTE_COMPRESSOR_MODELS_DATA_STATS_H_
 
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +48,90 @@ enum class DataType {
 template<typename T>
 class DataStatistics {
  public:
+  struct StatsTiming {
+    double mean_histogram_pass_ms;
+    double mad_deriv_pass_ms;
+    double entropy_calc_ms;
+    double total_ms;
+  };
+
+  /**
+   * Calculate all statistics in a single pass for maximum performance
+   * Returns: {shannon_entropy, mad, first_derivative, second_derivative}
+   */
+  static std::array<double, 4> CalculateAllStatistics(const T* data, size_t num_elements,
+                                                       StatsTiming* timing = nullptr) {
+    if (num_elements == 0) return {0.0, 0.0, 0.0, 0.0};
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+    size_t num_bytes = num_elements * sizeof(T);
+
+    // Stack-allocated histogram for better cache performance
+    size_t histogram[256] = {0};
+
+    double sum = 0.0;
+    double mad_sum = 0.0;
+    double first_deriv_sum = 0.0;
+    double second_deriv_sum = 0.0;
+
+    // Pass 1: calculate mean AND build histogram (independent operations)
+    auto t1 = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < num_elements; i++) {
+      sum += static_cast<double>(data[i]);
+    }
+    for (size_t i = 0; i < num_bytes; i++) {
+      histogram[bytes[i]]++;
+    }
+    double mean = sum / static_cast<double>(num_elements);
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    // Pass 2: MAD and derivatives (needs mean from pass 1)
+    for (size_t i = 0; i < num_elements; i++) {
+      // MAD
+      mad_sum += std::abs(static_cast<double>(data[i]) - mean);
+
+      // First derivative
+      if (i < num_elements - 1) {
+        first_deriv_sum += std::abs(static_cast<double>(data[i + 1]) - static_cast<double>(data[i]));
+      }
+
+      // Second derivative
+      if (i < num_elements - 2) {
+        second_deriv_sum += std::abs(static_cast<double>(data[i + 2])
+                                     - 2.0 * static_cast<double>(data[i + 1])
+                                     + static_cast<double>(data[i]));
+      }
+    }
+    auto t3 = std::chrono::high_resolution_clock::now();
+
+    // Calculate entropy from histogram
+    double entropy = 0.0;
+    auto t4 = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < 256; i++) {
+      if (histogram[i] > 0) {
+        double p_i = static_cast<double>(histogram[i]) / static_cast<double>(num_bytes);
+        entropy += -p_i * std::log2(p_i);
+      }
+    }
+    auto t5 = std::chrono::high_resolution_clock::now();
+
+    if (timing) {
+      timing->mean_histogram_pass_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+      timing->mad_deriv_pass_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+      timing->entropy_calc_ms = std::chrono::duration<double, std::milli>(t5 - t4).count();
+      timing->total_ms = std::chrono::duration<double, std::milli>(t5 - t_start).count();
+    }
+
+    return {
+      entropy,
+      mad_sum / static_cast<double>(num_elements),
+      first_deriv_sum / static_cast<double>(num_elements - 1),
+      second_deriv_sum / static_cast<double>(num_elements - 2)
+    };
+  }
+
   /**
    * Calculate Shannon Entropy
    *

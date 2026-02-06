@@ -43,6 +43,16 @@ add_executable(test_core_runtime_coverage
     test_core_runtime_coverage.cc
 )
 
+# Create test_tiered_storage_stress executable for tiered storage stress tests
+add_executable(test_tiered_storage_stress
+    test_tiered_storage_stress.cc
+)
+
+# Create test_reorganize_blob executable for ReorganizeBlob API tests
+add_executable(test_reorganize_blob
+    test_reorganize_blob.cc
+)
+
 # Include directories for all tests - using unified simple_test.h framework
 target_include_directories(cte_core_unit_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
@@ -65,6 +75,14 @@ target_include_directories(test_core_client_config PRIVATE
 )
 
 target_include_directories(test_core_runtime_coverage PRIVATE
+  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+)
+
+target_include_directories(test_tiered_storage_stress PRIVATE
+  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+)
+
+target_include_directories(test_reorganize_blob PRIVATE
   ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
 )
 
@@ -130,6 +148,30 @@ target_link_libraries(test_core_client_config
 
 # Link test_core_runtime_coverage - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_core_runtime_coverage
+    wrp_cte_core_runtime         # CTE core runtime library
+    wrp_cte_core_client          # CTE core client library
+    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
+    chimaera::admin_client       # Admin module client
+    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    chimaera::bdev_client        # Bdev client for BdevType enum
+    hshm::cxx                    # HermesShm library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+# Link test_tiered_storage_stress - using simple_test.h framework (NOT Catch2)
+target_link_libraries(test_tiered_storage_stress
+    wrp_cte_core_runtime         # CTE core runtime library
+    wrp_cte_core_client          # CTE core client library
+    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
+    chimaera::admin_client       # Admin module client
+    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    chimaera::bdev_client        # Bdev client for BdevType enum
+    hshm::cxx                    # HermesShm library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+# Link test_reorganize_blob - using simple_test.h framework (NOT Catch2)
+target_link_libraries(test_reorganize_blob
     wrp_cte_core_runtime         # CTE core runtime library
     wrp_cte_core_client          # CTE core client library
     chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
@@ -544,11 +586,61 @@ set_tests_properties(
         LABELS "unit;core;cte;runtime;coverage"
 )
 
+# Add tiered storage stress tests
+add_test(NAME cte_tiered_storage_put
+    COMMAND test_tiered_storage_stress "TieredStorage - Put 128MB with 64MB DRAM")
+
+add_test(NAME cte_tiered_storage_reorganize
+    COMMAND test_tiered_storage_stress "TieredStorage - ReorganizeBlob to score 0")
+
+add_test(NAME cte_tiered_storage_integrity
+    COMMAND test_tiered_storage_stress "TieredStorage - Verify data integrity")
+
+add_test(NAME cte_tiered_storage_cleanup
+    COMMAND test_tiered_storage_stress "TieredStorage - Cleanup")
+
+set_tests_properties(
+    cte_tiered_storage_put
+    cte_tiered_storage_reorganize
+    cte_tiered_storage_integrity
+    cte_tiered_storage_cleanup
+    PROPERTIES
+        TIMEOUT 300  # 5 minute timeout for each test
+        LABELS "stress;tiered;cte"
+)
+
+# Add reorganize blob tests
+add_test(NAME cte_reorganize_put_dram
+    COMMAND test_reorganize_blob "ReorganizeBlob - PutBlob to DRAM")
+
+add_test(NAME cte_reorganize_move_disk
+    COMMAND test_reorganize_blob "ReorganizeBlob - Move to Disk")
+
+add_test(NAME cte_reorganize_integrity
+    COMMAND test_reorganize_blob "ReorganizeBlob - Verify Data Integrity")
+
+add_test(NAME cte_reorganize_promote_dram
+    COMMAND test_reorganize_blob "ReorganizeBlob - Promote to DRAM")
+
+add_test(NAME cte_reorganize_cleanup
+    COMMAND test_reorganize_blob "ReorganizeBlob - Cleanup")
+
+set_tests_properties(
+    cte_reorganize_put_dram
+    cte_reorganize_move_disk
+    cte_reorganize_integrity
+    cte_reorganize_promote_dram
+    cte_reorganize_cleanup
+    PROPERTIES
+        TIMEOUT 300  # 5 minute timeout for each test
+        LABELS "unit;reorganize;cte"
+)
+
 # ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
 # Install Targets
 # ------------------------------------------------------------------------------
-install(TARGETS cte_core_unit_tests test_core_functionality test_query test_tag_operations test_core_client_config test_core_runtime_coverage
+install(TARGETS cte_core_unit_tests test_core_functionality test_query test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_reorganize_blob
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
