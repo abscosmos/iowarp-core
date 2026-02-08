@@ -844,9 +844,12 @@ void *IpcManager::GetHeartbeatSocket() const { return heartbeat_socket_; }
 const Host &IpcManager::GetThisHost() const { return this_host_; }
 
 FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
+#if HSHM_IS_HOST
+  // HOST-ONLY PATH: The device implementation is in ipc_manager.h
+
   // RUNTIME PATH: Use private memory (HSHM_MALLOC) to avoid shared memory
   // allocation and IncreaseMemory calls which can cause deadlocks
-  if (CHI_CHIMAERA_MANAGER->IsRuntime()) {
+  if (CHI_CHIMAERA_MANAGER && CHI_CHIMAERA_MANAGER->IsRuntime()) {
     // Use HSHM_MALLOC allocator for private memory allocation
     FullPtr<char> buffer = HSHM_MALLOC->AllocateObjs<char>(size);
     if (buffer.IsNull()) {
@@ -901,6 +904,10 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
        "memory",
        size);
   return FullPtr<char>::GetNull();
+#else
+  // GPU PATH: Handled by inline __device__ implementation in ipc_manager.h
+  return FullPtr<char>::GetNull();
+#endif  // HSHM_IS_HOST
 }
 
 void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
@@ -1457,6 +1464,31 @@ bool IpcManager::GetIsClientThread() const {
     return false;
   }
   return *flag;
+}
+
+//==============================================================================
+// GPU Memory Management
+//==============================================================================
+
+bool IpcManager::RegisterAcceleratorMemory(const hipc::MemoryBackend &backend) {
+#if !HSHM_ENABLE_CUDA && !HSHM_ENABLE_ROCM
+  HLOG(kError,
+       "RegisterAcceleratorMemory: GPU support not enabled at compile time");
+  return false;
+#else
+  // Store the GPU backend for later use
+  // This is called from GPU kernels where we have limited capability
+  // The actual allocation happens in CHIMAERA_GPU_INIT macro where
+  // each thread gets its own ArenaAllocator instance
+  gpu_backend_ = backend;
+  gpu_backend_initialized_ = true;
+
+  // Note: In GPU kernels, each thread maintains its own ArenaAllocator
+  // The macro CHIMAERA_GPU_INIT handles per-thread allocator setup
+  // No need to initialize allocators here as they're created per-thread in __shared__ memory
+
+  return true;
+#endif
 }
 
 }  // namespace chi

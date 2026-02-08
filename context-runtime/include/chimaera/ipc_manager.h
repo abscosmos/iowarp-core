@@ -56,6 +56,11 @@
 #include "chimaera/worker.h"
 #include "hermes_shm/memory/backend/posix_shm_mmap.h"
 
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+#include "hermes_shm/memory/backend/gpu_malloc.h"
+#include "hermes_shm/memory/allocator/buddy_allocator.h"
+#endif
+
 namespace chi {
 
 /**
@@ -184,6 +189,20 @@ class IpcManager {
   void ServerFinalize();
 
   /**
+   * Initialize GPU client components
+   * Sets up GPU-specific fields without calling constructor
+   * @param backend GPU memory backend
+   * @param allocator Pre-initialized GPU allocator
+   */
+  HSHM_CROSS_FUN
+  void ClientGpuInit(const hipc::MemoryBackend &backend,
+                     hipc::ArenaAllocator<false> *allocator) {
+    gpu_backend_ = backend;
+    gpu_backend_initialized_ = true;
+    gpu_thread_allocator_ = allocator;
+  }
+
+  /**
    * Create a new task in private memory (using standard new)
    * @param args Constructor arguments for the task
    * @return FullPtr wrapping the task with null allocator
@@ -214,7 +233,7 @@ class IpcManager {
    * @param size Size in bytes to allocate
    * @return FullPtr<char> to allocated memory
    */
-  FullPtr<char> AllocateBuffer(size_t size);
+  HSHM_CROSS_FUN FullPtr<char> AllocateBuffer(size_t size);
 
   /**
    * Free buffer from appropriate memory segment
@@ -642,7 +661,16 @@ class IpcManager {
    * match
    */
   template <typename T>
-  hipc::FullPtr<T> ToFullPtr(const hipc::ShmPtr<T> &shm_ptr) {
+  HSHM_CROSS_FUN hipc::FullPtr<T> ToFullPtr(const hipc::ShmPtr<T> &shm_ptr) {
+#if HSHM_IS_GPU
+    // GPU PATH: Simple conversion using the warp allocator
+    if (shm_ptr.IsNull()) {
+      return hipc::FullPtr<T>();
+    }
+    // Convert ShmPtr offset to pointer (assumes GPU path uses simple offset scheme)
+    return hipc::FullPtr<T>(gpu_thread_allocator_, shm_ptr);
+#else
+    // HOST PATH: Full allocator lookup implementation
     // Case 1: AllocatorId is null - offset IS the raw memory address
     // This is used for private memory allocations (new/delete)
     if (shm_ptr.alloc_id_ == hipc::AllocatorId::GetNull()) {
@@ -673,6 +701,7 @@ class IpcManager {
     allocator_map_lock_.ReadUnlock();
 
     return result;
+#endif
   }
 
   /**
@@ -687,7 +716,15 @@ class IpcManager {
    * allocator if no match (private memory)
    */
   template <typename T>
-  hipc::FullPtr<T> ToFullPtr(T *ptr) {
+  HSHM_CROSS_FUN hipc::FullPtr<T> ToFullPtr(T *ptr) {
+#if HSHM_IS_GPU
+    // GPU PATH: Wrap raw pointer with warp allocator
+    if (ptr == nullptr) {
+      return hipc::FullPtr<T>();
+    }
+    return hipc::FullPtr<T>(gpu_thread_allocator_, ptr);
+#else
+    // HOST PATH: Full allocator lookup implementation
     if (ptr == nullptr) {
       return hipc::FullPtr<T>();
     }
@@ -716,6 +753,7 @@ class IpcManager {
     // No matching allocator found - treat as private memory
     // Return FullPtr with the raw pointer (null allocator ID)
     return hipc::FullPtr<T>(ptr);
+#endif
   }
 
   /**
@@ -828,6 +866,18 @@ class IpcManager {
    * @return Number of shared memory segments successfully removed
    */
   size_t ClearUserIpcs();
+
+  /**
+   * Register GPU accelerator memory backend (GPU kernel use only)
+   *
+   * Called from GPU kernels to store GPU memory backend reference.
+   * Per-thread BuddyAllocators are initialized in CHIMAERA_GPU_INIT macro.
+   *
+   * @param backend GPU memory backend to register
+   * @return true on success, false on failure
+   */
+  HSHM_CROSS_FUN
+  bool RegisterAcceleratorMemory(const hipc::MemoryBackend &backend);
 
  private:
   /**
@@ -948,6 +998,19 @@ class IpcManager {
    */
   chi::CoRwLock allocator_map_lock_;
 
+  //============================================================================
+  // GPU Memory Management (public for CHIMAERA_GPU_INIT macro access)
+  //============================================================================
+
+  /** GPU memory backend for device memory (GPU kernels only) */
+  hipc::MemoryBackend gpu_backend_;
+
+  /** Pointer to current thread's GPU ArenaAllocator (GPU kernel only) */
+  hipc::ArenaAllocator<false> *gpu_thread_allocator_ = nullptr;
+
+  /** Flag indicating if GPU backend is initialized */
+  bool gpu_backend_initialized_ = false;
+
  private:
   /**
    * Vector of allocators owned by this process
@@ -985,9 +1048,55 @@ HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
 // Macro for accessing the IPC manager singleton using global pointer variable
 #define CHI_IPC HSHM_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
 
+// GPU kernel initialization macro
+// Creates a shared IPC manager instance in GPU __shared__ memory
+// Each thread has its own ArenaAllocator for memory allocation
+// Supports 1D, 2D, and 3D thread blocks (max 1024 threads per block)
+//
+// Usage in GPU kernel:
+//   __global__ void my_kernel(const hipc::MemoryBackend* backend) {
+//     CHIMAERA_GPU_INIT(*backend);
+//     // Now CHI_IPC->AllocateBuffer() works for this thread
+//   }
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+#define CHIMAERA_GPU_INIT(backend)                                                          \
+  __shared__ char g_ipc_manager_storage[sizeof(chi::IpcManager)];                           \
+  __shared__ chi::IpcManager *g_ipc_manager_ptr;                                            \
+  __shared__ hipc::ArenaAllocator<false> *g_arena_alloc;                                    \
+  /* Compute linear thread ID for 1D/2D/3D blocks */                                        \
+  int thread_id = threadIdx.x +                                                              \
+                  threadIdx.y * blockDim.x +                                                 \
+                  threadIdx.z * blockDim.x * blockDim.y;                                     \
+  if (thread_id == 0) {                                                                      \
+    /* Place ArenaAllocator at the beginning of backend's data region */                    \
+    g_arena_alloc = reinterpret_cast<hipc::ArenaAllocator<false>*>(backend.data_);         \
+    new (g_arena_alloc) hipc::ArenaAllocator<false>();                                      \
+    g_arena_alloc->shm_init(backend, backend.data_capacity_);                              \
+    /* Point to IpcManager storage without calling constructor */                           \
+    /* Do NOT use placement new - IpcManager has STL members that can't init on GPU */      \
+    g_ipc_manager_ptr = reinterpret_cast<chi::IpcManager*>(g_ipc_manager_storage);         \
+    /* Initialize GPU-specific fields */                                                    \
+    g_ipc_manager_ptr->ClientGpuInit(backend, g_arena_alloc);                              \
+  }                                                                                           \
+  __syncthreads();                                                                           \
+  chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr
+#endif
+
 // Define Future methods after IpcManager and CHI_IPC are fully defined
 // This avoids circular dependency issues between task.h and ipc_manager.h
 namespace chi {
+
+// GPU device implementation of AllocateBuffer
+// ToFullPtr implementations are inline in the class above
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+inline __device__ hipc::FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
+  // GPU PATH: Use per-warp ArenaAllocator
+  if (gpu_backend_initialized_ && gpu_thread_allocator_ != nullptr) {
+    return gpu_thread_allocator_->AllocateObjs<char>(size);
+  }
+  return hipc::FullPtr<char>::GetNull();
+}
+#endif
 
 // GetFutureShm() implementation - converts internal ShmPtr to FullPtr
 template <typename TaskT, typename AllocT>

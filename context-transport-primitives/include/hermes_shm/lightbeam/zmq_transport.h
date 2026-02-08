@@ -356,7 +356,7 @@ class ZeroMqServer : public Server {
   int GetFd() const {
     int fd;
     size_t fd_size = sizeof(fd);
-    zmq_getsockopt(socket_, ZMQ_FD, &fd, &fd_size);
+    zmq_getsockopt(socket_, ZMQ_FD, &fd, reinterpret_cast<::size_t *>(&fd_size));
     return fd;
   }
 

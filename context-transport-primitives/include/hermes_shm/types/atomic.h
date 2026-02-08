@@ -357,7 +357,11 @@ struct rocm_atomic {
   template <typename U>
   HSHM_INLINE_CROSS_FUN T
   exchange(U count, std::memory_order order = std::memory_order_seq_cst) {
-    return atomicExch(&x, count);
+    if constexpr (sizeof(T) == 8) {
+      return atomicExch(reinterpret_cast<unsigned long long*>(&x), static_cast<unsigned long long>(count));
+    } else {
+      return atomicExch(&x, count);
+    }
   }
 
   /** Atomic compare exchange weak wrapper */

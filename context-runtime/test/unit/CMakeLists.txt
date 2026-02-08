@@ -76,6 +76,12 @@ set(IPC_ERRORS_TEST_SOURCES
   test_ipc_errors.cc
 )
 
+# GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
+set(IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET chimaera_ipc_allocate_buffer_gpu_tests)
+set(IPC_ALLOCATE_BUFFER_GPU_TEST_SOURCES
+  test_ipc_allocate_buffer_gpu.cc
+)
+
 # Create core test executable
 add_executable(${TEST_TARGET} ${TEST_SOURCES})
 
@@ -335,6 +341,56 @@ set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
 set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
+# Create GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
+if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
+  # Copy source to cuda subdirectory and mark as CUDA
+  set(GPU_TEST_CUDA_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/cuda/${IPC_ALLOCATE_BUFFER_GPU_TEST_SOURCES})
+  configure_file(${IPC_ALLOCATE_BUFFER_GPU_TEST_SOURCES} ${GPU_TEST_CUDA_SOURCE} COPYONLY)
+  set_source_files_properties(${GPU_TEST_CUDA_SOURCE} PROPERTIES LANGUAGE CUDA)
+
+  add_executable(${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET} ${GPU_TEST_CUDA_SOURCE})
+
+  target_include_directories(${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET} PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/test  # For test utilities
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For accessing original source directory
+  )
+
+  target_link_libraries(${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET}
+    chimaera_cxx               # Main Chimaera library
+    hshm::cuda_cxx             # HermesShm CUDA library with GPU support
+    ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+  )
+
+  set_target_properties(${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+  )
+
+  target_compile_options(${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET} PUBLIC
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+
+  set_target_properties(${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+
+  if(CHIMAERA_ENABLE_TESTS)
+    add_test(
+      NAME cr_gpu_allocate_buffer_tests
+      COMMAND ${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_gpu_allocate_buffer_tests PROPERTIES
+      ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    )
+  endif()
+endif()
 
 # Enable CTest integration if testing is enabled
 if(CHIMAERA_ENABLE_TESTS)
