@@ -2,18 +2,25 @@
 ################################################################################
 # IOWarp Core - Code Coverage Calculation Script
 #
-# This script runs all unit tests (CTest + distributed tests) and generates
-# comprehensive code coverage reports.
+# This script collects coverage data and generates comprehensive code coverage
+# reports. By default, it assumes the project has already been built with
+# coverage enabled and tests have been run.
 #
 # Usage:
 #   ./CI/calculate_coverage.sh [options]
 #
 # Options:
-#   --skip-build          Skip the build step (use existing build)
-#   --skip-ctest          Skip CTest tests (only run distributed tests)
-#   --skip-distributed    Skip distributed tests (only run CTest)
+#   --build               Build the project with coverage instrumentation
+#   --run-ctest           Run CTest unit tests
+#   --run-distributed     Run distributed tests (requires Docker)
+#   --all                 Build and run all tests (equivalent to --build --run-ctest --run-distributed)
 #   --clean               Clean build directory before starting
 #   --help                Show this help message
+#
+# Examples:
+#   ./CI/calculate_coverage.sh              # Just generate reports from existing data
+#   ./CI/calculate_coverage.sh --all        # Full build + test + report generation
+#   ./CI/calculate_coverage.sh --run-ctest  # Run CTest and generate reports
 #
 ################################################################################
 
@@ -24,10 +31,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/build"
 
-# Default options
-SKIP_BUILD=false
-SKIP_CTEST=false
-SKIP_DISTRIBUTED=false
+# Default options - skip build and tests by default
+DO_BUILD=false
+DO_CTEST=false
+DO_DISTRIBUTED=false
 CLEAN_BUILD=false
 
 # Colors for output
@@ -74,16 +81,22 @@ show_help() {
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --skip-build)
-            SKIP_BUILD=true
+        --build)
+            DO_BUILD=true
             shift
             ;;
-        --skip-ctest)
-            SKIP_CTEST=true
+        --run-ctest)
+            DO_CTEST=true
             shift
             ;;
-        --skip-distributed)
-            SKIP_DISTRIBUTED=true
+        --run-distributed)
+            DO_DISTRIBUTED=true
+            shift
+            ;;
+        --all)
+            DO_BUILD=true
+            DO_CTEST=true
+            DO_DISTRIBUTED=true
             shift
             ;;
         --clean)
@@ -120,34 +133,34 @@ if [ "$CLEAN_BUILD" = true ]; then
 fi
 
 ################################################################################
-# Step 2: Configure and build with coverage enabled
+# Step 2: Configure and build with coverage enabled (optional)
 ################################################################################
 
-if [ "$SKIP_BUILD" = false ]; then
+if [ "$DO_BUILD" = true ]; then
     print_header "Step 1: Building with Coverage Instrumentation"
 
     print_info "Configuring build with coverage enabled..."
     cmake --preset=debug -DWRP_CORE_ENABLE_COVERAGE=ON
 
-    print_info "Building project (this may take a few minutes)..."
+    print_info "Building project..."
     NUM_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
     cmake --build "${BUILD_DIR}" -- -j"${NUM_CORES}"
 
     print_success "Build completed successfully"
 else
-    print_warning "Skipping build step (using existing build)"
+    print_info "Skipping build step (use --build to enable)"
 
     if [ ! -d "${BUILD_DIR}" ]; then
-        print_error "Build directory does not exist. Remove --skip-build option."
+        print_error "Build directory does not exist. Use --build option or build manually first."
         exit 1
     fi
 fi
 
 ################################################################################
-# Step 3: Run CTest unit tests
+# Step 3: Run CTest unit tests (optional)
 ################################################################################
 
-if [ "$SKIP_CTEST" = false ]; then
+if [ "$DO_CTEST" = true ]; then
     print_header "Step 2: Running CTest Unit Tests"
 
     cd "${BUILD_DIR}"
@@ -165,14 +178,14 @@ if [ "$SKIP_CTEST" = false ]; then
 
     cd "${REPO_ROOT}"
 else
-    print_warning "Skipping CTest tests"
+    print_info "Skipping CTest tests (use --run-ctest to enable)"
 fi
 
 ################################################################################
-# Step 4: Run distributed tests
+# Step 4: Run distributed tests (optional)
 ################################################################################
 
-if [ "$SKIP_DISTRIBUTED" = false ]; then
+if [ "$DO_DISTRIBUTED" = true ]; then
     print_header "Step 3: Running Distributed Tests"
 
     # Check if Docker is available
@@ -192,8 +205,8 @@ if [ "$SKIP_DISTRIBUTED" = false ]; then
         print_warning "Skipping distributed tests (Docker not available)"
         print_info "Install Docker to enable distributed tests"
     else
-        # Find all distributed test directories
-        DISTRIBUTED_DIRS=$(find "${REPO_ROOT}" -type d -path "*/test/unit/distributed" 2>/dev/null)
+        # Find all distributed test directories (in integration folders)
+        DISTRIBUTED_DIRS=$(find "${REPO_ROOT}" -type d -path "*/test/integration/distributed" 2>/dev/null)
 
         if [ -z "$DISTRIBUTED_DIRS" ]; then
             print_warning "No distributed test directories found"
@@ -204,7 +217,7 @@ if [ "$SKIP_DISTRIBUTED" = false ]; then
 
             for TEST_DIR in $DISTRIBUTED_DIRS; do
                 if [ -f "${TEST_DIR}/run_tests.sh" ]; then
-                    COMPONENT_NAME=$(echo "$TEST_DIR" | sed 's|.*/\([^/]*\)/test/unit/distributed|\1|')
+                    COMPONENT_NAME=$(echo "$TEST_DIR" | sed 's|.*/\([^/]*\)/test/integration/distributed|\1|')
                     print_info "Running distributed tests for: ${COMPONENT_NAME}"
 
                     DIST_TEST_COUNT=$((DIST_TEST_COUNT + 1))
@@ -260,7 +273,7 @@ if [ "$SKIP_DISTRIBUTED" = false ]; then
         fi
     fi
 else
-    print_warning "Skipping distributed tests (--skip-distributed flag)"
+    print_info "Skipping distributed tests (use --run-distributed to enable)"
 fi
 
 ################################################################################
@@ -271,12 +284,25 @@ print_header "Step 4: Collecting and Merging Coverage Data"
 
 cd "${BUILD_DIR}"
 
-print_info "Capturing final coverage data with lcov..."
+print_info "Capturing final coverage data with lcov (using RC file for comprehensive error handling)..."
+# Create temporary lcovrc to handle all known coverage data issues
+cat > lcovrc_temp << 'EOFRC'
+geninfo_unexecuted_blocks = 1
+geninfo_compat_libtool = 1
+lcov_branch_coverage = 0
+EOFRC
+
+# Use geninfo directly with comprehensive error ignoring for all components at once
+# This approach gives more accurate results than capturing from root directory
 lcov --capture \
      --directory . \
      --output-file coverage_combined.info \
-     --ignore-errors mismatch,negative,inconsistent \
-     2>&1 | grep -E "Processing|Finished|WARNING|ERROR" || true
+     --rc lcov_branch_coverage=0 \
+     --rc geninfo_unexecuted_blocks=1 \
+     --ignore-errors graph,mismatch,negative,inconsistent,unused,empty,gcov,source \
+     2>&1 | grep -E "Found [0-9]+ data files|Finished" || true
+
+rm -f lcovrc_temp
 
 if [ ! -f coverage_combined.info ] || [ ! -s coverage_combined.info ]; then
     print_error "Failed to generate coverage data"
@@ -294,13 +320,18 @@ print_success "Coverage data captured and merged"
 
 print_header "Step 5: Filtering Coverage Data"
 
-print_info "Filtering out system headers and test files..."
+print_info "Filtering out system headers, conda headers, test files, and external dependencies..."
 lcov --remove coverage_all.info \
      '/usr/*' \
      '*/test/*' \
+     '*/miniconda3/*' \
+     '*/conda/*' \
+     '*/external/*' \
+     '*/catch2/*' \
+     '*/nanobind/*' \
      --output-file coverage_filtered.info \
      --ignore-errors mismatch,negative,unused \
-     2>&1 | grep -E "Excluding|Summary|lines|functions" || true
+     2>&1 | grep -E "Removed|Summary|lines|functions" | tail -5 || true
 
 if [ ! -f coverage_filtered.info ] || [ ! -s coverage_filtered.info ]; then
     print_error "Failed to filter coverage data"
@@ -342,29 +373,36 @@ TMP_DIR=$(mktemp -d)
 # Extract coverage for each component
 print_info "Extracting component coverage..."
 
+# CTP is mostly header-only, so include both src/ and include/
 lcov --extract coverage_filtered.info \
      '/workspace/context-transport-primitives/src/*' \
+     '/workspace/context-transport-primitives/include/*' \
      --output-file "${TMP_DIR}/ctp.info" \
      --ignore-errors mismatch,negative,unused >/dev/null 2>&1 || true
 
 lcov --extract coverage_filtered.info \
      '/workspace/context-runtime/src/*' \
+     '/workspace/context-runtime/include/*' \
      '/workspace/context-runtime/modules/*/src/*' \
+     '/workspace/context-runtime/modules/*/include/*' \
      --output-file "${TMP_DIR}/runtime.info" \
      --ignore-errors mismatch,negative,unused >/dev/null 2>&1 || true
 
 lcov --extract coverage_filtered.info \
      '/workspace/context-transfer-engine/core/src/*' \
+     '/workspace/context-transfer-engine/core/include/*' \
      --output-file "${TMP_DIR}/cte.info" \
      --ignore-errors mismatch,negative,unused >/dev/null 2>&1 || true
 
 lcov --extract coverage_filtered.info \
      '/workspace/context-assimilation-engine/core/src/*' \
+     '/workspace/context-assimilation-engine/core/include/*' \
      --output-file "${TMP_DIR}/cae.info" \
      --ignore-errors mismatch,negative,unused >/dev/null 2>&1 || true
 
 lcov --extract coverage_filtered.info \
      '/workspace/context-exploration-engine/api/src/*' \
+     '/workspace/context-exploration-engine/api/include/*' \
      --output-file "${TMP_DIR}/cee.info" \
      --ignore-errors mismatch,negative,unused >/dev/null 2>&1 || true
 

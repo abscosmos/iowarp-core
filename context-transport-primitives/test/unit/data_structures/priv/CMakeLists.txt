@@ -23,32 +23,32 @@ target_link_libraries(test_priv_string_exec
 #------------------------------------------------------------------------------
 
 add_test(NAME ctp_priv_vector COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec "[priv_vector]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec)
 add_test(NAME ctp_priv_vector_pod COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec "[priv_vector][pod]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec)
 add_test(NAME ctp_priv_vector_complex COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec "[priv_vector][complex]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec)
 add_test(NAME ctp_priv_vector_edge COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec "[priv_vector][edge]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec)
 add_test(NAME ctp_priv_vector_stress COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec "[priv_vector][stress]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec)
 add_test(NAME ctp_priv_vector_serialization COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec "[priv_vector][serialization]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec)
 add_test(NAME ctp_priv_vector_local_serialize COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec "[priv_vector][local_serialize]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec)
 
 add_test(NAME ctp_priv_string COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec "[priv_string]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec)
 add_test(NAME ctp_priv_string_sso COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec "[priv_string][sso]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec)
 add_test(NAME ctp_priv_string_operations COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec "[priv_string][operation]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec)
 add_test(NAME ctp_priv_string_edge COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec "[priv_string][edge]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec)
 add_test(NAME ctp_priv_string_serialization COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec "[priv_string][serialization]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec)
 add_test(NAME ctp_priv_string_local_serialize COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec "[priv_string][local_serialize]")
+        ${CMAKE_BINARY_DIR}/bin/test_priv_string_exec)
 
 #------------------------------------------------------------------------------
 # Install Targets
@@ -60,10 +60,3 @@ install(TARGETS
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
 
-#-----------------------------------------------------------------------------
-# Coverage
-#-----------------------------------------------------------------------------
-if(HSHM_ENABLE_COVERAGE)
-    set_coverage_flags(test_priv_vector_exec)
-    set_coverage_flags(test_priv_string_exec)
-endif()

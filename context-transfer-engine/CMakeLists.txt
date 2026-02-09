@@ -8,7 +8,6 @@ set(WRP_CTE_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 # It controls both compressor chimod building and HSHM compression support
 
 # Python bindings are controlled by WRP_CORE_ENABLE_PYTHON in root CMakeLists.txt
-# WRP_CTE_ENABLE_PYTHON is defined in root CMakeLists.txt
 # CTE_ENABLE_ASAN is set by root CMakeLists.txt
 
 # C++ standard, compile commands, RPATH, ASAN, and output directories are all set by root CMakeLists.txt
@@ -55,8 +54,8 @@ add_subdirectory(adapter)
 include(CTest)
 
 # Add tests if enabled
-# WRP_CTE_ENABLE_TESTS is set by root CMakeLists.txt
-if(WRP_CTE_ENABLE_TESTS)
+# Tests are controlled by WRP_CORE_ENABLE_TESTS in root CMakeLists.txt
+if(WRP_CORE_ENABLE_TESTS)
   add_subdirectory(test)
   message(STATUS "CTE tests enabled - added test subdirectory")
 endif()
@@ -65,8 +64,8 @@ endif()
 add_subdirectory(wrapper)
 
 # Add benchmarks if enabled
-# WRP_CTE_ENABLE_BENCHMARKS is set by root CMakeLists.txt
-if(WRP_CTE_ENABLE_BENCHMARKS)
+# Benchmarks are controlled by WRP_CORE_ENABLE_BENCHMARKS
+if(WRP_CORE_ENABLE_BENCHMARKS)
   add_subdirectory(benchmark)
   message(STATUS "CTE benchmarks enabled - added benchmark subdirectory")
 endif()

@@ -49,7 +49,7 @@ endif()
 list(APPEND HSHM_LIBS cxx)
 
 # BUILD HSHM FOR CUDA ONLY
-if(HSHM_ENABLE_CUDA)
+if(WRP_CORE_ENABLE_CUDA)
     add_cuda_library(hermes_shm_cuda SHARED TRUE ${SRC_FILES})
     target_link_libraries(hermes_shm_cuda PUBLIC host_deps)
     target_compile_definitions(hermes_shm_cuda PUBLIC HSHM_ENABLE_CUDA=1)
@@ -69,7 +69,7 @@ if(HSHM_ENABLE_CUDA)
 endif()
 
 # BUILD HSHM FOR ROCM ONLY
-if(HSHM_ENABLE_ROCM)
+if(WRP_CORE_ENABLE_ROCM)
     add_rocm_gpu_library(hermes_shm_rocm_gpu STATIC TRUE ${SRC_FILES})
     target_link_libraries(hermes_shm_rocm_gpu PUBLIC host_deps)
     target_compile_definitions(hermes_shm_rocm_gpu PUBLIC HSHM_ENABLE_ROCM=1)
@@ -126,9 +126,3 @@ install(TARGETS
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin)
 
-# -----------------------------------------------------------------------------
-# Coverage
-# -----------------------------------------------------------------------------
-if(HSHM_ENABLE_COVERAGE)
-    set_coverage_flags(hermes_shm_host)
-endif()

@@ -1,14 +1,35 @@
-/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
- * Distributed under BSD 3-Clause license.                                   *
- * Copyright by The HDF Group.                                               *
- * Copyright by the Illinois Institute of Technology.                        *
- * All rights reserved.                                                      *
- *                                                                           *
- * This file is part of Hermes. The full Hermes copyright notice, including  *
- * terms governing use, modification, and redistribution, is contained in    *
- * the COPYING file, which can be found at the top directory. If you do not  *
- * have access to the file, you may request a copy from help@hdfgroup.org.   *
- * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
 
 #ifndef HSHM_DATA_STRUCTURES_IPC_VECTOR_H_
 #define HSHM_DATA_STRUCTURES_IPC_VECTOR_H_
@@ -1780,13 +1801,7 @@ vector<T, AllocT>::operator=(const vector &other) {
   // Clear current contents
   clear();
 
-  // Set allocator from other (recalculate offset for this address)
-  AllocT *alloc = other.GetAllocator();
-  if (alloc) {
-    this->this_ = OffsetPtr<void>((size_t)this - (size_t)alloc);
-  } else {
-    this->this_ = OffsetPtr<void>::GetNull();
-  }
+  // Note: this_ is not copied - it's position-dependent and set during construction
 
   // Copy elements from other
   if (other.size_ > 0) {
@@ -1820,13 +1835,8 @@ vector<T, AllocT>::operator=(vector &&other) noexcept {
   DestroyElements();
   DeallocateStorage();
 
-  // Move data from other (recalculate offset for this address)
-  AllocT *alloc = other.GetAllocator();
-  if (alloc) {
-    this->this_ = OffsetPtr<void>((size_t)this - (size_t)alloc);
-  } else {
-    this->this_ = OffsetPtr<void>::GetNull();
-  }
+  // Move data from other
+  // Note: this_ is not copied - it's position-dependent and set during construction
   size_ = other.size_;
   capacity_ = other.capacity_;
   data_ = other.data_;

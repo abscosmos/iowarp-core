@@ -9,15 +9,12 @@ pkgs:
     pkg_name: runtime
 
     # Worker thread configuration
-    low_latency_workers: 4
-    high_latency_workers: 2
-    reinforcement_workers: 1
+    num_threads: 4
     process_reaper_workers: 1
 
     # Memory segment configuration
-    main_segment_size: "1G"
+    main_segment_size: "auto"
     client_data_segment_size: "512M"
-    runtime_data_segment_size: "512M"
 
     # Networking
     port: 5555
@@ -26,8 +23,7 @@ pkgs:
     log_level: "info"
 
     # Runtime configuration
-    stack_size: 65536
-    queue_depth: 10000
+    queue_depth: 1024
     local_sched: "default"
     heartbeat_interval: 1000
     sleep: 1

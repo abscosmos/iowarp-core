@@ -205,6 +205,28 @@ if(CHIMAERA_ENABLE_TESTS)
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
   )
 
+  # Compose Tests
+  add_test(
+    NAME cr_compose_tests
+    COMMAND ${COMPOSE_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_compose_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CHIMAERA_TEST_MODE=1"
+    TIMEOUT 180
+  )
+
+  # Submit Batch Tests
+  add_test(
+    NAME cr_submit_batch_tests
+    COMMAND ${SUBMIT_BATCH_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_submit_batch_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CHIMAERA_TEST_MODE=1"
+    TIMEOUT 180
+  )
+
   # Set test properties
   set_tests_properties(
     cr_task_archive_basic_tests

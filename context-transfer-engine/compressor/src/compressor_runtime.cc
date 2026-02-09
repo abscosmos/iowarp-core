@@ -1,3 +1,36 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 // Copyright 2024 IOWarp contributors
 #include <wrp_cte/compressor/compressor_runtime.h>
 
@@ -30,22 +63,27 @@ using chi::Worker;
  */
 struct CompressionHeader {
   static constexpr uint32_t kMagic = 0x43544543;  // "CTEC" in ASCII
-  uint32_t magic_;           // Magic number to identify compressed data
-  uint32_t compress_lib_;    // Compression library ID
-  uint32_t compress_preset_; // Compression preset
-  uint64_t original_size_;   // Original uncompressed size
+  uint32_t magic_;            // Magic number to identify compressed data
+  uint32_t compress_lib_;     // Compression library ID
+  uint32_t compress_preset_;  // Compression preset
+  uint64_t original_size_;    // Original uncompressed size
 
   CompressionHeader()
-      : magic_(kMagic), compress_lib_(0), compress_preset_(0),
+      : magic_(kMagic),
+        compress_lib_(0),
+        compress_preset_(0),
         original_size_(0) {}
 
   CompressionHeader(uint32_t lib, uint32_t preset, uint64_t orig_size)
-      : magic_(kMagic), compress_lib_(lib), compress_preset_(preset),
+      : magic_(kMagic),
+        compress_lib_(lib),
+        compress_preset_(preset),
         original_size_(orig_size) {}
 
   bool IsValid() const { return magic_ == kMagic; }
 };
-static_assert(sizeof(CompressionHeader) == 24, "CompressionHeader must be 24 bytes");
+static_assert(sizeof(CompressionHeader) == 24,
+              "CompressionHeader must be 24 bytes");
 
 chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
                                 chi::RunContext& ctx) {
@@ -59,10 +97,11 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
   // Load Q-table model if configured (primary prediction method)
   if (!config_.qtable_model_path_.empty()) {
     try {
-      HLOG(kInfo, "Loading Q-table model from: {}", config_.qtable_model_path_);
+      HLOG(kDebug, "Loading Q-table model from: {}",
+           config_.qtable_model_path_);
       qtable_predictor_ = std::make_unique<QTablePredictor>();
       if (qtable_predictor_->Load(config_.qtable_model_path_)) {
-        HLOG(kInfo, "Q-table model loaded successfully with {} states",
+        HLOG(kDebug, "Q-table model loaded successfully with {} states",
              qtable_predictor_->GetNumStates());
       } else {
         HLOG(kWarning, "Failed to load Q-table model from: {}",
@@ -78,11 +117,11 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
   // Load LinReg table model if configured
   if (!config_.linreg_model_path_.empty()) {
     try {
-      HLOG(kInfo, "Loading LinReg table model from: {}",
+      HLOG(kDebug, "Loading LinReg table model from: {}",
            config_.linreg_model_path_);
       linreg_predictor_ = std::make_unique<LinRegTablePredictor>();
       if (linreg_predictor_->Load(config_.linreg_model_path_)) {
-        HLOG(kInfo, "LinReg table model loaded successfully");
+        HLOG(kDebug, "LinReg table model loaded successfully");
       } else {
         HLOG(kWarning, "Failed to load LinReg table model from: {}",
              config_.linreg_model_path_);
@@ -99,7 +138,7 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
     // Note: DistributionClassifier is template-based - use
     // DistributionClassifierFactory::Classify() directly No model loading
     // needed - the factory uses built-in mathematical classification
-    HLOG(kInfo,
+    HLOG(kDebug,
          "Distribution classifier available via factory (no model loading "
          "required)");
   }
@@ -108,11 +147,11 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
   // Load DNN model weights as fallback if Q-table not available
   if (!qtable_predictor_ && !config_.dnn_model_weights_path_.empty()) {
     try {
-      HLOG(kInfo, "Loading DNN model weights from: {}",
+      HLOG(kDebug, "Loading DNN model weights from: {}",
            config_.dnn_model_weights_path_);
       nn_predictor_ = std::make_unique<DenseNNPredictor>();
       if (nn_predictor_->LoadWeights(config_.dnn_model_weights_path_)) {
-        HLOG(kInfo, "DNN model loaded successfully");
+        HLOG(kDebug, "DNN model loaded successfully");
       } else {
         HLOG(kWarning, "Failed to load DNN model weights from: {}",
              config_.dnn_model_weights_path_);
@@ -131,7 +170,7 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
          "disabled");
   }
 
-  HLOG(kInfo,
+  HLOG(kDebug,
        "CTE Compressor container created and initialized for pool: {} (ID: {})",
        pool_name_, pool_id_);
 
@@ -153,7 +192,7 @@ chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task,
     // Clear compression telemetry log if allocated
     // ShmPtr cleanup handled automatically
 
-    HLOG(kInfo, "CTE Compressor container destroyed successfully");
+    HLOG(kDebug, "CTE Compressor container destroyed successfully");
   } catch (const std::exception& e) {
     HLOG(kError, "Exception during compressor destroy: {}", e.what());
   }
@@ -395,7 +434,8 @@ std::tuple<int, int, int, double, float> Runtime::BestCompressRatio(
     }
   }
 
-  return std::make_tuple(best_tier, best_lib, best_preset, best_time, best_tier_score);
+  return std::make_tuple(best_tier, best_lib, best_preset, best_time,
+                         best_tier_score);
 }
 
 std::tuple<int, int, int, double, float> Runtime::BestCompressTime(
@@ -442,7 +482,8 @@ std::tuple<int, int, int, double, float> Runtime::BestCompressTime(
     }
   }
 
-  return std::make_tuple(best_tier, best_lib, best_preset, best_time, best_tier_score);
+  return std::make_tuple(best_tier, best_lib, best_preset, best_time,
+                         best_tier_score);
 }
 
 std::tuple<int, int, int, double, float> Runtime::BestCompressForNode(
@@ -495,7 +536,8 @@ chi::TaskResume Runtime::DynamicSchedule(
     // Extract task parameters (same as PutBlobTask)
     chi::u64 chunk_size = task->size_;
     // Convert ShmPtr to raw pointer via FullPtr
-    auto blob_fullptr = CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    auto blob_fullptr =
+        CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
     void* chunk_data = blob_fullptr.ptr_;
     Context& context = task->context_;
 
@@ -540,7 +582,8 @@ chi::TaskResume Runtime::DynamicSchedule(
 
     // Choose best compression strategy
     auto [best_tier, best_lib, best_preset, best_time, tier_score] =
-        BestCompressForNode(context, chunk_data, chunk_size, container_id_, stats);
+        BestCompressForNode(context, chunk_data, chunk_size, container_id_,
+                            stats);
 
     // Update context with selected compression library and preset
     context.compress_lib_ = best_lib;
@@ -562,10 +605,9 @@ chi::TaskResume Runtime::DynamicSchedule(
 
     // Now call Compress to perform compression and PutBlob
     auto compress_task = client_.AsyncCompress(
-        chi::PoolQuery::Local(),
-        task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
-        task->blob_data_, task->score_, context, task->flags_,
-        task->core_pool_id_);
+        chi::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
+        task->offset_, task->size_, task->blob_data_, task->score_, context,
+        task->flags_, task->core_pool_id_);
     compress_task.Wait();
 
     // Copy results back
@@ -602,7 +644,8 @@ chi::TaskResume Runtime::Compress(hipc::FullPtr<CompressTask> task,
 
     // Initialize core client if needed
     if (!core_client_) {
-      core_client_ = std::make_unique<wrp_cte::core::Client>(task->core_pool_id_);
+      core_client_ =
+          std::make_unique<wrp_cte::core::Client>(task->core_pool_id_);
     }
 
     // Get tier score for output
@@ -620,9 +663,9 @@ chi::TaskResume Runtime::Compress(hipc::FullPtr<CompressTask> task,
     // If no compression requested, just call PutBlob directly
     if (context.compress_lib_ <= 0) {
       auto put_task = core_client_->AsyncPutBlob(
-          task->tag_id_, task->blob_name_.str(),
-          task->offset_, task->size_, task->blob_data_, task->score_,
-          context, task->flags_, chi::PoolQuery::Local());
+          task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
+          task->blob_data_, task->score_, context, task->flags_,
+          chi::PoolQuery::Local());
       put_task.Wait();
       task->context_ = put_task->context_;
       task->return_code_ = put_task->return_code_;
@@ -658,16 +701,18 @@ chi::TaskResume Runtime::Compress(hipc::FullPtr<CompressTask> task,
 
     auto compress_start = std::chrono::high_resolution_clock::now();
 
-    // Allocate buffer for compressed data (worst case: original size + 5% overhead)
+    // Allocate buffer for compressed data (worst case: original size + 5%
+    // overhead)
     std::vector<char> compressed_buffer(input_size + (input_size / 20) + 1024);
 
     // Compress the data
     size_t compressed_size = compressed_buffer.size();
     // Convert ShmPtr to raw pointer via FullPtr
-    auto input_fullptr = CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    auto input_fullptr =
+        CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
     char* input_ptr = input_fullptr.ptr_;
-    bool success = compressor->Compress(compressed_buffer.data(), compressed_size,
-                                        input_ptr, input_size);
+    bool success = compressor->Compress(compressed_buffer.data(),
+                                        compressed_size, input_ptr, input_size);
 
     auto compress_end = std::chrono::high_resolution_clock::now();
     double compress_time =
@@ -687,7 +732,8 @@ chi::TaskResume Runtime::Compress(hipc::FullPtr<CompressTask> task,
       context.actual_original_size_ = input_size;
       context.actual_compressed_size_ = total_stored_size;
       context.actual_compression_ratio_ =
-          static_cast<double>(input_size) / static_cast<double>(total_stored_size);
+          static_cast<double>(input_size) /
+          static_cast<double>(total_stored_size);
       context.actual_compress_time_ms_ = compress_time;
 
       // Allocate shared memory for header + compressed data
@@ -699,36 +745,38 @@ chi::TaskResume Runtime::Compress(hipc::FullPtr<CompressTask> task,
       }
 
       // Write compression header
-      CompressionHeader header(context.compress_lib_, context.compress_preset_, input_size);
+      CompressionHeader header(context.compress_lib_, context.compress_preset_,
+                               input_size);
       std::memcpy(compressed_shm.ptr_, &header, header_size);
 
       // Write compressed data after header
-      std::memcpy(compressed_shm.ptr_ + header_size,
-                  compressed_buffer.data(), compressed_size);
+      std::memcpy(compressed_shm.ptr_ + header_size, compressed_buffer.data(),
+                  compressed_size);
 
       // Call PutBlob with header + compressed data
-      hipc::ShmPtr<> compressed_shm_ptr = compressed_shm.shm_.template Cast<void>();
+      hipc::ShmPtr<> compressed_shm_ptr =
+          compressed_shm.shm_.template Cast<void>();
       auto put_task = core_client_->AsyncPutBlob(
-          task->tag_id_, task->blob_name_.str(),
-          task->offset_, total_stored_size,
-          compressed_shm_ptr, task->score_,
-          context, task->flags_, chi::PoolQuery::Local());
+          task->tag_id_, task->blob_name_.str(), task->offset_,
+          total_stored_size, compressed_shm_ptr, task->score_, context,
+          task->flags_, chi::PoolQuery::Local());
       put_task.Wait();
 
       // Free compressed data buffer
       CHI_IPC->FreeBuffer(compressed_shm);
 
       // Log compression telemetry
-      CompressionTelemetry telemetry(CteOp::kPutBlob, context.compress_lib_,
-                                     input_size, total_stored_size, compress_time,
-                                     0.0, 0.0, std::chrono::steady_clock::now(),
-                                     compression_logical_time_.fetch_add(1));
+      CompressionTelemetry telemetry(
+          CteOp::kPutBlob, context.compress_lib_, input_size, total_stored_size,
+          compress_time, 0.0, 0.0, std::chrono::steady_clock::now(),
+          compression_logical_time_.fetch_add(1));
       LogCompressionTelemetry(telemetry);
 
       HLOG(kDebug,
            "Compression: {} bytes -> {} bytes (ratio: {:.2f}, time: {:.2f}ms)",
            input_size, total_stored_size,
-           static_cast<double>(input_size) / static_cast<double>(total_stored_size),
+           static_cast<double>(input_size) /
+               static_cast<double>(total_stored_size),
            compress_time);
 
       task->context_ = context;
@@ -738,9 +786,9 @@ chi::TaskResume Runtime::Compress(hipc::FullPtr<CompressTask> task,
       HLOG(kDebug, "Compression not beneficial, storing original data");
 
       auto put_task = core_client_->AsyncPutBlob(
-          task->tag_id_, task->blob_name_.str(),
-          task->offset_, task->size_, task->blob_data_, task->score_,
-          context, task->flags_, chi::PoolQuery::Local());
+          task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
+          task->blob_data_, task->score_, context, task->flags_,
+          chi::PoolQuery::Local());
       put_task.Wait();
 
       context.compress_lib_ = 0;  // Mark as uncompressed
@@ -776,11 +824,13 @@ chi::TaskResume Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
 
     // Initialize core client if needed
     if (!core_client_) {
-      core_client_ = std::make_unique<wrp_cte::core::Client>(task->core_pool_id_);
+      core_client_ =
+          std::make_unique<wrp_cte::core::Client>(task->core_pool_id_);
     }
 
     // Allocate temporary buffer to receive compressed data from GetBlob
-    // We don't know the compressed size, so allocate expected_size as upper bound
+    // We don't know the compressed size, so allocate expected_size as upper
+    // bound
     auto temp_buffer = CHI_IPC->AllocateBuffer(expected_size);
     if (temp_buffer.IsNull()) {
       task->return_code_ = 2;  // Memory allocation failed
@@ -790,9 +840,8 @@ chi::TaskResume Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
 
     // Call GetBlob to retrieve the (potentially compressed) data
     auto get_task = core_client_->AsyncGetBlob(
-        task->tag_id_, task->blob_name_.str(),
-        task->offset_, expected_size, task->flags_,
-        temp_buffer_ptr, chi::PoolQuery::Local());
+        task->tag_id_, task->blob_name_.str(), task->offset_, expected_size,
+        task->flags_, temp_buffer_ptr, chi::PoolQuery::Local());
     get_task.Wait();
 
     if (get_task->return_code_ != 0) {
@@ -828,10 +877,12 @@ chi::TaskResume Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
       }
 
       // Create decompressor
-      auto decompressor = hshm::CompressionFactory::GetPreset(library_name, preset);
+      auto decompressor =
+          hshm::CompressionFactory::GetPreset(library_name, preset);
       if (!decompressor) {
         CHI_IPC->FreeBuffer(temp_buffer);
-        HLOG(kWarning, "Failed to create decompressor for library: {}", library_name);
+        HLOG(kWarning, "Failed to create decompressor for library: {}",
+             library_name);
         task->return_code_ = 3;  // Decompressor creation failed
         co_return;
       }
@@ -843,15 +894,17 @@ chi::TaskResume Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
       size_t compressed_size = expected_size - header_size;
 
       // Decompress to output buffer
-      auto output_fullptr = CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+      auto output_fullptr =
+          CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
       size_t decompressed_size = original_size;
-      bool success = decompressor->Decompress(
-          output_fullptr.ptr_, decompressed_size,
-          compressed_data, compressed_size);
+      bool success =
+          decompressor->Decompress(output_fullptr.ptr_, decompressed_size,
+                                   compressed_data, compressed_size);
 
       auto decompress_end = std::chrono::high_resolution_clock::now();
       double decompress_time = std::chrono::duration<double, std::milli>(
-                                   decompress_end - decompress_start).count();
+                                   decompress_end - decompress_start)
+                                   .count();
 
       CHI_IPC->FreeBuffer(temp_buffer);
 
@@ -861,8 +914,8 @@ chi::TaskResume Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
 
         // Log decompression telemetry
         CompressionTelemetry telemetry(
-            CteOp::kGetBlob, compress_lib, decompressed_size, compressed_size, 0.0,
-            decompress_time, 0.0, std::chrono::steady_clock::now(),
+            CteOp::kGetBlob, compress_lib, decompressed_size, compressed_size,
+            0.0, decompress_time, 0.0, std::chrono::steady_clock::now(),
             compression_logical_time_.fetch_add(1));
         LogCompressionTelemetry(telemetry);
 
@@ -879,7 +932,8 @@ chi::TaskResume Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
     } else {
       // No compression header - data is uncompressed
       // Copy directly to output buffer
-      auto output_fullptr = CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+      auto output_fullptr =
+          CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
       std::memcpy(output_fullptr.ptr_, temp_buffer.ptr_, expected_size);
       CHI_IPC->FreeBuffer(temp_buffer);
 

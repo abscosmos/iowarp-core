@@ -58,6 +58,11 @@ target_include_directories(wrp_cte_compressor_client PRIVATE
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include)
 
 #------------------------------------------------------------------------------
+# Synthetic Data Generators
+#------------------------------------------------------------------------------
+add_subdirectory(generator)
+
+#------------------------------------------------------------------------------
 # Tests
 #------------------------------------------------------------------------------
 if(BUILD_TESTING)

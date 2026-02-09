@@ -17,14 +17,13 @@ pkgs:
 
     # Worker thread configuration
     # Using fewer workers for testing
-    sched_workers: 4
+    num_threads: 4
     process_reaper_workers: 1
 
     # Memory segment configuration
     # Smaller segments for testing
-    main_segment_size: "512M"
+    main_segment_size: "auto"
     client_data_segment_size: "256M"
-    runtime_data_segment_size: "256M"
 
     # Networking configuration
     port: 5555
@@ -33,8 +32,7 @@ pkgs:
     log_level: "debug"
 
     # Runtime configuration
-    stack_size: 65536
-    queue_depth: 5000
+    queue_depth: 1024
     local_sched: "default"
     heartbeat_interval: 1000
 

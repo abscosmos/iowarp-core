@@ -20,7 +20,8 @@ add_compile_definitions(_CRT_SECURE_NO_DEPRECATE)
 # All HSHM_ENABLE_* options are now set by root CMakeLists.txt from WRP_CORE_* parameters
 # CMAKE_EXPORT_COMPILE_COMMANDS is set by root CMakeLists.txt
 # BUILD_SHARED_LIBS is set by root CMakeLists.txt
-# HSHM_ENABLE_TESTS and HSHM_ENABLE_BENCHMARKS are set by root CMakeLists.txt
+# HSHM_ENABLE_TESTS is set by root CMakeLists.txt
+# Benchmarks are controlled by WRP_CORE_ENABLE_BENCHMARKS
 # HSHM_ENABLE_WINDOWS_THREADS, HSHM_ENABLE_PTHREADS, HSHM_DEBUG_LOCK, and HSHM_NO_COMPILE are set by root CMakeLists.txt
 
 if(WIN32)
@@ -109,11 +110,11 @@ endif()
 # CMAKE_EXPORT_COMPILE_COMMANDS and RPATH settings are set by root CMakeLists.txt
 
 # ENABLE GPU SUPPORT
-if(HSHM_ENABLE_CUDA)
+if(WRP_CORE_ENABLE_CUDA)
     wrp_core_enable_cuda(17)
 endif()
 
-if(HSHM_ENABLE_ROCM)
+if(WRP_CORE_ENABLE_ROCM)
     wrp_core_enable_rocm("HIP" 17)
 endif()
 
@@ -129,75 +130,75 @@ add_library(hshm::configure ALIAS configure)
 
 # hshm::serialize - Serialization (cereal)
 add_library(serialize INTERFACE)
-if(HSHM_ENABLE_CEREAL)
+if(WRP_CORE_ENABLE_CEREAL)
     target_link_libraries(serialize INTERFACE ${SERIALIZATION_LIBS})
 endif()
 target_compile_definitions(serialize INTERFACE
-    HSHM_ENABLE_CEREAL=$<BOOL:${HSHM_ENABLE_CEREAL}>
+    HSHM_ENABLE_CEREAL=$<BOOL:${WRP_CORE_ENABLE_CEREAL}>
 )
 add_library(hshm::serialize ALIAS serialize)
 
 # hshm::interceptor - ELF interception support
 add_library(interceptor INTERFACE)
-if(HSHM_ENABLE_ELF)
+if(WRP_CORE_ENABLE_ELF)
     target_link_libraries(interceptor INTERFACE ${ELF_LIBS})
     target_link_directories(interceptor INTERFACE ${ELF_LIB_DIRS})
     target_include_directories(interceptor INTERFACE ${ELF_INCLUDES})
 endif()
 target_compile_definitions(interceptor INTERFACE
-    HSHM_ENABLE_ELF=$<BOOL:${HSHM_ENABLE_ELF}>
+    HSHM_ENABLE_ELF=$<BOOL:${WRP_CORE_ENABLE_ELF}>
 )
 add_library(hshm::interceptor ALIAS interceptor)
 
 # hshm::lightbeam - ZeroMQ and Thallium transport
 add_library(lightbeam INTERFACE)
-if(HSHM_ENABLE_ZMQ)
+if(WRP_CORE_ENABLE_ZMQ)
     target_link_libraries(lightbeam INTERFACE ${ZMQ_LIBS})
     target_link_directories(lightbeam INTERFACE ${ZMQ_LIB_DIRS})
     target_include_directories(lightbeam INTERFACE ${ZMQ_INCLUDES})
 endif()
-if(HSHM_ENABLE_LIBFABRIC)
+if(WRP_CORE_ENABLE_LIBFABRIC)
     target_link_libraries(lightbeam INTERFACE ${LIBFABRIC_LIBS})
     target_link_directories(lightbeam INTERFACE ${LIBFABRIC_LIB_DIRS})
     target_include_directories(lightbeam INTERFACE ${LIBFABRIC_INCLUDES})
 endif()
-if(HSHM_ENABLE_THALLIUM)
+if(WRP_CORE_ENABLE_THALLIUM)
     # Thallium dependencies would go here
 endif()
 target_compile_definitions(lightbeam INTERFACE
-    HSHM_ENABLE_ZMQ=$<BOOL:${HSHM_ENABLE_ZMQ}>
-    HSHM_ENABLE_LIBFABRIC=$<BOOL:${HSHM_ENABLE_LIBFABRIC}>
-    HSHM_ENABLE_THALLIUM=$<BOOL:${HSHM_ENABLE_THALLIUM}>
+    HSHM_ENABLE_ZMQ=$<BOOL:${WRP_CORE_ENABLE_ZMQ}>
+    HSHM_ENABLE_LIBFABRIC=$<BOOL:${WRP_CORE_ENABLE_LIBFABRIC}>
+    HSHM_ENABLE_THALLIUM=$<BOOL:${WRP_CORE_ENABLE_THALLIUM}>
 )
 add_library(hshm::lightbeam ALIAS lightbeam)
 
 # hshm::thread_all - Threading support (includes Thallium if enabled)
 add_library(thread_all INTERFACE)
-if(HSHM_ENABLE_OPENMP)
+if(WRP_CORE_ENABLE_OPENMP)
     target_link_libraries(thread_all INTERFACE ${OpenMP_LIBS})
 endif()
-if(HSHM_ENABLE_THALLIUM)
+if(WRP_CORE_ENABLE_THALLIUM)
     # Thallium threading dependencies would go here
 endif()
 if(HSHM_ENABLE_PTHREADS)
     target_link_libraries(thread_all INTERFACE pthread)
 endif()
 target_compile_definitions(thread_all INTERFACE
-    HSHM_ENABLE_OPENMP=$<BOOL:${HSHM_ENABLE_OPENMP}>
+    HSHM_ENABLE_OPENMP=$<BOOL:${WRP_CORE_ENABLE_OPENMP}>
     HSHM_ENABLE_PTHREADS=$<BOOL:${HSHM_ENABLE_PTHREADS}>
     HSHM_ENABLE_WINDOWS_THREADS=$<BOOL:${HSHM_ENABLE_WINDOWS_THREADS}>
     HSHM_DEFAULT_THREAD_MODEL=hshm::thread::$<IF:$<BOOL:${HSHM_ENABLE_PTHREADS}>,Pthread,$<IF:$<BOOL:${HSHM_ENABLE_WINDOWS_THREADS}>,StdThread,StdThread>>
-    HSHM_DEFAULT_THREAD_MODEL_GPU=hshm::thread::$<IF:$<BOOL:${HSHM_ENABLE_CUDA}>,Cuda,$<IF:$<BOOL:${HSHM_ENABLE_ROCM}>,Rocm,StdThread>>
+    HSHM_DEFAULT_THREAD_MODEL_GPU=hshm::thread::$<IF:$<BOOL:${WRP_CORE_ENABLE_CUDA}>,Cuda,$<IF:$<BOOL:${WRP_CORE_ENABLE_ROCM}>,Rocm,StdThread>>
 )
 add_library(hshm::thread_all ALIAS thread_all)
 
 # hshm::mpi - MPI support
 add_library(mpi INTERFACE)
-if(HSHM_ENABLE_MPI)
+if(WRP_CORE_ENABLE_MPI)
     target_link_libraries(mpi INTERFACE ${MPI_LIBS})
 endif()
 target_compile_definitions(mpi INTERFACE
-    HSHM_ENABLE_MPI=$<BOOL:${HSHM_ENABLE_MPI}>
+    HSHM_ENABLE_MPI=$<BOOL:${WRP_CORE_ENABLE_MPI}>
 )
 add_library(hshm::mpi ALIAS mpi)
 
@@ -215,8 +216,7 @@ function(hshm_target_compile_definitions target)
         HSHM_COMPILER_GNU=$<BOOL:${HSHM_COMPILER_GNU}>
         HSHM_ENABLE_WINDOWS_SYSINFO=$<BOOL:${HSHM_ENABLE_WINDOWS_SYSINFO}>
         HSHM_ENABLE_PROCFS_SYSINFO=$<BOOL:${HSHM_ENABLE_PROCFS_SYSINFO}>
-        HSHM_ENABLE_COVERAGE=$<BOOL:${HSHM_ENABLE_COVERAGE}>
-        HSHM_ENABLE_DOXYGEN=$<BOOL:${HSHM_ENABLE_DOXYGEN}>
+        HSHM_ENABLE_DOXYGEN=$<BOOL:${WRP_CORE_ENABLE_DOXYGEN}>
         HSHM_DEBUG_LOCK=$<BOOL:${HSHM_DEBUG_LOCK}>
         HSHM_DEFAULT_ALLOC_T=hipc::ThreadLocalAllocator
         HSHM_ENABLE_DLL_EXPORT=$<BOOL:${BUILD_SHARED_LIBS}>
@@ -234,8 +234,8 @@ function(hshm_target_compile_definitions target)
     else()
         # GPU and other targets: use CMake variable values
         list(APPEND common_definitions
-            HSHM_ENABLE_CUDA=$<BOOL:${HSHM_ENABLE_CUDA}>
-            HSHM_ENABLE_ROCM=$<BOOL:${HSHM_ENABLE_ROCM}>
+            HSHM_ENABLE_CUDA=$<BOOL:${WRP_CORE_ENABLE_CUDA}>
+            HSHM_ENABLE_ROCM=$<BOOL:${WRP_CORE_ENABLE_ROCM}>
         )
     endif()
 
@@ -276,7 +276,7 @@ add_subdirectory(src)
 
 # hshm::compress - Compression support
 add_library(compress INTERFACE)
-if(HSHM_ENABLE_COMPRESS)
+if(WRP_CTE_ENABLE_COMPRESS)
     target_link_libraries(compress INTERFACE ${COMPRESS_LIBS})
     target_link_directories(compress INTERFACE ${COMPRESS_LIB_DIRS})
     target_include_directories(compress INTERFACE ${COMPRESS_INCLUDES})
@@ -290,20 +290,20 @@ if(HSHM_ENABLE_COMPRESS)
     endif()
 endif()
 target_compile_definitions(compress INTERFACE
-    HSHM_ENABLE_COMPRESS=$<BOOL:${HSHM_ENABLE_COMPRESS}>
+    HSHM_ENABLE_COMPRESS=$<BOOL:${WRP_CTE_ENABLE_COMPRESS}>
     HSHM_ENABLE_LIBPRESSIO=$<BOOL:${HSHM_ENABLE_LIBPRESSIO}>
 )
 add_library(hshm::compress ALIAS compress)
 
 # hshm::encrypt - Encryption support
 add_library(encrypt INTERFACE)
-if(HSHM_ENABLE_ENCRYPT)
+if(WRP_CORE_ENABLE_ENCRYPT)
     target_link_libraries(encrypt INTERFACE ${ENCRYPT_LIBS})
     target_link_directories(encrypt INTERFACE ${ENCRYPT_LIB_DIRS})
     target_include_directories(encrypt INTERFACE ${ENCRYPT_INCLUDES})
 endif()
 target_compile_definitions(encrypt INTERFACE
-    HSHM_ENABLE_ENCRYPT=$<BOOL:${HSHM_ENABLE_ENCRYPT}>
+    HSHM_ENABLE_ENCRYPT=$<BOOL:${WRP_CORE_ENABLE_ENCRYPT}>
 )
 add_library(hshm::encrypt ALIAS encrypt)
 
@@ -339,7 +339,7 @@ install(TARGETS
 # -----------------------------------------------------------------------------
 # Documentation
 # -----------------------------------------------------------------------------
-if(HSHM_ENABLE_DOXYGEN)
+if(WRP_CORE_ENABLE_DOXYGEN)
     add_doxygen_doc(
         BUILD_DIR
         ${CMAKE_CURRENT_BINARY_DIR}/_build
@@ -368,7 +368,7 @@ if(HSHM_ENABLE_TESTS)
     add_subdirectory(test)
 endif()
 
-if(HSHM_ENABLE_BENCHMARKS)
+if(WRP_CORE_ENABLE_BENCHMARKS)
     message("Building HSHM benchmarks")
     add_subdirectory(benchmark)
 endif()

@@ -1,4 +1,4 @@
-if(HSHM_ENABLE_ZMQ)
+if(WRP_CORE_ENABLE_ZMQ)
     add_executable(lightbeam_transport_test lightbeam_transport_test.cc)
     target_link_libraries(lightbeam_transport_test hermes_shm_host hshm::lightbeam hshm::serialize)
     target_compile_definitions(lightbeam_transport_test PRIVATE HSHM_ENABLE_ZMQ)
@@ -19,7 +19,7 @@ if(HSHM_ENABLE_ZMQ)
 endif()
 
 # distributed_lightbeam_test requires MPI
-if(HSHM_ENABLE_MPI AND HSHM_ENABLE_ZMQ)
+if(WRP_CORE_ENABLE_MPI AND WRP_CORE_ENABLE_ZMQ)
     add_executable(distributed_lightbeam_test distributed_lightbeam_test.cc)
     target_link_libraries(distributed_lightbeam_test
         hermes_shm_host

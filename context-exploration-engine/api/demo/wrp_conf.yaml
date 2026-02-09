@@ -3,14 +3,9 @@
 # Demonstrates how to configure Chimaera runtime with CTE and CAE ChiMods
 # This configuration combines runtime settings with declarative pool creation
 
-# Worker thread configuration
-workers:
-  sched_threads: 1
-  slow_threads: 0
-
 # Memory segment configuration
 memory:
-  main_segment_size: 4GB
+  main_segment_size: auto
   client_data_segment_size: 2GB
   runtime_data_segment_size: 2GB
 
@@ -26,9 +21,9 @@ logging:
 
 # Runtime configuration
 runtime:
-  stack_size: 65536
-  queue_depth: 10000
-  local_sched: "default"  # Local task scheduler (default: "default")
+  num_threads: 1         # Worker threads for task execution
+  queue_depth: 1024      # Task queue depth per worker
+  local_sched: "default" # Local task scheduler
   heartbeat_interval: 1000
 
 # Compose section - declarative pool creation

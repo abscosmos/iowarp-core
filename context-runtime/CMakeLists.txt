@@ -56,8 +56,8 @@ add_subdirectory(src)
 add_subdirectory(modules)
 
 # Add benchmark subdirectory if benchmarks are enabled
-# CHIMAERA_ENABLE_BENCHMARKS is set by root CMakeLists.txt
-if(CHIMAERA_ENABLE_BENCHMARKS)
+# Benchmarks are controlled by WRP_CORE_ENABLE_BENCHMARKS
+if(WRP_CORE_ENABLE_BENCHMARKS)
   add_subdirectory(benchmark)
   message(STATUS "Benchmarks enabled - added benchmark subdirectory")
 endif()

@@ -3,3 +3,6 @@ cmake_minimum_required(VERSION 3.10)
 
 # Add unit tests subdirectory
 add_subdirectory(unit)
+
+# Add integration tests (Docker-based distributed tests)
+add_subdirectory(integration)

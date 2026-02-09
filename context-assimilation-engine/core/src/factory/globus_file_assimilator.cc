@@ -1,28 +1,65 @@
-#include <wrp_cae/core/factory/globus_file_assimilator.h>
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include <chimaera/chimaera.h>
+#include <wrp_cae/core/factory/globus_file_assimilator.h>
+
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <thread>
-#include <chrono>
 
 #ifdef CAE_ENABLE_GLOBUS
-#include <Poco/Net/HTTPSClientSession.h>
+#include <Poco/Exception.h>
+#include <Poco/Net/Context.h>
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
-#include <Poco/Net/Context.h>
-#include <Poco/URI.h>
+#include <Poco/Net/HTTPSClientSession.h>
 #include <Poco/StreamCopier.h>
-#include <Poco/Exception.h>
+#include <Poco/URI.h>
+
 #include <nlohmann/json.hpp>
 #include <sstream>
 #endif
 
-// Include wrp_cte headers after closing any wrp_cae namespace to avoid Method namespace collision
+// Include wrp_cte headers after closing any wrp_cae namespace to avoid Method
+// namespace collision
 #include <wrp_cte/core/core_client.h>
 
 namespace wrp_cae::core {
 
-GlobusFileAssimilator::GlobusFileAssimilator(std::shared_ptr<wrp_cte::core::Client> cte_client)
+GlobusFileAssimilator::GlobusFileAssimilator(
+    std::shared_ptr<wrp_cte::core::Client> cte_client)
     : cte_client_(cte_client) {}
 
 int GlobusFileAssimilator::Schedule(const AssimilationCtx& ctx) {
@@ -36,19 +73,24 @@ int GlobusFileAssimilator::Schedule(const AssimilationCtx& ctx) {
   bool is_globus_uri = (src_protocol == "globus");
 
   if (!is_globus_web_url && !is_globus_uri) {
-    HLOG(kError, "GlobusFileAssimilator: Source must be a Globus web URL or globus:// URI, got protocol '{}'",
-          src_protocol);
+    HLOG(kError,
+         "GlobusFileAssimilator: Source must be a Globus web URL or globus:// "
+         "URI, got protocol '{}'",
+         src_protocol);
     return -2;
   }
 
   // Validate destination protocol
   bool is_dst_globus_web_url = (ctx.dst.find("https://app.globus.org") == 0);
   std::string dst_protocol = GetUrlProtocol(ctx.dst);
-  bool is_valid_dst = (dst_protocol == "file" || dst_protocol == "globus" || is_dst_globus_web_url);
+  bool is_valid_dst = (dst_protocol == "file" || dst_protocol == "globus" ||
+                       is_dst_globus_web_url);
 
   if (!is_valid_dst) {
-    HLOG(kError, "GlobusFileAssimilator: Destination must be file://, globus://, or Globus web URL, got protocol '{}'",
-          dst_protocol);
+    HLOG(kError,
+         "GlobusFileAssimilator: Destination must be file://, globus://, or "
+         "Globus web URL, got protocol '{}'",
+         dst_protocol);
     return -3;
   }
 
@@ -61,33 +103,41 @@ int GlobusFileAssimilator::Schedule(const AssimilationCtx& ctx) {
     const char* access_token_env = std::getenv("GLOBUS_ACCESS_TOKEN");
     if (!access_token_env || std::strlen(access_token_env) == 0) {
       std::cerr << "ERROR: No access token provided" << std::endl;
-      HLOG(kError, "GlobusFileAssimilator: No access token provided. Set src_token in OMNI file or GLOBUS_ACCESS_TOKEN environment variable");
+      HLOG(kError,
+           "GlobusFileAssimilator: No access token provided. Set src_token in "
+           "OMNI file or GLOBUS_ACCESS_TOKEN environment variable");
       return -1;
     }
     access_token = access_token_env;
-    HLOG(kDebug, "GlobusFileAssimilator: Using access token from GLOBUS_ACCESS_TOKEN environment variable");
+    HLOG(kDebug,
+         "GlobusFileAssimilator: Using access token from GLOBUS_ACCESS_TOKEN "
+         "environment variable");
   }
 
-  // Parse source URI (supports both globus:// URIs and https://app.globus.org URLs)
+  // Parse source URI (supports both globus:// URIs and https://app.globus.org
+  // URLs)
   std::string src_endpoint;
   std::string src_path;
 
   // Check if this is a Globus web URL
   if (ctx.src.find("https://app.globus.org") == 0) {
     if (!ParseGlobusWebUrl(ctx.src, src_endpoint, src_path)) {
-      HLOG(kError, "GlobusFileAssimilator: Failed to parse Globus web URL: '{}'", ctx.src);
+      HLOG(kError,
+           "GlobusFileAssimilator: Failed to parse Globus web URL: '{}'",
+           ctx.src);
       return -4;
     }
   } else {
     // Parse as standard globus:// URI
     if (!ParseGlobusUri(ctx.src, src_endpoint, src_path)) {
-      HLOG(kError, "GlobusFileAssimilator: Failed to parse source URI: '{}'", ctx.src);
+      HLOG(kError, "GlobusFileAssimilator: Failed to parse source URI: '{}'",
+           ctx.src);
       return -4;
     }
   }
 
-  HLOG(kInfo, "GlobusFileAssimilator: Source endpoint='{}', path='{}'",
-        src_endpoint, src_path);
+  HLOG(kDebug, "GlobusFileAssimilator: Source endpoint='{}', path='{}'",
+       src_endpoint, src_path);
 
   // Handle different destination types
   if (dst_protocol == "file") {
@@ -96,12 +146,16 @@ int GlobusFileAssimilator::Schedule(const AssimilationCtx& ctx) {
     std::cout << "=========================================" << std::endl;
     std::cout << "Globus to Local Filesystem Transfer" << std::endl;
     std::cout << "=========================================" << std::endl;
-    HLOG(kInfo, "GlobusFileAssimilator: Transferring from Globus to local filesystem");
+    HLOG(kDebug,
+         "GlobusFileAssimilator: Transferring from Globus to local filesystem");
 
     std::string dst_path = GetUrlPath(ctx.dst);
     if (dst_path.empty()) {
-      std::cerr << "ERROR: Invalid destination URL, no file path found" << std::endl;
-      HLOG(kError, "GlobusFileAssimilator: Invalid destination URL, no file path found");
+      std::cerr << "ERROR: Invalid destination URL, no file path found"
+                << std::endl;
+      HLOG(
+          kError,
+          "GlobusFileAssimilator: Invalid destination URL, no file path found");
       return -5;
     }
 
@@ -110,62 +164,79 @@ int GlobusFileAssimilator::Schedule(const AssimilationCtx& ctx) {
     std::cout << std::endl;
 
     // Download file from Globus to local filesystem
-    int download_result = DownloadFile(src_endpoint, src_path, dst_path, access_token);
+    int download_result =
+        DownloadFile(src_endpoint, src_path, dst_path, access_token);
     if (download_result != 0) {
       std::cerr << "ERROR: Failed to download file from Globus (error code: "
                 << download_result << ")" << std::endl;
-      HLOG(kError, "GlobusFileAssimilator: Failed to download file from Globus");
+      HLOG(kError,
+           "GlobusFileAssimilator: Failed to download file from Globus");
       return download_result;
     }
 
     std::cout << "Transfer completed successfully!" << std::endl;
     std::cout << std::endl;
-    HLOG(kInfo, "GlobusFileAssimilator: Successfully downloaded file to local filesystem");
+    HLOG(kDebug,
+         "GlobusFileAssimilator: Successfully downloaded file to local "
+         "filesystem");
     return 0;
 
   } else {
     // Globus to Globus transfer
-    HLOG(kInfo, "GlobusFileAssimilator: Initiating Globus-to-Globus transfer");
+    HLOG(kDebug, "GlobusFileAssimilator: Initiating Globus-to-Globus transfer");
 
-    // Parse destination URI (supports both globus:// URIs and https://app.globus.org URLs)
+    // Parse destination URI (supports both globus:// URIs and
+    // https://app.globus.org URLs)
     std::string dst_endpoint;
     std::string dst_path;
 
     // Check if this is a Globus web URL
     if (ctx.dst.find("https://app.globus.org") == 0) {
       if (!ParseGlobusWebUrl(ctx.dst, dst_endpoint, dst_path)) {
-        HLOG(kError, "GlobusFileAssimilator: Failed to parse destination Globus web URL: '{}'", ctx.dst);
+        HLOG(kError,
+             "GlobusFileAssimilator: Failed to parse destination Globus web "
+             "URL: '{}'",
+             ctx.dst);
         return -5;
       }
     } else {
       // Parse as standard globus:// URI
       if (!ParseGlobusUri(ctx.dst, dst_endpoint, dst_path)) {
-        HLOG(kError, "GlobusFileAssimilator: Failed to parse destination URI: '{}'", ctx.dst);
+        HLOG(kError,
+             "GlobusFileAssimilator: Failed to parse destination URI: '{}'",
+             ctx.dst);
         return -5;
       }
     }
 
-    HLOG(kInfo, "GlobusFileAssimilator: Destination endpoint='{}', path='{}'",
-          dst_endpoint, dst_path);
+    HLOG(kDebug, "GlobusFileAssimilator: Destination endpoint='{}', path='{}'",
+         dst_endpoint, dst_path);
 
     // Get submission ID
     std::string submission_id = GetSubmissionId(access_token);
     if (submission_id.empty()) {
-      HLOG(kError, "GlobusFileAssimilator: Failed to get submission ID from Globus API");
+      HLOG(
+          kError,
+          "GlobusFileAssimilator: Failed to get submission ID from Globus API");
       return -6;
     }
 
-    HLOG(kInfo, "GlobusFileAssimilator: Obtained submission ID: '{}'", submission_id);
+    HLOG(kDebug, "GlobusFileAssimilator: Obtained submission ID: '{}'",
+         submission_id);
 
     // Submit transfer
-    std::string task_id = SubmitTransfer(src_endpoint, dst_endpoint, src_path, dst_path,
-                                         access_token, submission_id);
+    std::string task_id = SubmitTransfer(src_endpoint, dst_endpoint, src_path,
+                                         dst_path, access_token, submission_id);
     if (task_id.empty()) {
-      HLOG(kError, "GlobusFileAssimilator: Failed to submit transfer to Globus API");
+      HLOG(kError,
+           "GlobusFileAssimilator: Failed to submit transfer to Globus API");
       return -7;
     }
 
-    HLOG(kInfo, "GlobusFileAssimilator: Transfer submitted successfully, task ID: '{}'", task_id);
+    HLOG(
+        kDebug,
+        "GlobusFileAssimilator: Transfer submitted successfully, task ID: '{}'",
+        task_id);
 
     // Poll for transfer completion
     int poll_result = PollTransferStatus(task_id, access_token);
@@ -174,7 +245,7 @@ int GlobusFileAssimilator::Schedule(const AssimilationCtx& ctx) {
       return poll_result;
     }
 
-    HLOG(kInfo, "GlobusFileAssimilator: Transfer completed successfully");
+    HLOG(kDebug, "GlobusFileAssimilator: Transfer completed successfully");
     return 0;
   }
 #endif
@@ -237,8 +308,8 @@ bool GlobusFileAssimilator::ParseGlobusUri(const std::string& uri,
 }
 
 bool GlobusFileAssimilator::ParseGlobusWebUrl(const std::string& url,
-                                               std::string& endpoint_id,
-                                               std::string& path) {
+                                              std::string& endpoint_id,
+                                              std::string& path) {
   // Parse Globus web URLs like:
   // https://app.globus.org/file-manager?origin_id=ENDPOINT_ID&origin_path=%2Fpath%2Fto%2Ffile
 
@@ -249,8 +320,9 @@ bool GlobusFileAssimilator::ParseGlobusWebUrl(const std::string& url,
     return false;
   }
 
-  // Extract endpoint ID (everything between origin_id= and next & or end of string)
-  size_t id_start = origin_id_pos + 10; // length of "origin_id="
+  // Extract endpoint ID (everything between origin_id= and next & or end of
+  // string)
+  size_t id_start = origin_id_pos + 10;  // length of "origin_id="
   size_t id_end = url.find('&', id_start);
   if (id_end == std::string::npos) {
     endpoint_id = url.substr(id_start);
@@ -263,10 +335,12 @@ bool GlobusFileAssimilator::ParseGlobusWebUrl(const std::string& url,
   if (origin_path_pos == std::string::npos) {
     // No path specified, default to root
     path = "/";
-    HLOG(kInfo, "GlobusFileAssimilator: No origin_path in URL, using root '/'");
+    HLOG(kDebug,
+         "GlobusFileAssimilator: No origin_path in URL, using root '/'");
   } else {
-    // Extract path (everything between origin_path= and next & or end of string)
-    size_t path_start = origin_path_pos + 12; // length of "origin_path="
+    // Extract path (everything between origin_path= and next & or end of
+    // string)
+    size_t path_start = origin_path_pos + 12;  // length of "origin_path="
     size_t path_end = url.find('&', path_start);
     std::string encoded_path;
     if (path_end == std::string::npos) {
@@ -279,8 +353,10 @@ bool GlobusFileAssimilator::ParseGlobusWebUrl(const std::string& url,
     path = UrlDecode(encoded_path);
   }
 
-  HLOG(kInfo, "GlobusFileAssimilator: Parsed Globus web URL - endpoint='{}', path='{}'",
-        endpoint_id, path);
+  HLOG(
+      kDebug,
+      "GlobusFileAssimilator: Parsed Globus web URL - endpoint='{}', path='{}'",
+      endpoint_id, path);
 
   return !endpoint_id.empty();
 }
@@ -313,17 +389,14 @@ std::string GlobusFileAssimilator::HttpGet(const std::string& url,
     Poco::URI uri(url);
 
     // Create an SSL Context for HTTPS
-    Poco::Net::Context::Ptr context = new Poco::Net::Context(
-        Poco::Net::Context::CLIENT_USE,
-        "", "", "",
-        Poco::Net::Context::VERIFY_NONE,
-        9,
-        false,
-        "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH"
-    );
+    Poco::Net::Context::Ptr context =
+        new Poco::Net::Context(Poco::Net::Context::CLIENT_USE, "", "", "",
+                               Poco::Net::Context::VERIFY_NONE, 9, false,
+                               "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH");
 
     // Set up the session with timeout
-    Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort(), context);
+    Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort(),
+                                          context);
     session.setTimeout(Poco::Timespan(30, 0));  // 30 second timeout
 
     // Prepare the request
@@ -352,12 +425,13 @@ std::string GlobusFileAssimilator::HttpGet(const std::string& url,
       return responseStr;
     } else {
       HLOG(kError, "GlobusFileAssimilator: HTTP GET failed with status {} {}",
-            response.getStatus(), response.getReason());
+           response.getStatus(), response.getReason());
       HLOG(kError, "GlobusFileAssimilator: Response body: {}", responseStr);
       return "";
     }
   } catch (Poco::Exception& e) {
-    HLOG(kError, "GlobusFileAssimilator: POCO exception in HttpGet: {}", e.displayText());
+    HLOG(kError, "GlobusFileAssimilator: POCO exception in HttpGet: {}",
+         e.displayText());
     return "";
   } catch (std::exception& e) {
     HLOG(kError, "GlobusFileAssimilator: Exception in HttpGet: {}", e.what());
@@ -372,17 +446,14 @@ std::string GlobusFileAssimilator::HttpPost(const std::string& url,
     Poco::URI uri(url);
 
     // Create an SSL Context for HTTPS
-    Poco::Net::Context::Ptr context = new Poco::Net::Context(
-        Poco::Net::Context::CLIENT_USE,
-        "", "", "",
-        Poco::Net::Context::VERIFY_NONE,
-        9,
-        false,
-        "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH"
-    );
+    Poco::Net::Context::Ptr context =
+        new Poco::Net::Context(Poco::Net::Context::CLIENT_USE, "", "", "",
+                               Poco::Net::Context::VERIFY_NONE, 9, false,
+                               "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH");
 
     // Set up the session
-    Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort(), context);
+    Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort(),
+                                          context);
     session.setTimeout(Poco::Timespan(30, 0));  // 30 second timeout
 
     // Prepare the request
@@ -416,12 +487,13 @@ std::string GlobusFileAssimilator::HttpPost(const std::string& url,
       return responseStr;
     } else {
       HLOG(kError, "GlobusFileAssimilator: HTTP POST failed with status {} {}",
-            response.getStatus(), response.getReason());
+           response.getStatus(), response.getReason());
       HLOG(kError, "GlobusFileAssimilator: Response body: {}", responseStr);
       return "";
     }
   } catch (Poco::Exception& e) {
-    HLOG(kError, "GlobusFileAssimilator: POCO exception in HttpPost: {}", e.displayText());
+    HLOG(kError, "GlobusFileAssimilator: POCO exception in HttpPost: {}",
+         e.displayText());
     return "";
   } catch (std::exception& e) {
     HLOG(kError, "GlobusFileAssimilator: Exception in HttpPost: {}", e.what());
@@ -429,7 +501,8 @@ std::string GlobusFileAssimilator::HttpPost(const std::string& url,
   }
 }
 
-std::string GlobusFileAssimilator::GetSubmissionId(const std::string& access_token) {
+std::string GlobusFileAssimilator::GetSubmissionId(
+    const std::string& access_token) {
   std::string url = "https://transfer.api.globus.org/v0.10/submission_id";
   std::string response = HttpGet(url, access_token);
 
@@ -442,21 +515,22 @@ std::string GlobusFileAssimilator::GetSubmissionId(const std::string& access_tok
     if (json_response.contains("value")) {
       return json_response["value"];
     } else {
-      HLOG(kError, "GlobusFileAssimilator: No 'value' field in submission ID response");
+      HLOG(kError,
+           "GlobusFileAssimilator: No 'value' field in submission ID response");
       return "";
     }
   } catch (const std::exception& e) {
-    HLOG(kError, "GlobusFileAssimilator: Failed to parse submission ID response: {}", e.what());
+    HLOG(kError,
+         "GlobusFileAssimilator: Failed to parse submission ID response: {}",
+         e.what());
     return "";
   }
 }
 
-std::string GlobusFileAssimilator::SubmitTransfer(const std::string& src_endpoint,
-                                                  const std::string& dst_endpoint,
-                                                  const std::string& src_path,
-                                                  const std::string& dst_path,
-                                                  const std::string& access_token,
-                                                  const std::string& submission_id) {
+std::string GlobusFileAssimilator::SubmitTransfer(
+    const std::string& src_endpoint, const std::string& dst_endpoint,
+    const std::string& src_path, const std::string& dst_path,
+    const std::string& access_token, const std::string& submission_id) {
   // Create the JSON payload for the transfer request
   nlohmann::json transfer_request;
   transfer_request["DATA_TYPE"] = "transfer";
@@ -482,7 +556,9 @@ std::string GlobusFileAssimilator::SubmitTransfer(const std::string& src_endpoin
   // Convert to JSON string
   std::string payload = transfer_request.dump(2);
 
-  HLOG(kInfo, "GlobusFileAssimilator: Submitting transfer request with payload: {}", payload);
+  HLOG(kDebug,
+       "GlobusFileAssimilator: Submitting transfer request with payload: {}",
+       payload);
 
   // Submit the transfer
   std::string url = "https://transfer.api.globus.org/v0.10/transfer";
@@ -498,15 +574,18 @@ std::string GlobusFileAssimilator::SubmitTransfer(const std::string& src_endpoin
       if (json_response.contains("task_id")) {
         return json_response["task_id"];
       } else {
-        HLOG(kError, "GlobusFileAssimilator: No 'task_id' field in transfer response");
+        HLOG(kError,
+             "GlobusFileAssimilator: No 'task_id' field in transfer response");
         return "";
       }
     } else {
-      HLOG(kError, "GlobusFileAssimilator: Transfer not accepted. Response: {}", response);
+      HLOG(kError, "GlobusFileAssimilator: Transfer not accepted. Response: {}",
+           response);
       return "";
     }
   } catch (const std::exception& e) {
-    HLOG(kError, "GlobusFileAssimilator: Failed to parse transfer response: {}", e.what());
+    HLOG(kError, "GlobusFileAssimilator: Failed to parse transfer response: {}",
+         e.what());
     return "";
   }
 }
@@ -517,8 +596,9 @@ int GlobusFileAssimilator::PollTransferStatus(const std::string& task_id,
   const int delay_seconds = 10;
 
   for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-    HLOG(kInfo, "GlobusFileAssimilator: Checking transfer status (attempt {}/{})",
-          attempt, max_attempts);
+    HLOG(kDebug,
+         "GlobusFileAssimilator: Checking transfer status (attempt {}/{})",
+         attempt, max_attempts);
 
     std::string url = "https://transfer.api.globus.org/v0.10/task/" + task_id;
     std::string response = HttpGet(url, access_token);
@@ -534,40 +614,44 @@ int GlobusFileAssimilator::PollTransferStatus(const std::string& task_id,
       nlohmann::json json_response = nlohmann::json::parse(response);
 
       if (!json_response.contains("status")) {
-        HLOG(kError, "GlobusFileAssimilator: No 'status' field in status response");
+        HLOG(kError,
+             "GlobusFileAssimilator: No 'status' field in status response");
         std::this_thread::sleep_for(std::chrono::seconds(delay_seconds));
         continue;
       }
 
       std::string status = json_response["status"];
-      HLOG(kInfo, "GlobusFileAssimilator: Transfer status: {}", status);
+      HLOG(kDebug, "GlobusFileAssimilator: Transfer status: {}", status);
 
       if (status == "SUCCEEDED") {
-        HLOG(kInfo, "GlobusFileAssimilator: Transfer completed successfully");
+        HLOG(kDebug, "GlobusFileAssimilator: Transfer completed successfully");
         return 0;
       } else if (status == "FAILED" || status == "INACTIVE") {
-        HLOG(kError, "GlobusFileAssimilator: Transfer failed with status: {}", status);
+        HLOG(kError, "GlobusFileAssimilator: Transfer failed with status: {}",
+             status);
         if (json_response.contains("fatal_error")) {
           HLOG(kError, "GlobusFileAssimilator: Fatal error: {}",
-                json_response["fatal_error"].dump());
+               json_response["fatal_error"].dump());
         }
         if (json_response.contains("nice_status_details")) {
           HLOG(kError, "GlobusFileAssimilator: Details: {}",
-                json_response["nice_status_details"].dump());
+               json_response["nice_status_details"].dump());
         }
         return -8;
       }
       // Status is ACTIVE or other intermediate state, continue polling
     } catch (const std::exception& e) {
-      HLOG(kError, "GlobusFileAssimilator: Failed to parse status response: {}", e.what());
+      HLOG(kError, "GlobusFileAssimilator: Failed to parse status response: {}",
+           e.what());
     }
 
     // Wait before polling again
     std::this_thread::sleep_for(std::chrono::seconds(delay_seconds));
   }
 
-  HLOG(kError, "GlobusFileAssimilator: Transfer did not complete within {} seconds",
-        max_attempts * delay_seconds);
+  HLOG(kError,
+       "GlobusFileAssimilator: Transfer did not complete within {} seconds",
+       max_attempts * delay_seconds);
   return -8;
 }
 
@@ -583,19 +667,22 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
   std::cout << "Local path:   " << local_path << std::endl;
   std::cout << std::endl;
 
-  HLOG(kInfo, "GlobusFileAssimilator: Downloading file from Globus endpoint");
-  HLOG(kInfo, "GlobusFileAssimilator: Endpoint: {}, Remote path: {}, Local path: {}",
-        endpoint_id, remote_path, local_path);
+  HLOG(kDebug, "GlobusFileAssimilator: Downloading file from Globus endpoint");
+  HLOG(kDebug,
+       "GlobusFileAssimilator: Endpoint: {}, Remote path: {}, Local path: {}",
+       endpoint_id, remote_path, local_path);
 
   try {
     // Get endpoint details to find the HTTPS server
     std::cout << "[Step 1/4] Querying Globus endpoint details..." << std::endl;
-    std::string endpoint_url = "https://transfer.api.globus.org/v0.10/endpoint/" + endpoint_id;
+    std::string endpoint_url =
+        "https://transfer.api.globus.org/v0.10/endpoint/" + endpoint_id;
     std::cout << "  API URL: " << endpoint_url << std::endl;
     std::string endpoint_response = HttpGet(endpoint_url, access_token);
 
     if (endpoint_response.empty()) {
-      std::cerr << "ERROR: Failed to get endpoint details from Globus API" << std::endl;
+      std::cerr << "ERROR: Failed to get endpoint details from Globus API"
+                << std::endl;
       HLOG(kError, "GlobusFileAssimilator: Failed to get endpoint details");
       return -11;
     }
@@ -607,42 +694,48 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
     nlohmann::json endpoint_json = nlohmann::json::parse(endpoint_response);
 
     std::string https_server;
-    if (endpoint_json.contains("https_server") && !endpoint_json["https_server"].is_null()) {
+    if (endpoint_json.contains("https_server") &&
+        !endpoint_json["https_server"].is_null()) {
       https_server = endpoint_json["https_server"];
     } else {
-      std::cerr << "ERROR: Endpoint does not have HTTPS server enabled" << std::endl;
-      std::cerr << "       Endpoint must have HTTPS access enabled for local downloads" << std::endl;
-      HLOG(kError, "GlobusFileAssimilator: Endpoint does not have HTTPS server enabled");
-      HLOG(kError, "GlobusFileAssimilator: Endpoint must have HTTPS access enabled for local downloads");
+      std::cerr << "ERROR: Endpoint does not have HTTPS server enabled"
+                << std::endl;
+      std::cerr << "       Endpoint must have HTTPS access enabled for local "
+                   "downloads"
+                << std::endl;
+      HLOG(
+          kError,
+          "GlobusFileAssimilator: Endpoint does not have HTTPS server enabled");
+      HLOG(kError,
+           "GlobusFileAssimilator: Endpoint must have HTTPS access enabled for "
+           "local downloads");
       return -12;
     }
 
     std::cout << "  HTTPS server: " << https_server << std::endl;
     std::cout << std::endl;
-    HLOG(kInfo, "GlobusFileAssimilator: HTTPS server: {}", https_server);
+    HLOG(kDebug, "GlobusFileAssimilator: HTTPS server: {}", https_server);
 
     // Construct the download URL
     std::cout << "[Step 3/4] Initiating HTTPS download..." << std::endl;
     std::string download_url = "https://" + https_server + remote_path;
     std::cout << "  Download URL: " << download_url << std::endl;
-    HLOG(kInfo, "GlobusFileAssimilator: Download URL: {}", download_url);
+    HLOG(kDebug, "GlobusFileAssimilator: Download URL: {}", download_url);
 
     // Download the file using HTTPS
     Poco::URI uri(download_url);
 
     // Create an SSL Context for HTTPS
-    Poco::Net::Context::Ptr context = new Poco::Net::Context(
-        Poco::Net::Context::CLIENT_USE,
-        "", "", "",
-        Poco::Net::Context::VERIFY_NONE,
-        9,
-        false,
-        "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH"
-    );
+    Poco::Net::Context::Ptr context =
+        new Poco::Net::Context(Poco::Net::Context::CLIENT_USE, "", "", "",
+                               Poco::Net::Context::VERIFY_NONE, 9, false,
+                               "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH");
 
     // Set up the session with extended timeout for large files
-    Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort(), context);
-    session.setTimeout(Poco::Timespan(300, 0));  // 5 minute timeout for downloads
+    Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort(),
+                                          context);
+    session.setTimeout(
+        Poco::Timespan(300, 0));  // 5 minute timeout for downloads
 
     // Prepare the request
     std::string path = uri.getPathAndQuery();
@@ -667,12 +760,14 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
       std::cerr << "ERROR: HTTP GET failed with status " << response.getStatus()
                 << " " << response.getReason() << std::endl;
       HLOG(kError, "GlobusFileAssimilator: HTTP GET failed with status {} {}",
-            response.getStatus(), response.getReason());
+           response.getStatus(), response.getReason());
       return -13;
     }
-    std::cout << "  HTTP Status: " << response.getStatus() << " " << response.getReason() << std::endl;
+    std::cout << "  HTTP Status: " << response.getStatus() << " "
+              << response.getReason() << std::endl;
     if (response.has("Content-Length")) {
-      std::cout << "  Content-Length: " << response.get("Content-Length") << " bytes" << std::endl;
+      std::cout << "  Content-Length: " << response.get("Content-Length")
+                << " bytes" << std::endl;
     }
     std::cout << std::endl;
 
@@ -681,14 +776,16 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
     std::cout << "  Output path: " << local_path << std::endl;
     std::ofstream output_file(local_path, std::ios::binary);
     if (!output_file) {
-      std::cerr << "ERROR: Failed to open output file: " << local_path << std::endl;
-      HLOG(kError, "GlobusFileAssimilator: Failed to open output file: {}", local_path);
+      std::cerr << "ERROR: Failed to open output file: " << local_path
+                << std::endl;
+      HLOG(kError, "GlobusFileAssimilator: Failed to open output file: {}",
+           local_path);
       return -14;
     }
 
     // Copy the response stream to the output file
     std::cout << "  Downloading and writing file..." << std::endl;
-    HLOG(kInfo, "GlobusFileAssimilator: Writing file to {}", local_path);
+    HLOG(kDebug, "GlobusFileAssimilator: Writing file to {}", local_path);
     Poco::StreamCopier::copyStream(rs, output_file);
     output_file.close();
 
@@ -699,16 +796,18 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
     std::cout << "==========================================" << std::endl;
     std::cout << std::endl;
 
-    HLOG(kInfo, "GlobusFileAssimilator: File downloaded successfully");
+    HLOG(kDebug, "GlobusFileAssimilator: File downloaded successfully");
     return 0;
 
   } catch (Poco::Exception& e) {
     std::cerr << "ERROR: POCO exception - " << e.displayText() << std::endl;
-    HLOG(kError, "GlobusFileAssimilator: POCO exception in DownloadFile: {}", e.displayText());
+    HLOG(kError, "GlobusFileAssimilator: POCO exception in DownloadFile: {}",
+         e.displayText());
     return -15;
   } catch (const std::exception& e) {
     std::cerr << "ERROR: Exception - " << e.what() << std::endl;
-    HLOG(kError, "GlobusFileAssimilator: Exception in DownloadFile: {}", e.what());
+    HLOG(kError, "GlobusFileAssimilator: Exception in DownloadFile: {}",
+         e.what());
     return -15;
   }
 }

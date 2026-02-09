@@ -1,17 +1,30 @@
 #!/bin/bash
-# Run IOWarp Distributed Unit Test
+# Run IOWarp Distributed Integration Test (Chimaera Runtime)
 #
 # This script manages the distributed test environment, including:
-# - Docker cluster setup
-# - Hostfile generation
-# - Test execution
+# - Docker cluster setup using deps-cpu container
+# - Test execution with coverage support
 # - Cleanup
+#
+# Coverage: Uses deps-cpu container with mounted workspace, allowing
+# gcda files to be written directly to the build directory for coverage.
 
 set -e
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
+
+# Export workspace path for docker-compose
+# Priority: HOST_WORKSPACE > existing IOWARP_CORE_ROOT > computed REPO_ROOT
+if [ -n "${HOST_WORKSPACE:-}" ]; then
+    # Explicitly set by user
+    export IOWARP_CORE_ROOT="${HOST_WORKSPACE}"
+elif [ -z "${IOWARP_CORE_ROOT:-}" ]; then
+    # IOWARP_CORE_ROOT not set, use computed path
+    export IOWARP_CORE_ROOT="${REPO_ROOT}"
+fi
+# Otherwise keep existing IOWARP_CORE_ROOT (e.g., from devcontainer.json)
 
 # Configuration
 NUM_NODES=${NUM_NODES:-4}
@@ -162,6 +175,7 @@ log_info "IOWarp Distributed Test Runner"
 log_info "Configuration:"
 log_info "  Nodes: $NUM_NODES"
 log_info "  Test filter: $TEST_FILTER"
+log_info "  Workspace path: $IOWARP_CORE_ROOT"
 log_info ""
 
 case $COMMAND in

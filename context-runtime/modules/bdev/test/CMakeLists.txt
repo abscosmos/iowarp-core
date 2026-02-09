@@ -44,7 +44,7 @@ if(CHIMAERA_ENABLE_TESTS)
   # Bdev ChiMod Tests
   add_test(
     NAME cr_bdev_container_creation_tests
-    COMMAND ${BDEV_TEST_TARGET} "[bdev][create]"
+    COMMAND ${BDEV_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_bdev_container_creation_tests PROPERTIES
@@ -53,7 +53,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_bdev_block_allocation_tests
-    COMMAND ${BDEV_TEST_TARGET} "[bdev][allocate]"
+    COMMAND ${BDEV_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_bdev_block_allocation_tests PROPERTIES
@@ -62,7 +62,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_bdev_io_operations_tests
-    COMMAND ${BDEV_TEST_TARGET} "[bdev][io]"
+    COMMAND ${BDEV_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_bdev_io_operations_tests PROPERTIES
@@ -71,7 +71,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_bdev_async_operations_tests
-    COMMAND ${BDEV_TEST_TARGET} "[bdev][async]"
+    COMMAND ${BDEV_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_bdev_async_operations_tests PROPERTIES
@@ -80,7 +80,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_bdev_free_management_tests
-    COMMAND ${BDEV_TEST_TARGET} "[bdev][free]"
+    COMMAND ${BDEV_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_bdev_free_management_tests PROPERTIES
@@ -89,7 +89,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_bdev_performance_tests
-    COMMAND ${BDEV_TEST_TARGET} "[bdev][performance]"
+    COMMAND ${BDEV_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_bdev_performance_tests PROPERTIES
@@ -98,7 +98,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_bdev_error_handling_tests
-    COMMAND ${BDEV_TEST_TARGET} "[bdev][error]"
+    COMMAND ${BDEV_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_bdev_error_handling_tests PROPERTIES
@@ -107,7 +107,7 @@ if(CHIMAERA_ENABLE_TESTS)
 
   add_test(
     NAME cr_bdev_cleanup_tests
-    COMMAND ${BDEV_TEST_TARGET} "[bdev][cleanup]"
+    COMMAND ${BDEV_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_bdev_cleanup_tests PROPERTIES
@@ -150,42 +150,42 @@ add_custom_target(test_bdev
 )
 
 add_custom_target(test_bdev_create
-  COMMAND ${BDEV_TEST_TARGET} "[bdev][create]"
+  COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera bdev container creation tests"
 )
 
 add_custom_target(test_bdev_allocate
-  COMMAND ${BDEV_TEST_TARGET} "[bdev][allocate]"
+  COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera bdev block allocation tests"
 )
 
 add_custom_target(test_bdev_io
-  COMMAND ${BDEV_TEST_TARGET} "[bdev][io]"
+  COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera bdev I/O operation tests"
 )
 
 add_custom_target(test_bdev_async
-  COMMAND ${BDEV_TEST_TARGET} "[bdev][async]"
+  COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera bdev asynchronous I/O tests"
 )
 
 add_custom_target(test_bdev_performance
-  COMMAND ${BDEV_TEST_TARGET} "[bdev][performance]"
+  COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera bdev performance metrics tests"
 )
 
 add_custom_target(test_bdev_error
-  COMMAND ${BDEV_TEST_TARGET} "[bdev][error]"
+  COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera bdev error handling tests"

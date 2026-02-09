@@ -18,7 +18,7 @@ if(NOT WIN32)
 #         ${CMAKE_BINARY_DIR}/bin/test_types_exec "~[error=FatalError]")
 endif()
 add_test(NAME ctp_fatal_logger
-        COMMAND ${CMAKE_BINARY_DIR}/bin/test_types_exec "[error=FatalError]")
+        COMMAND ${CMAKE_BINARY_DIR}/bin/test_types_exec)
 
 set_tests_properties(
         ctp_fatal_logger PROPERTIES
@@ -28,7 +28,7 @@ set(INSTALLS ${INSTALLS} test_types_exec)
 #------------------------------------------------------------------------------
 # Build Timer Tests
 #------------------------------------------------------------------------------
-if (HSHM_ENABLE_MPI AND HSHM_ENABLE_OPENMP)
+if (WRP_CORE_ENABLE_MPI AND WRP_CORE_ENABLE_OPENMP)
     add_executable(test_timers_exec
             ${TEST_MAIN}/main_mpi.cc
             test_init.cc
@@ -51,12 +51,3 @@ install(TARGETS
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
 
-#-----------------------------------------------------------------------------
-# Coverage
-#-----------------------------------------------------------------------------
-if(HSHM_ENABLE_COVERAGE)
-    set_coverage_flags(test_types_exec)
-    if (HSHM_ENABLE_MPI AND HSHM_ENABLE_OPENMP)
-        set_coverage_flags(test_timers_exec)
-    endif()
-endif()

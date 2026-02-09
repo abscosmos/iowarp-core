@@ -184,6 +184,23 @@ install(TARGETS test_compression_benchmark_exec
 )
 
 #------------------------------------------------------------------------------
+# Feature-Targeted Data Generator (standalone test)
+#------------------------------------------------------------------------------
+
+# Commented out - source file missing
+# add_executable(test_feature_targeted_generator_exec
+#     test_feature_targeted_generator.cc
+# )
+#
+# target_compile_features(test_feature_targeted_generator_exec PRIVATE cxx_std_17)
+#
+# install(TARGETS test_feature_targeted_generator_exec
+#     RUNTIME DESTINATION bin
+# )
+
+# message(STATUS "Feature-targeted data generator enabled")
+
+#------------------------------------------------------------------------------
 # Synthetic Workload Generator (MPI-based benchmark)
 #------------------------------------------------------------------------------
 
@@ -196,6 +213,7 @@ if(MPI_FOUND)
 
     target_include_directories(synthetic_workload_exec PRIVATE
         ${MPI_CXX_INCLUDE_PATH}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../generator
     )
 
     target_link_libraries(synthetic_workload_exec
