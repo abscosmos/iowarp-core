@@ -709,6 +709,9 @@ void Worker::SuspendMe() {
       // Error occurred
       HLOG(kError, "Worker {}: epoll_wait error: errno={}", worker_id_, errno);
     }
+
+    // Force immediate rescan of all periodic tasks after waking
+    ContinueBlockedTasks(true);
   }
 }
 

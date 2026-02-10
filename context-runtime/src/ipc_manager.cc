@@ -1716,9 +1716,9 @@ void IpcManager::RecvZmqClientThread() {
   }
 
   while (zmq_recv_running_.load()) {
-    // Non-blocking receive via lightbeam
-    ClientTaskMeta meta;
-    int rc = zmq_response_server_->RecvMetadata(meta);
+    // Non-blocking receive via lightbeam into LoadTaskArchive
+    auto archive = std::make_unique<LoadTaskArchive>();
+    int rc = zmq_response_server_->RecvMetadata(*archive);
     if (rc == EAGAIN) {
       // No message available - sleep briefly to avoid busy-spinning
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1729,58 +1729,51 @@ void IpcManager::RecvZmqClientThread() {
       continue;
     }
 
-    // Parse response: [u8 msg_type=2][uintptr_t vaddr][u64 output_size][output_data]
-    const char *data = meta.wire_data.data();
-    size_t msg_size = meta.wire_data.size();
+    // Allocate temp buffers for each bulk entry with BULK_XFER
+    for (const auto &send_bulk : archive->send) {
+      hipc::FullPtr<char> buffer = AllocateBuffer(send_bulk.size);
+      archive->recv.push_back(
+          zmq_response_server_->Expose(buffer, send_bulk.size, send_bulk.flags.bits_));
+    }
 
-    if (msg_size < sizeof(uint8_t) + sizeof(uintptr_t) + sizeof(uint64_t)) {
-      HLOG(kError, "RecvZmqClientThread: Message too small: {}", msg_size);
+    // Receive all bulk data
+    rc = zmq_response_server_->RecvBulks(*archive);
+    if (rc != 0) {
+      HLOG(kError, "RecvZmqClientThread: RecvBulks failed: {}", rc);
+      // Free allocated buffers on error
+      for (auto &bulk : archive->recv) {
+        if (bulk.flags.Any(BULK_XFER) && bulk.data.ptr_) {
+          FreeBuffer(bulk.data);
+        }
+      }
       continue;
     }
 
-    size_t offset = 0;
-    uint8_t msg_type;
-    memcpy(&msg_type, data + offset, sizeof(msg_type));
-    offset += sizeof(msg_type);
-
-    if (msg_type != 2) {
-      HLOG(kError, "RecvZmqClientThread: Unexpected msg_type: {}", msg_type);
+    // Look up pending future by net_key from task_infos
+    if (archive->task_infos_.empty()) {
+      HLOG(kError, "RecvZmqClientThread: No task_infos in response");
       continue;
     }
+    size_t net_key = archive->task_infos_[0].task_id_.net_key_;
 
-    uintptr_t vaddr;
-    memcpy(&vaddr, data + offset, sizeof(vaddr));
-    offset += sizeof(vaddr);
-
-    uint64_t output_size;
-    memcpy(&output_size, data + offset, sizeof(output_size));
-    offset += sizeof(output_size);
-
-    // Find the pending future by vaddr
     std::lock_guard<std::mutex> lock(pending_futures_mutex_);
-    auto it = pending_zmq_futures_.find(vaddr);
+    auto it = pending_zmq_futures_.find(net_key);
     if (it == pending_zmq_futures_.end()) {
-      HLOG(kError, "RecvZmqClientThread: No pending future for vaddr 0x{:x}",
-           vaddr);
+      HLOG(kError, "RecvZmqClientThread: No pending future for net_key {}",
+           net_key);
+      // Free allocated buffers
+      for (auto &bulk : archive->recv) {
+        if (bulk.flags.Any(BULK_XFER) && bulk.data.ptr_) {
+          FreeBuffer(bulk.data);
+        }
+      }
       continue;
     }
 
     FutureShm *future_shm = it->second;
 
-    // Copy output data into copy_space
-    size_t data_size = msg_size - offset;
-    size_t capacity = future_shm->capacity_.load();
-    if (data_size > 0 && data_size <= capacity) {
-      memcpy(future_shm->copy_space, data + offset, data_size);
-      future_shm->output_size_.store(data_size);
-    } else if (data_size > capacity) {
-      HLOG(kError,
-           "RecvZmqClientThread: Response data ({}) exceeds capacity ({})",
-           data_size, capacity);
-      future_shm->output_size_.store(0);
-    } else {
-      future_shm->output_size_.store(0);
-    }
+    // Store the archive for Recv() to pick up
+    pending_response_archives_[net_key] = std::move(archive);
 
     // Memory fence before setting complete
     std::atomic_thread_fence(std::memory_order_release);
@@ -1789,7 +1782,7 @@ void IpcManager::RecvZmqClientThread() {
     future_shm->flags_.SetBits(FutureShm::FUTURE_NEW_DATA |
                                 FutureShm::FUTURE_COMPLETE);
 
-    // Remove from pending map
+    // Remove from pending futures map
     pending_zmq_futures_.erase(it);
   }
 }

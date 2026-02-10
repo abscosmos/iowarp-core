@@ -49,6 +49,8 @@
 #include "chimaera/corwlock.h"
 #include "chimaera/local_task_archives.h"
 #include "chimaera/local_transfer.h"
+#include "hermes_shm/data_structures/serialization/serialize_common.h"
+#include "chimaera/task_archives.h"
 #include "chimaera/scheduler/scheduler.h"
 #include "chimaera/task.h"
 #include "chimaera/task_queue.h"
@@ -689,22 +691,16 @@ class IpcManager {
       return Future<TaskT>();
     }
 
-    // Serialize the task inputs
-    LocalSaveTaskArchive archive(LocalMsgType::kSerializeIn);
+    // Set net_key for response routing (use task's address as unique key)
+    size_t net_key = reinterpret_cast<size_t>(task_ptr.ptr_);
+    task_ptr->task_id_.net_key_ = net_key;
+
+    // Serialize the task inputs using network archive
+    SaveTaskArchive archive(MsgType::kSerializeIn, zmq_client_.get());
     archive << (*task_ptr.ptr_);
 
-    size_t serialized_size = archive.GetSize();
-    const std::vector<char> &serialized = archive.GetData();
-
-    // Determine copy space size - must be large enough for output data
-    // Use max of recommended, serialized input, and a minimum floor
-    size_t recommended_size = task_ptr->GetCopySpaceSize();
-    size_t copy_space_size = recommended_size;
-    if (serialized_size > copy_space_size) copy_space_size = serialized_size;
-    if (copy_space_size < 65536) copy_space_size = 65536;  // 64KB minimum
-
-    // Allocate FutureShm via HSHM_MALLOC (matches FreeBuffer's deallocation)
-    size_t alloc_size = sizeof(FutureShm) + copy_space_size;
+    // Allocate FutureShm via HSHM_MALLOC (no copy_space needed)
+    size_t alloc_size = sizeof(FutureShm);
     hipc::FullPtr<char> buffer = HSHM_MALLOC->AllocateObjs<char>(alloc_size);
     if (buffer.IsNull()) {
       HLOG(kError, "SendZmq: Failed to allocate FutureShm ({} bytes)", alloc_size);
@@ -718,50 +714,19 @@ class IpcManager {
     future_shm->origin_ = (mode == IpcMode::kTcp)
                                ? FutureShm::FUTURE_CLIENT_TCP
                                : FutureShm::FUTURE_CLIENT_IPC;
-    future_shm->client_task_vaddr_ = reinterpret_cast<uintptr_t>(task_ptr.ptr_);
-    future_shm->capacity_.store(copy_space_size);
+    future_shm->client_task_vaddr_ = net_key;
+    future_shm->capacity_.store(0);
 
-    // Register in pending futures map
+    // Register in pending futures map keyed by net_key
     {
       std::lock_guard<std::mutex> lock(pending_futures_mutex_);
-      pending_zmq_futures_[future_shm->client_task_vaddr_] = future_shm;
+      pending_zmq_futures_[net_key] = future_shm;
     }
 
-    // Build wire message: [u8 msg_type=1][PoolId][u32 method][uintptr_t
-    // vaddr][u64 size][data]
-    size_t header_size = sizeof(uint8_t) + sizeof(PoolId) + sizeof(u32) +
-                         sizeof(uintptr_t) + sizeof(uint64_t);
-    size_t msg_size = header_size + serialized_size;
-    std::vector<char> wire_msg(msg_size);
-    size_t offset = 0;
-
-    uint8_t msg_type = 1;  // Task submission
-    memcpy(wire_msg.data() + offset, &msg_type, sizeof(msg_type));
-    offset += sizeof(msg_type);
-
-    memcpy(wire_msg.data() + offset, &task_ptr->pool_id_, sizeof(PoolId));
-    offset += sizeof(PoolId);
-
-    u32 method = task_ptr->method_;
-    memcpy(wire_msg.data() + offset, &method, sizeof(method));
-    offset += sizeof(method);
-
-    uintptr_t vaddr = future_shm->client_task_vaddr_;
-    memcpy(wire_msg.data() + offset, &vaddr, sizeof(vaddr));
-    offset += sizeof(vaddr);
-
-    uint64_t data_size = serialized_size;
-    memcpy(wire_msg.data() + offset, &data_size, sizeof(data_size));
-    offset += sizeof(data_size);
-
-    memcpy(wire_msg.data() + offset, serialized.data(), serialized_size);
-
     // Send via lightbeam PUSH client
-    ClientTaskMeta meta;
-    meta.wire_data = std::move(wire_msg);
     {
       std::lock_guard<std::mutex> lock(zmq_client_send_mutex_);
-      zmq_client_->Send(meta, hshm::lbm::LbmContext());
+      zmq_client_->Send(archive, hshm::lbm::LbmContext());
     }
 
     // Create Future wrapping the HSHM_MALLOC-allocated FutureShm
@@ -807,14 +772,30 @@ class IpcManager {
         // Memory fence
         std::atomic_thread_fence(std::memory_order_acquire);
 
-        // Deserialize task outputs from copy_space
-        size_t output_size = future_shm->output_size_.load();
-        if (output_size > 0) {
-          std::vector<char> data(future_shm->copy_space,
-                                 future_shm->copy_space + output_size);
-          LocalLoadTaskArchive archive(data);
-          archive.SetMsgType(LocalMsgType::kSerializeOut);
-          archive >> (*task_ptr);
+        // Look up stored LoadTaskArchive from pending_response_archives_
+        size_t net_key = future_shm->client_task_vaddr_;
+        std::unique_ptr<LoadTaskArchive> archive;
+        {
+          std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+          auto it = pending_response_archives_.find(net_key);
+          if (it != pending_response_archives_.end()) {
+            archive = std::move(it->second);
+            pending_response_archives_.erase(it);
+          }
+        }
+
+        if (archive) {
+          // Deserialize task outputs using post-receive bulk path
+          archive->ResetBulkIndex();
+          archive->msg_type_ = MsgType::kSerializeOut;
+          *archive >> (*task_ptr);
+
+          // Free temp bulk buffers allocated by RecvZmqClientThread
+          for (auto &bulk : archive->recv) {
+            if (bulk.flags.Any(BULK_XFER) && bulk.data.ptr_) {
+              FreeBuffer(bulk.data);
+            }
+          }
         }
       } else {
         // SHM PATH: Original logic using LocalTransfer
@@ -1386,9 +1367,12 @@ class IpcManager {
   std::thread zmq_recv_thread_;
   std::atomic<bool> zmq_recv_running_{false};
 
-  // Pending futures (client-side, keyed by client_task_vaddr)
-  std::unordered_map<uintptr_t, FutureShm*> pending_zmq_futures_;
+  // Pending futures (client-side, keyed by net_key)
+  std::unordered_map<size_t, FutureShm*> pending_zmq_futures_;
   std::mutex pending_futures_mutex_;
+
+  // Pending response archives (client-side, keyed by net_key)
+  std::unordered_map<size_t, std::unique_ptr<LoadTaskArchive>> pending_response_archives_;
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host

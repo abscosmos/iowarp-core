@@ -49,6 +49,19 @@
 
 #include "chimaera/types.h"
 
+// Type trait to detect types convertible to std::string but not std::string itself
+// Used to handle hshm::priv::basic_string which has an implicit operator std::string()
+// that conflicts with cereal's serialization detection
+template <typename T, typename = void>
+struct is_string_convertible_non_std : std::false_type {};
+template <typename T>
+struct is_string_convertible_non_std<T,
+    std::enable_if_t<
+        std::is_convertible_v<T, std::string> &&
+        !std::is_same_v<std::decay_t<T>, std::string> &&
+        !std::is_base_of_v<std::string, std::decay_t<T>>
+    >> : std::true_type {};
+
 namespace chi {
 
 // Forward declaration
@@ -259,6 +272,9 @@ private:
   template <typename T> void SerializeArg(T &arg) {
     if constexpr (std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<T>>>) {
       *this << arg;
+    } else if constexpr (is_string_convertible_non_std<std::decay_t<T>>::value) {
+      std::string tmp(arg);
+      (*archive_)(tmp);
     } else {
       (*archive_)(arg);
     }
@@ -460,6 +476,10 @@ private:
   template <typename T> void DeserializeArg(T &arg) {
     if constexpr (std::is_base_of_v<Task, std::remove_pointer_t<std::decay_t<T>>>) {
       *this >> arg;
+    } else if constexpr (is_string_convertible_non_std<std::decay_t<T>>::value) {
+      std::string tmp;
+      (*archive_)(tmp);
+      arg = tmp;
     } else {
       (*archive_)(arg);
     }

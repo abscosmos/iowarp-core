@@ -1004,59 +1004,54 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
     hshm::lbm::Server *server = ipc_manager->GetClientServer(mode);
     if (!server) continue;
 
-    // Non-blocking receive via lightbeam
-    chi::ClientTaskMeta meta;
-    int rc = server->RecvMetadata(meta);
+    // Non-blocking receive via lightbeam into LoadTaskArchive
+    chi::LoadTaskArchive archive;
+    int rc = server->RecvMetadata(archive);
     if (rc == EAGAIN) continue;
     if (rc != 0) {
       HLOG(kError, "ClientRecv: RecvMetadata failed: {}", rc);
       continue;
     }
 
-    const char *data = meta.wire_data.data();
-    size_t data_size = meta.wire_data.size();
-
-    // Parse: [u8 msg_type=1][PoolId][u32 method][uintptr_t vaddr][u64 size][data]
-    size_t offset = 0;
-    uint8_t msg_type;
-    memcpy(&msg_type, data + offset, sizeof(msg_type));
-    offset += sizeof(msg_type);
-
-    if (msg_type != 1) {
-      HLOG(kError, "ClientRecv: Unexpected msg_type: {}", msg_type);
+    const auto &task_infos = archive.GetTaskInfos();
+    if (task_infos.empty()) {
+      HLOG(kError, "ClientRecv: No task_infos in received message");
       continue;
     }
 
-    chi::PoolId pool_id;
-    memcpy(&pool_id, data + offset, sizeof(pool_id));
-    offset += sizeof(pool_id);
+    const auto &info = task_infos[0];
+    chi::PoolId pool_id = info.pool_id_;
+    chi::u32 method_id = info.method_id_;
 
-    chi::u32 method_id;
-    memcpy(&method_id, data + offset, sizeof(method_id));
-    offset += sizeof(method_id);
-
-    uintptr_t client_vaddr;
-    memcpy(&client_vaddr, data + offset, sizeof(client_vaddr));
-    offset += sizeof(client_vaddr);
-
-    uint64_t serialized_size;
-    memcpy(&serialized_size, data + offset, sizeof(serialized_size));
-    offset += sizeof(serialized_size);
-
-    // Deserialize the task using the container
+    // Get container for deserialization
     chi::Container *container = pool_manager->GetContainer(pool_id);
     if (!container) {
       HLOG(kError, "ClientRecv: Container not found for pool_id {}", pool_id);
       continue;
     }
 
-    // Create archive from serialized data
-    std::vector<char> task_data(data + offset, data + offset + serialized_size);
-    chi::LocalLoadTaskArchive archive(task_data);
+    // Allocate recv buffers for each bulk entry
+    for (const auto &send_bulk : archive.send) {
+      hipc::FullPtr<char> buffer = ipc_manager->AllocateBuffer(send_bulk.size);
+      archive.recv.push_back(
+          server->Expose(buffer, send_bulk.size, send_bulk.flags.bits_));
+    }
+
+    // Receive all bulk data
+    rc = server->RecvBulks(archive);
+    if (rc != 0) {
+      HLOG(kError, "ClientRecv: RecvBulks failed: {}", rc);
+      for (auto &bulk : archive.recv) {
+        if (bulk.flags.Any(BULK_XFER) && bulk.data.ptr_) {
+          ipc_manager->FreeBuffer(bulk.data);
+        }
+      }
+      continue;
+    }
 
     // Allocate and deserialize the task
     hipc::FullPtr<chi::Task> task_ptr =
-        container->LocalAllocLoadTask(method_id, archive);
+        container->AllocLoadTask(method_id, archive);
 
     if (task_ptr.IsNull()) {
       HLOG(kError, "ClientRecv: Failed to deserialize task");
@@ -1071,7 +1066,7 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
     future_shm->origin_ = (mode == chi::IpcMode::kTcp)
                                ? chi::FutureShm::FUTURE_CLIENT_TCP
                                : chi::FutureShm::FUTURE_CLIENT_IPC;
-    future_shm->client_task_vaddr_ = client_vaddr;
+    future_shm->client_task_vaddr_ = info.task_id_.net_key_;
     future_shm->capacity_.store(0);
     // Mark as copied so the worker routes the completed task back via lightbeam
     // rather than treating it as a runtime-internal task
@@ -1121,11 +1116,9 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
       auto origin_task = queued_future.GetTaskPtr();
       if (origin_task.IsNull()) continue;
 
-      // Get the FutureShm to find client_task_vaddr
+      // Get the FutureShm to find client's net_key
       auto future_shm = queued_future.GetFutureShm();
       if (future_shm.IsNull()) continue;
-
-      uintptr_t client_vaddr = future_shm->client_task_vaddr_;
 
       // Get container to serialize outputs
       chi::Container *container =
@@ -1136,48 +1129,25 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
         continue;
       }
 
-      // Serialize task outputs
-      chi::LocalSaveTaskArchive archive(chi::LocalMsgType::kSerializeOut);
-      container->LocalSaveTask(origin_task->method_, archive, origin_task);
-
-      size_t output_size = archive.GetSize();
-      const std::vector<char> &output_data = archive.GetData();
-
-      // Build response: [u8 msg_type=2][uintptr_t vaddr][u64 output_size][output_data]
-      size_t header_size =
-          sizeof(uint8_t) + sizeof(uintptr_t) + sizeof(uint64_t);
-      size_t msg_size = header_size + output_size;
-      std::vector<char> response_msg(msg_size);
-      size_t offset = 0;
-
-      uint8_t msg_type = 2;
-      memcpy(response_msg.data() + offset, &msg_type, sizeof(msg_type));
-      offset += sizeof(msg_type);
-
-      memcpy(response_msg.data() + offset, &client_vaddr,
-             sizeof(client_vaddr));
-      offset += sizeof(client_vaddr);
-
-      uint64_t out_size = output_size;
-      memcpy(response_msg.data() + offset, &out_size, sizeof(out_size));
-      offset += sizeof(out_size);
-
-      if (output_size > 0) {
-        memcpy(response_msg.data() + offset, output_data.data(), output_size);
-      }
-
-      // Send via lightbeam PUSH client to client's PULL response server
+      // Get response client for sending back to the client process
       hshm::lbm::Client *response_client =
           ipc_manager->GetClientResponseClient(mode);
-      if (response_client) {
-        chi::ClientTaskMeta meta;
-        meta.wire_data = std::move(response_msg);
-        int rc = response_client->Send(meta, hshm::lbm::LbmContext());
-        if (rc != 0) {
-          HLOG(kError, "ClientSend: lightbeam Send failed: {}", rc);
-        }
-      } else {
+      if (!response_client) {
         HLOG(kError, "ClientSend: No response client for mode {}", mode_idx);
+        continue;
+      }
+
+      // Preserve client's net_key for response routing
+      origin_task->task_id_.net_key_ = future_shm->client_task_vaddr_;
+
+      // Serialize task outputs using network archive
+      chi::SaveTaskArchive archive(chi::MsgType::kSerializeOut, response_client);
+      container->SaveTask(origin_task->method_, archive, origin_task);
+
+      // Send via lightbeam
+      int rc = response_client->Send(archive, hshm::lbm::LbmContext());
+      if (rc != 0) {
+        HLOG(kError, "ClientSend: lightbeam Send failed: {}", rc);
       }
 
       // Delete the task copy and free FutureShm
