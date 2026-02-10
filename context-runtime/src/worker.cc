@@ -489,7 +489,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     return false;
   }
 
-  HLOG(kInfo, "Worker {}: Popped future from lane, processing task",
+  HLOG(kDebug, "Worker {}: Popped future from lane, processing task",
        worker_id_);
   SetCurrentRunContext(nullptr);
 
@@ -562,14 +562,14 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     return true;
   }
 
-  HLOG(kInfo,
+  HLOG(kDebug,
        "Worker {}: Task deserialized successfully, task_ptr={}, checking "
        "if routed",
        worker_id_, (void *)task_full_ptr.ptr_);
 
   // Allocate stack and RunContext before routing
   if (!task_full_ptr->IsRouted()) {
-    HLOG(kInfo, "Worker {}: Task not routed, calling BeginTask",
+    HLOG(kDebug, "Worker {}: Task not routed, calling BeginTask",
          worker_id_);
     BeginTask(future, container, lane);
   }
