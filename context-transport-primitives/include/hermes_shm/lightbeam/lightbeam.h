@@ -110,6 +110,13 @@ class Server {
   int RecvBulks(MetaT& meta);
 
   virtual std::string GetAddress() const = 0;
+
+  /**
+   * Get the file descriptor for the underlying socket
+   * Can be used with epoll for event-driven I/O
+   * @return File descriptor, or -1 if not available
+   */
+  virtual int GetFd() const { return -1; }
 };
 
 // --- Transport Enum ---

@@ -147,6 +147,7 @@ public:
   std::vector<LocalTaskInfo> task_infos_;
 #endif
   LocalMsgType msg_type_; /**< Message type: kSerializeIn or kSerializeOut */
+  bool inline_bulk_ = false; /**< When true, bulk() inlines data instead of ShmPtr */
 
 private:
 #if HSHM_IS_HOST
@@ -159,6 +160,9 @@ private:
 #endif
 
 public:
+  /** Set inline bulk mode (for TCP/IPC transport) */
+  void SetInlineBulk(bool v) { inline_bulk_ = v; }
+
   /**
    * Constructor with message type (HOST - uses std::vector buffer)
    *
@@ -307,10 +311,23 @@ public:
    */
   template <typename T>
   void bulk(hipc::ShmPtr<T> ptr, size_t size, uint32_t flags) {
-    (void)size;   // Unused for local serialization
-    (void)flags;  // Unused for local serialization
-    // Serialize the ShmPtr value directly (offset and allocator ID)
-    serializer_ << ptr.off_.load() << ptr.alloc_id_.major_ << ptr.alloc_id_.minor_;
+    if (!inline_bulk_) {
+      // Pointer mode (SHM): mode=0, then ShmPtr
+      uint8_t mode = 0;
+      serializer_ << mode;
+      serializer_ << ptr.off_.load() << ptr.alloc_id_.major_ << ptr.alloc_id_.minor_;
+    } else if (flags & BULK_XFER) {
+      // Inline data mode: mode=1, then actual data bytes
+      // For null alloc_id (TCP/IPC), offset IS the raw pointer address
+      uint8_t mode = 1;
+      serializer_ << mode;
+      char *raw_ptr = reinterpret_cast<char *>(ptr.off_.load());
+      serializer_.write_binary(raw_ptr, size);
+    } else {
+      // Inline allocate-only mode (BULK_EXPOSE): mode=2, no data
+      uint8_t mode = 2;
+      serializer_ << mode;
+    }
   }
 
   /**
@@ -323,10 +340,21 @@ public:
    */
   template <typename T>
   void bulk(const hipc::FullPtr<T> &ptr, size_t size, uint32_t flags) {
-    (void)size;   // Unused for local serialization
-    (void)flags;  // Unused for local serialization
-    // Serialize only the ShmPtr part (offset and allocator ID)
-    serializer_ << ptr.shm_.off_.load() << ptr.shm_.alloc_id_.major_ << ptr.shm_.alloc_id_.minor_;
+    if (!inline_bulk_) {
+      // Pointer mode (SHM): mode=0, then ShmPtr
+      uint8_t mode = 0;
+      serializer_ << mode;
+      serializer_ << ptr.shm_.off_.load() << ptr.shm_.alloc_id_.major_ << ptr.shm_.alloc_id_.minor_;
+    } else if (flags & BULK_XFER) {
+      // Inline data mode: mode=1, then actual data bytes
+      uint8_t mode = 1;
+      serializer_ << mode;
+      serializer_.write_binary(reinterpret_cast<const char *>(ptr.ptr_), size);
+    } else {
+      // Inline allocate-only mode (BULK_EXPOSE): mode=2, no data
+      uint8_t mode = 2;
+      serializer_ << mode;
+    }
   }
 
   /**
@@ -597,15 +625,28 @@ public:
    */
   template <typename T>
   void bulk(hipc::ShmPtr<T> &ptr, size_t size, uint32_t flags) {
-    (void)size;   // Unused for local deserialization
-    (void)flags;  // Unused for local deserialization
-    // Deserialize the ShmPtr value (offset and allocator ID)
-    size_t off;
-    u32 major, minor;
-    deserializer_ >> off >> major >> minor;
-
-    ptr.off_ = off;
-    ptr.alloc_id_ = hipc::AllocatorId(major, minor);
+    (void)flags;
+    uint8_t mode;
+    deserializer_ >> mode;
+    if (mode == 1) {
+      // Inline data mode: allocate buffer and read data
+      hipc::FullPtr<char> buf = HSHM_MALLOC->AllocateObjs<char>(size);
+      deserializer_.read_binary(buf.ptr_, size);
+      ptr.off_ = buf.shm_.off_.load();
+      ptr.alloc_id_ = buf.shm_.alloc_id_;
+    } else if (mode == 2) {
+      // Allocate-only mode: allocate empty buffer (server will fill it)
+      hipc::FullPtr<char> buf = HSHM_MALLOC->AllocateObjs<char>(size);
+      ptr.off_ = buf.shm_.off_.load();
+      ptr.alloc_id_ = buf.shm_.alloc_id_;
+    } else {
+      // Pointer mode: deserialize the ShmPtr value
+      size_t off;
+      u32 major, minor;
+      deserializer_ >> off >> major >> minor;
+      ptr.off_ = off;
+      ptr.alloc_id_ = hipc::AllocatorId(major, minor);
+    }
   }
 
   /**
@@ -618,15 +659,30 @@ public:
    */
   template <typename T>
   void bulk(hipc::FullPtr<T> &ptr, size_t size, uint32_t flags) {
-    (void)size;   // Unused for local deserialization
-    (void)flags;  // Unused for local deserialization
-    // Deserialize only the ShmPtr part (offset and allocator ID)
-    size_t off;
-    u32 major, minor;
-    deserializer_ >> off >> major >> minor;
-
-    ptr.shm_.off_ = off;
-    ptr.shm_.alloc_id_ = hipc::AllocatorId(major, minor);
+    (void)flags;
+    uint8_t mode;
+    deserializer_ >> mode;
+    if (mode == 1) {
+      // Inline data mode: allocate buffer and read data
+      hipc::FullPtr<char> buf = HSHM_MALLOC->AllocateObjs<char>(size);
+      deserializer_.read_binary(buf.ptr_, size);
+      ptr.shm_.off_ = buf.shm_.off_.load();
+      ptr.shm_.alloc_id_ = buf.shm_.alloc_id_;
+      ptr.ptr_ = reinterpret_cast<T *>(buf.ptr_);
+    } else if (mode == 2) {
+      // Allocate-only mode: allocate empty buffer (server will fill it)
+      hipc::FullPtr<char> buf = HSHM_MALLOC->AllocateObjs<char>(size);
+      ptr.shm_.off_ = buf.shm_.off_.load();
+      ptr.shm_.alloc_id_ = buf.shm_.alloc_id_;
+      ptr.ptr_ = reinterpret_cast<T *>(buf.ptr_);
+    } else {
+      // Pointer mode: deserialize only the ShmPtr part
+      size_t off;
+      u32 major, minor;
+      deserializer_ >> off >> major >> minor;
+      ptr.shm_.off_ = off;
+      ptr.shm_.alloc_id_ = hipc::AllocatorId(major, minor);
+    }
   }
 
   /**

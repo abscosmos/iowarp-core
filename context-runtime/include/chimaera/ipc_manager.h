@@ -55,6 +55,7 @@
 #include "chimaera/types.h"
 #include "chimaera/worker.h"
 #include "hermes_shm/memory/backend/posix_shm_mmap.h"
+#include "hermes_shm/lightbeam/zmq_transport.h"
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 #include "hermes_shm/memory/allocator/buddy_allocator.h"
@@ -93,6 +94,24 @@ using NetQueue = hipc::multi_mpsc_ring_buffer<Future<Task>, CHI_MAIN_ALLOC_T>;
  * Typedef for worker queue type to simplify usage
  */
 using WorkQueue = chi::ipc::mpsc_ring_buffer<hipc::ShmPtr<TaskLane>>;
+
+/**
+ * Metadata for client <-> server communication via lightbeam
+ * Compatible with lightbeam Send/RecvMetadata via duck typing
+ * (has send, recv, send_bulks, recv_bulks fields)
+ */
+struct ClientTaskMeta {
+  std::vector<hshm::lbm::Bulk> send;
+  std::vector<hshm::lbm::Bulk> recv;
+  size_t send_bulks = 0;
+  size_t recv_bulks = 0;
+  std::vector<char> wire_data;
+
+  template <class Archive>
+  void serialize(Archive &ar) {
+    ar(send, recv, send_bulks, recv_bulks, wire_data);
+  }
+};
 
 /**
  * Custom header structure for shared memory allocator
@@ -657,8 +676,9 @@ class IpcManager {
   }
 
   /**
-   * Send a task via ZMQ transport (TCP or IPC)
-   * Serializes the task, creates a private-memory FutureShm, sends via ZMQ
+   * Send a task via lightbeam transport (TCP or IPC)
+   * Serializes the task, creates a private-memory FutureShm, sends via
+   * lightbeam PUSH/PULL
    * @param task_ptr Task to send
    * @param mode Transport mode (kTcp or kIpc)
    * @return Future for polling completion
@@ -669,23 +689,29 @@ class IpcManager {
       return Future<TaskT>();
     }
 
-    // Serialize the task inputs
+    // Serialize the task inputs (with inline bulk for TCP/IPC transport)
     LocalSaveTaskArchive archive(LocalMsgType::kSerializeIn);
+    archive.SetInlineBulk(true);
     archive << (*task_ptr.ptr_);
 
     size_t serialized_size = archive.GetSize();
     const std::vector<char> &serialized = archive.GetData();
 
-    // Determine copy space size
+    // Determine copy space size - must be large enough for output data
+    // Use max of recommended, serialized input, and a minimum floor
     size_t recommended_size = task_ptr->GetCopySpaceSize();
-    size_t copy_space_size = (recommended_size > serialized_size)
-                                 ? recommended_size
-                                 : serialized_size;
+    size_t copy_space_size = recommended_size;
+    if (serialized_size > copy_space_size) copy_space_size = serialized_size;
+    if (copy_space_size < 65536) copy_space_size = 65536;  // 64KB minimum
 
-    // Allocate FutureShm in private memory (not shared memory)
+    // Allocate FutureShm via HSHM_MALLOC (matches FreeBuffer's deallocation)
     size_t alloc_size = sizeof(FutureShm) + copy_space_size;
-    char *buffer = new char[alloc_size];
-    FutureShm *future_shm = new (buffer) FutureShm();
+    hipc::FullPtr<char> buffer = HSHM_MALLOC->AllocateObjs<char>(alloc_size);
+    if (buffer.IsNull()) {
+      HLOG(kError, "SendZmq: Failed to allocate FutureShm ({} bytes)", alloc_size);
+      return Future<TaskT>();
+    }
+    FutureShm *future_shm = new (buffer.ptr_) FutureShm();
 
     // Initialize FutureShm fields
     future_shm->pool_id_ = task_ptr->pool_id_;
@@ -702,7 +728,8 @@ class IpcManager {
       pending_zmq_futures_[future_shm->client_task_vaddr_] = future_shm;
     }
 
-    // Build wire message: [u8 msg_type=1][PoolId][u32 method][uintptr_t vaddr][u64 size][data]
+    // Build wire message: [u8 msg_type=1][PoolId][u32 method][uintptr_t
+    // vaddr][u64 size][data]
     size_t header_size = sizeof(uint8_t) + sizeof(PoolId) + sizeof(u32) +
                          sizeof(uintptr_t) + sizeof(uint64_t);
     size_t msg_size = header_size + serialized_size;
@@ -730,19 +757,17 @@ class IpcManager {
 
     memcpy(wire_msg.data() + offset, serialized.data(), serialized_size);
 
-    // Send via ZMQ
-    void *socket = (mode == IpcMode::kTcp) ? zmq_tcp_client_socket_
-                                            : zmq_ipc_client_socket_;
+    // Send via lightbeam PUSH client
+    ClientTaskMeta meta;
+    meta.wire_data = std::move(wire_msg);
     {
       std::lock_guard<std::mutex> lock(zmq_client_send_mutex_);
-      zmq_send(socket, wire_msg.data(), msg_size, 0);
+      zmq_client_->Send(meta, hshm::lbm::LbmContext());
     }
 
-    // Create Future wrapping the private-memory FutureShm
-    // Use null allocator ID since this is private memory
-    hipc::ShmPtr<FutureShm> future_shm_shmptr(
-        hipc::AllocatorId::GetNull(),
-        hipc::OffsetPtr<FutureShm>(reinterpret_cast<size_t>(future_shm)));
+    // Create Future wrapping the HSHM_MALLOC-allocated FutureShm
+    hipc::ShmPtr<FutureShm> future_shm_shmptr =
+        buffer.shm_.template Cast<FutureShm>();
 
     return Future<TaskT>(future_shm_shmptr, task_ptr);
   }
@@ -970,45 +995,24 @@ class IpcManager {
   const Host &GetThisHost() const;
 
   /**
-   * Get the ZMQ server socket for the given mode
+   * Get the lightbeam server for receiving client tasks
    * @param mode IPC mode (kTcp or kIpc)
-   * @return ZMQ ROUTER socket pointer
+   * @return Lightbeam Server pointer, or nullptr
    */
-  void *GetServerSocket(IpcMode mode) const;
+  hshm::lbm::Server *GetClientServer(IpcMode mode) const;
 
   /**
-   * Client-side thread that receives completed task outputs via ZMQ
+   * Get or create the lightbeam client for sending responses to clients
+   * Lazy-initialized on first call
+   * @param mode IPC mode (kTcp or kIpc)
+   * @return Lightbeam Client pointer, or nullptr
+   */
+  hshm::lbm::Client *GetClientResponseClient(IpcMode mode);
+
+  /**
+   * Client-side thread that receives completed task outputs via lightbeam
    */
   void RecvZmqClientThread();
-
-  /**
-   * Store a client identity for routing ZMQ responses
-   * @param client_vaddr Client task virtual address (key)
-   * @param identity ZMQ ROUTER identity frame
-   */
-  void StoreClientIdentity(uintptr_t client_vaddr,
-                           const std::vector<uint8_t> &identity) {
-    std::lock_guard<std::mutex> lock(zmq_identities_mutex_);
-    zmq_client_identities_[client_vaddr] = identity;
-  }
-
-  /**
-   * Look up and remove a client identity for ZMQ response routing
-   * @param client_vaddr Client task virtual address (key)
-   * @param[out] identity Retrieved identity frame
-   * @return true if identity found and removed
-   */
-  bool PopClientIdentity(uintptr_t client_vaddr,
-                         std::vector<uint8_t> &identity) {
-    std::lock_guard<std::mutex> lock(zmq_identities_mutex_);
-    auto it = zmq_client_identities_.find(client_vaddr);
-    if (it != zmq_client_identities_.end()) {
-      identity = std::move(it->second);
-      zmq_client_identities_.erase(it);
-      return true;
-    }
-    return false;
-  }
 
   /**
    * Start local ZeroMQ server
@@ -1363,29 +1367,29 @@ class IpcManager {
   // IPC transport mode (TCP default, configurable via CHI_IPC_MODE)
   IpcMode ipc_mode_ = IpcMode::kTcp;
 
-  // ZMQ transport context (shared by all transport sockets)
-  void *zmq_transport_ctx_ = nullptr;
-
-  // Client-side: DEALER sockets for sending tasks via ZMQ
-  void *zmq_tcp_client_socket_ = nullptr;
-  void *zmq_ipc_client_socket_ = nullptr;
+  // Client-side: lightbeam PUSH client for sending tasks to server
+  std::unique_ptr<hshm::lbm::Client> zmq_client_;
   std::mutex zmq_client_send_mutex_;
 
-  // Server-side: ROUTER sockets for receiving client tasks via ZMQ
-  void *zmq_tcp_server_socket_ = nullptr;
-  void *zmq_ipc_server_socket_ = nullptr;
+  // Client-side: lightbeam PULL server for receiving responses from server
+  std::unique_ptr<hshm::lbm::Server> zmq_response_server_;
 
-  // Client recv thread (receives completed task outputs via ZMQ)
+  // Server-side: lightbeam PULL servers for receiving client tasks
+  std::unique_ptr<hshm::lbm::Server> client_tcp_server_;
+  std::unique_ptr<hshm::lbm::Server> client_ipc_server_;
+
+  // Server-side: lightbeam PUSH clients for sending responses to clients
+  std::unique_ptr<hshm::lbm::Client> client_tcp_response_;
+  std::unique_ptr<hshm::lbm::Client> client_ipc_response_;
+  std::mutex client_response_mutex_;
+
+  // Client recv thread (receives completed task outputs via lightbeam)
   std::thread zmq_recv_thread_;
   std::atomic<bool> zmq_recv_running_{false};
 
-  // Pending ZMQ futures (client-side, keyed by client_task_vaddr)
+  // Pending futures (client-side, keyed by client_task_vaddr)
   std::unordered_map<uintptr_t, FutureShm*> pending_zmq_futures_;
   std::mutex pending_futures_mutex_;
-
-  // Server-side: ZMQ client identity tracking (keyed by client_task_vaddr)
-  std::unordered_map<uintptr_t, std::vector<uint8_t>> zmq_client_identities_;
-  std::mutex zmq_identities_mutex_;
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host

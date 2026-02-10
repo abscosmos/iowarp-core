@@ -117,8 +117,12 @@ class ZeroMqClient : public Client {
         ctx_(GetSharedContext()),
         owns_ctx_(false),
         socket_(zmq_socket(ctx_, ZMQ_PUSH)) {
-    std::string full_url =
-        protocol_ + "://" + addr_ + ":" + std::to_string(port_);
+    std::string full_url;
+    if (protocol_ == "ipc") {
+      full_url = "ipc://" + addr_;
+    } else {
+      full_url = protocol_ + "://" + addr_ + ":" + std::to_string(port_);
+    }
     HLOG(kDebug, "ZeroMqClient connecting to URL: {}", full_url);
 
     // Disable ZMQ_IMMEDIATE - let messages queue until connection is
@@ -256,8 +260,12 @@ class ZeroMqServer : public Server {
         port_(port),
         ctx_(zmq_ctx_new()),
         socket_(zmq_socket(ctx_, ZMQ_PULL)) {
-    std::string full_url =
-        protocol_ + "://" + addr_ + ":" + std::to_string(port_);
+    std::string full_url;
+    if (protocol_ == "ipc") {
+      full_url = "ipc://" + addr_;
+    } else {
+      full_url = protocol_ + "://" + addr_ + ":" + std::to_string(port_);
+    }
     HLOG(kDebug, "ZeroMqServer binding to URL: {}", full_url);
     int rc = zmq_bind(socket_, full_url.c_str());
     if (rc == -1) {
@@ -353,7 +361,7 @@ class ZeroMqServer : public Server {
    * Can be used with epoll for efficient event-driven I/O
    * @return File descriptor for the socket
    */
-  int GetFd() const {
+  int GetFd() const override {
     int fd;
     size_t fd_size = sizeof(fd);
     zmq_getsockopt(socket_, ZMQ_FD, &fd, reinterpret_cast<::size_t *>(&fd_size));

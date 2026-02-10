@@ -53,7 +53,87 @@
 #include "chimaera/chimaera.h"
 #include "chimaera/ipc_manager.h"
 
+#include <chimaera/bdev/bdev_client.h>
+#include <chimaera/bdev/bdev_tasks.h>
+
 using namespace chi;
+
+inline chi::priv::vector<chimaera::bdev::Block> WrapBlock(
+    const chimaera::bdev::Block& block) {
+  chi::priv::vector<chimaera::bdev::Block> blocks(HSHM_MALLOC);
+  blocks.push_back(block);
+  return blocks;
+}
+
+void SubmitTasksForMode(const std::string &mode_name) {
+  const chi::u64 kRamSize = 1024 * 1024;  // 1MB
+  const chi::u64 kBlockSize = 4096;       // 4KB
+
+  // --- Category 1: Create bdev pool (inputs > outputs) ---
+  chi::PoolId pool_id(9000, 0);
+  chimaera::bdev::Client client(pool_id);
+  std::string pool_name = "ipc_test_ram_" + mode_name;
+  auto create_task = client.AsyncCreate(
+      chi::PoolQuery::Dynamic(), pool_name, pool_id,
+      chimaera::bdev::BdevType::kRam, kRamSize);
+  create_task.Wait();
+  REQUIRE(create_task->return_code_ == 0);
+  client.pool_id_ = create_task->new_pool_id_;
+
+  // --- Category 2: AllocateBlocks (outputs > inputs) ---
+  auto alloc_task = client.AsyncAllocateBlocks(
+      chi::PoolQuery::Local(), kBlockSize);
+  alloc_task.Wait();
+  REQUIRE(alloc_task->return_code_ == 0);
+  REQUIRE(alloc_task->blocks_.size() > 0);
+  chimaera::bdev::Block block = alloc_task->blocks_[0];
+  REQUIRE(block.size_ >= kBlockSize);
+
+  // --- Category 3: Write + Read I/O round-trip ---
+  // Generate test data
+  std::vector<hshm::u8> write_data(kBlockSize);
+  for (size_t i = 0; i < kBlockSize; ++i) {
+    write_data[i] = static_cast<hshm::u8>((0xAB + i) % 256);
+  }
+
+  // Write
+  auto write_buffer = CHI_IPC->AllocateBuffer(write_data.size());
+  REQUIRE_FALSE(write_buffer.IsNull());
+  memcpy(write_buffer.ptr_, write_data.data(), write_data.size());
+  auto write_task = client.AsyncWrite(
+      chi::PoolQuery::Local(), WrapBlock(block),
+      write_buffer.shm_.template Cast<void>().template Cast<void>(),
+      write_data.size());
+  write_task.Wait();
+  REQUIRE(write_task->return_code_ == 0);
+  REQUIRE(write_task->bytes_written_ == write_data.size());
+
+  // Read
+  auto read_buffer = CHI_IPC->AllocateBuffer(kBlockSize);
+  REQUIRE_FALSE(read_buffer.IsNull());
+  auto read_task = client.AsyncRead(
+      chi::PoolQuery::Local(), WrapBlock(block),
+      read_buffer.shm_.template Cast<void>().template Cast<void>(),
+      kBlockSize);
+  read_task.Wait();
+  REQUIRE(read_task->return_code_ == 0);
+  REQUIRE(read_task->bytes_read_ == write_data.size());
+
+  // Verify data - read from task's data_ pointer (updated by deserialization
+  // in TCP/IPC mode, same as read_buffer in SHM mode)
+  hipc::FullPtr<char> data_ptr =
+      CHI_IPC->ToFullPtr(read_task->data_.template Cast<char>());
+  REQUIRE_FALSE(data_ptr.IsNull());
+  std::vector<hshm::u8> read_data(read_task->bytes_read_);
+  memcpy(read_data.data(), data_ptr.ptr_, read_task->bytes_read_);
+  for (size_t i = 0; i < write_data.size(); ++i) {
+    REQUIRE(read_data[i] == write_data[i]);
+  }
+
+  // Cleanup buffers
+  CHI_IPC->FreeBuffer(write_buffer);
+  CHI_IPC->FreeBuffer(read_buffer);
+}
 
 /**
  * Helper to start server in background process
@@ -156,6 +236,9 @@ TEST_CASE("IpcTransportMode - SHM Client Connection",
   // SHM mode attaches to shared queues
   REQUIRE(ipc->GetTaskQueue() != nullptr);
 
+  // Submit real tasks through the transport layer
+  SubmitTasksForMode("shm");
+
   // Cleanup
   CleanupServer(server_pid);
 }
@@ -184,6 +267,9 @@ TEST_CASE("IpcTransportMode - TCP Client Connection",
   // TCP mode does not attach to shared queues
   REQUIRE(ipc->GetTaskQueue() == nullptr);
 
+  // Submit real tasks through the transport layer
+  SubmitTasksForMode("tcp");
+
   // Cleanup
   CleanupServer(server_pid);
 }
@@ -211,6 +297,9 @@ TEST_CASE("IpcTransportMode - IPC Client Connection",
 
   // IPC mode does not attach to shared queues
   REQUIRE(ipc->GetTaskQueue() == nullptr);
+
+  // Submit real tasks through the transport layer
+  SubmitTasksForMode("ipc");
 
   // Cleanup
   CleanupServer(server_pid);

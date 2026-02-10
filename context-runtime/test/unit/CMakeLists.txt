@@ -354,10 +354,14 @@ add_executable(${IPC_TRANSPORT_MODES_TEST_TARGET} ${IPC_TRANSPORT_MODES_TEST_SOU
 target_include_directories(${IPC_TRANSPORT_MODES_TEST_TARGET} PRIVATE
   ${CHIMAERA_ROOT}/include
   ${CHIMAERA_ROOT}/test  # For simple_test.h
+  ${CHIMAERA_ROOT}/modules/bdev/include
+  ${CHIMAERA_ROOT}/modules/admin/include
 )
 
 target_link_libraries(${IPC_TRANSPORT_MODES_TEST_TARGET}
   chimaera_cxx               # Main Chimaera library
+  chimaera_bdev_client        # Bdev module client
+  chimaera_admin_client       # Admin module client
   hshm::cxx                  # HermesShm library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
@@ -824,7 +828,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_ipc_transport_shm PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 60
+    TIMEOUT 120
   )
 
   add_test(
@@ -834,7 +838,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_ipc_transport_tcp PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 60
+    TIMEOUT 120
   )
 
   add_test(
@@ -844,7 +848,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_ipc_transport_ipc PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 60
+    TIMEOUT 120
   )
 
   add_test(
@@ -854,7 +858,7 @@ if(WRP_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_ipc_transport_default PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 60
+    TIMEOUT 120
   )
 
   # Set test properties for timeout and environment
