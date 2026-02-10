@@ -276,11 +276,7 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
           std::cerr << "Warning: GetBlob failed for a blob in batch" << std::endl;
         }
       }
-
-      // Delete all tasks in this batch
-      for (auto& task : tasks) {
-        ipc_manager->DelTask(task.GetTaskPtr());
-      }
+      // Future destructors handle task cleanup automatically
     }
 
     // Convert buffer to std::string
