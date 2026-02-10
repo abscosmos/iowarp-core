@@ -1245,16 +1245,16 @@ class IpcManager {
   size_t WreapAllIpcs();
 
   /**
-   * Clear all chimaera_* shared memory segments from /dev/shm
+   * Clear all chimaera_* memfd symlinks from /tmp/chimaera_memfd/
    *
-   * Called during RuntimeInit to clean up leftover shared memory segments
+   * Called during RuntimeInit to clean up leftover memfd symlinks
    * from previous runs or crashed processes. Attempts to remove all files
-   * matching "chimaera_*" pattern in /dev/shm directory.
+   * matching "chimaera_*" pattern in /tmp/chimaera_memfd/ directory.
    *
    * Permission errors are silently ignored to allow multi-user systems where
    * other users may have active Chimaera processes.
    *
-   * @return Number of shared memory segments successfully removed
+   * @return Number of memfd symlinks successfully removed
    */
   size_t ClearUserIpcs();
 

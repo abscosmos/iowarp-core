@@ -1606,15 +1606,14 @@ size_t IpcManager::WreapAllIpcs() {
 
 size_t IpcManager::ClearUserIpcs() {
   size_t removed_count = 0;
-  const char *shm_dir = "/dev/shm";
+  const char *memfd_dir = "/tmp/chimaera_memfd";
   const char *prefix = "chimaera_";
   size_t prefix_len = strlen(prefix);
 
-  // Open /dev/shm directory
-  DIR *dir = opendir(shm_dir);
+  // Open memfd symlink directory
+  DIR *dir = opendir(memfd_dir);
   if (dir == nullptr) {
-    HLOG(kWarning, "ClearUserIpcs: Failed to open {}: {}", shm_dir,
-         strerror(errno));
+    // Directory may not exist yet, that's fine
     return 0;
   }
 
@@ -1631,18 +1630,13 @@ size_t IpcManager::ClearUserIpcs() {
       continue;
     }
 
-    // Construct full path
-    std::string full_path = std::string(shm_dir) + "/" + entry->d_name;
-
-    // Attempt to remove the file
-    // Use shm_unlink for proper shared memory cleanup
-    if (shm_unlink(entry->d_name) == 0) {
-      HLOG(kDebug, "ClearUserIpcs: Removed shared memory segment: {}",
+    // Construct full path and remove the symlink
+    std::string full_path = std::string(memfd_dir) + "/" + entry->d_name;
+    if (unlink(full_path.c_str()) == 0) {
+      HLOG(kDebug, "ClearUserIpcs: Removed memfd symlink: {}",
            entry->d_name);
       removed_count++;
     } else {
-      // Permission denied or other error - silently ignore
-      // This allows other users to have their own chimaera_* segments
       if (errno != EACCES && errno != EPERM && errno != ENOENT) {
         HLOG(kDebug, "ClearUserIpcs: Could not remove {} ({}): {}",
              entry->d_name, errno, strerror(errno));
@@ -1654,7 +1648,7 @@ size_t IpcManager::ClearUserIpcs() {
 
   if (removed_count > 0) {
     HLOG(kInfo,
-         "ClearUserIpcs: Removed {} shared memory segments from previous runs",
+         "ClearUserIpcs: Removed {} memfd symlinks from previous runs",
          removed_count);
   }
 

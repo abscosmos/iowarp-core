@@ -41,7 +41,7 @@
 
 #include "../simple_test.h"
 
-#include <sys/mman.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -88,13 +88,14 @@ pid_t StartServerProcess() {
 bool WaitForServer(int max_attempts = 50) {
   // The main shared memory segment name is "chi_main_segment_${USER}"
   const char *user = std::getenv("USER");
-  std::string shm_name = std::string("/chi_main_segment_") + (user ? user : "");
+  std::string memfd_path = std::string("/tmp/chimaera_memfd/chi_main_segment_") +
+                           (user ? user : "");
 
   for (int i = 0; i < max_attempts; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // Check if shared memory exists (indicates server is ready)
-    int fd = shm_open(shm_name.c_str(), O_RDONLY, 0666);
+    // Check if memfd symlink exists (indicates server is ready)
+    int fd = open(memfd_path.c_str(), O_RDONLY);
     if (fd >= 0) {
       close(fd);
       // Give it a bit more time to fully initialize
@@ -109,10 +110,11 @@ bool WaitForServer(int max_attempts = 50) {
  * Helper to cleanup server process
  */
 void CleanupSharedMemory() {
-  // Clean up leftover shared memory segments
+  // Clean up leftover memfd symlinks
   const char *user = std::getenv("USER");
-  std::string main_seg = std::string("/chi_main_segment_") + (user ? user : "");
-  shm_unlink(main_seg.c_str());
+  std::string memfd_path = std::string("/tmp/chimaera_memfd/chi_main_segment_") +
+                           (user ? user : "");
+  unlink(memfd_path.c_str());
 }
 
 void CleanupServer(pid_t server_pid) {
