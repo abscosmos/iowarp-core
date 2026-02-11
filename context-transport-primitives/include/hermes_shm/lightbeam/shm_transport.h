@@ -37,6 +37,7 @@
 #include <cstring>
 
 #include "hermes_shm/data_structures/serialization/local_serialize.h"
+#include "hermes_shm/thread/thread_model_manager.h"
 #include "lightbeam.h"
 
 namespace hshm::lbm {
@@ -109,7 +110,7 @@ class ShmClient : public Client {
       size_t space =
           ctx.shm_info_->copy_space_size_ - (total_written - total_read);
       if (space == 0) {
-        // std::this_thread::yield();
+        HSHM_THREAD_MODEL->Yield();
         continue;
       }
       size_t write_pos = total_written % ctx.shm_info_->copy_space_size_;
@@ -200,7 +201,7 @@ class ShmServer : public Server {
       size_t total_written = ctx.shm_info_->total_written_.load();
       size_t avail = total_written - total_read;
       if (avail == 0) {
-        // std::this_thread::yield();
+        HSHM_THREAD_MODEL->Yield();
         continue;
       }
       size_t read_pos = total_read % ctx.shm_info_->copy_space_size_;
