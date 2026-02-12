@@ -1528,6 +1528,35 @@ inline HSHM_CROSS_FUN void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
 }
 #endif  // !HSHM_IS_HOST
 
+// ~Future() implementation - frees resources if consumed (via Wait/await_resume)
+template <typename TaskT, typename AllocT>
+HSHM_CROSS_FUN Future<TaskT, AllocT>::~Future() {
+#if HSHM_IS_HOST
+  // Only clean up if Destroy(true) was called (from Wait/await_resume)
+  if (consumed_) {
+    // Clean up zero-copy response archive (frees zmq_msg_t handles)
+    if (!future_shm_.IsNull()) {
+      hipc::FullPtr<FutureShm> fs = CHI_IPC->ToFullPtr(future_shm_);
+      if (!fs.IsNull() && (fs->origin_ == FutureShm::FUTURE_CLIENT_TCP ||
+                           fs->origin_ == FutureShm::FUTURE_CLIENT_IPC)) {
+        CHI_IPC->CleanupResponseArchive(fs->client_task_vaddr_);
+      }
+    }
+    // Free FutureShm
+    if (!future_shm_.IsNull()) {
+      hipc::ShmPtr<char> buffer_shm = future_shm_.template Cast<char>();
+      CHI_IPC->FreeBuffer(buffer_shm);
+      future_shm_.SetNull();
+    }
+    // Free the task
+    if (!task_ptr_.IsNull()) {
+      CHI_IPC->DelTask(task_ptr_);
+      task_ptr_.SetNull();
+    }
+  }
+#endif
+}
+
 // GetFutureShm() implementation - converts internal ShmPtr to FullPtr
 // GPU-compatible: uses CHI_IPC macro which works on both CPU and GPU
 template <typename TaskT, typename AllocT>
@@ -1560,10 +1589,6 @@ void Future<TaskT, AllocT>::Wait() {
     __nanosleep(5);
   }
 #else
-  // Mark this Future as owner of the task (will be destroyed on Future
-  // destruction) Caller should NOT manually call DelTask() after Wait()
-  is_owner_ = true;
-
   if (!task_ptr_.IsNull() && !future_shm_.IsNull()) {
     // Convert ShmPtr to FullPtr to access flags_
     hipc::FullPtr<FutureShm> future_full = CHI_IPC->ToFullPtr(future_shm_);
@@ -1590,49 +1615,24 @@ void Future<TaskT, AllocT>::Wait() {
       CHI_IPC->Recv(*this);
     }
 
-    // Call PostWait() callback on the task for post-completion actions
-    task_ptr_->PostWait();
-
-    // Don't free future_shm here - let the destructor handle it since is_owner_
-    // = true
+    // PostWait + free FutureShm; task freed by ~Future()
+    Destroy(true);
   }
 #endif
 }
 
 template <typename TaskT, typename AllocT>
-void Future<TaskT, AllocT>::Destroy() {
+void Future<TaskT, AllocT>::Destroy(bool post_wait) {
 #if HSHM_IS_HOST
-  // Host path: use CHI_IPC thread-local
-  // Clean up zero-copy response archive (frees zmq_msg_t handles)
-  if (!future_shm_.IsNull()) {
-    hipc::FullPtr<FutureShm> fs = CHI_IPC->ToFullPtr(future_shm_);
-    if (!fs.IsNull() && (fs->origin_ == FutureShm::FUTURE_CLIENT_TCP ||
-                         fs->origin_ == FutureShm::FUTURE_CLIENT_IPC)) {
-      CHI_IPC->CleanupResponseArchive(fs->client_task_vaddr_);
-    }
+  // Call PostWait if requested
+  if (post_wait && !task_ptr_.IsNull()) {
+    task_ptr_->PostWait();
   }
-  // Destroy the task using CHI_IPC->DelTask if not null
-  if (!task_ptr_.IsNull()) {
-    CHI_IPC->DelTask(task_ptr_);
-    task_ptr_.SetNull();
-  }
-  // Also free FutureShm if it wasn't freed in Wait()
-  if (!future_shm_.IsNull()) {
-    // Cast ShmPtr<FutureShm> to ShmPtr<char> for FreeBuffer
-    hipc::ShmPtr<char> buffer_shm = future_shm_.template Cast<char>();
-    CHI_IPC->FreeBuffer(buffer_shm);
-    future_shm_.SetNull();
-  }
+  // Mark as consumed — all resource cleanup deferred to ~Future()
+  consumed_ = true;
 #else
-  // GPU path: Don't actually free resources - just null out pointers
-  // Tasks created on GPU are submitted to CPU queues for processing
-  // The CPU side handles the actual cleanup when tasks complete
-  // Trying to access g_ipc_manager here would fail because it's only
-  // defined within CHIMAERA_GPU_INIT macro scope
-  task_ptr_.SetNull();
-  future_shm_.SetNull();
+  (void)post_wait;
 #endif
-  is_owner_ = false;
 }
 
 }  // namespace chi

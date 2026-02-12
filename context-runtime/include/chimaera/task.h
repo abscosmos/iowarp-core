@@ -502,8 +502,8 @@ class Future {
   /** Parent task RunContext pointer (nullptr if no parent waiting) */
   RunContext* parent_task_;
 
-  /** Flag indicating if this Future owns the task and should destroy it */
-  bool is_owner_;
+  /** Whether Destroy(true) was called (via Wait/await_resume) */
+  bool consumed_;
 
   /**
    * Implementation of await_suspend
@@ -521,7 +521,7 @@ class Future {
   HSHM_CROSS_FUN Future(hipc::ShmPtr<FutureT> future_shm, const hipc::FullPtr<TaskT> &task_ptr)
       : future_shm_(future_shm),
         parent_task_(nullptr),
-        is_owner_(false) {
+        consumed_(false) {
 #if HSHM_IS_GPU
     printf("Future constructor ENTRY\n");
 #endif
@@ -543,7 +543,7 @@ class Future {
   /**
    * Default constructor - creates null future
    */
-  HSHM_CROSS_FUN Future() : parent_task_(nullptr), is_owner_(false) {}
+  HSHM_CROSS_FUN Future() : parent_task_(nullptr), consumed_(false) {}
 
   /**
    * Constructor from ShmPtr<FutureShm> - used by ring buffer deserialization
@@ -553,25 +553,22 @@ class Future {
   HSHM_CROSS_FUN explicit Future(const hipc::ShmPtr<FutureT>& future_shm_ptr)
       : future_shm_(future_shm_ptr),
         parent_task_(nullptr),
-        is_owner_(false) {
+        consumed_(false) {
     // Task pointer starts null - will be set in ProcessNewTasks
     task_ptr_.SetNull();
   }
 
   /**
-   * Destructor - destroys the task if this Future owns it
+   * Destructor - frees the task if this Future was consumed (via Wait/await_resume)
+   * Defined out-of-line in ipc_manager.h where CHI_IPC is available
    */
-  HSHM_CROSS_FUN ~Future() {
-    if (is_owner_) {
-      Destroy();
-    }
-  }
+  HSHM_CROSS_FUN ~Future();
 
   /**
    * Destroy the task using CHI_IPC->DelTask if not null
    * Sets the task pointer to null afterwards
    */
-  HSHM_CROSS_FUN void Destroy();
+  HSHM_CROSS_FUN void Destroy(bool post_wait = false);
 
   /**
    * Copy constructor - does not transfer ownership
@@ -580,7 +577,7 @@ class Future {
   HSHM_CROSS_FUN Future(const Future& other)
       : future_shm_(other.future_shm_),
         parent_task_(other.parent_task_),
-        is_owner_(false) {  // Copy does not transfer ownership
+        consumed_(false) {  // Copy is not consumed
     // Manually copy task_ptr_ to avoid FullPtr copy constructor bug on GPU
     task_ptr_.shm_ = other.task_ptr_.shm_;
     task_ptr_.ptr_ = other.task_ptr_.ptr_;
@@ -593,18 +590,12 @@ class Future {
    */
   HSHM_CROSS_FUN Future& operator=(const Future& other) {
     if (this != &other) {
-#if HSHM_IS_HOST
-      // Destroy existing task if we own it (host only - GPU never owns)
-      if (is_owner_) {
-        Destroy();
-      }
-#endif
       // Manually copy task_ptr_ to avoid FullPtr copy assignment bug on GPU
       task_ptr_.shm_ = other.task_ptr_.shm_;
       task_ptr_.ptr_ = other.task_ptr_.ptr_;
       future_shm_ = other.future_shm_;
       parent_task_ = other.parent_task_;
-      is_owner_ = false;  // Copy does not transfer ownership
+      consumed_ = false;  // Copy is not consumed
     }
     return *this;
   }
@@ -616,12 +607,13 @@ class Future {
   HSHM_CROSS_FUN Future(Future&& other) noexcept
       : future_shm_(std::move(other.future_shm_)),
         parent_task_(other.parent_task_),
-        is_owner_(other.is_owner_) {  // Transfer ownership
+        consumed_(other.consumed_) {
     // Manually move task_ptr_ to avoid FullPtr move constructor bug on GPU
     task_ptr_.shm_ = other.task_ptr_.shm_;
     task_ptr_.ptr_ = other.task_ptr_.ptr_;
+    other.task_ptr_.SetNull();
     other.parent_task_ = nullptr;
-    other.is_owner_ = false;  // Source no longer owns
+    other.consumed_ = false;
   }
 
   /**
@@ -631,20 +623,16 @@ class Future {
    */
   HSHM_CROSS_FUN Future& operator=(Future&& other) noexcept {
     if (this != &other) {
-#if HSHM_IS_HOST
-      // Destroy existing task if we own it (host only - GPU never owns)
-      if (is_owner_) {
-        Destroy();
-      }
-#endif
       // Manually move task_ptr_ to avoid FullPtr move assignment bug on GPU
       task_ptr_.shm_ = other.task_ptr_.shm_;
       task_ptr_.ptr_ = other.task_ptr_.ptr_;
       future_shm_ = std::move(other.future_shm_);
       parent_task_ = other.parent_task_;
-      is_owner_ = other.is_owner_;  // Transfer ownership
+      consumed_ = other.consumed_;
+      other.task_ptr_.SetNull();
+      other.future_shm_.SetNull();
       other.parent_task_ = nullptr;
-      other.is_owner_ = false;  // Source no longer owns
+      other.consumed_ = false;
     }
     return *this;
   }
@@ -789,7 +777,7 @@ class Future {
     result.task_ptr_ = task_ptr_.template Cast<NewTaskT>();
     result.future_shm_ = future_shm_;
     result.parent_task_ = parent_task_;
-    result.is_owner_ = false;  // Cast does not transfer ownership
+    result.consumed_ = false;  // Cast does not transfer ownership
     return result;
   }
 
@@ -836,9 +824,6 @@ class Future {
    * @return True to suspend, false to continue without suspending
    */
   bool await_suspend(std::coroutine_handle<> handle) noexcept {
-    // Mark this Future as owner of the task
-    is_owner_ = true;
-
     // Get RunContext via helper function (defined in worker.cc)
     // This avoids needing RunContext to be complete at this point
     return await_suspend_impl(handle);
@@ -853,13 +838,7 @@ class Future {
    * case). Calls PostWait() on the task for post-completion actions.
    */
   void await_resume() noexcept {
-    // If await_ready returned true, await_suspend wasn't called, so set
-    // ownership here
-    is_owner_ = true;
-    // Call PostWait() callback on the task for post-completion actions
-    if (!task_ptr_.IsNull()) {
-      task_ptr_->PostWait();
-    }
+    Destroy(true);
   }
 };
 
