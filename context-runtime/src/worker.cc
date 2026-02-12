@@ -370,10 +370,6 @@ void Worker::Run() {
 
     if (did_work_) {
       // Work was done - reset idle counters
-      //   if (sleep_count_ > 0) {
-      //     HLOG(kInfo, "Worker {}: Woke up after {} sleeps", worker_id_,
-      //           sleep_count_);
-      //   }
       idle_iterations_ = 0;
       current_sleep_us_ = 0;
       sleep_count_ = 0;
@@ -1273,12 +1269,9 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
 
 void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
                       bool is_started) {
-  // Set task_did_work_ to true by default (tasks can override via
-  // CHI_CUR_WORKER)
-  // This comes before the null check since the task was scheduled
-  // Periodic tasks only count as work when first started, not on subsequent
-  // reschedules - this prevents busy polling
-  if (!task_ptr->IsPeriodic() || task_ptr->task_flags_.Any(TASK_STARTED)) {
+  // Non-periodic tasks always count as real work.
+  // Periodic tasks must express work via run_ctx->did_work_.
+  if (!task_ptr->IsPeriodic()) {
     SetTaskDidWork(true);
   }
 
@@ -1293,6 +1286,13 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   } else {
     StartCoroutine(task_ptr, run_ctx);
     task_ptr->SetFlags(TASK_STARTED);
+  }
+
+  // For periodic tasks, only set task_did_work_ if the task reported
+  // actual work done (e.g., received data, sent data). This prevents
+  // idle polling from keeping the worker awake.
+  if (task_ptr->IsPeriodic() && run_ctx->did_work_) {
+    SetTaskDidWork(true);
   }
 
   // Only set did_work_ if the task actually did work

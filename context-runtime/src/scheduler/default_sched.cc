@@ -150,8 +150,10 @@ void DefaultScheduler::AdjustPolling(RunContext *run_ctx) {
   if (!run_ctx) {
     return;
   }
-  // Adaptive polling disabled for now
-  return;
+  // Adaptive polling disabled for now - restore the true period
+  // This is critical because co_await on Futures sets yield_time_us_ = 0,
+  // so we must restore it here to prevent periodic tasks from busy-looping
+  run_ctx->yield_time_us_ = run_ctx->true_period_ns_ / 1000.0;
 }
 
 }  // namespace chi
