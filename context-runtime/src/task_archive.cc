@@ -77,9 +77,6 @@ void SaveTaskArchive::bulk(hipc::ShmPtr<> ptr, size_t size, uint32_t flags) {
  * @param flags Transfer flags (BULK_XFER or BULK_EXPOSE)
  */
 void LoadTaskArchive::bulk(hipc::ShmPtr<> &ptr, size_t size, uint32_t flags) {
-  HLOG(kDebug, "[LoadTaskArchive::bulk] Called with size={}, flags={}, msg_type_={}",
-       size, flags, static_cast<int>(msg_type_));
-
   if (msg_type_ == MsgType::kSerializeIn) {
     // SerializeIn mode (input) - Get pointer from recv vector at current index
     // The task itself doesn't have a valid pointer during deserialization,
@@ -88,7 +85,6 @@ void LoadTaskArchive::bulk(hipc::ShmPtr<> &ptr, size_t size, uint32_t flags) {
       // Cast FullPtr<char>'s shm_ to ShmPtr<>
       ptr = recv[current_bulk_index_].data.shm_.template Cast<void>();
       current_bulk_index_++;
-      HLOG(kDebug, "[LoadTaskArchive::bulk] SerializeIn - used recv[{}]", current_bulk_index_ - 1);
     } else {
       // Error: not enough bulk transfers in recv vector
       ptr = hipc::ShmPtr<>::GetNull();
@@ -96,9 +92,25 @@ void LoadTaskArchive::bulk(hipc::ShmPtr<> &ptr, size_t size, uint32_t flags) {
     }
   } else if (msg_type_ == MsgType::kSerializeOut) {
     if (current_bulk_index_ < recv.size()) {
-      // Post-receive: point task's ShmPtr directly at recv buffer (zero-copy)
+      // Post-receive (TCP/IPC path): data arrived in recv buffer
       if (recv[current_bulk_index_].flags.Any(BULK_XFER)) {
-        ptr = recv[current_bulk_index_].data.shm_.template Cast<void>();
+        // If the task already has a valid buffer (caller-provided),
+        // copy received data into it so the caller's pointer stays valid.
+        // This handles the TCP case where the caller allocated a read buffer
+        // and expects data to appear there (matching SHM behavior).
+        // Note: MallocAllocator uses null alloc_id_, so check IsNull() on
+        // the ShmPtr (which checks offset) rather than alloc_id_.
+        if (!ptr.IsNull()) {
+          hipc::FullPtr<char> dst = CHI_IPC->ToFullPtr(ptr).template Cast<char>();
+          char *src = recv[current_bulk_index_].data.ptr_;
+          size_t copy_size = recv[current_bulk_index_].size;
+          if (dst.ptr_ && src) {
+            memcpy(dst.ptr_, src, copy_size);
+          }
+        } else {
+          // No original buffer — zero-copy, point directly at recv buffer
+          ptr = recv[current_bulk_index_].data.shm_.template Cast<void>();
+        }
       }
       current_bulk_index_++;
     } else if (lbm_server_) {
