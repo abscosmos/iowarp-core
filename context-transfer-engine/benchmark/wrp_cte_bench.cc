@@ -48,6 +48,9 @@
  *   io_count: Number of I/O operations to generate per thread
  */
 
+#include <chimaera/chimaera.h>
+#include <wrp_cte/core/core_client.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -59,9 +62,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <chimaera/chimaera.h>
-#include <wrp_cte/core/core_client.h>
 
 using namespace std::chrono;
 
@@ -96,18 +96,18 @@ chi::u64 ParseSize(const std::string &size_str) {
   size = std::stod(num_str);
 
   switch (suffix) {
-  case 'k':
-    multiplier = 1024;
-    break;
-  case 'm':
-    multiplier = 1024 * 1024;
-    break;
-  case 'g':
-    multiplier = 1024 * 1024 * 1024;
-    break;
-  default:
-    multiplier = 1;
-    break;
+    case 'k':
+      multiplier = 1024;
+      break;
+    case 'm':
+      multiplier = 1024 * 1024;
+      break;
+    case 'g':
+      multiplier = 1024 * 1024 * 1024;
+      break;
+    default:
+      multiplier = 1;
+      break;
   }
 
   return static_cast<chi::u64>(size * multiplier);
@@ -145,24 +145,26 @@ std::string FormatTime(double microseconds) {
  * Calculate bandwidth in MB/s
  */
 double CalcBandwidth(chi::u64 total_bytes, double microseconds) {
-  if (microseconds <= 0.0)
-    return 0.0;
+  if (microseconds <= 0.0) return 0.0;
   double seconds = microseconds / 1000000.0;
   double megabytes = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
   return megabytes / seconds;
 }
 
-} // namespace
+}  // namespace
 
 /**
  * Main benchmark class
  */
 class CTEBenchmark {
-public:
+ public:
   CTEBenchmark(size_t num_threads, const std::string &test_case, int depth,
                chi::u64 io_size, int io_count)
-      : num_threads_(num_threads), test_case_(test_case), depth_(depth),
-        io_size_(io_size), io_count_(io_count) {}
+      : num_threads_(num_threads),
+        test_case_(test_case),
+        depth_(depth),
+        io_size_(io_size),
+        io_count_(io_count) {}
 
   ~CTEBenchmark() = default;
 
@@ -184,7 +186,7 @@ public:
     }
   }
 
-private:
+ private:
   void PrintBenchmarkInfo() {
     std::cout << "=== CTE Core Benchmark ===" << std::endl;
     std::cout << "Test case: " << test_case_ << std::endl;
@@ -305,8 +307,8 @@ private:
 
       for (int j = 0; j < batch_size; ++j) {
         std::string blob_name = "blob_" + std::to_string(i + j);
-        auto task = cte_client->AsyncGetBlob(tag_id, blob_name, 0, io_size_,
-                                             0, get_ptr);
+        auto task = cte_client->AsyncGetBlob(tag_id, blob_name, 0, io_size_, 0,
+                                             get_ptr);
         task.Wait();
       }
     }
@@ -384,8 +386,8 @@ private:
 
       for (int j = 0; j < batch_size; ++j) {
         std::string blob_name = "blob_" + std::to_string(i + j);
-        auto task = cte_client->AsyncGetBlob(tag_id, blob_name, 0, io_size_,
-                                             0, get_ptr);
+        auto task = cte_client->AsyncGetBlob(tag_id, blob_name, 0, io_size_, 0,
+                                             get_ptr);
         task.Wait();
       }
     }
@@ -420,8 +422,10 @@ private:
   void PrintResults(const std::string &operation,
                     const std::vector<long long> &thread_times) {
     // Calculate statistics
-    long long min_time = *std::min_element(thread_times.begin(), thread_times.end());
-    long long max_time = *std::max_element(thread_times.begin(), thread_times.end());
+    long long min_time =
+        *std::min_element(thread_times.begin(), thread_times.end());
+    long long max_time =
+        *std::max_element(thread_times.begin(), thread_times.end());
     long long sum_time = 0;
     for (auto t : thread_times) {
       sum_time += t;
@@ -437,26 +441,42 @@ private:
     double agg_bw = CalcBandwidth(aggregate_bytes, avg_time);
 
     // Calculate bandwidth in bytes/sec for finer granularity
-    double min_bw_bytes = min_time > 0 ? (static_cast<double>(total_bytes) / (min_time / 1000000.0)) : 0.0;
-    double max_bw_bytes = max_time > 0 ? (static_cast<double>(total_bytes) / (max_time / 1000000.0)) : 0.0;
-    double avg_bw_bytes = avg_time > 0 ? (static_cast<double>(total_bytes) / (avg_time / 1000000.0)) : 0.0;
-    double agg_bw_bytes = avg_time > 0 ? (static_cast<double>(aggregate_bytes) / (avg_time / 1000000.0)) : 0.0;
+    double min_bw_bytes =
+        min_time > 0
+            ? (static_cast<double>(total_bytes) / (min_time / 1000000.0))
+            : 0.0;
+    double max_bw_bytes =
+        max_time > 0
+            ? (static_cast<double>(total_bytes) / (max_time / 1000000.0))
+            : 0.0;
+    double avg_bw_bytes =
+        avg_time > 0
+            ? (static_cast<double>(total_bytes) / (avg_time / 1000000.0))
+            : 0.0;
+    double agg_bw_bytes =
+        avg_time > 0
+            ? (static_cast<double>(aggregate_bytes) / (avg_time / 1000000.0))
+            : 0.0;
 
     std::cout << std::endl;
     std::cout << "=== " << operation << " Benchmark Results ===" << std::endl;
     std::cout << std::fixed << std::setprecision(3);
-    std::cout << "Time (min): " << min_time << " us (" << (min_time / 1000.0) << " ms)" << std::endl;
-    std::cout << "Time (max): " << max_time << " us (" << (max_time / 1000.0) << " ms)" << std::endl;
-    std::cout << "Time (avg): " << avg_time << " us (" << (avg_time / 1000.0) << " ms)" << std::endl;
+    std::cout << "Time (min): " << min_time << " us (" << (min_time / 1000.0)
+              << " ms)" << std::endl;
+    std::cout << "Time (max): " << max_time << " us (" << (max_time / 1000.0)
+              << " ms)" << std::endl;
+    std::cout << "Time (avg): " << avg_time << " us (" << (avg_time / 1000.0)
+              << " ms)" << std::endl;
     std::cout << std::endl;
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Bandwidth per thread (min): " << min_bw << " MB/s (" << min_bw_bytes << " bytes/s)"
-              << std::endl;
-    std::cout << "Bandwidth per thread (max): " << max_bw << " MB/s (" << max_bw_bytes << " bytes/s)"
-              << std::endl;
-    std::cout << "Bandwidth per thread (avg): " << avg_bw << " MB/s (" << avg_bw_bytes << " bytes/s)"
-              << std::endl;
-    std::cout << "Aggregate bandwidth: " << agg_bw << " MB/s (" << agg_bw_bytes << " bytes/s)" << std::endl;
+    std::cout << "Bandwidth per thread (min): " << min_bw << " MB/s ("
+              << min_bw_bytes << " bytes/s)" << std::endl;
+    std::cout << "Bandwidth per thread (max): " << max_bw << " MB/s ("
+              << max_bw_bytes << " bytes/s)" << std::endl;
+    std::cout << "Bandwidth per thread (avg): " << avg_bw << " MB/s ("
+              << avg_bw_bytes << " bytes/s)" << std::endl;
+    std::cout << "Aggregate bandwidth: " << agg_bw << " MB/s (" << agg_bw_bytes
+              << " bytes/s)" << std::endl;
     std::cout << "===========================" << std::endl;
   }
 
@@ -474,20 +494,23 @@ int main(int argc, char **argv) {
               << " <test_case> <num_threads> <depth> <io_size> <io_count>"
               << std::endl;
     std::cerr << "  test_case: Put, Get, or PutGet" << std::endl;
-    std::cerr << "  num_threads: Number of worker threads (e.g., 4)" << std::endl;
-    std::cerr << "  depth: Number of async requests per thread (e.g., 4)" << std::endl;
+    std::cerr << "  num_threads: Number of worker threads (e.g., 4)"
+              << std::endl;
+    std::cerr << "  depth: Number of async requests per thread (e.g., 4)"
+              << std::endl;
     std::cerr << "  io_size: Size of I/O operations (e.g., 1m, 4k, 1g)"
               << std::endl;
     std::cerr << "  io_count: Number of I/O operations per thread (e.g., 100)"
               << std::endl;
     std::cerr << std::endl;
     std::cerr << "Environment variables:" << std::endl;
-    std::cerr << "  CHIMAERA_WITH_RUNTIME: Set to '1', 'true', 'yes', or 'on' to "
-                 "initialize runtime"
-              << std::endl;
     std::cerr
-        << "                         Default: assumes runtime already initialized"
+        << "  CHIMAERA_WITH_RUNTIME: Set to '1', 'true', 'yes', or 'on' to "
+           "initialize runtime"
         << std::endl;
+    std::cerr << "                         Default: assumes runtime already "
+                 "initialized"
+              << std::endl;
     return 1;
   }
 
@@ -495,7 +518,7 @@ int main(int argc, char **argv) {
   std::cout << "Initializing Chimaera runtime..." << std::endl;
 
   // Initialize Chimaera (client with embedded runtime)
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
     std::cerr << "Error: Failed to initialize Chimaera runtime" << std::endl;
     return 1;
   }

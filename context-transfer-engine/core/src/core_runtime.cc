@@ -1668,6 +1668,11 @@ chi::TaskResume Runtime::ModifyExistingData(
        "ModifyExistingData: blocks={}, data_size={}, data_offset_in_blob={}",
        blocks.size(), data_size, data_offset_in_blob);
 
+  static thread_local size_t mod_count = 0;
+  static thread_local double t_setup_ms = 0, t_vec_alloc_ms = 0;
+  static thread_local double t_async_send_ms = 0, t_co_await_ms = 0;
+  hshm::Timer timer;
+
   // Step 1: Initially store the remaining_size equal to data_size
   size_t remaining_size = data_size;
 
@@ -1700,43 +1705,41 @@ chi::TaskResume Runtime::ModifyExistingData(
 
     if (data_offset_in_blob < block_end_in_blob &&
         data_end_in_blob > block_offset_in_blob) {
-      // Step 4: Clamp the range [data_offset_in_blob, data_offset_in_blob +
-      // data_size) to the range [block_offset_in_blob, block_offset_in_blob +
-      // block.size)
+      // Step 4: Clamp the range
+      timer.Resume();
       size_t write_start_in_blob =
           std::max(data_offset_in_blob, block_offset_in_blob);
       size_t write_end_in_blob = std::min(data_end_in_blob, block_end_in_blob);
       size_t write_size = write_end_in_blob - write_start_in_blob;
-
-      // Calculate offset within the block
       size_t write_start_in_block = write_start_in_blob - block_offset_in_blob;
-
-      // Calculate offset into the data buffer
       size_t data_buffer_offset = write_start_in_blob - data_offset_in_blob;
 
-      HLOG(kDebug,
-           "ModifyExistingData: block[{}] - writing write_size={}, "
-           "write_start_in_block={}, data_buffer_offset={}",
-           block_idx, write_size, write_start_in_block, data_buffer_offset);
-
-      // Step 5: Perform async write on the updated range
       chimaera::bdev::Block bdev_block(
           block.target_offset_ + write_start_in_block, write_size, 0);
       hipc::ShmPtr<> data_ptr = data + data_buffer_offset;
+      timer.Pause();
+      t_setup_ms += timer.GetMsec();
+      timer.Reset();
 
       // Wrap single block in chi::priv::vector for AsyncWrite
+      timer.Resume();
       chi::priv::vector<chimaera::bdev::Block> blocks(HSHM_MALLOC);
       blocks.push_back(bdev_block);
+      timer.Pause();
+      t_vec_alloc_ms += timer.GetMsec();
+      timer.Reset();
 
+      // Create and send the async write task
+      timer.Resume();
       chimaera::bdev::Client cte_clientcopy = block.bdev_client_;
       auto write_task = cte_clientcopy.AsyncWrite(block.target_query_, blocks,
                                                   data_ptr, write_size);
-
       write_tasks.push_back(std::move(write_task));
       expected_write_sizes.push_back(write_size);
+      timer.Pause();
+      t_async_send_ms += timer.GetMsec();
+      timer.Reset();
 
-      // Step 6: Subtract the amount of data we have written from the
-      // remaining_size
       remaining_size -= write_size;
     }
 
@@ -1745,34 +1748,30 @@ chi::TaskResume Runtime::ModifyExistingData(
   }
 
   // Step 7: Wait for all Async write operations to complete
-  HLOG(kDebug,
-       "ModifyExistingData: Waiting for {} async write tasks to complete",
-       write_tasks.size());
+  timer.Resume();
   for (size_t task_idx = 0; task_idx < write_tasks.size(); ++task_idx) {
     auto &task = write_tasks[task_idx];
     size_t expected_size = expected_write_sizes[task_idx];
-
-    bool was_ready = task.IsComplete();
     co_await task;
-
-    HLOG(kDebug,
-         "ModifyExistingData: task[{}] completed - bytes_written={}, "
-         "expected={}, status={}",
-         task_idx, task->bytes_written_, expected_size,
-         (task->bytes_written_ == expected_size ? "SUCCESS" : "FAILED"));
-
     if (task->bytes_written_ != expected_size) {
-      HLOG(kError,
-           "ModifyExistingData: WRITE FAILED - task[{}] wrote {} bytes, "
-           "expected {}, was_ready={}, is_complete_now={}, task_ptr={}",
-           task_idx, task->bytes_written_, expected_size,
-           was_ready, task.IsComplete(), (void*)task.get());
       error_code = 1;
       co_return;
     }
   }
+  timer.Pause();
+  t_co_await_ms += timer.GetMsec();
+  timer.Reset();
 
-  HLOG(kDebug, "ModifyExistingData: All write tasks completed successfully");
+  ++mod_count;
+  if (mod_count % 100 == 0) {
+    fprintf(stderr,
+            "[ModifyExistingData] ops=%zu setup=%.3f ms vec_alloc=%.3f ms "
+            "async_send=%.3f ms co_await=%.3f ms\n",
+            mod_count, t_setup_ms, t_vec_alloc_ms, t_async_send_ms,
+            t_co_await_ms);
+    t_setup_ms = t_vec_alloc_ms = t_async_send_ms = t_co_await_ms = 0;
+  }
+
   error_code = 0;  // Success
   co_return;
 }

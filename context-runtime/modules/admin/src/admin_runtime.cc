@@ -1084,8 +1084,11 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
           ipc_manager->GetScheduler()->ClientMapTask(ipc_manager, future);
       auto *worker_queues = ipc_manager->GetTaskQueue();
       auto &lane_ref = worker_queues->GetLane(lane_id, 0);
+      bool was_empty = lane_ref.Empty();
       lane_ref.Push(future);
-      ipc_manager->AwakenWorker(&lane_ref);
+      if (was_empty) {
+        ipc_manager->AwakenWorker(&lane_ref);
+      }
 
       did_work = true;
       task->tasks_received_++;

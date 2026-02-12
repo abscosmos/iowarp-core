@@ -315,7 +315,7 @@ Runtime::~Runtime() {
     close(file_fd_);
     file_fd_ = -1;
   } else if (bdev_type_ == BdevType::kRam && ram_buffer_ != nullptr) {
-    free(ram_buffer_);
+    munmap(ram_buffer_, ram_size_);
     ram_buffer_ = nullptr;
   }
 
@@ -462,13 +462,16 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
     }
 
     ram_size_ = params.total_size_;
-    ram_buffer_ = static_cast<char *>(malloc(ram_size_));
-    if (ram_buffer_ == nullptr) {
+    ram_buffer_ = static_cast<char *>(
+        mmap(nullptr, ram_size_, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0));
+    if (ram_buffer_ == MAP_FAILED) {
+      ram_buffer_ = nullptr;
       task->return_code_ = 5;
       co_return;
     }
-
-    // Initialize RAM buffer to zero
+    // Request transparent huge pages for better TLB performance
+    madvise(ram_buffer_, ram_size_, MADV_HUGEPAGE);
     file_size_ = ram_size_;  // Use file_size_ for common allocation logic
   }
 

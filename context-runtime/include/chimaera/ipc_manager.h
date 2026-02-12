@@ -596,11 +596,14 @@ class IpcManager {
 
     // 5. Enqueue the Future object to the worker queue
     auto &lane_ref = worker_queues_->GetLane(lane_id, 0);
+    bool was_empty = lane_ref.Empty();
     Future<Task> task_future_for_queue = future.template Cast<Task>();
     lane_ref.Push(task_future_for_queue);
 
-    // 6. Awaken worker for this lane
-    AwakenWorker(&lane_ref);
+    // 6. Awaken worker for this lane (only if it was idle)
+    if (was_empty) {
+      AwakenWorker(&lane_ref);
+    }
 
     // 7. Return the same Future (no separate user_future/queue_future)
     return future;
@@ -646,8 +649,11 @@ class IpcManager {
     LaneId lane_id =
         scheduler_->ClientMapTask(this, future.template Cast<Task>());
     auto &lane = worker_queues_->GetLane(lane_id, 0);
+    bool was_empty = lane.Empty();
     lane.Push(future.template Cast<Task>());
-    AwakenWorker(&lane);
+    if (was_empty) {
+      AwakenWorker(&lane);
+    }
 
     SaveTaskArchive archive(MsgType::kSerializeIn, shm_client_.get());
     archive << (*task_ptr.ptr_);

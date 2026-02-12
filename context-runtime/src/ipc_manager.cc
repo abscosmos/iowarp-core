@@ -1342,12 +1342,13 @@ bool IpcManager::IncreaseClientShm(size_t size) {
     // Release the lock before returning
     allocator_map_lock_.WriteUnlock();
 
-    // Tell the runtime server to attach to this new shared memory segment
-    auto *admin_client = CHI_ADMIN;
-    if (admin_client) {
-      admin_client->AsyncRegisterMemory(
-          chi::PoolQuery::Local(), alloc_id).Wait();
-    }
+    // Tell the runtime server to attach to this new shared memory segment.
+    // Use kAdminPoolId directly (not admin_client->pool_id_) because
+    // the admin client may not be initialized yet during ClientInit.
+    auto reg_task = NewTask<chimaera::admin::RegisterMemoryTask>(
+        chi::CreateTaskId(), chi::kAdminPoolId,
+        chi::PoolQuery::Local(), alloc_id);
+    SendZmq(reg_task, IpcMode::kTcp).Wait();
 
     return true;
 

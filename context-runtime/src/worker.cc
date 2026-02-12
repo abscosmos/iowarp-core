@@ -1410,8 +1410,9 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
         hipc::mpsc_ring_buffer<Future<Task, CHI_MAIN_ALLOC_T>,
                                hshm::ipc::MallocAllocator> *>(
         parent_task->event_queue_);
+    bool was_empty = parent_event_queue->Empty();
     parent_event_queue->Emplace(run_ctx->future_);
-    if (parent_task->lane_) {
+    if (was_empty && parent_task->lane_) {
       CHI_IPC->AwakenWorker(parent_task->lane_);
     }
   } else {

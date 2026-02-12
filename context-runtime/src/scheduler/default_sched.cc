@@ -75,10 +75,9 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
   }
 
   // Number of scheduling queues excludes the network worker
-  u32 num_sched_queues = (total_workers == 1) ? 1 : (total_workers - 1);
   IpcManager *ipc = CHI_IPC;
   if (ipc) {
-    ipc->SetNumSchedQueues(num_sched_queues);
+    ipc->SetNumSchedQueues(1);
   }
 
   HLOG(kInfo,
@@ -105,17 +104,6 @@ u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
     }
   }
 
-  // Route by I/O size
-  if (task_ptr != nullptr && !io_workers_.empty()) {
-    size_t io_size = task_ptr->stat_.io_size_;
-    if (io_size >= kLargeIOThreshold) {
-      // Round-robin among I/O worker lanes (1..N-2)
-      u32 idx = next_io_idx_.fetch_add(1, std::memory_order_relaxed)
-                % static_cast<u32>(io_workers_.size());
-      return idx + 1;  // lanes 1..N-2
-    }
-  }
-
   // Default: scheduler worker (lane 0)
   return 0;
 }
@@ -139,8 +127,8 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
   if (task_ptr != nullptr && !io_workers_.empty()) {
     size_t io_size = task_ptr->stat_.io_size_;
     if (io_size >= kLargeIOThreshold) {
-      u32 idx = next_io_idx_.fetch_add(1, std::memory_order_relaxed)
-                % static_cast<u32>(io_workers_.size());
+      u32 idx = next_io_idx_.fetch_add(1, std::memory_order_relaxed) %
+                static_cast<u32>(io_workers_.size());
       return io_workers_[idx]->GetId();
     }
   }
@@ -156,9 +144,7 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
   return 0;
 }
 
-void DefaultScheduler::RebalanceWorker(Worker *worker) {
-  (void)worker;
-}
+void DefaultScheduler::RebalanceWorker(Worker *worker) { (void)worker; }
 
 void DefaultScheduler::AdjustPolling(RunContext *run_ctx) {
   if (!run_ctx) {
