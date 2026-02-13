@@ -44,6 +44,7 @@
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/core/core_config.h>
 #include <wrp_cte/core/core_tasks.h>
+#include <wrp_cte/core/transaction_log.h>
 
 // Forward declarations to avoid circular dependency
 namespace wrp_cte::core {
@@ -228,6 +229,10 @@ private:
   std::atomic<std::uint64_t>
       telemetry_counter_; // Atomic counter for logical time
 
+  // Write-Ahead Transaction Logs (per-worker)
+  std::vector<std::unique_ptr<TransactionLog>> blob_txn_logs_;
+  std::vector<std::unique_ptr<TransactionLog>> tag_txn_logs_;
+
   /**
    * Get access to configuration manager
    */
@@ -398,6 +403,11 @@ private:
    * Restore metadata from persistent log during restart
    */
   void RestoreMetadataFromLog();
+
+  /**
+   * Replay transaction logs on top of restored snapshot during restart
+   */
+  void ReplayTransactionLogs();
 
   /**
    * Retrieve telemetry entries for analysis (non-destructive peek)

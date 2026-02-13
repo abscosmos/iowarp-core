@@ -56,6 +56,7 @@ struct PerformanceConfig {
   std::string metadata_log_path_;       // Path for metadata log (empty = disabled)
   chi::u32 flush_data_period_ms_;       // Period for data flush (default 10s)
   int flush_data_min_persistence_;      // Min persistence level to flush to (1=temp-nonvolatile)
+  chi::u64 transaction_log_capacity_bytes_;  // Total WAL capacity (default 32MB)
 
   PerformanceConfig()
       : target_stat_interval_ms_(5000),
@@ -66,7 +67,8 @@ struct PerformanceConfig {
         flush_metadata_period_ms_(5000),
         metadata_log_path_(""),
         flush_data_period_ms_(10000),
-        flush_data_min_persistence_(1) {}
+        flush_data_min_persistence_(1),
+        transaction_log_capacity_bytes_(32ULL * 1024ULL * 1024ULL) {}
 };
 
 /**

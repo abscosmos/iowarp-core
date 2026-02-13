@@ -346,6 +346,8 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
   if (!performance_.metadata_log_path_.empty()) {
     emitter << YAML::Key << "metadata_log_path" << YAML::Value << performance_.metadata_log_path_;
   }
+  emitter << YAML::Key << "transaction_log_capacity"
+          << YAML::Value << FormatSizeBytes(performance_.transaction_log_capacity_bytes_);
   emitter << YAML::Key << "flush_data_period_ms" << YAML::Value << performance_.flush_data_period_ms_;
   emitter << YAML::Key << "flush_data_min_persistence" << YAML::Value << performance_.flush_data_min_persistence_;
   emitter << YAML::EndMap;
@@ -428,6 +430,11 @@ bool Config::ParsePerformanceConfig(const YAML::Node &node) {
 
   if (node["flush_data_min_persistence"]) {
     performance_.flush_data_min_persistence_ = node["flush_data_min_persistence"].as<int>();
+  }
+
+  if (node["transaction_log_capacity"]) {
+    std::string cap_str = node["transaction_log_capacity"].as<std::string>();
+    ParseSizeString(cap_str, performance_.transaction_log_capacity_bytes_);
   }
 
   return true;

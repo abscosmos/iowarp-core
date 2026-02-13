@@ -142,6 +142,10 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
   next_tag_id_minor_ = 1;
   telemetry_counter_ = 0;
 
+  // Initialize WAL vectors (will be opened later if metadata_log_path is set)
+  blob_txn_logs_.clear();
+  tag_txn_logs_.clear();
+
   // Get configuration from params (loaded from pool_config.config_ via
   // LoadConfig)
   HLOG(kDebug, "CTE Create: About to call GetParams(), do_compose_={}",
@@ -253,6 +257,32 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
   // If this is a restart, restore metadata from the persistent log
   if (is_restart_) {
     RestoreMetadataFromLog();
+    ReplayTransactionLogs();
+  }
+
+  // Open WAL files if metadata_log_path is configured
+  if (!config_.performance_.metadata_log_path_.empty()) {
+    chi::u32 num_workers = std::max(
+        CHI_WORK_ORCHESTRATOR->GetTotalWorkerCount(), (chi::u32)1);
+    chi::u64 per_worker_capacity = std::max(
+        config_.performance_.transaction_log_capacity_bytes_ / num_workers,
+        (chi::u64)4096);
+    blob_txn_logs_.resize(num_workers);
+    tag_txn_logs_.resize(num_workers);
+    for (chi::u32 i = 0; i < num_workers; ++i) {
+      blob_txn_logs_[i] = std::make_unique<TransactionLog>();
+      blob_txn_logs_[i]->Open(
+          config_.performance_.metadata_log_path_ + ".blob." +
+              std::to_string(i),
+          per_worker_capacity);
+      tag_txn_logs_[i] = std::make_unique<TransactionLog>();
+      tag_txn_logs_[i]->Open(
+          config_.performance_.metadata_log_path_ + ".tag." +
+              std::to_string(i),
+          per_worker_capacity);
+    }
+    HLOG(kInfo, "WAL: Opened {} blob and {} tag transaction logs",
+         num_workers, num_workers);
   }
 
   // Start periodic StatTargets task to keep target stats updated
@@ -284,6 +314,12 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
 chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task,
                                  chi::RunContext &ctx) {
   try {
+    // Close WAL files before clearing data structures
+    for (auto &log : blob_txn_logs_) { if (log) log->Close(); }
+    blob_txn_logs_.clear();
+    for (auto &log : tag_txn_logs_) { if (log) log->Close(); }
+    tag_txn_logs_.clear();
+
     // Clear all registered targets and their associated data
     registered_targets_.clear();
     target_name_to_id_.clear();
@@ -730,7 +766,18 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task,
     if (blob_found) {
       bool cleared = false;
       co_await ClearBlob(*blob_info_ptr, blob_score, offset, size, cleared);
-      if (!cleared) {
+      if (cleared) {
+        // WAL: log blob clear
+        if (!blob_txn_logs_.empty()) {
+          chi::u32 wid = CHI_CUR_WORKER->GetWorkerStats().worker_id_;
+          TxnClearBlob txn;
+          txn.tag_major_ = tag_id.major_;
+          txn.tag_minor_ = tag_id.minor_;
+          txn.blob_name_ = blob_name;
+          blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(
+              TxnType::kClearBlob, txn);
+        }
+      } else {
         old_blob_size = blob_info_ptr->GetTotalSize();
       }
     }
@@ -751,6 +798,26 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task,
     if (alloc_result != 0) {
       task->return_code_ = 10 + alloc_result;
       co_return;
+    }
+
+    // WAL: log all current blocks (full replacement semantics)
+    if (!blob_txn_logs_.empty() && !blob_info_ptr->blocks_.empty()) {
+      chi::u32 wid = CHI_CUR_WORKER->GetWorkerStats().worker_id_;
+      TxnExtendBlob txn;
+      txn.tag_major_ = tag_id.major_;
+      txn.tag_minor_ = tag_id.minor_;
+      txn.blob_name_ = blob_name;
+      for (const auto &blk : blob_info_ptr->blocks_) {
+        TxnExtendBlobBlock tb;
+        tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
+        tb.bdev_minor_ = blk.bdev_client_.pool_id_.minor_;
+        tb.target_query_ = blk.target_query_;
+        tb.target_offset_ = blk.target_offset_;
+        tb.size_ = blk.size_;
+        txn.new_blocks_.push_back(tb);
+      }
+      blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(
+          TxnType::kExtendBlob, txn);
     }
 
     // Step 3: ModifyExistingData — write data to blocks
@@ -1055,6 +1122,17 @@ chi::TaskResume Runtime::DelBlob(hipc::FullPtr<DelBlobTask> task,
     auto now = std::chrono::steady_clock::now();
     LogTelemetry(CteOp::kDelBlob, 0, blob_size, tag_id, now, now);
 
+    // WAL: log blob deletion
+    if (!blob_txn_logs_.empty()) {
+      chi::u32 wid = CHI_CUR_WORKER->GetWorkerStats().worker_id_;
+      TxnDelBlob txn;
+      txn.tag_major_ = tag_id.major_;
+      txn.tag_minor_ = tag_id.minor_;
+      txn.blob_name_ = blob_name;
+      blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(
+          TxnType::kDelBlob, txn);
+    }
+
     // Success
     task->return_code_ = 0;
     HLOG(kDebug, "DelBlob successful: name={}, blob_size={}", blob_name,
@@ -1170,6 +1248,16 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task,
     // Log telemetry for DelTag operation
     auto now = std::chrono::steady_clock::now();
     LogTelemetry(CteOp::kDelTag, 0, total_size, tag_id, now, now);
+
+    // WAL: log tag deletion
+    if (!tag_txn_logs_.empty()) {
+      chi::u32 wid = CHI_CUR_WORKER->GetWorkerStats().worker_id_;
+      TxnDelTag txn;
+      txn.tag_name_ = tag_info_ptr->tag_name_;
+      txn.tag_major_ = tag_id.major_;
+      txn.tag_minor_ = tag_id.minor_;
+      tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
+    }
 
     tag_id_to_info_.erase(tag_id);
 
@@ -1354,6 +1442,16 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   tag_name_to_id_.insert_or_assign(tag_name, tag_id);
   tag_id_to_info_.insert_or_assign(tag_id, tag_info);
 
+  // WAL: log tag creation
+  if (!tag_txn_logs_.empty()) {
+    chi::u32 wid = CHI_CUR_WORKER->GetWorkerStats().worker_id_;
+    TxnCreateTag txn;
+    txn.tag_name_ = tag_name;
+    txn.tag_major_ = tag_id.major_;
+    txn.tag_minor_ = tag_id.minor_;
+    tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kCreateTag, txn);
+  }
+
   return tag_id;
 }
 
@@ -1445,6 +1543,25 @@ chi::TaskResume Runtime::FlushMetadata(hipc::FullPtr<FlushMetadataTask> task,
     });
 
     ofs.close();
+
+    // WAL: sync and compact transaction logs after snapshot
+    if (!blob_txn_logs_.empty()) {
+      chi::u64 total_wal_size = 0;
+      for (auto &log : blob_txn_logs_) {
+        if (log) { log->Sync(); total_wal_size += log->Size(); }
+      }
+      for (auto &log : tag_txn_logs_) {
+        if (log) { log->Sync(); total_wal_size += log->Size(); }
+      }
+      if (total_wal_size >
+          config_.performance_.transaction_log_capacity_bytes_) {
+        for (auto &log : blob_txn_logs_) { if (log) log->Truncate(); }
+        for (auto &log : tag_txn_logs_) { if (log) log->Truncate(); }
+        HLOG(kDebug, "FlushMetadata: Truncated WAL files (was {} bytes)",
+             total_wal_size);
+      }
+    }
+
     task->return_code_ = 0;
     HLOG(kDebug, "FlushMetadata: Flushed {} entries to {}",
          task->entries_flushed_, log_path);
@@ -1776,6 +1893,160 @@ void Runtime::RestoreMetadataFromLog() {
        tags_restored, blobs_restored, log_path);
 }
 
+void Runtime::ReplayTransactionLogs() {
+  const std::string &log_path = config_.performance_.metadata_log_path_;
+  if (log_path.empty()) return;
+
+  chi::u32 tags_replayed = 0;
+  chi::u32 blobs_replayed = 0;
+  chi::u32 max_minor = next_tag_id_minor_.load();
+
+  // Phase 1: Replay all tag logs first (tags must exist before blob ops)
+  for (size_t i = 0; ; ++i) {
+    std::string tag_log_path = log_path + ".tag." + std::to_string(i);
+    if (!std::filesystem::exists(tag_log_path)) break;
+
+    TransactionLog loader;
+    loader.Open(tag_log_path, 0);
+    auto entries = loader.Load();
+    loader.Close();
+
+    for (const auto &[type, payload] : entries) {
+      if (type == TxnType::kCreateTag) {
+        auto txn = TransactionLog::DeserializeCreateTag(payload);
+        TagId tag_id{txn.tag_major_, txn.tag_minor_};
+        tag_name_to_id_.insert_or_assign(txn.tag_name_, tag_id);
+        TagInfo tag_info(txn.tag_name_, tag_id);
+        tag_id_to_info_.insert_or_assign(tag_id, tag_info);
+        if (tag_id.minor_ >= max_minor) max_minor = tag_id.minor_ + 1;
+        tags_replayed++;
+      } else if (type == TxnType::kDelTag) {
+        auto txn = TransactionLog::DeserializeDelTag(payload);
+        TagId tag_id{txn.tag_major_, txn.tag_minor_};
+        // Erase tag name mapping
+        tag_name_to_id_.erase(txn.tag_name_);
+        // Erase all blobs belonging to this tag
+        std::string tag_prefix = std::to_string(tag_id.major_) + "." +
+                                 std::to_string(tag_id.minor_) + ".";
+        std::vector<std::string> keys_to_erase;
+        tag_blob_name_to_info_.for_each(
+            [&tag_prefix, &keys_to_erase](const std::string &key,
+                                          const BlobInfo &) {
+              if (key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
+                keys_to_erase.push_back(key);
+              }
+            });
+        for (const auto &key : keys_to_erase) {
+          tag_blob_name_to_info_.erase(key);
+        }
+        tag_id_to_info_.erase(tag_id);
+        tags_replayed++;
+      }
+    }
+  }
+
+  // Phase 2: Replay all blob logs
+  for (size_t i = 0; ; ++i) {
+    std::string blob_log_path = log_path + ".blob." + std::to_string(i);
+    if (!std::filesystem::exists(blob_log_path)) break;
+
+    TransactionLog loader;
+    loader.Open(blob_log_path, 0);
+    auto entries = loader.Load();
+    loader.Close();
+
+    for (const auto &[type, payload] : entries) {
+      if (type == TxnType::kCreateNewBlob) {
+        auto txn = TransactionLog::DeserializeCreateNewBlob(payload);
+        TagId tag_id{txn.tag_major_, txn.tag_minor_};
+        std::string composite_key = std::to_string(tag_id.major_) + "." +
+                                    std::to_string(tag_id.minor_) + "." +
+                                    txn.blob_name_;
+        BlobInfo blob_info;
+        blob_info.blob_name_ = txn.blob_name_;
+        blob_info.score_ = txn.score_;
+        tag_blob_name_to_info_.insert_or_assign(composite_key, blob_info);
+        blobs_replayed++;
+
+      } else if (type == TxnType::kExtendBlob) {
+        auto txn = TransactionLog::DeserializeExtendBlob(payload);
+        TagId tag_id{txn.tag_major_, txn.tag_minor_};
+        std::string composite_key = std::to_string(tag_id.major_) + "." +
+                                    std::to_string(tag_id.minor_) + "." +
+                                    txn.blob_name_;
+        BlobInfo *blob_info_ptr =
+            tag_blob_name_to_info_.find(composite_key);
+        if (blob_info_ptr) {
+          // Replace blocks with replayed blocks (full replacement semantics)
+          blob_info_ptr->blocks_.clear();
+          for (const auto &tb : txn.new_blocks_) {
+            chi::PoolId bdev_pool_id(tb.bdev_major_, tb.bdev_minor_);
+            // Filter volatile targets (matching RestoreMetadataFromLog)
+            TargetInfo *tinfo = registered_targets_.find(bdev_pool_id);
+            if (tinfo &&
+                tinfo->persistence_level_ ==
+                    chimaera::bdev::PersistenceLevel::kVolatile) {
+              continue;
+            }
+            chimaera::bdev::Client bdev_client(bdev_pool_id);
+            BlobBlock block(bdev_client, tb.target_query_,
+                            tb.target_offset_, tb.size_);
+            blob_info_ptr->blocks_.push_back(block);
+          }
+        }
+        blobs_replayed++;
+
+      } else if (type == TxnType::kClearBlob) {
+        auto txn = TransactionLog::DeserializeClearBlob(payload);
+        TagId tag_id{txn.tag_major_, txn.tag_minor_};
+        std::string composite_key = std::to_string(tag_id.major_) + "." +
+                                    std::to_string(tag_id.minor_) + "." +
+                                    txn.blob_name_;
+        BlobInfo *blob_info_ptr =
+            tag_blob_name_to_info_.find(composite_key);
+        if (blob_info_ptr) {
+          blob_info_ptr->blocks_.clear();
+        }
+        blobs_replayed++;
+
+      } else if (type == TxnType::kDelBlob) {
+        auto txn = TransactionLog::DeserializeDelBlob(payload);
+        TagId tag_id{txn.tag_major_, txn.tag_minor_};
+        std::string composite_key = std::to_string(tag_id.major_) + "." +
+                                    std::to_string(tag_id.minor_) + "." +
+                                    txn.blob_name_;
+        tag_blob_name_to_info_.erase(composite_key);
+        blobs_replayed++;
+      }
+    }
+  }
+
+  // Phase 3: Recompute tag total_size_ from blob blocks
+  tag_id_to_info_.for_each([&](const TagId &tag_id, TagInfo &tag_info) {
+    chi::u64 total = 0;
+    std::string tag_prefix = std::to_string(tag_id.major_) + "." +
+                             std::to_string(tag_id.minor_) + ".";
+    tag_blob_name_to_info_.for_each(
+        [&tag_prefix, &total](const std::string &key,
+                              const BlobInfo &blob_info) {
+          if (key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
+            total += blob_info.GetTotalSize();
+          }
+        });
+    tag_info.total_size_.store(total);
+  });
+
+  // Phase 4: Update next_tag_id_minor_
+  chi::u32 current_minor = next_tag_id_minor_.load();
+  if (max_minor > current_minor) {
+    next_tag_id_minor_.store(max_minor);
+  }
+
+  HLOG(kInfo,
+       "ReplayTransactionLogs: Replayed {} tag ops and {} blob ops",
+       tags_replayed, blobs_replayed);
+}
+
 // GetWorkRemaining implementation (required pure virtual method)
 chi::u64 Runtime::GetWorkRemaining() const {
   // Return approximate work remaining (simple implementation)
@@ -1870,6 +2141,18 @@ BlobInfo *Runtime::CreateNewBlob(const std::string &blob_name,
         tag_blob_name_to_info_.insert_or_assign(composite_key, new_blob_info);
     blob_info_ptr = insert_result.second;
   }  // Release lock immediately after insertion
+
+  // WAL: log blob creation
+  if (!blob_txn_logs_.empty()) {
+    chi::u32 wid = CHI_CUR_WORKER->GetWorkerStats().worker_id_;
+    TxnCreateNewBlob txn;
+    txn.tag_major_ = tag_id.major_;
+    txn.tag_minor_ = tag_id.minor_;
+    txn.blob_name_ = blob_name;
+    txn.score_ = blob_score;
+    blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(
+        TxnType::kCreateNewBlob, txn);
+  }
 
   return blob_info_ptr;
 }

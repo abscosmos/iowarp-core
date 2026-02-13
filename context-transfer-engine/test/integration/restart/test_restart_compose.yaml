@@ -16,5 +16,6 @@ compose:
         capacity_limit: 100MB
     performance:
       metadata_log_path: /tmp/chimaera_restart_test/metadata.log
+      transaction_log_capacity: 32MB
       flush_metadata_period_ms: 0
       flush_data_period_ms: 0
