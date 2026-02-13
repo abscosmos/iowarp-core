@@ -42,9 +42,11 @@
 #include <vector>
 #include <sstream>
 
+#if HSHM_ENABLE_CEREAL
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/string.hpp>
 #include <cereal/types/vector.hpp>
+#endif
 
 #include "hermes_shm/memory/allocator/allocator.h"
 #include "hermes_shm/types/bitfield.h"
@@ -67,10 +69,12 @@ struct Bulk {
   void* desc = nullptr;      // For RDMA memory registration
   void* mr = nullptr;        // For RDMA memory region handle (fid_mr*)
 
+#if HSHM_ENABLE_CEREAL
   template <typename Ar>
   void serialize(Ar& ar) {
     ar(size, flags);
   }
+#endif
 };
 
 // --- Metadata Base Class ---
@@ -83,10 +87,12 @@ class LbmMeta {
   size_t send_bulks = 0;  // Count of BULK_XFER entries in send vector
   size_t recv_bulks = 0;  // Count of BULK_XFER entries in recv vector
 
+#if HSHM_ENABLE_CEREAL
   template <typename Ar>
   void serialize(Ar& ar) {
     ar(send, recv, send_bulks, recv_bulks);
   }
+#endif
 };
 
 // --- LbmContext ---
