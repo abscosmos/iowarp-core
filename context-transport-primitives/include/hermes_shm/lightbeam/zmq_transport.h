@@ -102,9 +102,16 @@ class ZeroMqTransport : public Transport {
       owns_ctx_ = false;
       socket_ = zmq_socket(ctx_, ZMQ_DEALER);
 
-      // Set identity to 4-byte PID for ROUTER identification
+      // Set identity for ROUTER identification
+      // Use hostname + PID to ensure uniqueness across Docker containers
+      // (where multiple processes may have the same PID in different namespaces)
+      char hostname_buf[64] = {};
+      gethostname(hostname_buf, sizeof(hostname_buf) - 1);
       uint32_t pid = static_cast<uint32_t>(getpid());
-      zmq_setsockopt(socket_, ZMQ_IDENTITY, &pid, sizeof(pid));
+      std::string identity = std::string(hostname_buf) + ":" +
+                              std::to_string(pid);
+      zmq_setsockopt(socket_, ZMQ_IDENTITY, identity.data(),
+                      identity.size());
 
       HLOG(kDebug, "ZeroMqTransport(DEALER) connecting to URL: {}", full_url);
 

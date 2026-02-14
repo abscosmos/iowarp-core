@@ -94,6 +94,16 @@ ssize_t SendV(socket_t fd, const struct iovec* iov, int count) {
     ssize_t n = ::writev(fd, local_iov + iov_idx, local_count - iov_idx);
     if (n < 0) {
       if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // Non-blocking socket: poll for writability and retry
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        int pr = ::poll(&pfd, 1, 1000);
+        if (pr <= 0) return -1;
+        continue;
+      }
       return -1;
     }
     sent += n;

@@ -1013,6 +1013,15 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
       // Store transport and routing info for response
       future_shm->response_transport_ = transport;
       future_shm->response_fd_ = recv_info.fd_;
+      // Store ZMQ identity from recv frame for response routing
+      if (!recv_info.identity_.empty() &&
+          recv_info.identity_.size() <= sizeof(future_shm->response_identity_)) {
+        std::memcpy(future_shm->response_identity_,
+                    recv_info.identity_.data(),
+                    recv_info.identity_.size());
+        future_shm->response_identity_len_ =
+            static_cast<chi::u32>(recv_info.identity_.size());
+      }
       // No copy_space for ZMQ path — ShmTransferInfo defaults are fine
       // Mark as copied so the worker routes the completed task back via lightbeam
       // rather than treating it as a runtime-internal task
@@ -1108,10 +1117,18 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
       // Set routing info for the response
       if (mode == chi::IpcMode::kTcp) {
         // TCP (ZMQ ROUTER): identity-based routing
-        chi::u32 client_pid = future_shm->client_pid_;
-        std::string identity(reinterpret_cast<const char *>(&client_pid),
-                             sizeof(client_pid));
-        archive.client_info_.identity_ = identity;
+        // Use the actual ZMQ identity from the recv frame
+        if (future_shm->response_identity_len_ > 0) {
+          archive.client_info_.identity_ = std::string(
+              future_shm->response_identity_,
+              future_shm->response_identity_len_);
+        } else {
+          // Fallback: construct from PID (legacy 4-byte identity)
+          chi::u32 client_pid = future_shm->client_pid_;
+          archive.client_info_.identity_ = std::string(
+              reinterpret_cast<const char *>(&client_pid),
+              sizeof(client_pid));
+        }
       } else if (mode == chi::IpcMode::kIpc) {
         // IPC (Socket): fd-based routing on accepted connection
         archive.client_info_.fd_ = future_shm->response_fd_;

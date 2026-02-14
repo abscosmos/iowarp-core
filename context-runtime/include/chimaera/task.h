@@ -463,6 +463,10 @@ struct FutureShm {
   /** Socket fd for routing response (IPC mode) */
   int response_fd_;
 
+  /** ZMQ identity for routing response back to client (TCP mode) */
+  char response_identity_[64];
+  u32 response_identity_len_;
+
   /** Atomic bitfield for completion and data availability flags */
   hshm::abitfield32_t flags_;
 
@@ -481,6 +485,7 @@ struct FutureShm {
     client_pid_ = 0;
     response_transport_ = nullptr;
     response_fd_ = -1;
+    response_identity_len_ = 0;
     flags_.SetBits(0);
   }
 };

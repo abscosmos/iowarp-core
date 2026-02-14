@@ -339,12 +339,17 @@ void TestZmqTransportWithEM() {
   int rc = client->Send(send_meta);
   assert(rc == 0);
 
-  // Wait for event
-  int nfds = em.Wait(500000);
-  assert(nfds >= 1);
-
+  // Wait for event and recv (ZMQ FD is edge-triggered, so data may not be
+  // immediately available after epoll fires — retry with short waits)
   TestMeta recv_meta;
-  auto info = server->Recv(recv_meta);
+  ClientInfo info;
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    int nfds = em.Wait(500000);
+    (void)nfds;
+    info = server->Recv(recv_meta);
+    if (info.rc == 0) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
   assert(info.rc == 0);
   assert(recv_meta.request_id == 66);
   assert(recv_meta.operation == "zmq_em");
