@@ -14,11 +14,15 @@ config:
       engine: "bp5"
 
 vars:
-  gsbench.L: [64, 128, 256]
+  gsbench.L: [64, 128]
+  gsbench.nprocs: [4]
+  gsbench.ppn: [4]
 
 loop:
   - [gsbench.L]
-
-repeat: 3
+  - [gsbench.nprocs]
+  - [gsbench.ppn]
+  
+repeat: 1
 
 output: "${HOME}/gray_scott_results"

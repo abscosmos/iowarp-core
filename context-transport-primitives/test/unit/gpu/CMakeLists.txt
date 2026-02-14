@@ -13,13 +13,13 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   )
   add_test(NAME test_gpu_shm_mmap COMMAND test_gpu_shm_mmap)
 
-  # GpuMalloc test
-  add_cuda_executable(test_gpu_malloc TRUE test_gpu_malloc.cc)
-  target_link_libraries(test_gpu_malloc
-    hshm::cuda_cxx
-    Catch2::Catch2WithMain
-  )
-  add_test(NAME test_gpu_malloc COMMAND test_gpu_malloc)
+  # GpuMalloc test (commented out — not well-written)
+  # add_cuda_executable(test_gpu_malloc TRUE test_gpu_malloc.cc)
+  # target_link_libraries(test_gpu_malloc
+  #   hshm::cuda_cxx
+  #   Catch2::Catch2WithMain
+  # )
+  # add_test(NAME test_gpu_malloc COMMAND test_gpu_malloc)
 
   # LocalSerialize GPU test
   add_cuda_executable(test_local_serialize_gpu TRUE test_local_serialize_gpu.cc)

@@ -230,6 +230,12 @@ public:
   chi::TaskResume RestartContainers(hipc::FullPtr<RestartContainersTask> task, chi::RunContext &rctx);
 
   /**
+   * Handle AddNode - Register a new node with this runtime
+   * Updates IpcManager's hostfile and calls Expand on all containers
+   */
+  chi::TaskResume AddNode(hipc::FullPtr<AddNodeTask> task, chi::RunContext &rctx);
+
+  /**
    * Handle SubmitBatch - Submit a batch of tasks in a single RPC
    * Deserializes tasks from the batch and executes them in parallel
    * up to 32 tasks at a time, then co_awaits their completion
@@ -241,12 +247,12 @@ public:
   /**
    * Helper: Receive task inputs from remote node
    */
-  void RecvIn(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Server* lbm_server);
+  void RecvIn(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Transport* lbm_transport);
 
   /**
    * Helper: Receive task outputs from remote node
    */
-  void RecvOut(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Server* lbm_server);
+  void RecvOut(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Transport* lbm_transport);
 
   /**
    * Get remaining work count for this admin container
