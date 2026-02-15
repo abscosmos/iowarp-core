@@ -60,21 +60,20 @@ volatile bool g_keep_running = true;
  * Print usage information
  */
 void PrintUsage(const char* program_name) {
-  std::cout << "Usage: " << program_name << " [OPTIONS]\n"
-            << "\n"
-            << "Options:\n"
-            << "  -h, --help        Show this help message\n"
-            << "  -i, --interval N  Set monitoring interval in seconds (default: 1)\n"
-            << "  -o, --once        Run once and exit (default: continuous monitoring)\n"
-            << "  -j, --json        Output raw JSON format\n"
-            << "  -v, --verbose     Enable verbose output\n"
-            << "\n"
-            << "Examples:\n"
-            << "  " << program_name << "              # Continuous monitoring at 1 second intervals\n"
-            << "  " << program_name << " -i 5         # Update every 5 seconds\n"
-            << "  " << program_name << " -o           # Run once and exit\n"
-            << "  " << program_name << " -j           # Output raw JSON\n"
-            << std::endl;
+  HIPRINT("Usage: {} [OPTIONS]", program_name);
+  HIPRINT("");
+  HIPRINT("Options:");
+  HIPRINT("  -h, --help        Show this help message");
+  HIPRINT("  -i, --interval N  Set monitoring interval in seconds (default: 1)");
+  HIPRINT("  -o, --once        Run once and exit (default: continuous monitoring)");
+  HIPRINT("  -j, --json        Output raw JSON format");
+  HIPRINT("  -v, --verbose     Enable verbose output");
+  HIPRINT("");
+  HIPRINT("Examples:");
+  HIPRINT("  {}              # Continuous monitoring at 1 second intervals", program_name);
+  HIPRINT("  {} -i 5         # Update every 5 seconds", program_name);
+  HIPRINT("  {} -o           # Run once and exit", program_name);
+  HIPRINT("  {} -j           # Output raw JSON", program_name);
 }
 
 /**
@@ -98,11 +97,11 @@ bool ParseArgs(int argc, char* argv[], MonitorOptions& opts) {
       if (i + 1 < argc) {
         opts.interval_sec = std::atoi(argv[++i]);
         if (opts.interval_sec < 1) {
-          std::cerr << "Error: Interval must be >= 1 second" << std::endl;
+          HLOG(kError, "Interval must be >= 1 second");
           return false;
         }
       } else {
-        std::cerr << "Error: -i/--interval requires an argument" << std::endl;
+        HLOG(kError, "-i/--interval requires an argument");
         return false;
       }
     } else if (arg == "-o" || arg == "--once") {
@@ -112,7 +111,7 @@ bool ParseArgs(int argc, char* argv[], MonitorOptions& opts) {
     } else if (arg == "-v" || arg == "--verbose") {
       opts.verbose = true;
     } else {
-      std::cerr << "Error: Unknown option: " << arg << std::endl;
+      HLOG(kError, "Unknown option: {}", arg);
       PrintUsage(argv[0]);
       return false;
     }
@@ -126,16 +125,18 @@ bool ParseArgs(int argc, char* argv[], MonitorOptions& opts) {
  */
 void PrintStats(const chimaera::admin::MonitorTask& task) {
   // Clear screen and move cursor to top
-  std::cout << "\033[2J\033[H";
+  HIPRINT("\033[2J\033[H");
 
   // Print header
   auto now = std::chrono::system_clock::now();
   auto now_t = std::chrono::system_clock::to_time_t(now);
-  std::cout << "==================================================" << std::endl;
-  std::cout << "        Chimaera Worker Monitor" << std::endl;
-  std::cout << "        " << std::put_time(std::localtime(&now_t), "%Y-%m-%d %H:%M:%S") << std::endl;
-  std::cout << "==================================================" << std::endl;
-  std::cout << std::endl;
+  std::ostringstream time_ss;
+  time_ss << std::put_time(std::localtime(&now_t), "%Y-%m-%d %H:%M:%S");
+  HIPRINT("==================================================");
+  HIPRINT("        Chimaera Worker Monitor");
+  HIPRINT("        {}", time_ss.str());
+  HIPRINT("==================================================");
+  HIPRINT("");
 
   // Calculate summary statistics
   chi::u32 total_queued = 0;
@@ -149,41 +150,43 @@ void PrintStats(const chimaera::admin::MonitorTask& task) {
   }
 
   // Print summary
-  std::cout << "Summary:" << std::endl;
-  std::cout << "  Total Workers:        " << task.info_.size() << std::endl;
-  std::cout << "  Total Queued Tasks:   " << total_queued << std::endl;
-  std::cout << "  Total Blocked Tasks:  " << total_blocked << std::endl;
-  std::cout << "  Total Periodic Tasks: " << total_periodic << std::endl;
-  std::cout << std::endl;
+  HIPRINT("Summary:");
+  HIPRINT("  Total Workers:        {}", task.info_.size());
+  HIPRINT("  Total Queued Tasks:   {}", total_queued);
+  HIPRINT("  Total Blocked Tasks:  {}", total_blocked);
+  HIPRINT("  Total Periodic Tasks: {}", total_periodic);
+  HIPRINT("");
 
-  // Print table header
-  std::cout << "Worker Details:" << std::endl;
-  std::cout << std::setw(6) << "ID"
-            << std::setw(10) << "Running"
-            << std::setw(10) << "Active"
-            << std::setw(12) << "Idle Iters"
-            << std::setw(10) << "Queued"
-            << std::setw(10) << "Blocked"
-            << std::setw(10) << "Periodic"
-            << std::setw(15) << "Suspend (us)"
-            << std::endl;
-  std::cout << std::string(83, '-') << std::endl;
+  // Print table header using std::ostringstream for setw formatting
+  std::ostringstream header;
+  header << std::setw(6) << "ID"
+         << std::setw(10) << "Running"
+         << std::setw(10) << "Active"
+         << std::setw(12) << "Idle Iters"
+         << std::setw(10) << "Queued"
+         << std::setw(10) << "Blocked"
+         << std::setw(10) << "Periodic"
+         << std::setw(15) << "Suspend (us)";
+  HIPRINT("Worker Details:");
+  HIPRINT("{}", header.str());
+  HIPRINT("{}", std::string(83, '-'));
 
   // Print worker statistics
   for (const auto& stats : task.info_) {
-    std::cout << std::setw(6) << stats.worker_id_
-              << std::setw(10) << (stats.is_running_ ? "Yes" : "No")
-              << std::setw(10) << (stats.is_active_ ? "Yes" : "No")
-              << std::setw(12) << stats.idle_iterations_
-              << std::setw(10) << stats.num_queued_tasks_
-              << std::setw(10) << stats.num_blocked_tasks_
-              << std::setw(10) << stats.num_periodic_tasks_
-              << std::setw(15) << stats.suspend_period_us_
-              << std::endl;
+    std::ostringstream row;
+    row << std::setw(6) << stats.worker_id_
+        << std::setw(10) << (stats.is_running_ ? "Yes" : "No")
+        << std::setw(10) << (stats.is_active_ ? "Yes" : "No")
+        << std::setw(12) << stats.idle_iterations_
+        << std::setw(10) << stats.num_queued_tasks_
+        << std::setw(10) << stats.num_blocked_tasks_
+        << std::setw(10) << stats.num_periodic_tasks_
+        << std::setw(15) << stats.suspend_period_us_;
+    HIPRINT("{}", row.str());
   }
 
-  std::cout << std::endl;
-  std::cout << "Press Ctrl+C to exit" << std::endl;
+  HIPRINT("");
+  HIPRINT("Press Ctrl+C to exit");
 }
 
 }  // namespace
@@ -195,18 +198,14 @@ int main(int argc, char* argv[]) {
     return (argc > 1) ? 1 : 0;  // Return 0 if help was requested, 1 for errors
   }
 
-  // Don't install signal handler - allow default Ctrl+C behavior to terminate immediately
-  // std::signal(SIGINT, SignalHandler);
-  // std::signal(SIGTERM, SignalHandler);
-
   if (opts.verbose) {
     HLOG(kInfo, "Initializing Chimaera client...");
   }
 
   // Initialize Chimaera in client mode
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
-    std::cerr << "ERROR: Failed to initialize Chimaera client" << std::endl;
-    std::cerr << "Make sure the Chimaera runtime is running" << std::endl;
+    HLOG(kError, "Failed to initialize Chimaera client");
+    HLOG(kError, "Make sure the Chimaera runtime is running");
     return 1;
   }
 
@@ -218,7 +217,7 @@ int main(int argc, char* argv[]) {
   HLOG(kInfo, "Getting admin client...");
   auto* admin_client = CHI_ADMIN;
   if (!admin_client) {
-    std::cerr << "ERROR: Failed to get admin client" << std::endl;
+    HLOG(kError, "Failed to get admin client");
     return 1;
   }
 
@@ -242,30 +241,32 @@ int main(int argc, char* argv[]) {
 
       // Get the task result (Future has operator->)
       if (future->GetReturnCode() != 0) {
-        std::cerr << "ERROR: Monitor task failed with return code "
-                  << future->GetReturnCode() << std::endl;
+        HLOG(kError, "Monitor task failed with return code {}",
+             future->GetReturnCode());
         break;
       }
 
       // Display the results
       if (opts.json_output) {
-        // Output JSON format
-        std::cout << "{\"workers\":[";
+        // Output JSON format using ostringstream
+        std::ostringstream json;
+        json << "{\"workers\":[";
         bool first = true;
         for (const auto& stats : future->info_) {
-          if (!first) std::cout << ",";
+          if (!first) json << ",";
           first = false;
-          std::cout << "{"
-                    << "\"worker_id\":" << stats.worker_id_ << ","
-                    << "\"is_running\":" << (stats.is_running_ ? "true" : "false") << ","
-                    << "\"is_active\":" << (stats.is_active_ ? "true" : "false") << ","
-                    << "\"idle_iterations\":" << stats.idle_iterations_ << ","
-                    << "\"num_queued_tasks\":" << stats.num_queued_tasks_ << ","
-                    << "\"num_blocked_tasks\":" << stats.num_blocked_tasks_ << ","
-                    << "\"num_periodic_tasks\":" << stats.num_periodic_tasks_ << ","
-                    << "\"suspend_period_us\":" << stats.suspend_period_us_ << "}";
+          json << "{"
+               << "\"worker_id\":" << stats.worker_id_ << ","
+               << "\"is_running\":" << (stats.is_running_ ? "true" : "false") << ","
+               << "\"is_active\":" << (stats.is_active_ ? "true" : "false") << ","
+               << "\"idle_iterations\":" << stats.idle_iterations_ << ","
+               << "\"num_queued_tasks\":" << stats.num_queued_tasks_ << ","
+               << "\"num_blocked_tasks\":" << stats.num_blocked_tasks_ << ","
+               << "\"num_periodic_tasks\":" << stats.num_periodic_tasks_ << ","
+               << "\"suspend_period_us\":" << stats.suspend_period_us_ << "}";
         }
-        std::cout << "]}" << std::endl;
+        json << "]}";
+        HIPRINT("{}", json.str());
       } else {
         // Print formatted output
         PrintStats(*future);
@@ -282,7 +283,7 @@ int main(int argc, char* argv[]) {
       }
 
     } catch (const std::exception& e) {
-      std::cerr << "ERROR: Exception during monitoring: " << e.what() << std::endl;
+      HLOG(kError, "Exception during monitoring: {}", e.what());
       break;
     }
   }

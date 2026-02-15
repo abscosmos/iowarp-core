@@ -48,10 +48,10 @@
 #include <chimaera/admin/admin_client.h>
 
 void PrintUsage(const char* program_name) {
-  std::cout << "Usage: " << program_name << " [--unregister] <compose_config.yaml>\n";
-  std::cout << "  Loads compose configuration and creates/destroys specified pools\n";
-  std::cout << "  --unregister: Destroy pools instead of creating them\n";
-  std::cout << "  Requires runtime to be already initialized\n";
+  HIPRINT("Usage: {} [--unregister] <compose_config.yaml>", program_name);
+  HIPRINT("  Loads compose configuration and creates/destroys specified pools");
+  HIPRINT("  --unregister: Destroy pools instead of creating them");
+  HIPRINT("  Requires runtime to be already initialized");
 }
 
 int main(int argc, char** argv) {
@@ -77,46 +77,46 @@ int main(int argc, char** argv) {
   }
 
   if (config_path.empty()) {
-    std::cerr << "Missing compose config path\n";
+    HLOG(kError, "Missing compose config path");
     PrintUsage(argv[0]);
     return 1;
   }
 
   // Initialize Chimaera client
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
-    std::cerr << "Failed to initialize Chimaera client\n";
+    HLOG(kError, "Failed to initialize Chimaera client");
     return 1;
   }
 
   // Load configuration
   auto* config_manager = CHI_CONFIG_MANAGER;
   if (!config_manager->LoadYaml(config_path)) {
-    std::cerr << "Failed to load configuration from " << config_path << "\n";
+    HLOG(kError, "Failed to load configuration from {}", config_path);
     return 1;
   }
 
   // Get compose configuration
   const auto& compose_config = config_manager->GetComposeConfig();
   if (compose_config.pools_.empty()) {
-    std::cerr << "No compose section found in configuration\n";
+    HLOG(kError, "No compose section found in configuration");
     return 1;
   }
 
-  std::cout << "Found " << compose_config.pools_.size() << " pools to "
-            << (unregister ? "destroy" : "create") << "\n";
+  HLOG(kInfo, "Found {} pools to {}",
+       compose_config.pools_.size(), (unregister ? "destroy" : "create"));
 
   // Get admin client
   auto* admin_client = CHI_ADMIN;
   if (!admin_client) {
-    std::cerr << "Failed to get admin client\n";
+    HLOG(kError, "Failed to get admin client");
     return 1;
   }
 
   if (unregister) {
     // Unregister mode: destroy pools
     for (const auto& pool_config : compose_config.pools_) {
-      std::cout << "Destroying pool " << pool_config.pool_name_
-                << " (module: " << pool_config.mod_name_ << ")\n";
+      HLOG(kInfo, "Destroying pool {} (module: {})",
+           pool_config.pool_name_, pool_config.mod_name_);
 
       auto task = admin_client->AsyncDestroyPool(
           chi::PoolQuery::Dynamic(), pool_config.pool_id_);
@@ -124,11 +124,11 @@ int main(int argc, char** argv) {
 
       chi::u32 return_code = task->GetReturnCode();
       if (return_code != 0) {
-        std::cerr << "Failed to destroy pool " << pool_config.pool_name_
-                  << ", return code: " << return_code << "\n";
+        HLOG(kError, "Failed to destroy pool {}, return code: {}",
+             pool_config.pool_name_, return_code);
         // Continue destroying other pools
       } else {
-        std::cout << "Successfully destroyed pool " << pool_config.pool_name_ << "\n";
+        HLOG(kSuccess, "Successfully destroyed pool {}", pool_config.pool_name_);
       }
 
       // Remove restart file if it exists
@@ -137,17 +137,17 @@ int main(int argc, char** argv) {
                                  + pool_config.pool_name_ + ".yaml";
       if (fs::exists(restart_file)) {
         fs::remove(restart_file);
-        std::cout << "Removed restart file: " << restart_file << "\n";
+        HLOG(kInfo, "Removed restart file: {}", restart_file);
       }
     }
 
-    std::cout << "Unregister completed for "
-              << compose_config.pools_.size() << " pools\n";
+    HLOG(kSuccess, "Unregister completed for {} pools",
+         compose_config.pools_.size());
   } else {
     // Register mode: create pools
     for (const auto& pool_config : compose_config.pools_) {
-      std::cout << "Creating pool " << pool_config.pool_name_
-                << " (module: " << pool_config.mod_name_ << ")\n";
+      HLOG(kInfo, "Creating pool {} (module: {})",
+           pool_config.pool_name_, pool_config.mod_name_);
 
       // Create pool asynchronously and wait
       auto task = admin_client->AsyncCompose(pool_config);
@@ -156,13 +156,12 @@ int main(int argc, char** argv) {
       // Check return code
       chi::u32 return_code = task->GetReturnCode();
       if (return_code != 0) {
-        std::cerr << "Failed to create pool " << pool_config.pool_name_
-                  << " (module: " << pool_config.mod_name_
-                  << "), return code: " << return_code << "\n";
+        HLOG(kError, "Failed to create pool {} (module: {}), return code: {}",
+             pool_config.pool_name_, pool_config.mod_name_, return_code);
         return 1;
       }
 
-      std::cout << "Successfully created pool " << pool_config.pool_name_ << "\n";
+      HLOG(kSuccess, "Successfully created pool {}", pool_config.pool_name_);
 
       // Save restart config if restart_ flag is set
       if (pool_config.restart_) {
@@ -190,15 +189,15 @@ int main(int argc, char** argv) {
           }
           ofs << "compose:\n" << indented;
           ofs.close();
-          std::cout << "Saved restart config: " << restart_file << "\n";
+          HLOG(kInfo, "Saved restart config: {}", restart_file);
         } else {
-          std::cerr << "Warning: Failed to save restart config: " << restart_file << "\n";
+          HLOG(kWarning, "Failed to save restart config: {}", restart_file);
         }
       }
     }
 
-    std::cout << "Compose processing completed successfully - all "
-              << compose_config.pools_.size() << " pools created\n";
+    HLOG(kSuccess, "Compose processing completed successfully - all {} pools created",
+         compose_config.pools_.size());
   }
   return 0;
 }

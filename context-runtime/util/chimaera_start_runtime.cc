@@ -155,9 +155,9 @@ bool InductNode() {
 }
 
 void PrintUsage(const char* program_name) {
-  std::cout << "Usage: " << program_name << " [--induct]\n";
-  std::cout << "  Starts the Chimaera runtime server\n";
-  std::cout << "  --induct: Register this node with all existing cluster nodes\n";
+  HIPRINT("Usage: {} [--induct]", program_name);
+  HIPRINT("  Starts the Chimaera runtime server");
+  HIPRINT("  --induct: Register this node with all existing cluster nodes");
 }
 
 }  // namespace
@@ -173,7 +173,7 @@ int main(int argc, char* argv[]) {
       PrintUsage(argv[0]);
       return 0;
     } else {
-      std::cerr << "Unknown argument: " << argv[i] << "\n";
+      HLOG(kError, "Unknown argument: {}", argv[i]);
       PrintUsage(argv[0]);
       return 1;
     }

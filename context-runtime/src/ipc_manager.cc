@@ -650,7 +650,7 @@ bool IpcManager::StartLocalServer() {
         hshm::lbm::TransportMode::kServer, protocol, port);
 
     if (local_transport_ != nullptr) {
-      HLOG(kInfo, "Successfully started local server at {}:{}", addr, port);
+      HLOG(kSuccess, "Successfully started local server at {}:{}", addr, port);
       return true;
     }
 
