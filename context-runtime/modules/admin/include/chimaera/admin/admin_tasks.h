@@ -1551,6 +1551,158 @@ struct HeartbeatTask : public chi::Task {
   }
 };
 
+/**
+ * HeartbeatProbeTask - Periodic SWIM failure detector
+ * Local periodic task, no extra fields needed
+ */
+struct HeartbeatProbeTask : public chi::Task {
+  /** SHM default constructor */
+  HeartbeatProbeTask() : chi::Task() {}
+
+  /** Emplace constructor */
+  explicit HeartbeatProbeTask(const chi::TaskId &task_node,
+                              const chi::PoolId &pool_id,
+                              const chi::PoolQuery &pool_query)
+      : chi::Task(task_node, pool_id, pool_query, Method::kHeartbeatProbe) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kHeartbeatProbe;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const hipc::FullPtr<HeartbeatProbeTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+  }
+
+  void Aggregate(const hipc::FullPtr<HeartbeatProbeTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
+/**
+ * ProbeRequestTask - Indirect probe request to helper node
+ * Remote task: asks a helper node to probe a target on our behalf
+ */
+struct ProbeRequestTask : public chi::Task {
+  IN chi::u64 target_node_id_;   // node to probe on behalf of requester
+  OUT int32_t probe_result_;     // 0 = alive, -1 = unreachable
+
+  /** SHM default constructor */
+  ProbeRequestTask() : chi::Task(), target_node_id_(0), probe_result_(-1) {}
+
+  /** Emplace constructor */
+  explicit ProbeRequestTask(const chi::TaskId &task_node,
+                            const chi::PoolId &pool_id,
+                            const chi::PoolQuery &pool_query,
+                            chi::u64 target_node_id)
+      : chi::Task(task_node, pool_id, pool_query, Method::kProbeRequest),
+        target_node_id_(target_node_id),
+        probe_result_(-1) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kProbeRequest;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(target_node_id_);
+  }
+
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(probe_result_);
+  }
+
+  void Copy(const hipc::FullPtr<ProbeRequestTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    target_node_id_ = other->target_node_id_;
+    probe_result_ = other->probe_result_;
+  }
+
+  void Aggregate(const hipc::FullPtr<ProbeRequestTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
+/**
+ * RecoverContainersTask - Leader broadcasts recovery plan to surviving nodes
+ * Each node updates address_map_, only dest node creates the container
+ */
+struct RecoverContainersTask : public chi::Task {
+  IN chi::priv::string assignments_data_;  // Serialized vector<RecoveryAssignment>
+  IN chi::u64 dead_node_id_;
+  OUT chi::u32 num_recovered_;
+  OUT chi::priv::string error_message_;
+
+  /** SHM default constructor */
+  RecoverContainersTask()
+      : chi::Task(),
+        assignments_data_(HSHM_MALLOC),
+        dead_node_id_(0),
+        num_recovered_(0),
+        error_message_(HSHM_MALLOC) {}
+
+  /** Emplace constructor */
+  explicit RecoverContainersTask(const chi::TaskId &task_node,
+                                  const chi::PoolId &pool_id,
+                                  const chi::PoolQuery &pool_query,
+                                  const std::string &assignments_data,
+                                  chi::u64 dead_node_id)
+      : chi::Task(task_node, pool_id, pool_query, Method::kRecoverContainers),
+        assignments_data_(HSHM_MALLOC, assignments_data),
+        dead_node_id_(dead_node_id),
+        num_recovered_(0),
+        error_message_(HSHM_MALLOC) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kRecoverContainers;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(assignments_data_, dead_node_id_);
+  }
+
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_recovered_, error_message_);
+  }
+
+  void Copy(const hipc::FullPtr<RecoverContainersTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    assignments_data_ = other->assignments_data_;
+    dead_node_id_ = other->dead_node_id_;
+    num_recovered_ = other->num_recovered_;
+    error_message_ = other->error_message_;
+  }
+
+  void Aggregate(const hipc::FullPtr<RecoverContainersTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
 }  // namespace chimaera::admin
 
 #endif  // ADMIN_TASKS_H_

@@ -896,6 +896,43 @@ class IpcManager {
    */
   void SetAlive(u64 node_id);
 
+  /**
+   * Get the SWIM node state for a node
+   * @param node_id Node to query
+   * @return NodeState (kDead for unknown nodes)
+   */
+  NodeState GetNodeState(u64 node_id) const;
+
+  /**
+   * Set the SWIM node state and update state_changed_at timestamp
+   * @param node_id Node to update
+   * @param new_state New state to set
+   */
+  void SetNodeState(u64 node_id, NodeState new_state);
+
+  /**
+   * Set self-fenced status (partition detection)
+   * @param fenced true if this node should fence itself
+   */
+  void SetSelfFenced(bool fenced);
+
+  /**
+   * Check if this node is self-fenced
+   * @return true if self-fenced
+   */
+  bool IsSelfFenced() const { return self_fenced_; }
+
+  /**
+   * Get the leader node ID (lowest alive node_id)
+   * All nodes compute the same leader deterministically from local state
+   */
+  u64 GetLeaderNodeId() const;
+
+  /**
+   * Check if this node is the current leader
+   */
+  bool IsLeader() const;
+
   struct DeadNodeEntry {
     u64 node_id;
     std::chrono::steady_clock::time_point detected_at;
@@ -1335,6 +1372,9 @@ class IpcManager {
 
   // Dead node tracking for failure detection
   std::vector<DeadNodeEntry> dead_nodes_;
+
+  // Self-fencing flag for partition detection (SWIM protocol)
+  bool self_fenced_ = false;
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host

@@ -33,6 +33,9 @@ GLOBAL_CONST chi::u32 kAddNode = 24;
 GLOBAL_CONST chi::u32 kChangeAddressTable = 25;
 GLOBAL_CONST chi::u32 kMigrateContainers = 26;
 GLOBAL_CONST chi::u32 kHeartbeat = 27;
+GLOBAL_CONST chi::u32 kHeartbeatProbe = 28;
+GLOBAL_CONST chi::u32 kProbeRequest = 29;
+GLOBAL_CONST chi::u32 kRecoverContainers = 30;
 }  // namespace Method
 
 }  // namespace chimaera::admin

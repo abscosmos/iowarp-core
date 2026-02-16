@@ -144,8 +144,27 @@ chi::TaskResume Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
       break;
     }
     case Method::kHeartbeat: {
+      // Cast task FullPtr to specific type
       hipc::FullPtr<HeartbeatTask> typed_task = task_ptr.template Cast<HeartbeatTask>();
       co_await Heartbeat(typed_task, rctx);
+      break;
+    }
+    case Method::kHeartbeatProbe: {
+      // Cast task FullPtr to specific type
+      hipc::FullPtr<HeartbeatProbeTask> typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
+      co_await HeartbeatProbe(typed_task, rctx);
+      break;
+    }
+    case Method::kProbeRequest: {
+      // Cast task FullPtr to specific type
+      hipc::FullPtr<ProbeRequestTask> typed_task = task_ptr.template Cast<ProbeRequestTask>();
+      co_await ProbeRequest(typed_task, rctx);
+      break;
+    }
+    case Method::kRecoverContainers: {
+      // Cast task FullPtr to specific type
+      hipc::FullPtr<RecoverContainersTask> typed_task = task_ptr.template Cast<RecoverContainersTask>();
+      co_await RecoverContainers(typed_task, rctx);
       break;
     }
     default: {
@@ -240,6 +259,18 @@ void Runtime::DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
     }
     case Method::kHeartbeat: {
       ipc_manager->DelTask(task_ptr.template Cast<HeartbeatTask>());
+      break;
+    }
+    case Method::kHeartbeatProbe: {
+      ipc_manager->DelTask(task_ptr.template Cast<HeartbeatProbeTask>());
+      break;
+    }
+    case Method::kProbeRequest: {
+      ipc_manager->DelTask(task_ptr.template Cast<ProbeRequestTask>());
+      break;
+    }
+    case Method::kRecoverContainers: {
+      ipc_manager->DelTask(task_ptr.template Cast<RecoverContainersTask>());
       break;
     }
     default: {
@@ -353,6 +384,21 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
+    case Method::kHeartbeatProbe: {
+      auto typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kProbeRequest: {
+      auto typed_task = task_ptr.template Cast<ProbeRequestTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kRecoverContainers: {
+      auto typed_task = task_ptr.template Cast<RecoverContainersTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -460,6 +506,21 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
     }
     case Method::kHeartbeat: {
       auto typed_task = task_ptr.template Cast<HeartbeatTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kHeartbeatProbe: {
+      auto typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kProbeRequest: {
+      auto typed_task = task_ptr.template Cast<ProbeRequestTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kRecoverContainers: {
+      auto typed_task = task_ptr.template Cast<RecoverContainersTask>();
       archive >> *typed_task.ptr_;
       break;
     }
@@ -597,6 +658,25 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kHeartbeat: {
       auto typed_task = task_ptr.template Cast<HeartbeatTask>();
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
+      typed_task.ptr_->SerializeIn(archive);
+      break;
+    }
+    case Method::kHeartbeatProbe: {
+      auto typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
+      typed_task.ptr_->SerializeIn(archive);
+      break;
+    }
+    case Method::kProbeRequest: {
+      auto typed_task = task_ptr.template Cast<ProbeRequestTask>();
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
+      typed_task.ptr_->SerializeIn(archive);
+      break;
+    }
+    case Method::kRecoverContainers: {
+      auto typed_task = task_ptr.template Cast<RecoverContainersTask>();
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
       typed_task.ptr_->SerializeIn(archive);
       break;
     }
@@ -734,6 +814,25 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive,
     }
     case Method::kHeartbeat: {
       auto typed_task = task_ptr.template Cast<HeartbeatTask>();
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
+      typed_task.ptr_->SerializeOut(archive);
+      break;
+    }
+    case Method::kHeartbeatProbe: {
+      auto typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
+      typed_task.ptr_->SerializeOut(archive);
+      break;
+    }
+    case Method::kProbeRequest: {
+      auto typed_task = task_ptr.template Cast<ProbeRequestTask>();
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
+      typed_task.ptr_->SerializeOut(archive);
+      break;
+    }
+    case Method::kRecoverContainers: {
+      auto typed_task = task_ptr.template Cast<RecoverContainersTask>();
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
     }
@@ -961,9 +1060,44 @@ hipc::FullPtr<chi::Task> Runtime::NewCopyTask(chi::u32 method, hipc::FullPtr<chi
       break;
     }
     case Method::kHeartbeat: {
+      // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<HeartbeatTask>();
       if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
         auto task_typed = orig_task_ptr.template Cast<HeartbeatTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
+    case Method::kHeartbeatProbe: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<HeartbeatProbeTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_task_ptr.template Cast<HeartbeatProbeTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
+    case Method::kProbeRequest: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<ProbeRequestTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_task_ptr.template Cast<ProbeRequestTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
+    case Method::kRecoverContainers: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<RecoverContainersTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_task_ptr.template Cast<RecoverContainersTask>();
         new_task_ptr->Copy(task_typed);
         return new_task_ptr.template Cast<chi::Task>();
       }
@@ -1069,6 +1203,18 @@ hipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
     }
     case Method::kHeartbeat: {
       auto new_task_ptr = ipc_manager->NewTask<HeartbeatTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
+    case Method::kHeartbeatProbe: {
+      auto new_task_ptr = ipc_manager->NewTask<HeartbeatProbeTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
+    case Method::kProbeRequest: {
+      auto new_task_ptr = ipc_manager->NewTask<ProbeRequestTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
+    case Method::kRecoverContainers: {
+      auto new_task_ptr = ipc_manager->NewTask<RecoverContainersTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
     default: {
@@ -1234,8 +1380,34 @@ void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_pt
       break;
     }
     case Method::kHeartbeat: {
+      // Get typed tasks for Aggregate call
       auto typed_origin = origin_task_ptr.template Cast<HeartbeatTask>();
       auto typed_replica = replica_task_ptr.template Cast<HeartbeatTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin.ptr_->Aggregate(typed_replica);
+      break;
+    }
+    case Method::kHeartbeatProbe: {
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_task_ptr.template Cast<HeartbeatProbeTask>();
+      auto typed_replica = replica_task_ptr.template Cast<HeartbeatProbeTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin.ptr_->Aggregate(typed_replica);
+      break;
+    }
+    case Method::kProbeRequest: {
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_task_ptr.template Cast<ProbeRequestTask>();
+      auto typed_replica = replica_task_ptr.template Cast<ProbeRequestTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin.ptr_->Aggregate(typed_replica);
+      break;
+    }
+    case Method::kRecoverContainers: {
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_task_ptr.template Cast<RecoverContainersTask>();
+      auto typed_replica = replica_task_ptr.template Cast<RecoverContainersTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
       typed_origin.ptr_->Aggregate(typed_replica);
       break;
     }

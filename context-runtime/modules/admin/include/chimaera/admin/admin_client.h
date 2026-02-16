@@ -429,6 +429,43 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * HeartbeatProbe - Periodic SWIM failure detector
+   * @param pool_query Pool routing (use Local())
+   * @param period_us Period in microseconds (default 2000000us = 2s)
+   * @return Future for the HeartbeatProbeTask
+   */
+  chi::Future<HeartbeatProbeTask> AsyncHeartbeatProbe(
+      const chi::PoolQuery& pool_query, double period_us = 2000000) {
+    auto* ipc_manager = CHI_IPC;
+
+    auto task = ipc_manager->NewTask<HeartbeatProbeTask>(
+        chi::CreateTaskId(), pool_id_, pool_query);
+
+    if (period_us > 0) {
+      task->SetPeriod(period_us, chi::kMicro);
+      task->SetFlags(TASK_PERIODIC);
+    }
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * ProbeRequest - Ask a helper node to probe a target on our behalf
+   * @param pool_query Pool routing (use Physical(helper_node_id))
+   * @param target_node_id Node to probe
+   * @return Future for the ProbeRequestTask
+   */
+  chi::Future<ProbeRequestTask> AsyncProbeRequest(
+      const chi::PoolQuery& pool_query, chi::u64 target_node_id) {
+    auto* ipc_manager = CHI_IPC;
+
+    auto task = ipc_manager->NewTask<ProbeRequestTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, target_node_id);
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * MigrateContainers - Orchestrate container migration
    * @param pool_query Pool routing
    * @param migrations Vector of MigrateInfo describing migrations to perform
@@ -446,6 +483,27 @@ class Client : public chi::ContainerClient {
     }
     auto task = ipc_manager->NewTask<MigrateContainersTask>(
         chi::CreateTaskId(), pool_id_, pool_query, os.str());
+    return ipc_manager->Send(task);
+  }
+  /**
+   * RecoverContainers - Broadcast recovery plan to all surviving nodes
+   * @param pool_query Pool routing (typically Broadcast)
+   * @param assignments Recovery assignments computed by leader
+   * @param dead_node_id ID of the dead node being recovered
+   * @return Future for the RecoverContainers task
+   */
+  chi::Future<RecoverContainersTask> AsyncRecoverContainers(
+      const chi::PoolQuery& pool_query,
+      const std::vector<chi::RecoveryAssignment>& assignments,
+      chi::u64 dead_node_id) {
+    auto* ipc_manager = CHI_IPC;
+    std::ostringstream os;
+    {
+      cereal::BinaryOutputArchive ar(os);
+      ar(assignments);
+    }
+    auto task = ipc_manager->NewTask<RecoverContainersTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, os.str(), dead_node_id);
     return ipc_manager->Send(task);
   }
 };
