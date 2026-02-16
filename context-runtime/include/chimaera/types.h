@@ -82,11 +82,12 @@ class Chimaera;
 struct Host {
   std::string ip_address;  // IP address as string (IPv4 or IPv6)
   u64 node_id;             // 64-bit representation of IP address
+  bool alive;              // Whether node is believed to be alive
 
   /**
    * Default constructor
    */
-  Host() : node_id(0) {}
+  Host() : node_id(0), alive(true) {}
 
   /**
    * Constructor with IP address and node ID (required)
@@ -94,7 +95,7 @@ struct Host {
    * @param ip IP address string
    * @param id Node ID (typically offset in hostfile)
    */
-  Host(const std::string &ip, u64 id) : ip_address(ip), node_id(id) {}
+  Host(const std::string &ip, u64 id) : ip_address(ip), node_id(id), alive(true) {}
 
   /**
    * Stream output operator for Host
@@ -103,7 +104,8 @@ struct Host {
    * @return Reference to output stream
    */
   friend std::ostream &operator<<(std::ostream &os, const Host &host) {
-    os << "Host(ip=" << host.ip_address << ", node_id=" << host.node_id << ")";
+    os << "Host(ip=" << host.ip_address << ", node_id=" << host.node_id
+       << ", alive=" << host.alive << ")";
     return os;
   }
 };

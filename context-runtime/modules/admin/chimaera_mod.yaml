@@ -34,3 +34,4 @@ kRestartContainers: 23   # Restart containers from saved compose configs
 kAddNode: 24             # Register a new node with all existing nodes
 kChangeAddressTable: 25  # Update ContainerId->NodeId mapping on a node
 kMigrateContainers: 26   # Orchestrate container migration
+kHeartbeat: 27           # Liveness probe - just returns success

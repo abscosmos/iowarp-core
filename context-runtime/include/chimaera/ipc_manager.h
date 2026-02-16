@@ -877,6 +877,39 @@ class IpcManager {
   size_t GetNumHosts() const;
 
   /**
+   * Check if a node is believed to be alive
+   * @param node_id Node to check
+   * @return true if alive, false if dead or unknown
+   */
+  bool IsAlive(u64 node_id) const;
+
+  /**
+   * Mark a node as dead and record it for retry tracking
+   * Removes cached client connections for the dead node
+   * @param node_id Node to mark as dead
+   */
+  void SetDead(u64 node_id);
+
+  /**
+   * Mark a node as alive and remove it from dead-node tracking
+   * @param node_id Node to mark as alive
+   */
+  void SetAlive(u64 node_id);
+
+  struct DeadNodeEntry {
+    u64 node_id;
+    std::chrono::steady_clock::time_point detected_at;
+  };
+
+  /**
+   * Get the list of dead nodes for retry queue scanning
+   * @return Const reference to dead_nodes_ vector
+   */
+  const std::vector<DeadNodeEntry>& GetDeadNodes() const {
+    return dead_nodes_;
+  }
+
+  /**
    * Add a new node to the internal hostfile
    * @param ip_address IP address of the new node
    * @param port Port of the new node's runtime
@@ -1299,6 +1332,9 @@ class IpcManager {
   // buffers (stored in recv[].desc) remain valid until Future::Destroy().
   std::unordered_map<size_t, std::unique_ptr<LoadTaskArchive>>
       pending_response_archives_;
+
+  // Dead node tracking for failure detection
+  std::vector<DeadNodeEntry> dead_nodes_;
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host

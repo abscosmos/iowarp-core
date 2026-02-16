@@ -417,6 +417,18 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * Heartbeat - Liveness probe to a specific node
+   * @param pool_query Pool routing (use Physical(node_id) to target a node)
+   * @return Future for the HeartbeatTask
+   */
+  chi::Future<HeartbeatTask> AsyncHeartbeat(const chi::PoolQuery& pool_query) {
+    auto* ipc_manager = CHI_IPC;
+    auto task = ipc_manager->NewTask<HeartbeatTask>(
+        chi::CreateTaskId(), pool_id_, pool_query);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * MigrateContainers - Orchestrate container migration
    * @param pool_query Pool routing
    * @param migrations Vector of MigrateInfo describing migrations to perform

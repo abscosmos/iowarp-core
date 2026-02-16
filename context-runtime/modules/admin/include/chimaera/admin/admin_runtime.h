@@ -41,7 +41,22 @@
 #include <chimaera/pool_manager.h>
 #include <chimaera/unordered_map_ll.h>
 
+#include <deque>
+
 namespace chimaera::admin {
+
+/** Return code set on tasks that fail due to network timeout */
+static constexpr int kNetworkTimeoutRC = -1000;
+
+/** How long (seconds) to keep a task in retry queue before failing it */
+static constexpr float kRetryTimeoutSec = 30.0f;
+
+/** Entry in a retry queue for tasks that couldn't be sent */
+struct RetryEntry {
+  hipc::FullPtr<chi::Task> task;
+  chi::u64 target_node_id;
+  std::chrono::steady_clock::time_point enqueued_at;
+};
 
 // Admin local queue indices
 enum AdminQueueIndex {
@@ -257,6 +272,11 @@ public:
   chi::TaskResume MigrateContainers(hipc::FullPtr<MigrateContainersTask> task, chi::RunContext &rctx);
 
   /**
+   * Handle Heartbeat - Liveness probe, just returns success
+   */
+  chi::TaskResume Heartbeat(hipc::FullPtr<HeartbeatTask> task, chi::RunContext &rctx);
+
+  /**
    * Helper: Receive task inputs from remote node
    */
   void RecvIn(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Transport* lbm_transport);
@@ -328,11 +348,25 @@ public:
                  hipc::FullPtr<chi::Task> origin_task_ptr,
                  hipc::FullPtr<chi::Task> replica_task_ptr) override;
 
+  /**
+   * Process retry queues: retry sends to revived nodes, timeout stale entries
+   */
+  void ProcessRetryQueues();
+
+  /**
+   * Scan send_map_ for tasks waiting on dead nodes and time them out
+   */
+  void ScanSendMapTimeouts();
+
 private:
   /**
    * Initiate runtime shutdown sequence
    */
   void InitiateShutdown(chi::u32 grace_period_ms);
+
+  // Retry queues for tasks that failed to send due to dead nodes
+  std::deque<RetryEntry> send_in_retry_;
+  std::deque<RetryEntry> send_out_retry_;
 };
 
 } // namespace chimaera::admin

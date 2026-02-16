@@ -51,6 +51,7 @@
 #include <zmq.h>
 #include <hermes_shm/lightbeam/transport_factory_impl.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -798,6 +799,55 @@ const std::vector<Host> &IpcManager::GetAllHosts() const {
 }
 
 size_t IpcManager::GetNumHosts() const { return hostfile_map_.size(); }
+
+bool IpcManager::IsAlive(u64 node_id) const {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return false;
+  return it->second.alive;
+}
+
+void IpcManager::SetDead(u64 node_id) {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return;
+  if (!it->second.alive) return;  // Already dead
+  it->second.alive = false;
+
+  // Record dead-node entry for retry tracking
+  DeadNodeEntry entry;
+  entry.node_id = node_id;
+  entry.detected_at = std::chrono::steady_clock::now();
+  dead_nodes_.push_back(entry);
+
+  // Remove cached client connections to the dead node
+  {
+    std::lock_guard<std::mutex> lock(client_pool_mutex_);
+    auto *config_manager = CHI_CONFIG_MANAGER;
+    int port = static_cast<int>(config_manager->GetPort());
+    std::string key = it->second.ip_address + ":" + std::to_string(port);
+    client_pool_.erase(key);
+  }
+
+  HLOG(kWarning, "IpcManager: Node {} ({}) marked as DEAD",
+       node_id, it->second.ip_address);
+}
+
+void IpcManager::SetAlive(u64 node_id) {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return;
+  if (it->second.alive) return;  // Already alive
+  it->second.alive = true;
+
+  // Remove from dead_nodes_ list
+  dead_nodes_.erase(
+      std::remove_if(dead_nodes_.begin(), dead_nodes_.end(),
+                     [node_id](const DeadNodeEntry &e) {
+                       return e.node_id == node_id;
+                     }),
+      dead_nodes_.end());
+
+  HLOG(kInfo, "IpcManager: Node {} ({}) marked as ALIVE",
+       node_id, it->second.ip_address);
+}
 
 u64 IpcManager::AddNode(const std::string& ip_address, u32 port) {
   (void)port;  // Port stored elsewhere (ConfigManager) for now

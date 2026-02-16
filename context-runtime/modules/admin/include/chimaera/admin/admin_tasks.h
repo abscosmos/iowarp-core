@@ -1511,6 +1511,46 @@ struct MigrateContainersTask : public chi::Task {
   }
 };
 
+/**
+ * HeartbeatTask - Liveness probe that just returns success
+ * No input or output fields beyond base Task
+ */
+struct HeartbeatTask : public chi::Task {
+  /** SHM default constructor */
+  HeartbeatTask() : chi::Task() {}
+
+  /** Emplace constructor */
+  explicit HeartbeatTask(const chi::TaskId &task_node,
+                         const chi::PoolId &pool_id,
+                         const chi::PoolQuery &pool_query)
+      : chi::Task(task_node, pool_id, pool_query, Method::kHeartbeat) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kHeartbeat;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const hipc::FullPtr<HeartbeatTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+  }
+
+  void Aggregate(const hipc::FullPtr<HeartbeatTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
 }  // namespace chimaera::admin
 
 #endif  // ADMIN_TASKS_H_

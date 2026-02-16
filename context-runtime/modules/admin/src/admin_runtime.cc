@@ -54,6 +54,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <filesystem>
 #include <vector>
 
@@ -449,22 +450,7 @@ void Runtime::SendIn(hipc::FullPtr<chi::Task> origin_task,
       continue;
     }
 
-    // Get or create persistent Lightbeam client using connection pool
-    auto *config_manager = CHI_CONFIG_MANAGER;
-    int port = static_cast<int>(config_manager->GetPort());
-    hshm::lbm::Transport *lbm_transport =
-        ipc_manager->GetOrCreateClient(target_host->ip_address, port);
-
-    if (!lbm_transport) {
-      HLOG(kError, "[SendIn] Task {} FAILED: Could not get client for {}:{}",
-           origin_task->task_id_, target_host->ip_address, port);
-      continue;
-    }
-
-    // Create SaveTaskArchive with SerializeIn mode and lbm_transport
-    chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn, lbm_transport);
-
-    // Create task copy
+    // Create task copy first (needed for both send and retry)
     hipc::FullPtr<chi::Task> task_copy =
         container->NewCopyTask(origin_task->method_, origin_task, true);
     origin_task_rctx->subtasks_[i] = task_copy;
@@ -481,6 +467,33 @@ void Runtime::SendIn(hipc::FullPtr<chi::Task> origin_task,
     chi::u64 this_node_id = ipc_manager->GetNodeId();
     task_copy->pool_query_.SetReturnNode(this_node_id);
 
+    // Check aliveness before sending
+    if (!ipc_manager->IsAlive(target_node_id)) {
+      HLOG(kWarning, "[SendIn] Task {} target node {} is dead, queuing for retry",
+           origin_task->task_id_, target_node_id);
+      send_in_retry_.push_back({task_copy, target_node_id,
+                                std::chrono::steady_clock::now()});
+      continue;
+    }
+
+    // Get or create persistent Lightbeam client using connection pool
+    auto *config_manager = CHI_CONFIG_MANAGER;
+    int port = static_cast<int>(config_manager->GetPort());
+    hshm::lbm::Transport *lbm_transport =
+        ipc_manager->GetOrCreateClient(target_host->ip_address, port);
+
+    if (!lbm_transport) {
+      HLOG(kError, "[SendIn] Task {} FAILED: Could not get client for {}:{}",
+           origin_task->task_id_, target_host->ip_address, port);
+      ipc_manager->SetDead(target_node_id);
+      send_in_retry_.push_back({task_copy, target_node_id,
+                                std::chrono::steady_clock::now()});
+      continue;
+    }
+
+    // Create SaveTaskArchive with SerializeIn mode and lbm_transport
+    chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn, lbm_transport);
+
     // Serialize the task using container->SaveTask (Expose will be called
     // automatically for bulks)
     container->SaveTask(task_copy->method_, archive, task_copy);
@@ -494,6 +507,9 @@ void Runtime::SendIn(hipc::FullPtr<chi::Task> origin_task,
       HLOG(kError,
            "[SendIn] Task {} Lightbeam async Send FAILED with error code {}",
            origin_task->task_id_, rc);
+      ipc_manager->SetDead(target_node_id);
+      send_in_retry_.push_back({task_copy, target_node_id,
+                                std::chrono::steady_clock::now()});
       continue;
     }
   }
@@ -546,6 +562,15 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
   // Get return node from pool_query
   chi::u64 target_node_id = origin_task->pool_query_.GetReturnNode();
 
+  // Check aliveness before sending output back
+  if (!ipc_manager->IsAlive(target_node_id)) {
+    HLOG(kWarning, "[SendOut] Task {} return node {} is dead, queuing for retry",
+         origin_task->task_id_, target_node_id);
+    send_out_retry_.push_back({origin_task, target_node_id,
+                               std::chrono::steady_clock::now()});
+    return;
+  }
+
   // Get host information
   const chi::Host *target_host = ipc_manager->GetHost(target_node_id);
   if (target_host == nullptr) {
@@ -563,6 +588,9 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
   if (lbm_transport == nullptr) {
     HLOG(kError, "[SendOut] Task {} FAILED: Could not get client for {}:{}",
          origin_task->task_id_, target_host->ip_address, port);
+    ipc_manager->SetDead(target_node_id);
+    send_out_retry_.push_back({origin_task, target_node_id,
+                               std::chrono::steady_clock::now()});
     return;
   }
 
@@ -581,6 +609,9 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
   if (rc != 0) {
     HLOG(kError, "[SendOut] Task {} Lightbeam Send FAILED with error code {}",
          origin_task->task_id_, rc);
+    ipc_manager->SetDead(target_node_id);
+    send_out_retry_.push_back({origin_task, target_node_id,
+                               std::chrono::steady_clock::now()});
     return;
   }
 
@@ -600,6 +631,12 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
   chi::Future<chi::Task> queued_future;
   bool did_send = false;
   int send_in_count = 0;
+
+  // Process retry queues before normal sends
+  ProcessRetryQueues();
+
+  // Scan send_map_ for timed-out entries from dead nodes
+  ScanSendMapTimeouts();
 
   // Poll priority 0 (SendIn) queue - tasks waiting to be sent to remote nodes
   while (ipc_manager->TryPopNetTask(chi::NetQueuePriority::kSendIn,
@@ -1498,6 +1535,132 @@ chi::TaskResume Runtime::MigrateContainers(
   task->SetReturnCode(0);
   HLOG(kInfo, "Admin: MigrateContainers completed, {} migrated",
        task->num_migrated_);
+  co_return;
+}
+
+void Runtime::ProcessRetryQueues() {
+  auto *ipc_manager = CHI_IPC;
+  auto *pool_manager = CHI_POOL_MANAGER;
+  auto *config_manager = CHI_CONFIG_MANAGER;
+  auto now = std::chrono::steady_clock::now();
+
+  // Process send_in retry queue
+  auto it = send_in_retry_.begin();
+  while (it != send_in_retry_.end()) {
+    float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
+    if (elapsed >= kRetryTimeoutSec) {
+      // Timeout: mark task as failed
+      HLOG(kError, "[RetryQueue] SendIn task timed out after {}s for node {}",
+           elapsed, it->target_node_id);
+      it->task->SetReturnCode(kNetworkTimeoutRC);
+      it = send_in_retry_.erase(it);
+    } else if (ipc_manager->IsAlive(it->target_node_id)) {
+      // Node came back: retry the send
+      const chi::Host *target_host = ipc_manager->GetHost(it->target_node_id);
+      if (target_host) {
+        int port = static_cast<int>(config_manager->GetPort());
+        hshm::lbm::Transport *lbm_transport =
+            ipc_manager->GetOrCreateClient(target_host->ip_address, port);
+        if (lbm_transport) {
+          chi::Container *container =
+              pool_manager->GetStaticContainer(it->task->pool_id_);
+          if (container) {
+            chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn, lbm_transport);
+            container->SaveTask(it->task->method_, archive, it->task);
+            hshm::lbm::LbmContext ctx(0);
+            int rc = lbm_transport->Send(archive, ctx);
+            if (rc == 0) {
+              HLOG(kInfo, "[RetryQueue] SendIn retry succeeded for node {}",
+                   it->target_node_id);
+              it = send_in_retry_.erase(it);
+              continue;
+            }
+          }
+        }
+      }
+      // Retry failed, keep in queue
+      ++it;
+    } else {
+      ++it;
+    }
+  }
+
+  // Process send_out retry queue
+  it = send_out_retry_.begin();
+  while (it != send_out_retry_.end()) {
+    float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
+    if (elapsed >= kRetryTimeoutSec) {
+      HLOG(kError, "[RetryQueue] SendOut task timed out after {}s for node {}",
+           elapsed, it->target_node_id);
+      // For send_out, the result is lost; origin will timeout
+      it = send_out_retry_.erase(it);
+    } else if (ipc_manager->IsAlive(it->target_node_id)) {
+      // Node came back: retry by calling SendOut
+      SendOut(it->task);
+      it = send_out_retry_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void Runtime::ScanSendMapTimeouts() {
+  auto *ipc_manager = CHI_IPC;
+  auto now = std::chrono::steady_clock::now();
+
+  // Iterate dead nodes and check if any send_map_ entries target them
+  const auto &dead_nodes = ipc_manager->GetDeadNodes();
+  if (dead_nodes.empty()) return;
+
+  // Build set of dead node IDs for fast lookup
+  std::unordered_set<chi::u64> dead_set;
+  for (const auto &entry : dead_nodes) {
+    // Only timeout entries that have been dead long enough
+    float dead_elapsed = std::chrono::duration<float>(
+        now - entry.detected_at).count();
+    if (dead_elapsed >= kRetryTimeoutSec) {
+      dead_set.insert(entry.node_id);
+    }
+  }
+
+  if (dead_set.empty()) return;
+
+  // Scan send_map_ for tasks targeting dead nodes using for_each
+  std::vector<size_t> keys_to_remove;
+  send_map_.for_each([&](const size_t &key,
+                         hipc::FullPtr<chi::Task> &origin_task) {
+    if (origin_task.IsNull() || !origin_task->run_ctx_) return;
+
+    chi::RunContext *rctx = origin_task->run_ctx_.get();
+    // Check if any replica targets a dead node
+    bool any_dead = false;
+    for (const auto &pq : rctx->pool_queries_) {
+      if (pq.IsPhysicalMode() && dead_set.count(pq.GetNodeId())) {
+        any_dead = true;
+        break;
+      }
+    }
+
+    if (any_dead) {
+      HLOG(kError, "[ScanSendMapTimeouts] Task {} timed out waiting for dead node",
+           origin_task->task_id_);
+      origin_task->SetReturnCode(kNetworkTimeoutRC);
+      // Complete the task as failed
+      auto *worker = CHI_CUR_WORKER;
+      worker->EndTask(origin_task, rctx, true);
+      keys_to_remove.push_back(key);
+    }
+  });
+
+  for (size_t key : keys_to_remove) {
+    send_map_.erase(key);
+  }
+}
+
+chi::TaskResume Runtime::Heartbeat(hipc::FullPtr<HeartbeatTask> task,
+                                   chi::RunContext &rctx) {
+  task->SetReturnCode(0);
+  rctx.did_work_ = true;
   co_return;
 }
 
