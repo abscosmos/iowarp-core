@@ -363,7 +363,10 @@ TriggerRecovery(dead_node_id):
 ### 5.2  ComputeRecoveryPlan
 
 The leader scans every pool's `address_map_` for containers that were on the
-dead node and assigns each to a surviving node using round-robin:
+dead node.  For each affected container it first asks the pool's
+`local_container_` where recovery should go (`ScheduleRecover`).  If the
+container returns `-1` (the default), the leader falls back to round-robin
+among alive nodes:
 
 ```
 ComputeRecoveryPlan(dead_node_id):
@@ -373,10 +376,16 @@ ComputeRecoveryPlan(dead_node_id):
   for each pool in GetAllPoolIds():
     for each (container_id, node_id) in pool.address_map_:
       if node_id == dead_node_id:
+        dest = (u32)-1
+        if pool.local_container_:
+          dest = pool.local_container_->ScheduleRecover()
+        if dest == (u32)-1:
+          dest = alive_nodes[rr_idx++ % len(alive_nodes)]
+
         assignment = RecoveryAssignment {
           pool_id, chimod_name, pool_name, chimod_params,
           container_id, dead_node_id,
-          dest_node_id = alive_nodes[rr_idx++ % len(alive_nodes)]
+          dest_node_id = dest
         }
         assignments.append(assignment)
 
@@ -398,7 +407,7 @@ RecoverContainers(assignments):
     // ONLY DEST NODE: create the container
     if self_node_id == dest_node_id:
       container = CreateContainer(chimod_name, pool_id, pool_name)
-      container->Restart(pool_id, pool_name, container_id)  // callback
+      container->Recover(pool_id, pool_name, container_id)  // callback
       RegisterContainer(pool_id, container_id, container)
 ```
 
@@ -406,7 +415,24 @@ RecoverContainers(assignments):
 consistency, but the container is only physically created on the destination
 node.
 
-### 5.4  Container Callback: Restart
+### 5.4  Container Callbacks: Recover vs Restart
+
+Recovery and restart serve different purposes:
+
+**Recover** -- node failure, container recreated on a **different** node:
+
+```cpp
+virtual void Recover(const PoolId& pool_id, const std::string& pool_name,
+                     u32 container_id = 0) {
+  Init(pool_id, pool_name, container_id);
+}
+```
+
+Called during `RecoverContainers` on the destination node.  Aims to reconstruct
+both data and metadata from replicas or checkpoints.  Override to pull state
+from surviving replicas, remote checkpoints, or other external sources.
+
+**Restart** -- same node, warm start after brief shutdown:
 
 ```cpp
 virtual void Restart(const PoolId& pool_id, const std::string& pool_name,
@@ -415,13 +441,21 @@ virtual void Restart(const PoolId& pool_id, const std::string& pool_name,
 }
 ```
 
-The default `Restart` implementation calls `Init`, which reinitializes the
-container with a clean state.  Modules that need to restore persistent state
-(e.g., from a checkpoint or WAL) should override `Restart` to load that state
-after calling `Init`.
+Called during `RestartContainers` / Compose pathway on the **same** node.
+Aims to rebuild metadata only (data assumed intact on local storage).  Override
+to reload metadata from a local WAL or config.
 
-**When invoked**: During `RecoverContainers` on the destination node, after
-`CreateContainer` allocates the container but before it begins accepting tasks.
+**ScheduleRecover** -- placement decision for recovery:
+
+```cpp
+virtual u32 ScheduleRecover() {
+  return static_cast<u32>(-1);  // let admin choose at random
+}
+```
+
+Called on the leader's `local_container_` during `ComputeRecoveryPlan`.  Return
+a specific node ID to direct recovery (e.g., nearest replica), or `-1` to fall
+back to round-robin.
 
 ---
 
@@ -708,8 +742,10 @@ for each task_info in archive:
 
 | Callback | When Invoked | Default Behavior |
 |----------|-------------|-----------------|
-| `Init(pool_id, pool_name, container_id)` | Pool creation, start of `Restart` | Initialize base fields, clear flags |
-| `Restart(pool_id, pool_name, container_id)` | Recovery (`RecoverContainers` on dest node), warm start (`RestartContainers`) | Calls `Init`. Override to restore persistent state. |
+| `Init(pool_id, pool_name, container_id)` | Pool creation, start of `Restart`/`Recover` | Initialize base fields, clear flags |
+| `ScheduleRecover()` | `ComputeRecoveryPlan` on leader's `local_container_` | Returns `(u32)-1` (random placement). Override to pick a specific node. |
+| `Recover(pool_id, pool_name, container_id)` | `RecoverContainers` on dest node (different node from the dead one) | Calls `Init`. Override to restore data + metadata from replicas/checkpoints. |
+| `Restart(pool_id, pool_name, container_id)` | Warm start (`RestartContainers` / Compose) on the same node | Calls `Init`. Override to reload metadata from local WAL/config. |
 | `Expand(new_host)` | `AddNode` -- a new node joined the cluster | No-op. Override to re-partition data. |
 | `Migrate(dest_node_id)` | `MigrateContainers` -- after plug and drain on source node | No-op. Override to serialize and transfer state. |
 | `GetWorkRemaining()` | Migration drain check, shutdown drain | Pure virtual. Return count of pending work units. |
@@ -717,12 +753,12 @@ for each task_info in archive:
 
 ### 10.1  Correctness Guarantees for Recovery Callbacks
 
-1. **Restart is called after CreateContainer**: The container object exists and
-   has been allocated by `ModuleManager::CreateContainer` before `Restart` is
+1. **Recover is called after CreateContainer**: The container object exists and
+   has been allocated by `ModuleManager::CreateContainer` before `Recover` is
    invoked.  The container is not yet registered with `PoolManager`, so no
    tasks can reach it during initialization.
 
-2. **RegisterContainer happens after Restart**: Only after `Restart` completes
+2. **RegisterContainer happens after Recover**: Only after `Recover` completes
    does the container become visible to the routing system via
    `RegisterContainer`.  This prevents tasks from reaching a half-initialized
    container.
@@ -770,7 +806,7 @@ t=18s   Leader calls TriggerRecovery(node_4)
           ComputeRecoveryPlan: scan all pools, assign containers
           Broadcast RecoverContainers:
             All nodes: update address_map_
-            Dest nodes: CreateContainer + Restart + RegisterContainer
+            Dest nodes: CreateContainer + Recover + RegisterContainer
 t=18s+  Retry queues re-resolve: RerouteRetryEntry finds new node
         Tasks that were waiting for dead node route to recovered container
         Normal operation resumes
