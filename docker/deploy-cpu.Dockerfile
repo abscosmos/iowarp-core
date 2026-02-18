@@ -44,6 +44,14 @@ COPY . /workspace/
 
 RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     git submodule update --init --recursive && \
+    cd /workspace/external/runtime-deployment && \
+    source /home/iowarp/miniconda3/etc/profile.d/conda.sh && \
+    conda activate base && \
+    pip install -e . -r requirements.txt && \
+    jarvis init && \
+    jarvis rg build && \
+    jarvis repo add /workspace/jarvis_iowarp && \
+    cd /workspace && \
     mkdir -p build && \
     cd build && \
     cmake --preset build-cpu-release ../ && \

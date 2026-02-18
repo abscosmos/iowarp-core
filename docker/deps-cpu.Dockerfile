@@ -290,19 +290,6 @@ RUN source /home/iowarp/miniconda3/etc/profile.d/conda.sh \
     && conda activate base \
     && conda install -y libaio -c conda-forge
 
-# Install Jarvis (IOWarp runtime deployment tool)
-# Try SSH clone first, fall back to HTTPS if SSH is unavailable
-RUN cd /home/iowarp \
-    && (git clone git@github.com:iowarp/runtime-deployment.git 2>/dev/null || \
-        git clone https://github.com/iowarp/runtime-deployment.git) \
-    && cd runtime-deployment \
-    && source /home/iowarp/miniconda3/etc/profile.d/conda.sh \
-    && conda activate base \
-    && pip install -e . -r requirements.txt  \
-    && jarvis init \
-    && jarvis rg build \
-    && jarvis repo add /workspace/jarvis_iowarp
-
 # Install Node.js 22 LTS (required by Docusaurus docs site)
 USER root
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
