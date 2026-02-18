@@ -62,19 +62,25 @@ RUN sudo mkdir -p /etc/iowarp && \
     sudo cp /workspace/context-runtime/config/chimaera_default.yaml /etc/iowarp/wrp_conf.yaml && \
     sudo touch /etc/iowarp/hostfile
 
+# Strip build-only artifacts to minimize final image size
+RUN sudo rm -rf /home/iowarp/miniconda3/pkgs \
+    /home/iowarp/miniconda3/include \
+    /home/iowarp/miniconda3/share \
+    /home/iowarp/miniconda3/conda-meta \
+    /usr/local/include
+
 #------------------------------------------------------------
 # Final Deploy Image
 #------------------------------------------------------------
 
 FROM runtime-base
 
-# Copy conda environment (needed for runtime dependencies like hdf5, zeromq, etc.)
-COPY --from=builder /home/iowarp/miniconda3 /home/iowarp/miniconda3
+# Copy conda runtime libraries (build artifacts stripped in builder)
+COPY --from=builder --chown=iowarp:iowarp /home/iowarp/miniconda3 /home/iowarp/miniconda3
 
 # Copy IOWarp installation from build container
 COPY --from=builder /usr/local/lib /usr/local/lib
 COPY --from=builder /usr/local/bin /usr/local/bin
-COPY --from=builder /usr/local/include /usr/local/include
 COPY --from=builder /usr/local/share /usr/local/share
 
 # Copy IOWarp runtime configuration
@@ -84,16 +90,13 @@ COPY --from=builder /etc/iowarp /etc/iowarp
 ENV LD_LIBRARY_PATH=/usr/local/lib:/home/iowarp/miniconda3/lib:/usr/lib/x86_64-linux-gnu
 ENV PATH=/usr/local/bin:/home/iowarp/miniconda3/bin:${PATH}
 ENV CONDA_PREFIX=/home/iowarp/miniconda3
-ENV CMAKE_PREFIX_PATH=/home/iowarp/miniconda3:${CMAKE_PREFIX_PATH}
+ENV CMAKE_PREFIX_PATH=/home/iowarp/miniconda3
 
 # Set runtime configuration environment variable
 ENV WRP_RUNTIME_CONF=/etc/iowarp/wrp_conf.yaml
 
 # Update library cache
 RUN ldconfig
-
-# Set ownership for iowarp user
-RUN chown -R iowarp:iowarp /home/iowarp
 
 # Switch to iowarp user
 USER iowarp
