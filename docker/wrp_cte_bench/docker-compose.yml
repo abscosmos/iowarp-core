@@ -34,6 +34,10 @@ services:
     volumes:
       - ./cte_config.yaml:/etc/iowarp/chimaera.yaml:ro
 
+    # Config lookup: CHI_SERVER_CONF is checked first by the runtime
+    environment:
+      - CHI_SERVER_CONF=/etc/iowarp/chimaera.yaml
+
     # Expose ZeroMQ port for client connections
     ports:
       - "5555:5555"

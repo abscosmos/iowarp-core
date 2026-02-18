@@ -290,11 +290,18 @@ RUN source /home/iowarp/miniconda3/etc/profile.d/conda.sh \
     && conda activate base \
     && conda install -y libaio -c conda-forge
 
-# Install Node.js 22 LTS (required by Docusaurus docs site)
+# Install Node.js 22 LTS (required by Docusaurus docs site, needs >= 20)
 USER root
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+      | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+      > /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/* && \
+    node --version && \
     chown -R iowarp:iowarp /home/iowarp/.npm || true
 USER iowarp
 
