@@ -111,13 +111,14 @@
                 "WRP_CTE_ENABLE_COMPRESS": "ON",
                 "WRP_CTE_ENABLE_ADIOS2_ADAPTER": "ON",
                 "WRP_CORE_ENABLE_GRAY_SCOTT": "ON",
-                "WRP_CORE_ENABLE_CONDA": "ON",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
                 "WRP_CORE_ENABLE_ASAN": "OFF",
                 "WRP_CORE_ENABLE_RPATH": "ON",
                 "WRP_CORE_ENABLE_PYTHON": "ON",
                 "WRP_CORE_ENABLE_ZMQ": "ON",
                 "WRP_CORE_ENABLE_CEREAL": "ON",
+                "WRP_CORE_ENABLE_HDF5": "ON",
+                "WRP_CORE_ENABLE_MPI": "ON",
                 "HSHM_LOG_LEVEL": "1"
             }
         },

@@ -191,15 +191,6 @@ RUN cd /tmp \
     && cmake --install cereal-build \
     && rm -rf /tmp/cereal-*
 
-# cppzmq (header-only — C++ bindings for ZeroMQ)
-RUN cd /tmp \
-    && curl -sL https://github.com/zeromq/cppzmq/archive/refs/tags/v4.10.0.tar.gz | tar xz \
-    && cmake -S cppzmq-4.10.0 -B cppzmq-build \
-       -DCMAKE_INSTALL_PREFIX=/usr/local \
-       -DCPPZMQ_BUILD_TESTS=OFF \
-    && cmake --install cppzmq-build \
-    && rm -rf /tmp/cppzmq-*
-
 # libsodium 1.0.20 (shared + static with -fPIC, required by zeromq)
 RUN cd /tmp \
     && curl -sL https://github.com/jedisct1/libsodium/releases/download/1.0.20-RELEASE/libsodium-1.0.20.tar.gz | tar xz \
@@ -228,16 +219,30 @@ RUN cd /tmp \
     && ldconfig \
     && rm -rf /tmp/zeromq-* /tmp/zmq-build
 
+# cppzmq 4.10.0 (header-only — C++ bindings for ZeroMQ, must come after zeromq)
+RUN cd /tmp \
+    && curl -sL https://github.com/zeromq/cppzmq/archive/refs/tags/v4.10.0.tar.gz | tar xz \
+    && cmake -S cppzmq-4.10.0 -B cppzmq-build \
+       -DCMAKE_INSTALL_PREFIX=/usr/local \
+       -DCMAKE_PREFIX_PATH=/usr/local \
+       -DCPPZMQ_BUILD_TESTS=OFF \
+    && cmake --install cppzmq-build \
+    && rm -rf /tmp/cppzmq-*
+
 # libaio 0.3.113 (shared + static with -fPIC)
-# Strip .symver asm directives so the static archive can be linked into
+# Build twice: first with symver intact for a working shared library,
+# then with symver stripped for a static archive that can be linked into
 # shared objects without "version node not found" errors.
 RUN cd /tmp \
     && curl -sL https://pagure.io/libaio/archive/libaio-0.3.113/libaio-libaio-0.3.113.tar.gz | tar xz \
     && cd libaio-libaio-0.3.113 \
-    && sed -i 's/__asm__(".symver.*;//g' src/syscall.h \
     && make prefix=/usr/local CFLAGS="-fPIC -O2" \
     && make prefix=/usr/local install \
     && ldconfig \
+    && make clean \
+    && sed -i 's/__asm__(".symver.*;//g' src/syscall.h \
+    && make prefix=/usr/local CFLAGS="-fPIC -O2" \
+    && cp src/libaio.a /usr/local/lib/libaio.a \
     && rm -rf /tmp/libaio-*
 
 #------------------------------------------------------------

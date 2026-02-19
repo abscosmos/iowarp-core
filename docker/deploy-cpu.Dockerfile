@@ -9,7 +9,7 @@
 #
 FROM ubuntu:24.04 AS runtime-base
 LABEL maintainer="llogan@hawk.iit.edu"
-LABEL version="1.0"
+LABEL version="2.0"
 LABEL description="IOWarp CPU deployment container"
 
 # Disable prompt during packages installation
@@ -40,12 +40,12 @@ FROM iowarp/deps-cpu:latest AS builder
 WORKDIR /workspace
 COPY . /workspace/
 
+ENV PATH="/home/iowarp/.local/bin:${PATH}"
+
 RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     git submodule update --init --recursive && \
     cd /workspace/external/runtime-deployment && \
-    source /home/iowarp/miniconda3/etc/profile.d/conda.sh && \
-    conda activate base && \
-    pip install -e . -r requirements.txt && \
+    pip3 install --break-system-packages -e . -r requirements.txt && \
     jarvis init && \
     jarvis rg build && \
     jarvis repo add /workspace/jarvis_iowarp && \
@@ -60,21 +60,11 @@ RUN mkdir -p /home/iowarp/.chimaera && \
     cp /workspace/context-runtime/config/chimaera_default.yaml \
        /home/iowarp/.chimaera/chimaera.yaml
 
-# Strip build-only artifacts to minimize final image size
-RUN sudo rm -rf /home/iowarp/miniconda3/pkgs \
-    /home/iowarp/miniconda3/include \
-    /home/iowarp/miniconda3/share \
-    /home/iowarp/miniconda3/conda-meta \
-    /usr/local/include
-
 #------------------------------------------------------------
 # Final Deploy Image
 #------------------------------------------------------------
 
 FROM runtime-base
-
-# Copy conda runtime libraries (build artifacts stripped in builder)
-COPY --from=builder --chown=iowarp:iowarp /home/iowarp/miniconda3 /home/iowarp/miniconda3
 
 # Copy IOWarp installation from build container
 COPY --from=builder /usr/local/lib /usr/local/lib
@@ -85,10 +75,8 @@ COPY --from=builder /usr/local/share /usr/local/share
 COPY --from=builder --chown=iowarp:iowarp /home/iowarp/.chimaera /home/iowarp/.chimaera
 
 # Set up library paths
-ENV LD_LIBRARY_PATH=/usr/local/lib:/home/iowarp/miniconda3/lib:/usr/lib/x86_64-linux-gnu
-ENV PATH=/usr/local/bin:/home/iowarp/miniconda3/bin:${PATH}
-ENV CONDA_PREFIX=/home/iowarp/miniconda3
-ENV CMAKE_PREFIX_PATH=/home/iowarp/miniconda3
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu
+ENV PATH=/usr/local/bin:${PATH}
 
 # Update library cache
 RUN ldconfig
@@ -97,8 +85,7 @@ RUN ldconfig
 USER iowarp
 WORKDIR /home/iowarp
 
-# Initialize conda in bashrc
-RUN echo 'eval "$(/home/iowarp/miniconda3/bin/conda shell.bash hook)"' >> /home/iowarp/.bashrc && \
-    echo 'export LD_LIBRARY_PATH=/usr/local/lib:/home/iowarp/miniconda3/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> /home/iowarp/.bashrc
+# Set up environment in bashrc
+RUN echo 'export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> /home/iowarp/.bashrc
 
 CMD ["/bin/bash"]

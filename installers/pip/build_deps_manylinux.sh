@@ -86,18 +86,24 @@ cd /tmp
 curl -sL https://github.com/zeromq/cppzmq/archive/refs/tags/v4.10.0.tar.gz | tar xz
 cmake -S cppzmq-4.10.0 -B cppzmq-build \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_PREFIX_PATH=$PREFIX \
     -DCPPZMQ_BUILD_TESTS=OFF
 cmake --install cppzmq-build
 rm -rf /tmp/cppzmq-*
 
-# libaio 0.3.113 (strip symver for clean static linking)
+# libaio 0.3.113 (shared with symver + static without symver)
+# Build twice: first with symver intact for working shared library,
+# then with symver stripped for static archive that can link into .so files.
 echo "--- libaio 0.3.113 ---"
 cd /tmp
 curl -sL https://pagure.io/libaio/archive/libaio-0.3.113/libaio-libaio-0.3.113.tar.gz | tar xz
 cd libaio-libaio-0.3.113
-sed -i 's/__asm__(".symver.*;//g' src/syscall.h
 make prefix=$PREFIX CFLAGS="-fPIC -O2"
 make prefix=$PREFIX install
+make clean
+sed -i 's/__asm__(".symver.*;//g' src/syscall.h
+make prefix=$PREFIX CFLAGS="-fPIC -O2"
+cp src/libaio.a $PREFIX/lib/libaio.a
 cd /tmp && rm -rf libaio-*
 
 ldconfig
