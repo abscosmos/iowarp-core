@@ -15,11 +15,15 @@ NPROC=$(nproc)
 # AlmaLinux 9 / manylinux_2_34: the default compiler may generate x86_64_v2
 # instructions (SSE4.2, POPCNT) because RHEL 9 requires x86_64_v2 hardware.
 # Force baseline x86_64 so the wheel runs on any x86_64 CPU.
-export CFLAGS="${CFLAGS:+$CFLAGS }-march=x86-64"
-export CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-march=x86-64"
+# On aarch64 we leave the flags alone — the compiler defaults are fine.
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then
+    export CFLAGS="-march=x86-64"
+    export CXXFLAGS="-march=x86-64"
+fi
 
-echo "=== Building IOWarp dependencies (prefix=$PREFIX, nproc=$NPROC) ==="
-echo "=== CFLAGS=$CFLAGS CXXFLAGS=$CXXFLAGS ==="
+echo "=== Building IOWarp dependencies (prefix=$PREFIX, nproc=$NPROC, arch=$ARCH) ==="
+echo "=== CFLAGS=${CFLAGS:-} CXXFLAGS=${CXXFLAGS:-} ==="
 
 # yaml-cpp 0.8.0
 echo "--- yaml-cpp 0.8.0 ---"
@@ -109,7 +113,7 @@ cd /tmp
 curl -sL https://github.com/axboe/liburing/archive/refs/tags/liburing-2.5.tar.gz | tar xz
 cd liburing-liburing-2.5
 ./configure --prefix=$PREFIX
-make -j$NPROC CFLAGS="${CFLAGS} -fPIC"
+make -j$NPROC CFLAGS="${CFLAGS:-} -fPIC"
 make install
 cd /tmp && rm -rf liburing-*
 

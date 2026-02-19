@@ -27,10 +27,18 @@ jobs:
             arch: x86_64
             cibw_build: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
             cibw_image: manylinux_2_34
+            cibw_environment: >-
+              CMAKE_PREFIX_PATH=/usr/local
+              PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
+              CFLAGS=-march=x86-64
+              CXXFLAGS=-march=x86-64
           - runner: ubuntu-24.04-arm
             arch: aarch64
             cibw_build: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64"
             cibw_image: manylinux_2_34
+            cibw_environment: >-
+              CMAKE_PREFIX_PATH=/usr/local
+              PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
 
     steps:
     - name: Checkout repository
@@ -55,11 +63,7 @@ jobs:
         CIBW_BEFORE_ALL: >
           yum install -y curl patchelf &&
           bash {project}/installers/pip/build_deps_manylinux.sh
-        CIBW_ENVIRONMENT: >
-          CMAKE_PREFIX_PATH=/usr/local
-          PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig
-          CFLAGS=-march=x86-64
-          CXXFLAGS=-march=x86-64
+        CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
           bash {project}/installers/pip/repair_wheel.sh {dest_dir} {wheel}
         CIBW_TEST_COMMAND: >
