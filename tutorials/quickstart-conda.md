@@ -65,7 +65,7 @@ The runtime resolves its configuration in this order:
 | 2 | `WRP_RUNTIME_CONF` environment variable (legacy) |
 | 3 | `~/.chimaera/chimaera.yaml` |
 
-The default configuration starts 4 worker threads on port 5555 and
+The default configuration starts 4 worker threads on port 9413 and
 composes three modules automatically:
 
 - **chimaera_bdev** -- 512 MB RAM block device

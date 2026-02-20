@@ -61,7 +61,7 @@ The runtime resolves its configuration in this order:
 | 2 | `~/.chimaera/chimaera.yaml` |
 | 3 | Bundled `iowarp_core/data/chimaera_default.yaml` |
 
-The default configuration starts 4 worker threads on port 5555 and
+The default configuration starts 4 worker threads on port 9413 and
 composes three modules automatically:
 
 - **chimaera_bdev** -- 512 MB RAM block device

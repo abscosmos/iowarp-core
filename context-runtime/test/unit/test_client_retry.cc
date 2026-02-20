@@ -133,7 +133,7 @@ void KillServerHard(pid_t server_pid) {
   // Clean up shared memory and sockets
   CleanupSharedMemory();
   // Remove unix domain socket
-  unlink("/tmp/chimaera_5555.ipc");
+  unlink("/tmp/chimaera_9413.ipc");
   // Remove any /dev/shm artifacts
   system("rm -f /dev/shm/chimaera_* 2>/dev/null");
 
@@ -150,7 +150,7 @@ void CleanupServer(pid_t server_pid) {
     int status;
     waitpid(server_pid, &status, 0);
     CleanupSharedMemory();
-    unlink("/tmp/chimaera_5555.ipc");
+    unlink("/tmp/chimaera_9413.ipc");
     system("rm -f /dev/shm/chimaera_* 2>/dev/null");
   }
 }

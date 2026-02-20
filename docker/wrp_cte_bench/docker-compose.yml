@@ -40,7 +40,7 @@ services:
 
     # Expose ZeroMQ port for client connections
     ports:
-      - "5555:5555"
+      - "9413:9413"
 
     # Resource limits
     mem_limit: 8g

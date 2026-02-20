@@ -789,7 +789,8 @@ environment:
   - CHI_MAIN_SEGMENT_SIZE=1G
   - CHI_CLIENT_DATA_SEGMENT_SIZE=512M
   - CHI_RUNTIME_DATA_SEGMENT_SIZE=512M
-  - CHI_ZMQ_PORT=5555
+  - CHI_PORT=9413              # Override RPC port (default: 9413)
+  - CHI_SERVER_ADDR=127.0.0.1 # Override server address for clients
   - CHI_IPC_MODE=TCP          # SHM, TCP (default), or IPC
   - CHI_LOG_LEVEL=info
   - CHI_SHM_SIZE=2147483648
