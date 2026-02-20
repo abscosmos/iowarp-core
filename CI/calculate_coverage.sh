@@ -156,6 +156,7 @@ if [ "$DO_BUILD" = true ]; then
     print_info "Configuring build with coverage enabled..."
     cmake --preset=debug \
         -DWRP_CORE_ENABLE_COVERAGE=ON \
+        -DWRP_CORE_ENABLE_DOCKER_CI=OFF \
         -DWRP_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
         -DWRP_CTE_ENABLE_COMPRESS=OFF \
         -DWRP_CORE_ENABLE_GRAY_SCOTT=OFF
