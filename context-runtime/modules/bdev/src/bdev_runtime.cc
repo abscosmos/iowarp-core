@@ -766,7 +766,6 @@ chi::TaskResume Runtime::GetStats(hipc::FullPtr<GetStatsTask> task,
   // Get remaining size from heap allocator
   chi::u64 remaining = heap_.GetRemainingSize();
   task->remaining_size_ = remaining;
-  HLOG(kDebug, "GetStats: file_size_={}, remaining={}", file_size_, remaining);
   task->return_code_ = 0;
   (void)ctx;
   co_return;

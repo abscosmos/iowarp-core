@@ -348,8 +348,6 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     return false;
   }
 
-  HLOG(kDebug, "Worker {}: Popped future from lane, processing task",
-       worker_id_);
   SetCurrentRunContext(nullptr);
 
   // Get FutureShm (allocator is pre-registered by Admin::RegisterMemory)
@@ -391,15 +389,8 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     return true;
   }
 
-  HLOG(kDebug,
-       "Worker {}: Task deserialized successfully, task_ptr={}, checking "
-       "if routed",
-       worker_id_, (void *)task_full_ptr.ptr_);
-
   // Allocate RunContext before routing (skip if already created)
   if (!task_full_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-    HLOG(kDebug, "Worker {}: RunContext not yet created, calling BeginTask",
-         worker_id_);
     BeginTask(future, container, lane);
   }
 
@@ -1110,13 +1101,7 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
 
   // Resume the coroutine - it will run until next co_await or co_return
   try {
-    HLOG(kDebug,
-         "ResumeCoroutine: About to resume coro_handle_={} for task method={}",
-         (void *)run_ctx->coro_handle_.address(), task_ptr->method_);
     run_ctx->coro_handle_.resume();
-    HLOG(kDebug, "ResumeCoroutine: Returned from resume, coro_handle_={}",
-         (void *)(run_ctx->coro_handle_ ? run_ctx->coro_handle_.address()
-                                        : nullptr));
 
     // Check if coroutine completed after resumption
     if (run_ctx->coro_handle_.done()) {
@@ -1467,9 +1452,6 @@ void Worker::ProcessEventQueue() {
     if (!run_ctx->coro_handle_ || run_ctx->coro_handle_.done()) {
       continue;
     }
-
-    HLOG(kDebug, "ProcessEventQueue: Resuming task method={}, coro_handle_={}",
-         run_ctx->task_->method_, (void *)run_ctx->coro_handle_.address());
 
     // Reset the is_yielded_ flag before executing the task
     run_ctx->is_yielded_ = false;
