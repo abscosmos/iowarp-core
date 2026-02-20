@@ -95,7 +95,7 @@ class EventManager {
         return -1;
       }
       it->second.action_ = action;
-      return it->second.event_id;
+      return it->second.event_id_;
     }
     int event_id = next_event_id_++;
     if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) == -1) {
