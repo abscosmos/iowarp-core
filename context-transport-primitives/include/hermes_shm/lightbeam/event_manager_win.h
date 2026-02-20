@@ -94,6 +94,12 @@ class EventManager {
     return SetEvent(event_handle) ? 0 : -1;
   }
 
+  static int Signal(int runtime_pid, int tid) {
+    (void)runtime_pid;
+    (void)tid;
+    return 0;
+  }
+
   int Wait(int timeout_us = -1) {
     int timeout_ms;
     if (timeout_us < 0) {
@@ -107,7 +113,7 @@ class EventManager {
 
     // Check signal event first (non-blocking)
     if (signal_event_) {
-      DWORD wait_result = WaitForSingleObject(signal_event_, 0);
+      ::DWORD wait_result = WaitForSingleObject(signal_event_, 0);
       if (wait_result == WAIT_OBJECT_0 && signal_action_) {
         EventInfo info;
         info.trigger_ = {-1, 0};
