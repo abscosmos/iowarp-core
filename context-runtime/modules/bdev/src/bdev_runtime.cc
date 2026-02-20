@@ -673,7 +673,7 @@ chi::TaskResume Runtime::WriteToFile(hipc::FullPtr<WriteTask> task,
 
     hshm::IoResult result;
     while (!io_ctx->async_io_->IsComplete(token, result)) {
-      co_await chi::yield();
+      HSHM_THREAD_MODEL->Yield();
     }
 
     if (result.error_code != 0) {
@@ -736,7 +736,7 @@ chi::TaskResume Runtime::ReadFromFile(hipc::FullPtr<ReadTask> task,
 
     hshm::IoResult result;
     while (!io_ctx->async_io_->IsComplete(token, result)) {
-      co_await chi::yield();
+      HSHM_THREAD_MODEL->Yield();
     }
 
     if (result.error_code != 0) {
