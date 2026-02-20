@@ -1174,8 +1174,14 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
 
   // If coroutine yielded (not done and is_yielded_ set), don't clean up
   if (run_ctx->is_yielded_ && !coro_done) {
-    // Task is blocked - don't clean up, will be resumed later
-    return;  // Task is not completed, blocked for later resume
+    // yield_time_us_ > 0 means cooperative yield (polling) — add to periodic
+    // queue so the worker re-checks after the requested delay.
+    // yield_time_us_ == 0 means waiting for a Future event — the event queue
+    // will resume it, so we must NOT add it to any queue here.
+    if (run_ctx->yield_time_us_ > 0) {
+      AddToBlockedQueue(run_ctx);
+    }
+    return;
   }
 
   // Check if this is a dynamic scheduling task
@@ -1420,6 +1426,9 @@ void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
       if (RouteTask(run_ctx->future_, run_ctx->lane_, container)) {
         // Routing successful, execute the task
         ExecTask(run_ctx->task_, run_ctx, is_started);
+
+        // If task re-yielded with a polling interval, ExecTask already
+        // re-added it to the periodic queue via AddToBlockedQueue.
       }
     } else {
       // Time threshold not reached yet - re-add to same queue
