@@ -1610,18 +1610,18 @@ size_t IpcManager::WreapAllIpcs() {
 
 size_t IpcManager::ClearUserIpcs() {
   size_t removed_count = 0;
-  const char *memfd_dir = "/tmp/chimaera_memfd";
-  const char *prefix = "chimaera_";
-  size_t prefix_len = strlen(prefix);
+  const char *user = getenv("USER");
+  if (!user) user = "unknown";
+  std::string memfd_dir = std::string("/tmp/chimaera_") + user;
 
-  // Open memfd symlink directory
-  DIR *dir = opendir(memfd_dir);
+  // Open per-user memfd symlink directory
+  DIR *dir = opendir(memfd_dir.c_str());
   if (dir == nullptr) {
     // Directory may not exist yet, that's fine
     return 0;
   }
 
-  // Iterate through directory entries
+  // Iterate through directory entries and remove all symlinks
   struct dirent *entry;
   while ((entry = readdir(dir)) != nullptr) {
     // Skip "." and ".."
@@ -1629,13 +1629,8 @@ size_t IpcManager::ClearUserIpcs() {
       continue;
     }
 
-    // Check if filename starts with "chimaera_"
-    if (strncmp(entry->d_name, prefix, prefix_len) != 0) {
-      continue;
-    }
-
     // Construct full path and remove the symlink
-    std::string full_path = std::string(memfd_dir) + "/" + entry->d_name;
+    std::string full_path = memfd_dir + "/" + entry->d_name;
     if (unlink(full_path.c_str()) == 0) {
       HLOG(kDebug, "ClearUserIpcs: Removed memfd symlink: {}",
            entry->d_name);

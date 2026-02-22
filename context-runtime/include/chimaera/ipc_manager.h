@@ -1360,14 +1360,11 @@ class IpcManager {
   size_t WreapAllIpcs();
 
   /**
-   * Clear all chimaera_* memfd symlinks from /tmp/chimaera_memfd/
+   * Clear all memfd symlinks from per-user /tmp/chimaera_${USER}/ directory.
    *
    * Called during RuntimeInit to clean up leftover memfd symlinks
-   * from previous runs or crashed processes. Attempts to remove all files
-   * matching "chimaera_*" pattern in /tmp/chimaera_memfd/ directory.
-   *
-   * Permission errors are silently ignored to allow multi-user systems where
-   * other users may have active Chimaera processes.
+   * from previous runs or crashed processes. Since the directory is
+   * per-user, all entries are cleaned up.
    *
    * @return Number of memfd symlinks successfully removed
    */
