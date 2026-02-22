@@ -117,7 +117,8 @@ bool IpcManager::ClientInit() {
 
     if (ipc_mode_ == IpcMode::kIpc) {
       // IPC mode: Unix domain socket transport
-      std::string ipc_path = "/tmp/chimaera_" + std::to_string(port) + ".ipc";
+      std::string ipc_path =
+          hshm::SystemInfo::GetMemfdPath("chimaera_" + std::to_string(port) + ".ipc");
       try {
         zmq_transport_ = hshm::lbm::TransportFactory::Get(
             ipc_path, hshm::lbm::TransportType::kSocket,
@@ -292,7 +293,8 @@ bool IpcManager::ServerInit() {
 
     try {
       // IPC server on Unix domain socket
-      std::string ipc_path = "/tmp/chimaera_" + std::to_string(port) + ".ipc";
+      std::string ipc_path =
+          hshm::SystemInfo::GetMemfdPath("chimaera_" + std::to_string(port) + ".ipc");
       client_ipc_transport_ = hshm::lbm::TransportFactory::Get(
           ipc_path, hshm::lbm::TransportType::kSocket,
           hshm::lbm::TransportMode::kServer, "ipc", 0);
@@ -1620,9 +1622,7 @@ size_t IpcManager::WreapAllIpcs() {
 
 size_t IpcManager::ClearUserIpcs() {
   size_t removed_count = 0;
-  const char *user = getenv("USER");
-  if (!user) user = "unknown";
-  std::string memfd_dir = std::string("/tmp/chimaera_") + user;
+  std::string memfd_dir = hshm::SystemInfo::GetMemfdDir();
 
   // Open per-user memfd symlink directory
   DIR *dir = opendir(memfd_dir.c_str());
