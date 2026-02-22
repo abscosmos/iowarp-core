@@ -213,7 +213,7 @@ class WrpRuntime(Service):
         # The chimaera binary will also read CHI_SERVER_CONF from environment
         cmd = 'chimaera runtime stop'
 
-        Exec(cmd, LocalExecInfo(
+        Exec(cmd, PsshExecInfo(
             env=self.env,
             hostfile=self.jarvis.hostfile
         )).run()
