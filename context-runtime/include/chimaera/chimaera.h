@@ -79,6 +79,16 @@ enum class ChimaeraMode {
  */
 bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime = false);
 
+/**
+ * Finalize Chimaera and release all resources
+ *
+ * Calls ClientFinalize on the Chimaera manager to close ZMQ sockets and
+ * join background threads. Must be called before process exit to avoid
+ * hangs in zmq_ctx_destroy (the Chimaera singleton is heap-allocated so
+ * its destructor is never invoked automatically).
+ */
+void CHIMAERA_FINALIZE();
+
 }  // namespace chi
 
 #endif  // CHIMAERA_INCLUDE_CHIMAERA_CHIMAERA_H_

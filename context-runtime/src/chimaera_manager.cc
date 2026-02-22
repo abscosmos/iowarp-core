@@ -45,6 +45,13 @@
 // Global pointer variable definition for Chimaera manager singleton
 HSHM_DEFINE_GLOBAL_PTR_VAR_CC(chi::Chimaera, g_chimaera_manager);
 
+static void ChimaeraCleanupAtExit() {
+  if (g_chimaera_manager) {
+    delete g_chimaera_manager;
+    g_chimaera_manager = nullptr;
+  }
+}
+
 namespace chi {
 
 // HSHM Thread-local storage key definitions
@@ -105,14 +112,14 @@ TaskId CreateTaskId() {
 
 Chimaera::~Chimaera() {
   if (is_initialized_) {
-    // Always finalize client components if client mode was initialized
-    if (is_client_mode_) {
-      ClientFinalize();
-    }
-
-    // Only finalize server components if runtime mode was initialized
+    // Finalize server first (stops worker threads that may be processing tasks)
     if (is_runtime_mode_) {
       ServerFinalize();
+    }
+
+    // Then finalize client (closes DEALER socket on the shared ZMQ context)
+    if (is_client_mode_) {
+      ClientFinalize();
     }
   }
 }
@@ -165,6 +172,7 @@ bool Chimaera::ClientInit() {
   is_client_initialized_ = true;
   is_initialized_ = true;
   client_is_initializing_ = false;
+  std::atexit(ChimaeraCleanupAtExit);
 
   return true;
 }
@@ -279,6 +287,7 @@ bool Chimaera::ServerInit() {
   is_runtime_initialized_ = true;
   is_initialized_ = true;
   runtime_is_initializing_ = false;
+  std::atexit(ChimaeraCleanupAtExit);
 
   return true;
 }

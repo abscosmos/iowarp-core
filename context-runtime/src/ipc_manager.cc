@@ -337,6 +337,9 @@ void IpcManager::ServerFinalize() {
     return;
   }
 
+  // Close persistent outbound DEALER sockets before resetting transports
+  ClearClientPool();
+
   // Cleanup servers
   local_transport_.reset();
   main_transport_.reset();

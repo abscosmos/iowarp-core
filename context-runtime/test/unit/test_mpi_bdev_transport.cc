@@ -288,6 +288,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup
+    chi::CHIMAERA_FINALIZE();
     CleanupSharedMemory();
     MPI_Finalize();
     return (global_pass == 1) ? 0 : 1;
@@ -338,6 +339,7 @@ int main(int argc, char* argv[]) {
     MPI_Reduce(&local_pass, &global_pass, 1, MPI_INT, MPI_MIN,
                0, MPI_COMM_WORLD);
 
+    chi::CHIMAERA_FINALIZE();
     MPI_Finalize();
     return (local_pass == 1) ? 0 : 1;
   }

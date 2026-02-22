@@ -64,6 +64,7 @@ void EnsureInitialized() {
   if (!g_initialized) {
     chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     g_initialized = true;
+    SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
   }
 }
 
