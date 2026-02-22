@@ -250,9 +250,14 @@ bool Chimaera::ServerInit() {
     }
 
     // Iterate over each pool configuration and create asynchronously
-    for (const auto& pool_config : compose_config.pools_) {
-      HLOG(kInfo, "Compose: Creating pool {} (module: {})",
-            pool_config.pool_name_, pool_config.mod_name_);
+    for (auto pool_config : compose_config.pools_) {
+      // On restart, force restart_=true so containers call Restart() instead of Init()
+      if (is_restart_) {
+        pool_config.restart_ = true;
+      }
+
+      HLOG(kInfo, "Compose: Creating pool {} (module: {}, restart: {})",
+            pool_config.pool_name_, pool_config.mod_name_, pool_config.restart_);
 
       // Create pool asynchronously and wait
       auto task = admin_client->AsyncCompose(pool_config);
@@ -273,6 +278,12 @@ bool Chimaera::ServerInit() {
     }
 
     HLOG(kInfo, "Compose: All {} pools created successfully", compose_config.pools_.size());
+
+    // After compose, replay WAL to recover address table state from before crash
+    if (is_restart_) {
+      HLOG(kInfo, "Replaying address table WAL for restart recovery...");
+      pool_manager->ReplayAddressTableWAL();
+    }
   }
 
   // Start local server last - after all other initialization is complete

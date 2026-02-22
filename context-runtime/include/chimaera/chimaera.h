@@ -70,6 +70,8 @@ enum class ChimaeraMode {
  * @param default_with_runtime Default behavior if CHI_WITH_RUNTIME env var not set
  *        If true, will start runtime in addition to client initialization
  *        If false, will only initialize client components
+ * @param is_restart If true, force restart_=true on compose pools and replay WAL
+ *        after compose to recover address table state from before the crash
  * @return true if initialization successful, false otherwise
  *
  * Environment variable:
@@ -77,7 +79,8 @@ enum class ChimaeraMode {
  *   CHI_WITH_RUNTIME=0 - Don't start runtime (client only)
  *   If not set, uses default_with_runtime parameter
  */
-bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime = false);
+bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime = false,
+                   bool is_restart = false);
 
 /**
  * Finalize Chimaera and release all resources

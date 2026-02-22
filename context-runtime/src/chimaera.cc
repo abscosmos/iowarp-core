@@ -43,7 +43,7 @@
 
 namespace chi {
 
-bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime) {
+bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime, bool is_restart) {
   // Static guard to prevent double initialization
   static bool s_initialized = false;
   if (s_initialized) {
@@ -51,6 +51,7 @@ bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime) {
   }
 
   auto* chimaera_manager = CHI_CHIMAERA_MANAGER;
+  chimaera_manager->is_restart_ = is_restart;
 
   // Check environment variable CHI_WITH_RUNTIME
   bool with_runtime = default_with_runtime;
