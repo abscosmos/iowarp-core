@@ -16,7 +16,7 @@ pkgs:
     port: 9413
     ipc_mode: "tcp"
     log_level: "info"
-    sleep: 0
+    sleep: 4
 
   # Stage 2: Deploy CTE pools on all nodes (via parallel SSH + chimaera compose)
   - pkg_type: jarvis_iowarp.wrp_cte
@@ -31,11 +31,11 @@ pkgs:
   # Stage 3: Run CTE benchmark (4 procs, 1 per node)
   - pkg_type: jarvis_iowarp.wrp_cte_bench
     pkg_name: cte_bench
-    test_case: "PutGet"
+    test_case: "Put"
     num_threads: 1
     depth: 1
     io_size: "1m"
-    io_count: 10
-    nprocs: 64
-    ppn: 16
+    io_count: 5
+    nprocs: 1
+    ppn: 1
     init_runtime: false

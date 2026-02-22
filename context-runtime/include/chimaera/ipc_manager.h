@@ -1268,6 +1268,13 @@ class IpcManager {
   void ClearClientPool();
 
   /**
+   * Set the net worker's lane pointer for signaling on EnqueueNetTask
+   * Called by scheduler after DivideWorkers assigns net_worker_
+   * @param lane Pointer to the net worker's TaskLane
+   */
+  void SetNetLane(TaskLane *lane) { net_lane_ = lane; }
+
+  /**
    * Enqueue a Future<SendTask> to the network queue
    * @param future Future containing the SendTask to enqueue
    * @param priority Network queue priority (kSendIn or kSendOut)
@@ -1453,6 +1460,9 @@ class IpcManager {
 
   // Network queue for send operations (one lane, two priorities)
   hipc::FullPtr<NetQueue> net_queue_;
+
+  // Net worker's lane pointer for signaling on EnqueueNetTask
+  TaskLane *net_lane_ = nullptr;
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   // GPU memory backends (one per GPU device, using pinned host memory)
