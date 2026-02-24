@@ -49,6 +49,7 @@
 
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/vector.hpp>
+#include <msgpack.hpp>
 #include <chrono>
 #include <memory>
 #include <sstream>
@@ -1217,34 +1218,45 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
 
 chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
                                  chi::RunContext &rctx) {
-  // Get work orchestrator to access all workers
-  auto *work_orchestrator = CHI_WORK_ORCHESTRATOR;
-  if (!work_orchestrator) {
-    task->SetReturnCode(1);
-    HLOG(kError, "Monitor: WorkOrchestrator not available");
-    (void)rctx;
-    co_return;
-  }
-
-  // Get worker count from the work orchestrator
-  size_t num_workers = work_orchestrator->GetWorkerCount();
-
-  // Reserve space in the vector
-  task->info_.reserve(num_workers);
-
-  // Collect stats from all workers
-  for (size_t i = 0; i < num_workers; ++i) {
-    chi::Worker *worker =
-        work_orchestrator->GetWorker(static_cast<chi::u32>(i));
-    if (!worker) {
-      continue;
+  if (task->query_ == "worker_stats") {
+    auto *work_orchestrator = CHI_WORK_ORCHESTRATOR;
+    if (!work_orchestrator) {
+      task->SetReturnCode(1);
+      HLOG(kError, "Monitor(worker_stats): WorkOrchestrator not available");
+      (void)rctx;
+      co_return;
     }
 
-    // Get stats from this worker and add to vector
-    chi::WorkerStats stats = worker->GetWorkerStats();
-    task->info_.push_back(stats);
-  }
+    size_t num_workers = work_orchestrator->GetWorkerCount();
 
+    msgpack::sbuffer sbuf;
+    msgpack::packer<msgpack::sbuffer> pk(sbuf);
+    pk.pack_array(num_workers);
+
+    for (size_t i = 0; i < num_workers; ++i) {
+      chi::Worker *worker =
+          work_orchestrator->GetWorker(static_cast<chi::u32>(i));
+      if (!worker) {
+        pk.pack_map(0);
+        continue;
+      }
+      chi::WorkerStats stats = worker->GetWorkerStats();
+      pk.pack_map(10);
+      pk.pack("worker_id");           pk.pack(stats.worker_id_);
+      pk.pack("is_running");          pk.pack(stats.is_running_);
+      pk.pack("is_active");           pk.pack(stats.is_active_);
+      pk.pack("idle_iterations");     pk.pack(stats.idle_iterations_);
+      pk.pack("num_queued_tasks");    pk.pack(stats.num_queued_tasks_);
+      pk.pack("num_blocked_tasks");   pk.pack(stats.num_blocked_tasks_);
+      pk.pack("num_periodic_tasks");  pk.pack(stats.num_periodic_tasks_);
+      pk.pack("num_retry_tasks");     pk.pack(stats.num_retry_tasks_);
+      pk.pack("suspend_period_us");   pk.pack(stats.suspend_period_us_);
+      pk.pack("num_tasks_processed"); pk.pack(stats.num_tasks_processed_);
+    }
+
+    task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+  }
+  // Unknown queries get empty results (forward-compatible)
   task->SetReturnCode(0);
   (void)rctx;
   co_return;
