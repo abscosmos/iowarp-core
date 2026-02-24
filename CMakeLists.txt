@@ -273,11 +273,16 @@ if(cereal_FOUND)
     message(STATUS "found cereal at ${cereal_DIR}")
 endif()
 
-# MessagePack C library (pure C, no Boost dependency) — always link static
+# MessagePack C library (pure C, no Boost dependency)
+# Prefer static linkage so pip wheels don't need libmsgpack-c.so at runtime.
 find_package(msgpack-c REQUIRED CONFIG)
 message(STATUS "found msgpack-c at ${msgpack-c_DIR}")
-if(NOT TARGET msgpack-c-static)
-  message(FATAL_ERROR "msgpack-c-static target not found; build msgpack-c with static libraries enabled")
+if(TARGET msgpack-c-static)
+  set(MSGPACK_TARGET msgpack-c-static)
+  message(STATUS "  using static msgpack-c")
+else()
+  set(MSGPACK_TARGET msgpack-c)
+  message(STATUS "  using shared msgpack-c (static not available)")
 endif()
 
 # MPICH (only find when explicitly enabled)
@@ -315,8 +320,8 @@ if(WRP_CORE_ENABLE_CEREAL)
     set(SERIALIZATION_LIBS cereal::cereal ${SERIALIZATION_LIBS})
 endif()
 
-# Add msgpack-c to serialization libs (always enabled, static linkage)
-set(SERIALIZATION_LIBS msgpack-c-static ${SERIALIZATION_LIBS})
+# Add msgpack-c to serialization libs (always enabled)
+set(SERIALIZATION_LIBS ${MSGPACK_TARGET} ${SERIALIZATION_LIBS})
 
 # Thread support
 find_package(Threads REQUIRED)
