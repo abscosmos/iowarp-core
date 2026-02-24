@@ -201,6 +201,7 @@ RUN cd /tmp \
     && cmake -S msgpack-c -B msgpack-build \
        -DCMAKE_INSTALL_PREFIX=/usr/local \
        -DMSGPACK_CXX20=ON \
+       -DMSGPACK_USE_BOOST=OFF \
        -DMSGPACK_BUILD_TESTS=OFF \
        -DMSGPACK_BUILD_EXAMPLES=OFF \
     && cmake --build msgpack-build -j$(nproc) \

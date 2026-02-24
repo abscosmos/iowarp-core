@@ -273,9 +273,15 @@ if(cereal_FOUND)
     message(STATUS "found cereal at ${cereal_DIR}")
 endif()
 
-# MessagePack (header-only C++ serialization)
-find_package(msgpack-cxx REQUIRED)
-message(STATUS "found msgpack-cxx")
+# MessagePack C++ (header-only serialization)
+# Avoid find_package(msgpack-cxx) because its cmake config may pull in Boost.
+# Since msgpack-cxx is purely header-only, finding the header is sufficient.
+find_path(MSGPACK_INCLUDE_DIR msgpack.hpp REQUIRED)
+message(STATUS "found msgpack.hpp at ${MSGPACK_INCLUDE_DIR}")
+add_library(msgpack_cxx INTERFACE IMPORTED)
+set_target_properties(msgpack_cxx PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${MSGPACK_INCLUDE_DIR}"
+)
 
 # MPICH (only find when explicitly enabled)
 if(WRP_CORE_ENABLE_MPI)
@@ -311,6 +317,9 @@ endif()
 if(WRP_CORE_ENABLE_CEREAL)
     set(SERIALIZATION_LIBS cereal::cereal ${SERIALIZATION_LIBS})
 endif()
+
+# Add msgpack to serialization libs (always enabled, header-only)
+set(SERIALIZATION_LIBS msgpack_cxx ${SERIALIZATION_LIBS})
 
 # Thread support
 find_package(Threads REQUIRED)
