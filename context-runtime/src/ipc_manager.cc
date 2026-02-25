@@ -189,15 +189,8 @@ bool IpcManager::ClientInit() {
         "", hshm::lbm::TransportType::kShm, hshm::lbm::TransportMode::kServer);
   }
 
-  // Retrieve node ID from shared header and store in this_host_
-  if (shared_header_) {
-    this_host_.node_id = shared_header_->node_id;
-    HLOG(kDebug, "Retrieved node ID from shared memory: 0x{:x}",
-         this_host_.node_id);
-  } else {
-    HLOG(kWarning, "Warning: Could not access shared header during ClientInit");
-    this_host_ = Host();  // Default constructor gives node_id = 0
-  }
+  // Default host until identified
+  this_host_ = Host();
 
   // Initialize HSHM TLS key for task counter
   HSHM_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
@@ -247,20 +240,12 @@ bool IpcManager::ServerInit() {
   }
 #endif
 
-  // Identify this host and store node ID in shared header
+  // Identify this host
   if (!IdentifyThisHost()) {
     HLOG(kError, "Warning: Could not identify host, using default node ID");
     this_host_ = Host();  // Default constructor gives node_id = 0
-    if (shared_header_) {
-      shared_header_->node_id = this_host_.node_id;
-    }
   } else {
-    // Store the identified host's node ID in shared header
-    if (shared_header_) {
-      shared_header_->node_id = this_host_.node_id;
-    }
-
-    HLOG(kDebug, "Node ID stored in shared memory: 0x{:x}", this_host_.node_id);
+    HLOG(kDebug, "Node ID identified: 0x{:x}", this_host_.node_id);
   }
 
   // Initialize HSHM TLS key for task counter (needed for CreateTaskId in
@@ -349,10 +334,6 @@ void IpcManager::ServerFinalize() {
   client_tcp_transport_.reset();
   client_ipc_transport_.reset();
 
-  // Cleanup task queue in shared header (queue handles cleanup automatically)
-  // Only the last process to detach will actually destroy shared data
-  shared_header_ = nullptr;
-
   // Clear main allocator pointer
   main_allocator_ = nullptr;
 
@@ -367,25 +348,15 @@ TaskQueue *IpcManager::GetTaskQueue() { return worker_queues_.ptr_; }
 bool IpcManager::IsInitialized() const { return is_initialized_; }
 
 u32 IpcManager::GetWorkerCount() {
-  if (!shared_header_) {
-    return 0;
-  }
-  return shared_header_->num_workers;
+  return num_workers_;
 }
 
 u32 IpcManager::GetNumSchedQueues() const {
-  if (!shared_header_) {
-    return 0;
-  }
-  return shared_header_->num_sched_queues;
+  return num_sched_queues_;
 }
 
 void IpcManager::SetNumSchedQueues(u32 num_sched_queues) {
-  if (!shared_header_) {
-    HLOG(kError, "IpcManager::SetNumSchedQueues: shared_header_ is null");
-    return;
-  }
-  shared_header_->num_sched_queues = num_sched_queues;
+  num_sched_queues_ = num_sched_queues;
   HLOG(kInfo, "IpcManager: Updated num_sched_queues to {}", num_sched_queues);
 }
 
@@ -401,9 +372,7 @@ void IpcManager::AwakenWorker(TaskLane *lane) {
   // worker is processing
   pid_t tid = lane->GetTid();
   if (tid > 0) {
-    // Get runtime PID from shared header (client's getpid() won't work for
-    // runtime threads)
-    pid_t runtime_pid = shared_header_ ? shared_header_->runtime_pid : getpid();
+    pid_t runtime_pid = runtime_pid_ ? runtime_pid_ : getpid();
 
     // Send SIGUSR1 to the worker thread in the runtime process
     int result = hshm::lbm::EventManager::Signal(runtime_pid, tid);
@@ -488,18 +457,9 @@ bool IpcManager::ServerInitQueues() {
   }
 
   try {
-    // Get the custom header from the backend
-    shared_header_ = main_backend_.template GetSharedHeader<IpcSharedHeader>();
-
-    if (!shared_header_) {
-      return false;
-    }
-
-    // Initialize shared header
-    shared_header_->node_id = 0;  // Will be set after host identification
-    shared_header_->runtime_pid =
-        getpid();  // Store runtime's PID for client tgkill
-    shared_header_->server_generation.store(
+    // Initialize runtime metadata
+    runtime_pid_ = getpid();
+    server_generation_.store(
         static_cast<u64>(
             std::chrono::steady_clock::now().time_since_epoch().count()),
         std::memory_order_release);
@@ -512,8 +472,8 @@ bool IpcManager::ServerInitQueues() {
     u32 total_workers = thread_count;
 
     // Store worker count and scheduling queue count
-    shared_header_->num_workers = total_workers;
-    shared_header_->num_sched_queues = thread_count;
+    num_workers_ = total_workers;
+    num_sched_queues_ = thread_count;
 
     // Get configured queue depth (no longer hardcoded)
     u32 queue_depth = config->GetQueueDepth();
@@ -523,17 +483,12 @@ bool IpcManager::ServerInitQueues() {
          "role)",
          total_workers, queue_depth);
 
-    // Initialize TaskQueue in shared header
-    // Number of lanes equals total worker count
-    new (&shared_header_->worker_queues) TaskQueue(
+    // Allocate TaskQueue in shared memory
+    worker_queues_ = main_allocator_->NewObj<TaskQueue>(
         main_allocator_,
         total_workers,  // num_lanes equals total worker count
         2,  // num_priorities (2 priorities: 0=normal, 1=resumed tasks)
         queue_depth);  // Use configured depth instead of hardcoded 1024
-
-    // Create FullPtr reference to the shared TaskQueue
-    worker_queues_ = hipc::FullPtr<TaskQueue>(main_allocator_,
-                                              &shared_header_->worker_queues);
 
     // Initialize network queue for send operations
     // One lane with four priorities (SendIn, SendOut, ClientSendTcp,
@@ -637,19 +592,8 @@ bool IpcManager::ClientInitQueues() {
   }
 
   try {
-    // Get the custom header from the backend
-    shared_header_ = main_backend_.template GetSharedHeader<IpcSharedHeader>();
-
-    if (!shared_header_) {
-      return false;
-    }
-
-    // Client accesses the server's shared TaskQueue
-    // Create FullPtr reference to the shared TaskQueue
-    worker_queues_ = hipc::FullPtr<TaskQueue>(main_allocator_,
-                                              &shared_header_->worker_queues);
-
-    return !worker_queues_.IsNull();
+    // Client currently does not use shared memory queues
+    return true;
   } catch (const std::exception &e) {
     return false;
   }
@@ -743,13 +687,6 @@ bool IpcManager::WaitForLocalRuntimeStop(u32 timeout_sec) {
 
 void IpcManager::SetNodeId(const std::string &hostname) {
   (void)hostname;  // Unused parameter
-  if (!shared_header_) {
-    return;
-  }
-
-  // Set the node ID from this_host_ which was identified during
-  // IdentifyThisHost
-  shared_header_->node_id = this_host_.node_id;
 }
 
 u64 IpcManager::GetNodeId() const {
@@ -1716,9 +1653,8 @@ bool IpcManager::GetIsClientThread() const {
 
 bool IpcManager::IsServerAlive() const {
   // SHM mode: check runtime PID is still running
-  if (ipc_mode_ == IpcMode::kShm && shared_header_) {
-    pid_t pid = shared_header_->runtime_pid;
-    if (kill(pid, 0) == -1 && errno == ESRCH) return false;
+  if (ipc_mode_ == IpcMode::kShm && runtime_pid_ > 0) {
+    if (kill(runtime_pid_, 0) == -1 && errno == ESRCH) return false;
   }
   // For ZMQ modes, assume alive until proven otherwise by timeout
   return true;
@@ -1730,7 +1666,6 @@ bool IpcManager::ClientReconnect() {
   if (ipc_mode_ == IpcMode::kShm) {
     // Detach old shared memory (don't destroy — server owns it)
     main_allocator_ = nullptr;
-    shared_header_ = nullptr;
     worker_queues_ = hipc::FullPtr<TaskQueue>();
     main_backend_ = hipc::PosixShmMmap();
 

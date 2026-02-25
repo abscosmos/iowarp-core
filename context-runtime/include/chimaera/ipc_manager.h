@@ -114,20 +114,6 @@ struct ClientTaskMeta {
 };
 
 /**
- * Custom header structure for shared memory allocator
- * Contains shared data structures
- */
-struct IpcSharedHeader {
-  TaskQueue worker_queues;  // Multi-lane worker task queue in shared memory
-  u32 num_workers;          // Number of workers for which queues are allocated
-  u32 num_sched_queues;     // Number of scheduling queues for task distribution
-  u64 node_id;        // 64-bit hash of the hostname for node identification
-  pid_t runtime_pid;  // PID of the runtime process (for tgkill)
-  std::atomic<u64>
-      server_generation;  // Monotonic counter, set from epoch nanos at init
-};
-
-/**
  * Information about a per-process shared memory segment
  * Used for registering client memory with the runtime
  */
@@ -924,13 +910,11 @@ class IpcManager {
   IpcMode GetIpcMode() const { return ipc_mode_; }
 
   /**
-   * Get the server's generation counter from shared memory
+   * Get the server's generation counter
    * @return Server generation value, 0 if not available
    */
   u64 GetServerGeneration() const {
-    return shared_header_ ? shared_header_->server_generation.load(
-                                std::memory_order_acquire)
-                          : 0;
+    return server_generation_.load(std::memory_order_acquire);
   }
 
   /**
@@ -1481,8 +1465,7 @@ class IpcManager {
 
   bool is_initialized_ = false;
 
-  // Shared memory backend for main segment (contains IpcSharedHeader,
-  // TaskQueue)
+  // Shared memory backend for main segment (contains TaskQueue)
   hipc::PosixShmMmap main_backend_;
 
   // Allocator ID for main segment
@@ -1491,8 +1474,17 @@ class IpcManager {
   // Main allocator pointer for runtime shared memory (queues, FutureShm)
   CHI_MAIN_ALLOC_T *main_allocator_ = nullptr;
 
-  // Pointer to shared header containing the task queue pointer
-  IpcSharedHeader *shared_header_ = nullptr;
+  // Number of workers for which queues are allocated
+  u32 num_workers_ = 0;
+
+  // Number of scheduling queues for task distribution
+  u32 num_sched_queues_ = 0;
+
+  // PID of the runtime process (for tgkill)
+  pid_t runtime_pid_ = 0;
+
+  // Monotonic counter, set from epoch nanos at init
+  std::atomic<u64> server_generation_{0};
 
   // The worker task queues (multi-lane queue)
   hipc::FullPtr<TaskQueue> worker_queues_;
