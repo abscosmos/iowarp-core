@@ -384,7 +384,7 @@ class _BuddyAllocator : public Allocator {
 
     // Step 2: Check each entry in this list for a fit
     for (size_t i = list_idx; i < kMaxLargePages; ++i) {
-        size_t found_offset = FindFirstFit(list_idx, total_size);
+        size_t found_offset = FindFirstFit(i, total_size);
         if (found_offset != 0) {
         hipc::FullPtr<FreeLargeBuddyPage> free_page(this, OffsetPtr<FreeLargeBuddyPage>(found_offset));
         size_t page_data_size = free_page.ptr_->size_;
