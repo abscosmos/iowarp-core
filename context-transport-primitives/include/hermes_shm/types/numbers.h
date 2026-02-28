@@ -127,6 +127,46 @@ typedef u64 min_u64;
 /** A custom definition of size_t compatible with cuda */
 typedef std::conditional<sizeof(size_t) == 8, min_u64, min_u32>::type size_t;
 
+/**
+ * Compute the number of bits needed to represent a value.
+ * Equivalent to std::bit_width (C++20). Compilers optimize this to BSR.
+ *
+ * @param x The value to compute bit width for
+ * @return Number of bits needed (0 for x == 0, floor(log2(x)) + 1 otherwise)
+ */
+HSHM_INLINE_CROSS_FUN
+static size_t BitWidth(size_t x) {
+  size_t width = 0;
+  while (x > 0) {
+    x >>= 1;
+    ++width;
+  }
+  return width;
+}
+
+/**
+ * Compute floor(log2(x)) using bit manipulation (no floating point).
+ *
+ * @param x The value (must be > 0 for valid result)
+ * @return floor(log2(x))
+ */
+HSHM_INLINE_CROSS_FUN
+static size_t FloorLog2(size_t x) {
+  return BitWidth(x) - 1;
+}
+
+/**
+ * Compute ceil(log2(x)) using bit manipulation (no floating point).
+ *
+ * @param x The value (must be > 0 for valid result)
+ * @return ceil(log2(x)), or 0 if x <= 1
+ */
+HSHM_INLINE_CROSS_FUN
+static size_t CeilLog2(size_t x) {
+  if (x <= 1) return 0;
+  return BitWidth(x - 1);
+}
+
 template <typename T>
 class Unit {
  public:
