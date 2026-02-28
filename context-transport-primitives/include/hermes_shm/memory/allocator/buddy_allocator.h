@@ -311,8 +311,11 @@ class _BuddyAllocator : public Allocator {
    * @param region Offset pointer to the new region
    * @param region_size Size of the new region in bytes
    */
-  void Expand(OffsetPtr<> region, size_t region_size) { 
+  void Expand(OffsetPtr<> region, size_t region_size) {
     if (region.IsNull() || region_size == 0) {
+      return;
+    }
+    if (region_size <= sizeof(BuddyPage)) {
       return;
     }
     FullPtr<BuddyPage> node(this, OffsetPtr<BuddyPage>(region.load()));
