@@ -390,8 +390,8 @@ class _BuddyAllocator : public Allocator {
         size_t page_data_size = free_page.ptr_->size_;
         size_t page_total_size = page_data_size + sizeof(BuddyPage);
 
-        // If there's remainder, add it back to appropriate list using exact size
-        if (page_total_size > total_size) {
+        // If there's a large enough remainder, add it back to appropriate list
+        if (page_total_size > total_size && (page_total_size - total_size) > sizeof(BuddyPage)) {
             AddRemainderToFreeList(found_offset + total_size, page_total_size - total_size);
         }
 
@@ -545,6 +545,9 @@ class _BuddyAllocator : public Allocator {
    * @param total_size Total size of remainder (including BuddyPage header)
    */
   HSHM_CROSS_FUN void AddRemainderToFreeList(size_t page_offset, size_t total_size) {
+    if (total_size <= sizeof(BuddyPage)) {
+      return;
+    }
     size_t data_size = total_size - sizeof(BuddyPage);
 
     if (data_size <= kSmallThreshold) {
