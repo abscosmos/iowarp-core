@@ -38,7 +38,6 @@
 #include "hermes_shm/memory/allocator/heap.h"
 #include "hermes_shm/data_structures/ipc/slist_pre.h"
 #include "hermes_shm/data_structures/ipc/rb_tree_pre.h"
-#include <cmath>
 
 namespace hshm::ipc {
 
@@ -589,8 +588,8 @@ class _BuddyAllocator : public Allocator {
       return 0;
     }
 
-    // Round up to next power of 2
-    size_t log2 = static_cast<size_t>(std::ceil(std::log2(static_cast<double>(alloc_size))));
+    // Round up to next power of 2 using integer bit manipulation
+    size_t log2 = hshm::CeilLog2(alloc_size);
 
     if (log2 < kMinLog2) {
       alloc_size = kMinSize;
@@ -614,8 +613,8 @@ class _BuddyAllocator : public Allocator {
       return 0;
     }
 
-    // Round down to exact power of 2
-    size_t log2 = static_cast<size_t>(std::floor(std::log2(static_cast<double>(size))));
+    // Round down to exact power of 2 using integer bit manipulation
+    size_t log2 = hshm::FloorLog2(size);
 
     if (log2 < kMinLog2) {
       return 0;
@@ -635,8 +634,8 @@ class _BuddyAllocator : public Allocator {
       return 0;
     }
 
-    // Round down to previous power of 2
-    size_t log2 = static_cast<size_t>(std::floor(std::log2(static_cast<double>(size))));
+    // Round down to previous power of 2 using integer bit manipulation
+    size_t log2 = hshm::FloorLog2(size);
 
     if (log2 <= kSmallLog2) {
       return 0;
