@@ -196,7 +196,7 @@ class _BuddyAllocator : public Allocator {
    * @param requested_size Size in bytes to allocate (excluding BuddyPage header)
    * @return Offset pointer to allocated memory (after BuddyPage header)
    */
-  OffsetPtr<> AllocateOffset(size_t requested_size) {
+  HSHM_CROSS_FUN OffsetPtr<> AllocateOffset(size_t requested_size) {
     if (requested_size < kMinSize) {
       requested_size = kMinSize;
     }
@@ -218,7 +218,7 @@ class _BuddyAllocator : public Allocator {
    * @param new_size New size in bytes (excluding BuddyPage header)
    * @return Offset pointer to reallocated memory (may be same or different location)
    */
-  OffsetPtr<> ReallocateOffset(OffsetPtr<> offset, size_t new_size) {
+  HSHM_CROSS_FUN OffsetPtr<> ReallocateOffset(OffsetPtr<> offset, size_t new_size) {
     // Handle null pointer case
     if (offset.IsNull()) {
       return AllocateOffset(new_size);
@@ -256,7 +256,7 @@ class _BuddyAllocator : public Allocator {
    *
    * @param offset Offset pointer to memory (after BuddyPage header)
    */
-  void FreeOffset(OffsetPtr<> offset) {
+  HSHM_CROSS_FUN void FreeOffset(OffsetPtr<> offset) {
     if (offset.IsNull()) {
       return;
     }
@@ -268,7 +268,7 @@ class _BuddyAllocator : public Allocator {
    *
    * @param offset Offset pointer to memory (after BuddyPage header) - must not be null
    */
-  void FreeOffsetNoNullCheck(OffsetPtr<> offset) {
+  HSHM_CROSS_FUN void FreeOffsetNoNullCheck(OffsetPtr<> offset) {
     // Get the BuddyPage header (offset points after header)
     size_t page_offset = offset.load() - sizeof(BuddyPage);
     hipc::FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(page_offset));
@@ -329,7 +329,7 @@ class _BuddyAllocator : public Allocator {
   /**
    * Allocate small memory (<16KB) using round-up sizing
    */
-  OffsetPtr<> AllocateSmall(size_t size) {
+  HSHM_CROSS_FUN OffsetPtr<> AllocateSmall(size_t size) {
     // Step 1: Get the free list for this size (round up to next largest)
     // This also modifies size to be the rounded-up value
     size_t list_idx = GetSmallPageListIndexForAlloc(size);
@@ -376,7 +376,7 @@ class _BuddyAllocator : public Allocator {
   /**
    * Allocate large memory (>16KB) using round-down sizing with best-fit
    */
-  OffsetPtr<> AllocateLarge(size_t size) {
+  HSHM_CROSS_FUN OffsetPtr<> AllocateLarge(size_t size) {
     size_t total_size = size + sizeof(BuddyPage);
 
     // Step 1: Identify the free list using round down
@@ -419,7 +419,7 @@ class _BuddyAllocator : public Allocator {
    * @param required_size Minimum size required (including BuddyPage header)
    * @return Offset to the found page, or 0 if no fit found
    */
-  size_t FindFirstFit(size_t list_idx, size_t required_size) {
+  HSHM_CROSS_FUN size_t FindFirstFit(size_t list_idx, size_t required_size) {
     if (large_pages_[list_idx].empty()) {
       return 0;
     }
@@ -448,7 +448,7 @@ class _BuddyAllocator : public Allocator {
    * Repopulate small arena with more space
    * @return true if arena was successfully repopulated
    */
-  bool RepopulateSmallArena() {
+  HSHM_CROSS_FUN bool RepopulateSmallArena() {
     size_t arena_size = kSmallArenaSize + kSmallArenaPages * sizeof(BuddyPage);
 
     // Divide small arena into pages
@@ -535,7 +535,7 @@ class _BuddyAllocator : public Allocator {
    * @param page_offset Offset to the remainder page
    * @param total_size Total size of remainder (including BuddyPage header)
    */
-  void AddRemainderToFreeList(size_t page_offset, size_t total_size) {
+  HSHM_CROSS_FUN void AddRemainderToFreeList(size_t page_offset, size_t total_size) {
     size_t data_size = total_size - sizeof(BuddyPage);
 
     if (data_size <= kSmallThreshold) {
@@ -568,7 +568,7 @@ class _BuddyAllocator : public Allocator {
    * @param user_size Size of the data portion (excluding BuddyPage header)
    * @return Offset pointer to usable memory (after BuddyPage header)
    */
-  OffsetPtr<> FinalizeAllocation(size_t page_offset, size_t user_size) {
+  HSHM_CROSS_FUN OffsetPtr<> FinalizeAllocation(size_t page_offset, size_t user_size) {
     hipc::FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(page_offset));
     page.ptr_->size_ = user_size;  // Store size without header
 
