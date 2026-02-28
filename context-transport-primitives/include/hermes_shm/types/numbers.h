@@ -36,7 +36,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#if HSHM_IS_HOST
 #include <iostream>
+#endif
 #include <limits>
 
 #include "hermes_shm/constants/macros.h"
@@ -99,11 +101,12 @@ struct ThreadId {
   HSHM_INLINE_CROSS_FUN
   bool operator>=(const ThreadId &other) const { return tid_ >= other.tid_; }
 
-  HSHM_INLINE_CROSS_FUN
+#if HSHM_IS_HOST
   friend std::ostream &operator<<(std::ostream &os, const ThreadId &tid) {
     os << tid.tid_;
     return os;
   }
+#endif
 };
 
 #if HSHM_ENABLE_CUDA or HSHM_ENABLE_ROCM
