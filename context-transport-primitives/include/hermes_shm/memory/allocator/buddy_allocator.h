@@ -582,7 +582,7 @@ class _BuddyAllocator : public Allocator {
    * @param alloc_size Reference to size - will be modified to the rounded-up power-of-2 size
    * @return Index into the small_pages_ array
    */
-  static size_t GetSmallPageListIndexForAlloc(size_t &alloc_size) {
+  static HSHM_CROSS_FUN size_t GetSmallPageListIndexForAlloc(size_t &alloc_size) {
     if (alloc_size <= kMinSize) {
       alloc_size = kMinSize;
       return 0;
@@ -608,7 +608,7 @@ class _BuddyAllocator : public Allocator {
   /**
    * Get free list index for small pages when freeing (round down to exact or next smallest)
    */
-  static size_t GetSmallPageListIndexForFree(size_t size) {
+  static HSHM_CROSS_FUN size_t GetSmallPageListIndexForFree(size_t size) {
     if (size <= kMinSize) {
       return 0;
     }
@@ -629,7 +629,7 @@ class _BuddyAllocator : public Allocator {
   /**
    * Get free list index for large allocations when allocating (round down)
    */
-  static size_t GetLargePageListIndexForAlloc(size_t size) {
+  static HSHM_CROSS_FUN size_t GetLargePageListIndexForAlloc(size_t size) {
     if (size <= kSmallThreshold) {
       return 0;
     }
@@ -650,7 +650,7 @@ class _BuddyAllocator : public Allocator {
   /**
    * Get free list index for large pages when freeing (round down to exact)
    */
-  size_t GetLargePageListIndexForFree(size_t size) {
+  HSHM_CROSS_FUN size_t GetLargePageListIndexForFree(size_t size) {
     return GetLargePageListIndexForAlloc(size);  // Same logic for large pages
   }
 };
