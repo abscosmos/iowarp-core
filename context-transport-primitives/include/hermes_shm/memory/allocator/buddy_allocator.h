@@ -337,13 +337,14 @@ class _BuddyAllocator : public Allocator {
     // This also modifies size to be the rounded-up value
     size_t list_idx = GetSmallPageListIndexForAlloc(size);
 
-    // Step 2: Check if page exists in this free list
-    if (!small_pages_[list_idx].empty()) {
-      auto node = small_pages_[list_idx].pop(this);
-      if (!node.IsNull()) {
-        return FinalizeAllocation(node.shm_.off_.load(), size);
+    // Step 2: Check free lists from this size class upward
+    for (size_t i = list_idx; i < kMaxSmallPages; ++i) {
+      if (!small_pages_[i].empty()) {
+        auto node = small_pages_[i].pop(this);
+        if (!node.IsNull()) {
+          return FinalizeAllocation(node.shm_.off_.load(), size);
+        }
       }
-      // If pop returned null despite list not being empty, fall through to next step
     }
 
     // Step 3: Try allocating from small_arena_
@@ -356,11 +357,13 @@ class _BuddyAllocator : public Allocator {
     // Step 4: Repopulate the small arena
     if (RepopulateSmallArena()) {
       // After repopulating, the pages are in free lists, not in the arena
-      // Retry allocation from the free list
-      if (!small_pages_[list_idx].empty()) {
-        auto node = small_pages_[list_idx].pop(this);
-        if (!node.IsNull()) {
-          return FinalizeAllocation(node.shm_.off_.load(), size);
+      // Retry allocation from the free list, searching upward from list_idx
+      for (size_t i = list_idx; i < kMaxSmallPages; ++i) {
+        if (!small_pages_[i].empty()) {
+          auto node = small_pages_[i].pop(this);
+          if (!node.IsNull()) {
+            return FinalizeAllocation(node.shm_.off_.load(), size);
+          }
         }
       }
     }
