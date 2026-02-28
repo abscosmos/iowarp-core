@@ -469,7 +469,16 @@ class _BuddyAllocator : public Allocator {
       for (size_t list_idx = 0; list_idx < kMaxLargePages; ++list_idx) {
         size_t offset = FindFirstFit(list_idx, arena_size);
         if (offset != 0) {
+          // Read original page size before overwriting with new arena bounds
+          FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(offset));
+          size_t page_total_size = page.ptr_->size_ + sizeof(BuddyPage);
+
           small_arena_.Init(offset, offset + arena_size);
+
+          // Return remainder to free list if large enough
+          if (page_total_size > arena_size && (page_total_size - arena_size) > sizeof(BuddyPage)) {
+            AddRemainderToFreeList(offset + arena_size, page_total_size - arena_size);
+          }
           return true;
         }
       }
