@@ -44,6 +44,7 @@
 #include <chimaera/task.h>
 #include <hermes_shm/memory/backend/gpu_malloc.h>
 #include <hermes_shm/util/gpu_api.h>
+#include <hermes_shm/lightbeam/shm_transport.h>
 
 #include <cstring>
 #include <memory>
@@ -152,11 +153,10 @@ __global__ void test_gpu_ipc_construct_kernel(int *results) {
  * Just verifies initialization succeeds
  */
 __global__ void test_gpu_init_only_kernel(
-    const hipc::MemoryBackend backend,
-    int *results)  ///< Output: test results (0=pass, non-zero=fail)
+    chi::IpcManagerGpu gpu_info,
+    int *results)
 {
-  // Initialize IPC manager using the macro
-  CHIMAERA_GPU_INIT(backend, nullptr);
+  CHIMAERA_GPU_INIT(gpu_info);
 
   // Just report success if initialization didn't crash
   results[thread_id] = 0;
@@ -168,13 +168,12 @@ __global__ void test_gpu_init_only_kernel(
  * Each thread allocates a buffer, writes data, and verifies it
  */
 __global__ void test_gpu_allocate_buffer_kernel(
-    const hipc::MemoryBackend backend,
+    chi::IpcManagerGpu gpu_info,
     int *results,             ///< Output: test results (0=pass, non-zero=fail)
     size_t *allocated_sizes,  ///< Output: sizes allocated per thread
     char **allocated_ptrs)    ///< Output: pointers allocated per thread
 {
-  // Initialize IPC manager using the macro
-  CHIMAERA_GPU_INIT(backend, nullptr);
+  CHIMAERA_GPU_INIT(gpu_info);
 
   // Each thread allocates a small buffer (64 bytes)
   size_t alloc_size = 64;
@@ -216,11 +215,10 @@ __global__ void test_gpu_allocate_buffer_kernel(
  * Allocates a buffer, gets its FullPtr, and verifies it works
  */
 __global__ void test_gpu_to_full_ptr_kernel(
-    const hipc::MemoryBackend backend,
-    int *results)  ///< Output: test results (0=pass, non-zero=fail)
+    chi::IpcManagerGpu gpu_info,
+    int *results)
 {
-  // Initialize IPC manager in shared memory
-  CHIMAERA_GPU_INIT(backend, nullptr);
+  CHIMAERA_GPU_INIT(gpu_info);
 
   // Allocate a buffer
   size_t alloc_size = 512;
@@ -265,11 +263,10 @@ __global__ void test_gpu_to_full_ptr_kernel(
  * Each thread makes multiple allocations and verifies they're independent
  */
 __global__ void test_gpu_multiple_allocs_kernel(
-    const hipc::MemoryBackend backend,
-    int *results)  ///< Output: test results (0=pass, non-zero=fail)
+    chi::IpcManagerGpu gpu_info,
+    int *results)
 {
-  // Initialize IPC manager in shared memory
-  CHIMAERA_GPU_INIT(backend, nullptr);
+  CHIMAERA_GPU_INIT(gpu_info);
 
   const int num_allocs = 4;
   size_t alloc_sizes[] = {256, 512, 1024, 2048};
@@ -314,10 +311,9 @@ __global__ void test_gpu_multiple_allocs_kernel(
  * GPU kernel for testing NewTask from GPU
  * Tests that IpcManager::NewTask works from GPU kernel
  */
-__global__ void test_gpu_new_task_kernel(const hipc::MemoryBackend backend,
+__global__ void test_gpu_new_task_kernel(chi::IpcManagerGpu gpu_info,
                                          int *results) {
-  // Initialize IPC manager (defines thread_id)
-  CHIMAERA_GPU_INIT(backend, nullptr);
+  CHIMAERA_GPU_INIT(gpu_info);
 
   // Only thread 0 creates task
   if (thread_id == 0) {
@@ -348,13 +344,11 @@ __global__ void test_gpu_new_task_kernel(const hipc::MemoryBackend backend,
 
 /**
  * GPU kernel for testing task serialization/deserialization on GPU
- * Creates a task, uses GpuSaveTaskArchive to serialize it,
- * then GpuLoadTaskArchive to deserialize and verify
+ * Creates a task, serializes it, then deserializes and verifies
  */
 __global__ void test_gpu_serialize_deserialize_kernel(
-    const hipc::MemoryBackend backend, int *results) {
-  // Initialize IPC manager (defines thread_id)
-  CHIMAERA_GPU_INIT(backend, nullptr);
+    chi::IpcManagerGpu gpu_info, int *results) {
+  CHIMAERA_GPU_INIT(gpu_info);
 
   // Only thread 0 tests serialization
   if (thread_id == 0) {
@@ -374,19 +368,10 @@ __global__ void test_gpu_serialize_deserialize_kernel(
       return;
     }
 
-    // Allocate buffer for serialization
-    size_t buffer_size = 1024;
-    auto buffer_ptr = CHI_IPC->AllocateBuffer(buffer_size);
-
-    if (buffer_ptr.IsNull()) {
-      results[0] = 2;  // Buffer allocation failed
-      __syncthreads();
-      return;
-    }
-
-    // Serialize task using LocalSaveTaskArchive
-    chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn,
-                                      buffer_ptr.ptr_, buffer_size);
+    // Serialize task using LocalSaveTaskArchive with priv::vector
+    auto *alloc = CHI_IPC->gpu_alloc_table_[CHI_IPC->GetGpuThreadId()];
+    hshm::priv::vector<char, HSHM_DEFAULT_ALLOC_GPU_T> buf(alloc);
+    chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn, buf, alloc);
     original_task->SerializeIn(save_ar);
     size_t serialized_size = save_ar.GetSize();
 
@@ -400,8 +385,8 @@ __global__ void test_gpu_serialize_deserialize_kernel(
       return;
     }
 
-    // Deserialize using LocalLoadTaskArchive
-    chi::LocalLoadTaskArchive load_ar(buffer_ptr.ptr_, serialized_size);
+    // Deserialize using LocalLoadTaskArchive with priv::vector
+    chi::LocalLoadTaskArchive load_ar(buf, alloc);
     loaded_task->SerializeIn(load_ar);
 
     // Verify deserialized task matches original
@@ -419,14 +404,12 @@ __global__ void test_gpu_serialize_deserialize_kernel(
 
 /**
  * GPU kernel for testing task serialization on GPU for CPU deserialization
- * Creates task, serializes with LocalSaveTaskArchive, ready for ShmTransport
- * transfer to CPU
+ * Creates task, serializes with LocalSaveTaskArchive, copies to output buffer
  */
 __global__ void test_gpu_serialize_for_cpu_kernel(
-    const hipc::MemoryBackend backend, char *output_buffer, size_t *output_size,
+    chi::IpcManagerGpu gpu_info, char *output_buffer, size_t *output_size,
     int *results) {
-  // Initialize IPC manager (defines thread_id)
-  CHIMAERA_GPU_INIT(backend, nullptr);
+  CHIMAERA_GPU_INIT(gpu_info);
 
   // Only thread 0 serializes
   if (thread_id == 0) {
@@ -447,13 +430,18 @@ __global__ void test_gpu_serialize_for_cpu_kernel(
       return;
     }
 
-    // Serialize task using LocalSaveTaskArchive
-    chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn,
-                                      output_buffer, 1024);
+    // Serialize task using LocalSaveTaskArchive with priv::vector
+    auto *alloc = CHI_IPC->gpu_alloc_table_[CHI_IPC->GetGpuThreadId()];
+    hshm::priv::vector<char, HSHM_DEFAULT_ALLOC_GPU_T> buf(alloc);
+    chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn, buf, alloc);
     task->SerializeIn(save_ar);
 
+    // Copy serialized data to output buffer
+    size_t sz = save_ar.GetSize();
+    memcpy(output_buffer, buf.data(), sz);
+
     // Store serialized size
-    *output_size = save_ar.GetSize();
+    *output_size = sz;
     results[0] = 0;  // Success
   }
 
@@ -461,73 +449,15 @@ __global__ void test_gpu_serialize_for_cpu_kernel(
 }
 
 /**
- * GPU kernel that creates a task, serializes it into FutureShm via
- * MakeCopyFutureGpu, and returns the FutureShm ShmPtr for CPU deserialization.
- *
- * @param backend GPU memory backend for IPC allocation
- * @param d_future_shm_out Output: ShmPtr to FutureShm containing serialized
- * task
- * @param d_result Output: 0 on success, negative on error
- */
-__global__ void test_gpu_make_copy_future_for_cpu_kernel(
-    const hipc::MemoryBackend backend,
-    hipc::ShmPtr<chi::FutureShm> *d_future_shm_out, int *d_result) {
-  CHIMAERA_GPU_INIT(backend, nullptr);
-
-  if (thread_id == 0) {
-    // Create task on GPU
-    chi::TaskId task_id = chi::CreateTaskId();
-    chi::PoolId pool_id(5000, 0);
-    chi::PoolQuery query = chi::PoolQuery::Local();
-    chi::u32 gpu_id = 42;
-    chi::u32 test_value = 99999;
-
-    auto task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
-                        task_id, pool_id, query, gpu_id, test_value);
-    if (task.IsNull()) {
-      *d_result = -1;  // NewTask failed
-      return;
-    }
-
-    // Serialize task into FutureShm via MakeCopyFutureGpu
-    auto future = CHI_IPC->MakeCopyFutureGpu(task);
-    if (future.IsNull()) {
-      *d_result = -2;  // MakeCopyFutureGpu failed
-      return;
-    }
-
-    // Return the FutureShm ShmPtr so CPU can deserialize
-    hipc::ShmPtr<chi::FutureShm> future_shm_ptr = future.GetFutureShmPtr();
-    if (future_shm_ptr.IsNull()) {
-      *d_result = -3;  // GetFutureShmPtr failed
-      return;
-    }
-    *d_future_shm_out = future_shm_ptr;
-    *d_result = 0;
-  }
-
-  __syncthreads();
-}
-
-/**
- * GPU kernel that reimplements IpcManager::Send on the GPU.
- * Creates a task, serializes it into FutureShm via MakeCopyFutureGpu,
- * enqueues the Future into the worker queue, and then blocks in
- * Future::Wait until the CPU sets FUTURE_COMPLETE.
- *
- * @param backend GPU memory backend for IPC allocation
- * @param worker_queue TaskQueue for enqueuing futures
- * @param d_result Output: 0 on success, negative on error
+ * GPU kernel that uses SendGpu to create+serialize+enqueue a task,
+ * then blocks in Future::Wait until the CPU sets FUTURE_COMPLETE.
  */
 __global__ void test_gpu_send_queue_wait_kernel(
-    const hipc::MemoryBackend backend,
-    chi::TaskQueue *worker_queue,
+    chi::IpcManagerGpu gpu_info,
     int *d_result) {
-  CHIMAERA_GPU_INIT(backend, worker_queue);
+  CHIMAERA_GPU_INIT(gpu_info);
 
   if (thread_id == 0) {
-    printf("GPU send_queue_wait: creating task\n");
-
     // 1. Create task on GPU
     chi::TaskId task_id = chi::CreateTaskId();
     chi::PoolId pool_id(6000, 0);
@@ -538,38 +468,19 @@ __global__ void test_gpu_send_queue_wait_kernel(
     auto task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
                         task_id, pool_id, query, gpu_id, test_value);
     if (task.IsNull()) {
-      printf("GPU send_queue_wait: NewTask failed\n");
       *d_result = -1;
       return;
     }
 
-    printf("GPU send_queue_wait: serializing into FutureShm\n");
-
-    // 2. Serialize task into FutureShm via MakeCopyFutureGpu
-    auto future = CHI_IPC->MakeCopyFutureGpu(task);
+    // 2. Use SendGpu (serializes into ring buffer + enqueues)
+    auto future = CHI_IPC->SendGpu(task);
     if (future.IsNull()) {
-      printf("GPU send_queue_wait: MakeCopyFutureGpu failed\n");
       *d_result = -2;
       return;
     }
 
-    printf("GPU send_queue_wait: pushing to queue\n");
-
-    // 3. Enqueue Future into worker queue lane 0
-    auto &lane = worker_queue->GetLane(0, 0);
-    chi::Future<chi::Task> task_future(future.GetFutureShmPtr());
-    if (!lane.Push(task_future)) {
-      printf("GPU send_queue_wait: Push failed\n");
-      *d_result = -3;
-      return;
-    }
-
-    printf("GPU send_queue_wait: waiting for FUTURE_COMPLETE\n");
-
-    // 4. Block until CPU sets FUTURE_COMPLETE
+    // 3. Block until CPU sets FUTURE_COMPLETE
     future.Wait();
-
-    printf("GPU send_queue_wait: done\n");
     *d_result = 0;
   }
 
@@ -577,11 +488,141 @@ __global__ void test_gpu_send_queue_wait_kernel(
 }
 
 /**
+ * Test 1: AllocateBuffer + NewTask with IpcManagerGpu per-thread allocators
+ * Each thread allocates a buffer and creates a task
+ */
+__global__ void test_gpu_ipc_manager_gpu_alloc_kernel(
+    chi::IpcManagerGpu gpu_info, int *results) {
+  CHIMAERA_GPU_INIT(gpu_info);
+
+  // Each thread allocates a buffer
+  hipc::FullPtr<char> buffer = CHI_IPC->AllocateBuffer(64);
+  if (buffer.IsNull()) {
+    results[thread_id] = 1;  // Allocation failed
+    __syncthreads();
+    return;
+  }
+
+  // Write and verify
+  char pattern = (char)(thread_id + 1);
+  for (int i = 0; i < 64; ++i) {
+    buffer.ptr_[i] = pattern;
+  }
+  for (int i = 0; i < 64; ++i) {
+    if (buffer.ptr_[i] != pattern) {
+      results[thread_id] = 2;
+      __syncthreads();
+      return;
+    }
+  }
+
+  // Thread 0 also creates a task
+  if (thread_id == 0) {
+    chi::TaskId task_id = chi::CreateTaskId();
+    chi::PoolId pool_id(7000, 0);
+    chi::PoolQuery query = chi::PoolQuery::Local();
+    auto task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+        task_id, pool_id, query, (chi::u32)1, (chi::u32)42);
+    if (task.IsNull()) {
+      results[0] = 3;
+      __syncthreads();
+      return;
+    }
+    if (task->gpu_id_ != 1 || task->test_value_ != 42) {
+      results[0] = 4;
+      __syncthreads();
+      return;
+    }
+  }
+
+  results[thread_id] = 0;
+  __syncthreads();
+}
+
+/**
+ * Test 2: GPU SendGpu serialization via ring buffer
+ * GPU creates task, calls SendGpu (which writes to ring buffer).
+ * CPU thread pops from queue, reads input via ShmTransport::Recv.
+ */
+__global__ void test_gpu_send_serialization_kernel(
+    chi::IpcManagerGpu gpu_info,
+    int *d_result) {
+  CHIMAERA_GPU_INIT(gpu_info);
+
+  if (thread_id == 0) {
+    chi::TaskId task_id = chi::CreateTaskId();
+    chi::PoolId pool_id(8000, 0);
+    chi::PoolQuery query = chi::PoolQuery::Local();
+    chi::u32 gpu_id = 55;
+    chi::u32 test_value = 12345;
+
+    auto task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+        task_id, pool_id, query, gpu_id, test_value);
+    if (task.IsNull()) {
+      *d_result = -1;
+      return;
+    }
+
+    auto future = CHI_IPC->SendGpu(task);
+    if (future.IsNull()) {
+      *d_result = -2;
+      return;
+    }
+
+    // Wait for CPU to signal completion
+    future.Wait();
+    *d_result = 0;
+  }
+
+  __syncthreads();
+}
+
+/**
+ * Test 4: GPU SendGpu + CPU process + GPU RecvGpu (round-trip)
+ * GPU sends, CPU processes via ring buffer, GPU receives output via RecvGpu
+ */
+__global__ void test_gpu_send_recv_roundtrip_kernel(
+    chi::IpcManagerGpu gpu_info,
+    int *d_result) {
+  CHIMAERA_GPU_INIT(gpu_info);
+
+  if (thread_id == 0) {
+    // Create and send task
+    chi::TaskId task_id = chi::CreateTaskId();
+    chi::PoolId pool_id(9000, 0);
+    chi::PoolQuery query = chi::PoolQuery::Local();
+    chi::u32 gpu_id = 10;
+    chi::u32 test_value = 55555;
+
+    auto task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+        task_id, pool_id, query, gpu_id, test_value);
+    if (task.IsNull()) {
+      *d_result = -1;
+      return;
+    }
+
+    auto future = CHI_IPC->SendGpu(task);
+    if (future.IsNull()) {
+      *d_result = -2;
+      return;
+    }
+
+    // Receive output via RecvGpu (reads ring buffer, then waits for FUTURE_COMPLETE)
+    CHI_IPC->RecvGpu(future, task.ptr_);
+
+    // Check deserialized output (CPU should have set result_value_ = test_value * 2)
+    if (task->result_value_ == test_value * 2) {
+      *d_result = 0;
+    } else {
+      *d_result = (int)task->result_value_;  // Return actual value for debug
+    }
+  }
+
+  __syncthreads();
+}
+
+/**
  * Helper function to run GPU kernel and check results
- * @param kernel_name Name of the kernel for error messages
- * @param backend GPU memory backend
- * @param block_size Number of GPU threads
- * @return true if all tests passed, false otherwise
  */
 bool run_gpu_kernel_test(const std::string &kernel_name,
                          const hipc::MemoryBackend &backend, int block_size) {
@@ -592,7 +633,9 @@ bool run_gpu_kernel_test(const std::string &kernel_name,
   std::vector<int> h_results(block_size, -1);
   hshm::GpuApi::Memcpy(d_results, h_results.data(), sizeof(int) * block_size);
 
-  // Special test kernels
+  chi::IpcManagerGpu gpu_info(backend, nullptr);
+
+  // Special test kernels (don't use IpcManagerGpu)
   if (kernel_name == "minimal") {
     test_gpu_minimal_kernel<<<1, block_size>>>(d_results);
   } else if (kernel_name == "backend_write") {
@@ -606,7 +649,7 @@ bool run_gpu_kernel_test(const std::string &kernel_name,
   } else if (kernel_name == "ipc_construct") {
     test_gpu_ipc_construct_kernel<<<1, block_size>>>(d_results);
   } else if (kernel_name == "init_only") {
-    test_gpu_init_only_kernel<<<1, block_size>>>(backend, d_results);
+    test_gpu_init_only_kernel<<<1, block_size>>>(gpu_info, d_results);
   } else if (kernel_name == "allocate_buffer") {
     size_t *d_allocated_sizes =
         hshm::GpuApi::Malloc<size_t>(sizeof(size_t) * block_size);
@@ -614,18 +657,18 @@ bool run_gpu_kernel_test(const std::string &kernel_name,
         hshm::GpuApi::Malloc<char *>(sizeof(char *) * block_size);
 
     test_gpu_allocate_buffer_kernel<<<1, block_size>>>(
-        backend, d_results, d_allocated_sizes, d_allocated_ptrs);
+        gpu_info, d_results, d_allocated_sizes, d_allocated_ptrs);
 
     hshm::GpuApi::Free(d_allocated_sizes);
     hshm::GpuApi::Free(d_allocated_ptrs);
   } else if (kernel_name == "to_full_ptr") {
-    test_gpu_to_full_ptr_kernel<<<1, block_size>>>(backend, d_results);
+    test_gpu_to_full_ptr_kernel<<<1, block_size>>>(gpu_info, d_results);
   } else if (kernel_name == "multiple_allocs") {
-    test_gpu_multiple_allocs_kernel<<<1, block_size>>>(backend, d_results);
+    test_gpu_multiple_allocs_kernel<<<1, block_size>>>(gpu_info, d_results);
   } else if (kernel_name == "new_task") {
-    test_gpu_new_task_kernel<<<1, 1>>>(backend, d_results);
+    test_gpu_new_task_kernel<<<1, 1>>>(gpu_info, d_results);
   } else if (kernel_name == "serialize_deserialize") {
-    test_gpu_serialize_deserialize_kernel<<<1, 1>>>(backend, d_results);
+    test_gpu_serialize_deserialize_kernel<<<1, 1>>>(gpu_info, d_results);
   }
 
   // Synchronize to check for kernel errors
@@ -731,8 +774,9 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
         "Testing GPU task serialization -> ShmTransport -> CPU "
         "deserialization");
 
-    // Allocate pinned host buffer for transfer (ShmTransport requires pinned
-    // memory)
+    chi::IpcManagerGpu gpu_info(gpu_backend, nullptr);
+
+    // Allocate pinned host buffer for transfer
     size_t buffer_size = 1024;
     char *h_buffer = nullptr;
     cudaError_t err = cudaMallocHost(&h_buffer, buffer_size);
@@ -744,7 +788,7 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     int *d_results = hshm::GpuApi::Malloc<int>(sizeof(int));
 
     // Run GPU kernel to serialize task using LocalSaveTaskArchive
-    test_gpu_serialize_for_cpu_kernel<<<1, 1>>>(gpu_backend, d_buffer,
+    test_gpu_serialize_for_cpu_kernel<<<1, 1>>>(gpu_info, d_buffer,
                                                 d_output_size, d_results);
 
     err = cudaDeviceSynchronize();
@@ -771,19 +815,10 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     chimaera::MOD_NAME::GpuSubmitTask cpu_task;
     cpu_task.SerializeIn(load_ar);
 
-    // Debug output
-    INFO("Deserialized values: gpu_id=" + std::to_string(cpu_task.gpu_id_) +
-         ", test_value=" + std::to_string(cpu_task.test_value_) +
-         ", result_value=" + std::to_string(cpu_task.result_value_));
-
     // Verify deserialized task values
     REQUIRE(cpu_task.gpu_id_ == 42);
     REQUIRE(cpu_task.test_value_ == 99999);
     REQUIRE(cpu_task.result_value_ == 0);
-
-    INFO(
-        "SUCCESS: GPU serialized task -> ShmTransport -> CPU deserialized "
-        "correctly!");
 
     // Cleanup
     cudaFreeHost(h_buffer);
@@ -791,127 +826,74 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     hshm::GpuApi::Free(d_output_size);
     hshm::GpuApi::Free(d_results);
   }
+}
 
-  // TODO: Fix these tests
-  // SECTION("GPU kernel ToFullPtr") {
-  //   int block_size = 32;
-  //   REQUIRE(run_gpu_kernel_test("to_full_ptr", gpu_backend, block_size));
-  // }
+TEST_CASE("GPU IPC IpcManagerGpu per-thread allocators",
+          "[gpu][ipc][ipc_manager_gpu]") {
+  hipc::MemoryBackendId backend_id(2, 0);
+  size_t gpu_memory_size = 10 * 1024 * 1024;
 
-  // SECTION("GPU kernel multiple allocations") {
-  //   int block_size = 32;
-  //   REQUIRE(run_gpu_kernel_test("multiple_allocs", gpu_backend, block_size));
-  // }
+  hipc::GpuShmMmap gpu_backend;
+  REQUIRE(gpu_backend.shm_init(backend_id, gpu_memory_size, "/gpu_test_ipc_mgr", 0));
 
-  SECTION("GPU MakeCopyFuture -> CPU Deserialize") {
-    INFO(
-        "Testing GPU task serialization into FutureShm, then CPU "
-        "deserialization");
+  SECTION("Test 1: AllocateBuffer + NewTask with IpcManagerGpu") {
+    INFO("Testing per-thread allocator table with AllocateBuffer and NewTask");
+    chi::IpcManagerGpu gpu_info(gpu_backend, nullptr);
 
-    // Allocate GPU output buffers
-    auto *d_future_shm_ptr = hshm::GpuApi::Malloc<hipc::ShmPtr<chi::FutureShm>>(
-        sizeof(hipc::ShmPtr<chi::FutureShm>));
-    int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
+    int block_size = 4;
+    int *d_results = hshm::GpuApi::Malloc<int>(sizeof(int) * block_size);
+    std::vector<int> h_results(block_size, -1);
+    hshm::GpuApi::Memcpy(d_results, h_results.data(), sizeof(int) * block_size);
 
-    // Initialize output buffers
-    hipc::ShmPtr<chi::FutureShm> h_null_ptr;
-    h_null_ptr.SetNull();
-    hshm::GpuApi::Memcpy(d_future_shm_ptr, &h_null_ptr,
-                         sizeof(hipc::ShmPtr<chi::FutureShm>));
-    int h_result_init = -999;
-    hshm::GpuApi::Memcpy(d_result, &h_result_init, sizeof(int));
+    cudaDeviceSetLimit(cudaLimitStackSize, 32768);
+    test_gpu_ipc_manager_gpu_alloc_kernel<<<1, block_size>>>(gpu_info, d_results);
 
-    // MakeCopyFutureGpu needs extra stack for serialization
-    cudaDeviceSetLimit(cudaLimitStackSize, 8192);
-
-    // Launch kernel: creates task and serializes into FutureShm
-    test_gpu_make_copy_future_for_cpu_kernel<<<1, 1>>>(
-        gpu_backend, d_future_shm_ptr, d_result);
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
       INFO("CUDA error: " << cudaGetErrorString(err));
     }
     REQUIRE(err == cudaSuccess);
 
-    // Verify kernel succeeded
-    int h_result = -999;
-    hshm::GpuApi::Memcpy(&h_result, d_result, sizeof(int));
-    INFO("GPU kernel result: " << h_result);
-    REQUIRE(h_result == 0);
+    hshm::GpuApi::Memcpy(h_results.data(), d_results, sizeof(int) * block_size);
+    for (int i = 0; i < block_size; ++i) {
+      INFO("Thread " << i << " result: " << h_results[i]);
+      REQUIRE(h_results[i] == 0);
+    }
 
-    // Retrieve FutureShm ShmPtr from GPU
-    hipc::ShmPtr<chi::FutureShm> h_future_shm_ptr;
-    hshm::GpuApi::Memcpy(&h_future_shm_ptr, d_future_shm_ptr,
-                         sizeof(hipc::ShmPtr<chi::FutureShm>));
-    REQUIRE(!h_future_shm_ptr.IsNull());
-
-    // Resolve ShmPtr to raw pointer using backend base address + offset
-    chi::FutureShm *future_shm = reinterpret_cast<chi::FutureShm *>(
-        reinterpret_cast<char *>(gpu_backend.data_) +
-        h_future_shm_ptr.off_.load());
-    REQUIRE(future_shm != nullptr);
-
-    // Verify serialized data exists in copy_space
-    size_t input_size = future_shm->input_.total_written_.load();
-    INFO("Serialized size: " << input_size << " bytes");
-    REQUIRE(input_size > 0);
-    REQUIRE(future_shm->flags_.Any(chi::FutureShm::FUTURE_COPY_FROM_CLIENT));
-
-    // Deserialize on CPU from FutureShm copy_space
-    std::vector<char> cpu_buffer(future_shm->copy_space,
-                                 future_shm->copy_space + input_size);
-    chi::LocalLoadTaskArchive load_ar(cpu_buffer);
-    chimaera::MOD_NAME::GpuSubmitTask deserialized_task;
-    deserialized_task.SerializeIn(load_ar);
-
-    // Verify deserialized task matches original values
-    INFO("Deserialized: gpu_id="
-         << deserialized_task.gpu_id_
-         << ", test_value=" << deserialized_task.test_value_
-         << ", result_value=" << deserialized_task.result_value_);
-    REQUIRE(deserialized_task.gpu_id_ == 42);
-    REQUIRE(deserialized_task.test_value_ == 99999);
-    REQUIRE(deserialized_task.result_value_ == 0);
-
-    // Cleanup
-    hshm::GpuApi::Free(d_future_shm_ptr);
-    hshm::GpuApi::Free(d_result);
+    hshm::GpuApi::Free(d_results);
   }
 
-  SECTION("GPU Send -> Queue -> Wait") {
-    INFO("Testing GPU task creation, queue enqueue, and Future::Wait");
+  SECTION("Test 2: SendGpu serialization via ring buffer") {
+    INFO("Testing SendGpu with ShmTransport ring buffer + CPU Recv");
 
-    // Create queue backend (GPU-accessible host memory)
+    // Create queue backend
     hipc::MemoryBackendId queue_backend_id(3, 0);
     size_t queue_memory_size = 64 * 1024 * 1024;
     hipc::GpuShmMmap queue_backend;
     REQUIRE(queue_backend.shm_init(queue_backend_id, queue_memory_size,
-                                   "/gpu_queue_test", 0));
+                                   "/gpu_queue_test2", 0));
 
-    // Create ArenaAllocator on queue backend
     auto *queue_allocator = reinterpret_cast<hipc::ArenaAllocator<false> *>(
         queue_backend.data_);
     new (queue_allocator) hipc::ArenaAllocator<false>();
     queue_allocator->shm_init(queue_backend, queue_backend.data_capacity_);
 
-    // Create TaskQueue (1 group, 1 lane per group, depth 256)
     auto gpu_queue = queue_allocator->template NewObj<chi::TaskQueue>(
         queue_allocator, 1, 1, 256);
     REQUIRE(!gpu_queue.IsNull());
 
-    // Allocate GPU result buffer
+    chi::IpcManagerGpu gpu_info(gpu_backend, gpu_queue.ptr_);
+
     int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
     int h_result_init = -999;
     hshm::GpuApi::Memcpy(d_result, &h_result_init, sizeof(int));
 
-    // Extra stack for serialization
-    cudaDeviceSetLimit(cudaLimitStackSize, 8192);
+    cudaDeviceSetLimit(cudaLimitStackSize, 32768);
 
-    // Launch kernel async (kernel will block in Future::Wait)
-    test_gpu_send_queue_wait_kernel<<<1, 1>>>(
-        gpu_backend, gpu_queue.ptr_, d_result);
+    // Launch kernel async — GPU writes to ring buffer + enqueues + waits
+    test_gpu_send_serialization_kernel<<<1, 1>>>(gpu_info, d_result);
 
-    // CPU polls queue until a Future is available (no cudaDeviceSynchronize)
+    // CPU polls queue until a Future is available
     auto &lane = gpu_queue.ptr_->GetLane(0, 0);
     chi::Future<chi::Task> popped_future;
     while (!lane.Pop(popped_future)) {
@@ -927,27 +909,106 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
         reinterpret_cast<char *>(gpu_backend.data_) +
         future_shm_ptr.off_.load());
 
-    // Verify FUTURE_COPY_FROM_CLIENT flag and serialized data
+    // Verify FUTURE_COPY_FROM_CLIENT flag
     REQUIRE(future_shm->flags_.Any(chi::FutureShm::FUTURE_COPY_FROM_CLIENT));
-    size_t input_size = future_shm->input_.total_written_.load();
-    INFO("Serialized size: " << input_size << " bytes");
-    REQUIRE(input_size > 0);
 
-    // Deserialize on CPU and verify task values
-    std::vector<char> cpu_buffer(future_shm->copy_space,
-                                 future_shm->copy_space + input_size);
-    chi::LocalLoadTaskArchive load_ar(cpu_buffer);
+    // CPU reads from ring buffer using ShmTransport::Recv with LocalLoadTaskArchive
+    hshm::lbm::LbmContext recv_ctx;
+    recv_ctx.copy_space = future_shm->copy_space;
+    recv_ctx.shm_info_ = &future_shm->input_;
+
+    chi::LocalLoadTaskArchive load_ar;
+    hshm::lbm::ShmTransport::Recv(load_ar, recv_ctx);
+
+    // Deserialize task and verify fields
     chimaera::MOD_NAME::GpuSubmitTask deserialized_task;
     deserialized_task.SerializeIn(load_ar);
 
-    INFO("Deserialized: gpu_id=" << deserialized_task.gpu_id_
-         << ", test_value=" << deserialized_task.test_value_
-         << ", result_value=" << deserialized_task.result_value_);
-    REQUIRE(deserialized_task.gpu_id_ == 42);
-    REQUIRE(deserialized_task.test_value_ == 77777);
-    REQUIRE(deserialized_task.result_value_ == 0);
+    // Set FUTURE_COMPLETE to unblock the GPU kernel BEFORE checking results
+    future_shm->flags_.SetBits(chi::FutureShm::FUTURE_COMPLETE);
 
-    // Set FUTURE_COMPLETE to unblock the GPU kernel's Future::Wait
+    cudaError_t err = cudaDeviceSynchronize();
+
+    int h_result = -999;
+    hshm::GpuApi::Memcpy(&h_result, d_result, sizeof(int));
+
+    // Now check results after GPU is done (so GPU printf is visible)
+    REQUIRE(err == cudaSuccess);
+    REQUIRE(deserialized_task.gpu_id_ == 55);
+    REQUIRE(deserialized_task.test_value_ == 12345);
+    REQUIRE(deserialized_task.result_value_ == 0);
+    REQUIRE(h_result == 0);
+
+    hshm::GpuApi::Free(d_result);
+  }
+
+  SECTION("Test 3: GPU SendGpu + CPU process + GPU RecvGpu (round-trip)") {
+    INFO("Testing full round-trip: GPU SendGpu -> CPU process -> GPU RecvGpu");
+
+    // Create queue backend
+    hipc::MemoryBackendId queue_backend_id(4, 0);
+    size_t queue_memory_size = 64 * 1024 * 1024;
+    hipc::GpuShmMmap queue_backend;
+    REQUIRE(queue_backend.shm_init(queue_backend_id, queue_memory_size,
+                                   "/gpu_queue_test4", 0));
+
+    auto *queue_allocator = reinterpret_cast<hipc::ArenaAllocator<false> *>(
+        queue_backend.data_);
+    new (queue_allocator) hipc::ArenaAllocator<false>();
+    queue_allocator->shm_init(queue_backend, queue_backend.data_capacity_);
+
+    auto gpu_queue = queue_allocator->template NewObj<chi::TaskQueue>(
+        queue_allocator, 1, 1, 256);
+    REQUIRE(!gpu_queue.IsNull());
+
+    chi::IpcManagerGpu gpu_info(gpu_backend, gpu_queue.ptr_);
+
+    int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
+    int h_result_init = -999;
+    hshm::GpuApi::Memcpy(d_result, &h_result_init, sizeof(int));
+
+    cudaDeviceSetLimit(cudaLimitStackSize, 32768);
+
+    // Launch kernel async — GPU writes input to ring buffer, then blocks in RecvGpu
+    test_gpu_send_recv_roundtrip_kernel<<<1, 1>>>(gpu_info, d_result);
+
+    // CPU polls queue
+    auto &lane = gpu_queue.ptr_->GetLane(0, 0);
+    chi::Future<chi::Task> popped_future;
+    while (!lane.Pop(popped_future)) {}
+
+    hipc::ShmPtr<chi::FutureShm> future_shm_ptr =
+        popped_future.GetFutureShmPtr();
+    REQUIRE(!future_shm_ptr.IsNull());
+    chi::FutureShm *future_shm = reinterpret_cast<chi::FutureShm *>(
+        reinterpret_cast<char *>(gpu_backend.data_) +
+        future_shm_ptr.off_.load());
+
+    // CPU reads input from ring buffer
+    hshm::lbm::LbmContext recv_ctx;
+    recv_ctx.copy_space = future_shm->copy_space;
+    recv_ctx.shm_info_ = &future_shm->input_;
+
+    chi::LocalLoadTaskArchive load_ar;
+    hshm::lbm::ShmTransport::Recv(load_ar, recv_ctx);
+
+    chimaera::MOD_NAME::GpuSubmitTask deserialized_task;
+    deserialized_task.SerializeIn(load_ar);
+
+    // "Process" the task: set result_value_ = test_value_ * 2
+    deserialized_task.result_value_ = deserialized_task.test_value_ * 2;
+
+    // CPU writes output to ring buffer using ShmTransport::Send
+    hshm::lbm::LbmContext send_ctx;
+    send_ctx.copy_space = future_shm->copy_space;
+    send_ctx.shm_info_ = &future_shm->output_;
+
+    // Serialize output via LocalSaveTaskArchive + ShmTransport::Send
+    chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeOut);
+    deserialized_task.SerializeOut(save_ar);
+    hshm::lbm::ShmTransport::Send(save_ar, send_ctx);
+
+    // Set FUTURE_COMPLETE
     future_shm->flags_.SetBits(chi::FutureShm::FUTURE_COMPLETE);
 
     // Wait for kernel to finish
@@ -957,36 +1018,14 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     }
     REQUIRE(err == cudaSuccess);
 
-    // Verify kernel result
     int h_result = -999;
     hshm::GpuApi::Memcpy(&h_result, d_result, sizeof(int));
     INFO("GPU kernel result: " << h_result);
     REQUIRE(h_result == 0);
 
-    // Cleanup
     hshm::GpuApi::Free(d_result);
   }
 }
-
-// TODO: Fix per-thread allocations test
-/*TEST_CASE("GPU IPC per-thread allocations", "[gpu][ipc][per_thread]") {
-  // Create GPU memory backend with larger size for multiple threads
-  hipc::MemoryBackendId backend_id(3, 0);
-  size_t gpu_memory_size = 50 * 1024 * 1024;  // 50MB for more threads
-
-  hipc::GpuShmMmap gpu_backend;
-  REQUIRE(gpu_backend.shm_init(backend_id, gpu_memory_size, "/gpu_test_mt", 0));
-
-  SECTION("GPU kernel with 64 threads") {
-    int block_size = 64;
-    REQUIRE(run_gpu_kernel_test("allocate_buffer", gpu_backend, block_size));
-  }
-
-  SECTION("GPU kernel with 128 threads") {
-    int block_size = 128;
-    REQUIRE(run_gpu_kernel_test("allocate_buffer", gpu_backend, block_size));
-  }
-}*/
 
 SIMPLE_TEST_MAIN()
 

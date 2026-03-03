@@ -269,7 +269,6 @@ bool WorkOrchestrator::SpawnWorkerThreads() {
     }
   }
 
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   // Assign GPU lanes only to the designated GPU worker
   size_t num_gpus = ipc->GetGpuQueueCount();
   if (num_gpus > 0 && scheduler_) {
@@ -293,7 +292,6 @@ bool WorkOrchestrator::SpawnWorkerThreads() {
            num_gpus);
     }
   }
-#endif
 
   // Use HSHM thread model to spawn worker threads
   auto thread_model = HSHM_THREAD_MODEL;

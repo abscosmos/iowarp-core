@@ -236,12 +236,10 @@ void Worker::Run() {
       u32 count = ProcessNewTasks(assigned_lane_);
       if (count > 0) did_work_ = true;
     }
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
     for (auto *gpu_lane : gpu_lanes_) {
       u32 count = ProcessNewTasks(gpu_lane);
       if (count > 0) did_work_ = true;
     }
-#endif
 
     // Check blocked queue for completed tasks at end of each iteration
     ContinueBlockedTasks(false);
@@ -278,7 +276,6 @@ void Worker::SetLane(TaskLane *lane) {
 
 TaskLane *Worker::GetLane() const { return assigned_lane_; }
 
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 void Worker::SetGpuLanes(const std::vector<TaskLane *> &lanes) {
   gpu_lanes_ = lanes;
 }
@@ -286,7 +283,6 @@ void Worker::SetGpuLanes(const std::vector<TaskLane *> &lanes) {
 const std::vector<TaskLane *> &Worker::GetGpuLanes() const {
   return gpu_lanes_;
 }
-#endif
 
 hipc::FullPtr<Task> Worker::GetOrCopyTaskFromFuture(Future<Task> &future,
                                                     Container *container,
@@ -456,12 +452,10 @@ double Worker::GetSuspendPeriod() const {
 }
 
 void Worker::SuspendMe() {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   // GPU workers must never sleep — they need to poll GPU lanes continuously
   if (!gpu_lanes_.empty()) {
     return;
   }
-#endif
 
   // No work was done in this iteration - increment idle counter
   idle_iterations_++;

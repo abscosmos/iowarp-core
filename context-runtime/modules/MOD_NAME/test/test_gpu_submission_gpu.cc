@@ -51,13 +51,13 @@
  * GPU kernel that submits a task from within the kernel
  * Tests Part 3: GPU kernel calling NewTask and Send
  */
-__global__ void gpu_submit_task_kernel(hipc::MemoryBackend backend,
+__global__ void gpu_submit_task_kernel(chi::IpcManagerGpu gpu_info,
                                        chi::PoolId pool_id, chi::u32 test_value,
                                        int *result) {
   *result = 100;  // Kernel started
 
   // Step 1: Initialize IPC manager (no queue needed for NewTask-only test)
-  CHIMAERA_GPU_INIT(backend, nullptr);
+  CHIMAERA_GPU_INIT(gpu_info);
 
   *result = 200;  // After CHIMAERA_GPU_INIT
 
@@ -70,25 +70,12 @@ __global__ void gpu_submit_task_kernel(hipc::MemoryBackend backend,
   task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
                       task_id, pool_id, query, 0, test_value);
 
-  // Immediately copy ptr to separate variable for comparison
-  void *task_ptr_copy = task.ptr_;
-  printf("KERNEL tid=%d: task.ptr_=%p (copy=%p) off=%lu\n",
-         threadIdx.x + blockIdx.x * blockDim.x, task.ptr_, task_ptr_copy, task.shm_.off_.load());
-
-  if (task_ptr_copy == nullptr) {
-    printf("NULL CHECK tid=%d: task.ptr_=%p task_ptr_copy=%p off=%lu\n",
-           threadIdx.x + blockIdx.x * blockDim.x, task.ptr_, task_ptr_copy, task.shm_.off_.load());
+  if (task.ptr_ == nullptr) {
     *result = -1;  // NewTask failed
     return;
   }
 
-  printf("PASSED NULL CHECK: task.ptr_=%p task_ptr_copy=%p\n", task.ptr_, task_ptr_copy);
-
-  // Step 3: GPU kernel successfully created task using NewTask
-  // Full Send() path blocked by FullPtr copy constructor bug - tracked in issue #74
-  printf("NewTask succeeded on GPU! Marking test as passing.\n");
   *result = 1;  // Success - NewTask works
-  printf("SUCCESS: GPU kernel can call NewTask\n");
 }
 
 /**
@@ -111,11 +98,11 @@ extern "C" int run_gpu_kernel_task_submission_test(chi::PoolId pool_id,
   int h_result = 0;
   hshm::GpuApi::Memcpy(d_result, &h_result, sizeof(int));
 
-  // Backend can be passed by value to kernel
-  hipc::MemoryBackend h_backend = gpu_backend;
+  // Create IpcManagerGpu for kernel
+  chi::IpcManagerGpu gpu_info(gpu_backend, nullptr);
 
   // Launch kernel with 1 thread, 1 block
-  gpu_submit_task_kernel<<<1, 1>>>(h_backend, pool_id, test_value, d_result);
+  gpu_submit_task_kernel<<<1, 1>>>(gpu_info, pool_id, test_value, d_result);
 
   // Check for kernel launch errors
   cudaError_t launch_err = cudaGetLastError();
@@ -137,6 +124,102 @@ extern "C" int run_gpu_kernel_task_submission_test(chi::PoolId pool_id,
   // Cleanup
   hshm::GpuApi::Free(d_result);
 
+  return h_result;
+}
+
+/**
+ * GPU kernel that tests full end-to-end runtime roundtrip using client API:
+ * GPU kernel calls AsyncGpuSubmit() -> worker processes -> Wait() -> verify
+ */
+__global__ void gpu_full_runtime_kernel(chi::IpcManagerGpu gpu_info,
+                                         chi::PoolId pool_id,
+                                         chi::u32 test_value,
+                                         int *d_result,
+                                         chi::u32 *d_result_value) {
+  *d_result = 0;
+  CHIMAERA_GPU_INIT(gpu_info);
+  chimaera::MOD_NAME::Client client(pool_id);
+  auto future = client.AsyncGpuSubmit(chi::PoolQuery::Local(), 0, test_value);
+  future.Wait();
+  *d_result_value = future->result_value_;
+  *d_result = 1;  // success
+}
+
+/**
+ * C++ wrapper to launch the full runtime roundtrip GPU kernel
+ */
+extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
+                                          chi::u32 test_value,
+                                          chi::u32 *out_result_value) {
+  cudaDeviceSetLimit(cudaLimitStackSize, 131072);  // 128KB stack for deep template chains
+
+  // Create GPU memory backend for kernel allocations
+  hipc::MemoryBackendId backend_id(3, 0);
+  hipc::GpuShmMmap gpu_backend;
+  if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024, "/gpu_rt_test", 0))
+    return -100;
+
+  // Create GPU queue in pinned shared memory for task submission
+  hipc::MemoryBackendId queue_backend_id(4, 0);
+  hipc::GpuShmMmap queue_backend;
+  if (!queue_backend.shm_init(queue_backend_id, 2 * 1024 * 1024,
+                               "/gpu_rt_queue", 0))
+    return -101;
+
+  // Create allocator in the queue backend's data region
+  auto *queue_alloc = queue_backend.MakeAlloc<hipc::ArenaAllocator<false>>(
+      queue_backend.data_capacity_);
+  if (!queue_alloc)
+    return -103;
+
+  // Create TaskQueue (1 lane, 2 priorities, depth 1024)
+  auto gpu_queue_ptr = queue_alloc->NewObj<chi::TaskQueue>(
+      queue_alloc, 1, 2, 1024);
+  if (gpu_queue_ptr.IsNull())
+    return -102;
+
+  // Register queue with runtime and assign to GPU worker
+  CHI_IPC->RegisterGpuQueue(gpu_queue_ptr);
+  CHI_IPC->AssignGpuLanesToWorker();
+
+  // Register GPU backend memory for host-side ShmPtr resolution.
+  // The GPU kernel allocates FutureShm in this pinned memory; the worker
+  // needs to resolve ShmPtrs pointing into it via ToFullPtr.
+  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+                                 gpu_backend.data_capacity_);
+
+  chi::IpcManagerGpu gpu_info(gpu_backend, gpu_queue_ptr.ptr_);
+
+  int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
+  chi::u32 *d_rv = hshm::GpuApi::Malloc<chi::u32>(sizeof(chi::u32));
+  int h_result = 0;
+  chi::u32 h_rv = 0;
+  hshm::GpuApi::Memcpy(d_result, &h_result, sizeof(int));
+  hshm::GpuApi::Memcpy(d_rv, &h_rv, sizeof(chi::u32));
+
+  gpu_full_runtime_kernel<<<1, 1>>>(gpu_info, pool_id, test_value, d_result,
+                                     d_rv);
+
+  cudaError_t launch_err = cudaGetLastError();
+  if (launch_err != cudaSuccess) {
+    hshm::GpuApi::Free(d_result);
+    hshm::GpuApi::Free(d_rv);
+    return -201;
+  }
+
+  cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    hshm::GpuApi::Free(d_result);
+    hshm::GpuApi::Free(d_rv);
+    return -200;
+  }
+
+  hshm::GpuApi::Memcpy(&h_result, d_result, sizeof(int));
+  hshm::GpuApi::Memcpy(&h_rv, d_rv, sizeof(chi::u32));
+
+  *out_result_value = h_rv;
+  hshm::GpuApi::Free(d_result);
+  hshm::GpuApi::Free(d_rv);
   return h_result;
 }
 

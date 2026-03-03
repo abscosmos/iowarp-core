@@ -58,12 +58,19 @@ using namespace std::chrono_literals;
 #include <chimaera/MOD_NAME/MOD_NAME_client.h>
 #include <chimaera/MOD_NAME/MOD_NAME_tasks.h>
 
-// Forward declare the C++ wrapper function from GPU file
+// Forward declare the C++ wrapper functions from GPU file
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 extern "C" int run_gpu_kernel_task_submission_test(chi::PoolId pool_id, chi::u32 test_value);
+extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
+                                          chi::u32 test_value,
+                                          chi::u32 *out_result_value);
 #else
 extern "C" inline int run_gpu_kernel_task_submission_test(chi::PoolId, chi::u32) {
   return -200;  // No GPU support compiled
+}
+extern "C" inline int run_gpu_full_runtime_test(chi::PoolId, chi::u32,
+                                                 chi::u32 *) {
+  return -200;
 }
 #endif
 
@@ -268,6 +275,44 @@ TEST_CASE("gpu_kernel_task_submission", "[gpu][kernel_submit]") {
 
   REQUIRE(result == 1);
   INFO("SUCCESS: GPU kernel submitted task using NewTask and Send!");
+}
+
+/**
+ * Test: Full GPU→Runtime→GPU roundtrip using client API
+ * GPU kernel calls AsyncGpuSubmit() → worker processes → Wait() → verify result
+ */
+TEST_CASE("gpu_full_runtime_roundtrip", "[gpu][runtime][roundtrip]") {
+  // Initialize if not already done
+  if (!g_initialized) {
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    REQUIRE(success);
+    g_initialized = true;
+    SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+    std::this_thread::sleep_for(500ms);
+  }
+
+  // Create unique pool ID for this test
+  g_test_counter++;
+  chi::PoolId pool_id(10000, g_test_counter);
+
+  // Create MOD_NAME container
+  chimaera::MOD_NAME::Client client(pool_id);
+  std::string pool_name = "gpu_rt_test_" + std::to_string(pool_id.ToU64());
+  auto create_task = client.AsyncCreate(chi::PoolQuery::Dynamic(), pool_name, pool_id);
+  create_task.Wait();
+  REQUIRE(create_task->return_code_ == 0);
+  std::this_thread::sleep_for(100ms);
+
+  // Run GPU kernel test (wrapper gets GPU queue internally)
+  chi::u32 test_value = 42;
+  chi::u32 result_value = 0;
+  int result = run_gpu_full_runtime_test(pool_id, test_value, &result_value);
+
+  INFO("GPU full runtime test result: " + std::to_string(result));
+  INFO("Result value: " + std::to_string(result_value));
+
+  REQUIRE(result == 1);
+  REQUIRE(result_value == (test_value * 2) + 0);  // Runtime handler: (test_value*2)+gpu_id
 }
 
 //==============================================================================

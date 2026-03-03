@@ -277,7 +277,6 @@ class Worker {
    */
   TaskLane *GetLane() const;
 
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   /**
    * Set GPU lanes for this worker to process
    * @param lanes Vector of TaskLane pointers for GPU queues
@@ -289,7 +288,6 @@ class Worker {
    * @return Reference to vector of GPU TaskLanes
    */
   const std::vector<TaskLane *> &GetGpuLanes() const;
-#endif
 
  private:
   /**
@@ -428,10 +426,8 @@ class Worker {
   // Single lane assigned to this worker (one lane per worker)
   TaskLane *assigned_lane_;
 
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-  // GPU lanes assigned to this worker (one lane per GPU)
+  // GPU lanes assigned to this worker (one lane per GPU, empty when no GPU)
   std::vector<TaskLane *> gpu_lanes_;
-#endif
 
   // Note: RunContext cache removed - RunContext is now embedded in Task
 

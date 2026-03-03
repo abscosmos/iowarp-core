@@ -269,6 +269,10 @@ namespace hipc = hshm::ipc;
 #define HSHM_DEFAULT_ALLOC \
   HSHM_MEMORY_MANAGER->template GetDefaultAllocator<HSHM_DEFAULT_ALLOC_T>()
 
+#ifndef HSHM_DEFAULT_ALLOC_GPU_T
+#define HSHM_DEFAULT_ALLOC_GPU_T hipc::ArenaAllocator<false>
+#endif
+
 /** Default memory context macro (no longer used - kept for compatibility) */
 #define HSHM_MCTX (void)0
 

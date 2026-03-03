@@ -51,10 +51,10 @@ namespace chimaera::MOD_NAME {
 class Client : public chi::ContainerClient {
  public:
   /** Default constructor */
-  Client() = default;
+  HSHM_CROSS_FUN Client() = default;
 
   /** Constructor with pool ID */
-  explicit Client(const chi::PoolId& pool_id) { Init(pool_id); }
+  HSHM_CROSS_FUN explicit Client(const chi::PoolId& pool_id) { Init(pool_id); }
 
   /**
    * Create the container (asynchronous)
@@ -192,6 +192,7 @@ class Client : public chi::ContainerClient {
    * @param test_value Test value to verify correct execution
    * @return Future for the GpuSubmitTask
    */
+  HSHM_CROSS_FUN
   chi::Future<GpuSubmitTask> AsyncGpuSubmit(const chi::PoolQuery& pool_query,
                                             chi::u32 gpu_id,
                                             chi::u32 test_value) {

@@ -550,6 +550,36 @@ bool IpcManager::ServerInitQueues() {
   }
 }
 
+void IpcManager::AssignGpuLanesToWorker() {
+  size_t num_gpus = GetGpuQueueCount();
+  if (num_gpus == 0 || !scheduler_) return;
+  Worker *gpu_worker = scheduler_->GetGpuWorker();
+  if (!gpu_worker) return;
+  std::vector<TaskLane *> gpu_lanes;
+  gpu_lanes.reserve(num_gpus);
+  for (size_t gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
+    TaskQueue *gpu_queue = GetGpuQueue(gpu_id);
+    if (gpu_queue) {
+      TaskLane *gpu_lane = &gpu_queue->GetLane(0, 0);
+      gpu_lanes.push_back(gpu_lane);
+      gpu_lane->SetAssignedWorkerId(gpu_worker->GetId());
+    }
+  }
+  gpu_worker->SetGpuLanes(gpu_lanes);
+  HLOG(kInfo, "AssignGpuLanesToWorker: Assigned {} GPU lane(s) to worker {}",
+       gpu_lanes.size(), gpu_worker->GetId());
+
+  // Wake the GPU worker in case it's sleeping in epoll_wait.
+  // The worker may have entered sleep before gpu_lanes_ was set.
+  TaskLane *lane = gpu_worker->GetLane();
+  if (lane) {
+    pid_t tid = lane->GetTid();
+    if (tid > 0) {
+      hshm::lbm::EventManager::Signal(getpid(), tid);
+    }
+  }
+}
+
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 bool IpcManager::ServerInitGpuQueues() {
   // Get number of GPUs on the system

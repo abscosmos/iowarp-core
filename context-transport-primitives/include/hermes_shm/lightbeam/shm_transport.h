@@ -249,7 +249,7 @@ class ShmTransport
     return 0;
   }
 
- public:
+ private:
   // GPU-safe min of three values
   HSHM_CROSS_FUN
   static size_t Min3(size_t a, size_t b, size_t c) {

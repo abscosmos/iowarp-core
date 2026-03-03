@@ -483,14 +483,15 @@ class ContainerClient {
   /**
    * Default constructor
    */
-  ContainerClient() : pool_id_(), return_code_(0) {}
+  HSHM_CROSS_FUN ContainerClient() : pool_id_(), return_code_(0) {}
 
+#if HSHM_IS_HOST
   /**
    * Initialize client with pool ID
    * @param pool_id Pool identifier to connect to
    */
-  virtual void Init(const PoolId& pool_id) { 
-    pool_id_ = pool_id; 
+  virtual void Init(const PoolId& pool_id) {
+    pool_id_ = pool_id;
     return_code_ = 0;
   }
 
@@ -498,6 +499,16 @@ class ContainerClient {
    * Virtual destructor
    */
   virtual ~ContainerClient() = default;
+#else
+  /**
+   * Initialize client with pool ID (GPU version, non-virtual)
+   * @param pool_id Pool identifier to connect to
+   */
+  HSHM_GPU_FUN void Init(const PoolId& pool_id) {
+    pool_id_ = pool_id;
+    return_code_ = 0;
+  }
+#endif
 
   /**
    * Serialization support

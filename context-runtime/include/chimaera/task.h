@@ -556,22 +556,10 @@ class Future {
       : future_shm_(future_shm),
         parent_task_(nullptr),
         consumed_(false) {
-#if HSHM_IS_GPU
-    printf("Future constructor ENTRY\n");
-#endif
     // Manually initialize task_ptr_ to avoid FullPtr copy constructor bug on GPU
     // Copy shm_ directly, then reconstruct ptr_ from it
-#if HSHM_IS_GPU
-    printf("Future constructor: copying shm_\n");
-#endif
     task_ptr_.shm_ = task_ptr.shm_;
-#if HSHM_IS_GPU
-    printf("Future constructor: copying ptr_\n");
-#endif
     task_ptr_.ptr_ = task_ptr.ptr_;
-#if HSHM_IS_GPU
-    printf("Future constructor: copies complete\n");
-#endif
   }
 
   /**
@@ -680,7 +668,7 @@ class Future {
    * Get raw pointer to the task
    * @return Pointer to the task object
    */
-  TaskT* get() const { return task_ptr_.ptr_; }
+  HSHM_CROSS_FUN TaskT* get() const { return task_ptr_.ptr_; }
 
   /**
    * Get the FullPtr to the task (non-const version)
@@ -698,13 +686,13 @@ class Future {
    * Dereference operator - access task members
    * @return Reference to the task object
    */
-  TaskT& operator*() const { return *task_ptr_.ptr_; }
+  HSHM_CROSS_FUN TaskT& operator*() const { return *task_ptr_.ptr_; }
 
   /**
    * Arrow operator - access task members
    * @return Pointer to the task object
    */
-  TaskT* operator->() const { return task_ptr_.ptr_; }
+  HSHM_CROSS_FUN TaskT* operator->() const { return task_ptr_.ptr_; }
 
   /**
    * Check if the task is complete
@@ -767,7 +755,7 @@ class Future {
    * @return FullPtr to the FutureShm object
    * Note: Implementation provided in ipc_manager.h where CHI_IPC is defined
    */
-  hipc::FullPtr<FutureT> GetFutureShm() const;
+  HSHM_CROSS_FUN hipc::FullPtr<FutureT> GetFutureShm() const;
 
   /**
    * Get the pool ID from the FutureShm
