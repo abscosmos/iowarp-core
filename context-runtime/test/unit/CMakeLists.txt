@@ -88,6 +88,7 @@ set(CLIENT_RETRY_TEST_SOURCES
   test_client_retry.cc
 )
 
+
 # GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET test_ipc_allocate_buffer_gpu)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_SOURCES
@@ -109,7 +110,7 @@ target_link_libraries(${TEST_TARGET}
 )
 
 set_target_properties(${TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -132,7 +133,7 @@ target_link_libraries(${IPC_ALLOCATE_BUFFER_TEST_TARGET}
 )
 
 set_target_properties(${IPC_ALLOCATE_BUFFER_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -149,7 +150,7 @@ target_link_libraries(${UNORDERED_MAP_LL_TEST_TARGET}
 )
 
 set_target_properties(${UNORDERED_MAP_LL_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -177,7 +178,7 @@ target_link_libraries(${SAVE_LOAD_TASK_TEST_TARGET}
 )
 
 set_target_properties(${SAVE_LOAD_TASK_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -205,7 +206,7 @@ target_link_libraries(${LOCAL_TASK_ARCHIVE_TEST_TARGET}
 )
 
 set_target_properties(${LOCAL_TASK_ARCHIVE_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -228,7 +229,7 @@ target_link_libraries(${PER_PROCESS_SHM_TEST_TARGET}
 )
 
 set_target_properties(${PER_PROCESS_SHM_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -264,7 +265,7 @@ target_link_libraries(${AUTOGEN_COVERAGE_TEST_TARGET}
 )
 
 set_target_properties(${AUTOGEN_COVERAGE_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -290,7 +291,7 @@ target_link_libraries(${STREAMING_TEST_TARGET}
 )
 
 set_target_properties(${STREAMING_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -313,7 +314,7 @@ target_link_libraries(${EXTERNAL_CLIENT_TEST_TARGET}
 )
 
 set_target_properties(${EXTERNAL_CLIENT_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -336,7 +337,7 @@ target_link_libraries(${RUNTIME_CLEANUP_TEST_TARGET}
 )
 
 set_target_properties(${RUNTIME_CLEANUP_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -359,7 +360,7 @@ target_link_libraries(${IPC_ERRORS_TEST_TARGET}
 )
 
 set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -386,7 +387,7 @@ target_link_libraries(${IPC_TRANSPORT_MODES_TEST_TARGET}
 )
 
 set_target_properties(${IPC_TRANSPORT_MODES_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -413,13 +414,14 @@ target_link_libraries(${CLIENT_RETRY_TEST_TARGET}
 )
 
 set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
 set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
 
 # Create GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
 if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
@@ -912,7 +914,7 @@ if(WRP_CORE_ENABLE_TESTS)
     cr_all_chimaera_tests
     PROPERTIES
       TIMEOUT 180
-      ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CHIMAERA_TEST_MODE=1"
+      ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CHIMAERA_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
   )
 
   # Unordered Map LL Tests (standalone test with custom main)
@@ -924,6 +926,58 @@ if(WRP_CORE_ENABLE_TESTS)
   set_tests_properties(cr_unordered_map_ll_tests PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 180
+  )
+
+  # Mark all CR runtime tests as msan_skip (they use ZMQ which is uninstrumented)
+  set_tests_properties(
+    cr_runtime_initialization_tests
+    cr_client_initialization_tests
+    cr_mod_name_task_tests
+    cr_error_handling_tests
+    cr_concurrent_tests
+    cr_memory_tests
+    cr_performance_tests
+    cr_all_chimaera_tests
+    cr_ipc_allocate_buffer_basic_tests
+    cr_ipc_allocate_buffer_types_tests
+    cr_ipc_allocate_buffer_sizes_tests
+    cr_ipc_allocate_buffer_multiple_tests
+    cr_ipc_allocate_buffer_client_runtime_tests
+    cr_ipc_allocate_buffer_error_tests
+    cr_ipc_allocate_buffer_alignment_tests
+    cr_ipc_allocate_buffer_documentation_tests
+    cr_per_process_shm_increase_memory_tests
+    cr_per_process_shm_medium_alloc_tests
+    cr_per_process_shm_large_alloc_tests
+    cr_per_process_shm_multiple_large_tests
+    cr_per_process_shm_patterns_tests
+    cr_per_process_shm_free_tests
+    cr_per_process_shm_tofullptr_tests
+    cr_per_process_shm_stress_tests
+    cr_per_process_shm_info_tests
+    cr_autogen_coverage_tests
+    cr_streaming_small_output_tests
+    cr_streaming_large_output_tests
+    cr_streaming_bitfield_tests
+    cr_all_streaming_tests
+    cr_external_client_basic_connection
+    cr_external_client_multiple_clients
+    cr_external_client_without_server
+    cr_external_client_operations
+    cr_runtime_cleanup_tests
+    cr_ipc_errors_tests
+    cr_ipc_transport_shm
+    cr_ipc_transport_tcp
+    cr_ipc_transport_ipc
+    cr_ipc_transport_default
+    cr_client_retry_server_restart_tcp
+    cr_client_retry_server_restart_ipc
+    cr_client_retry_server_restart_shm
+    cr_client_retry_client_death_tcp
+    cr_client_retry_client_death_ipc
+    cr_client_retry_client_death_shm
+    cr_unordered_map_ll_tests
+    PROPERTIES LABELS "msan_skip"
   )
 endif()
 
@@ -1037,7 +1091,7 @@ if(WRP_CORE_ENABLE_MPI)
   )
 
   set_target_properties(${MPI_BDEV_TRANSPORT_TEST_TARGET} PROPERTIES
-    CXX_STANDARD 17
+    CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )

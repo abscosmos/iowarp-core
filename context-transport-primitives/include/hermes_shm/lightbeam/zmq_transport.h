@@ -69,6 +69,21 @@ static inline void ClearZmqRecvHandles(LbmMeta<> &meta) {
   }
 }
 
+/** Action that reads ZMQ_EVENTS when epoll fires on ZMQ_FD.
+ *  Required by ZMQ docs: the FD is edge-triggered and won't
+ *  re-arm until the application reads ZMQ_EVENTS. */
+class ZmqFiredAction : public EventAction {
+ public:
+  void *socket_;
+  explicit ZmqFiredAction(void *socket) : socket_(socket) {}
+  void Run(const EventInfo &event) override {
+    (void)event;
+    int zmq_events = 0;
+    size_t opt_len = sizeof(zmq_events);
+    zmq_getsockopt(socket_, ZMQ_EVENTS, &zmq_events, &opt_len);
+  }
+};
+
 class ZeroMqTransport : public Transport {
  private:
   static void* GetSharedContext() {
@@ -79,7 +94,14 @@ class ZeroMqTransport : public Transport {
       std::mutex mtx;
       ~CtxOwner() {
         if (ctx) {
-          zmq_ctx_shutdown(ctx);  // Interrupt blocking I/O threads immediately
+          // zmq_ctx_shutdown() causes all blocking ZMQ calls on open sockets
+          // to return immediately with ETERM.  This unblocks any background
+          // receive threads (e.g. RecvZmqClientThread) that are polling the
+          // socket, allowing them to exit cleanly.  zmq_ctx_destroy() would
+          // otherwise block forever if a socket is still open (because the
+          // Chimaera singleton is heap-allocated and its destructor -- which
+          // calls ClientFinalize / closes the socket -- is never invoked).
+          zmq_ctx_shutdown(ctx);
           zmq_ctx_destroy(ctx);
           ctx = nullptr;
         }
@@ -101,7 +123,8 @@ class ZeroMqTransport : public Transport {
       : Transport(mode),
         addr_(addr),
         protocol_(protocol),
-        port_(port) {
+        port_(port),
+        zmq_fired_action_(nullptr) {
     type_ = TransportType::kZeroMq;
     sock::InitSocketLib();
 
@@ -173,6 +196,7 @@ class ZeroMqTransport : public Transport {
       }
 
       HLOG(kDebug, "ZeroMqTransport(DEALER) connected to {} (pid={})", full_url, pid);
+      zmq_fired_action_.socket_ = socket_;
     } else {
       // ROUTER socket for server
       ctx_ = zmq_ctx_new();
@@ -208,6 +232,7 @@ class ZeroMqTransport : public Transport {
         throw std::runtime_error(err);
       }
       HLOG(kDebug, "ZeroMqTransport(ROUTER) bound successfully to {}", full_url);
+      zmq_fired_action_.socket_ = socket_;
     }
   }
 
@@ -216,6 +241,7 @@ class ZeroMqTransport : public Transport {
          port_);
 
     int linger = 0;  // Close immediately; don't wait for unsent messages
+
     zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
 
     zmq_close(socket_);
@@ -460,11 +486,45 @@ class ZeroMqTransport : public Transport {
     size_t fd_size = sizeof(fd);
     zmq_getsockopt(socket_, ZMQ_FD, &fd, reinterpret_cast<::size_t *>(&fd_size));
     if (fd >= 0) {
-      em.AddEvent(fd, kDefaultReadEvent);
+      em.AddEvent(fd, kDefaultReadEvent, nullptr);
     }
   }
 
   std::string GetAddress() const { return addr_; }
+
+  /** Check if the server is still alive via a TCP connect probe. */
+  bool IsServerAlive(const LbmContext& ctx = LbmContext()) const {
+    (void)ctx;
+    if (protocol_ == "ipc") {
+      // Unix domain socket — try connect
+      sock::socket_t fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+      if (fd == sock::kInvalidSocket) return false;
+      struct sockaddr_un sun;
+      std::memset(&sun, 0, sizeof(sun));
+      sun.sun_family = AF_UNIX;
+      std::strncpy(sun.sun_path, addr_.c_str(), sizeof(sun.sun_path) - 1);
+      int rc = ::connect(fd, reinterpret_cast<struct sockaddr*>(&sun),
+                         sizeof(sun));
+      sock::Close(fd);
+      return rc == 0;
+    }
+    // TCP — probe addr_:port_
+    sock::socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == sock::kInvalidSocket) return false;
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 500000;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(static_cast<uint16_t>(port_));
+    ::inet_pton(AF_INET, addr_.c_str(), &sa.sin_addr);
+    int rc = ::connect(fd, reinterpret_cast<struct sockaddr*>(&sa),
+                       sizeof(sa));
+    sock::Close(fd);
+    return rc == 0;
+  }
 
  private:
   std::string addr_;
@@ -473,6 +533,7 @@ class ZeroMqTransport : public Transport {
   void* ctx_;
   bool owns_ctx_;
   void* socket_;
+  ZmqFiredAction zmq_fired_action_;
 };
 
 }  // namespace hshm::lbm

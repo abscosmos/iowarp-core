@@ -40,6 +40,17 @@
 #include <filesystem>
 
 #include "hermes_shm/constants/macros.h"
+// MSan: inform sanitizer that mmap-backed memory is initialized by the kernel
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
+#include <sanitizer/msan_interface.h>
+#define HSHM_MSAN_UNPOISON(ptr, size) __msan_unpoison((ptr), (size))
+#else
+#define HSHM_MSAN_UNPOISON(ptr, size) ((void)0)
+#endif
+#else
+#define HSHM_MSAN_UNPOISON(ptr, size) ((void)0)
+#endif
 #if HSHM_ENABLE_PROCFS_SYSINFO
 #include <dlfcn.h>
 #include <signal.h>
@@ -79,11 +90,13 @@ void SystemInfo::RefreshCpuFreqKhz() {
 size_t SystemInfo::GetCpuFreqKhz(int cpu) {
 #if HSHM_IS_HOST
 #if HSHM_ENABLE_PROCFS_SYSINFO
-  // Read /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq
-  std::string cpu_str = hshm::Formatter::format(
-      "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_cur_freq", cpu);
-  std::ifstream cpu_file(cpu_str);
-  size_t freq_khz;
+  // Read /sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_cur_freq
+  // Use snprintf to build the path so MSan can track the buffer as initialized
+  char cpu_path[256];
+  snprintf(cpu_path, sizeof(cpu_path),
+           "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_cur_freq", cpu);
+  std::ifstream cpu_file(cpu_path);
+  size_t freq_khz = 0;
   cpu_file >> freq_khz;
   return freq_khz;
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
@@ -97,11 +110,12 @@ size_t SystemInfo::GetCpuFreqKhz(int cpu) {
 size_t SystemInfo::GetCpuMaxFreqKhz(int cpu) {
 #if HSHM_IS_HOST
 #if HSHM_ENABLE_PROCFS_SYSINFO
-  // Read /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq
-  std::string cpu_str = hshm::Formatter::format(
-      "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu);
-  std::ifstream cpu_file(cpu_str);
-  size_t freq_khz;
+  // Read /sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_max_freq
+  char cpu_path[256];
+  snprintf(cpu_path, sizeof(cpu_path),
+           "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+  std::ifstream cpu_file(cpu_path);
+  size_t freq_khz = 0;
   cpu_file >> freq_khz;
   return freq_khz;
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
@@ -290,6 +304,48 @@ size_t SystemInfo::GetRamCapacity() {
 #endif
 }
 
+size_t SystemInfo::GetRamAvailable() {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  std::ifstream meminfo("/proc/meminfo");
+  if (!meminfo.is_open()) return 0;
+  std::string line;
+  while (std::getline(meminfo, line)) {
+    if (line.rfind("MemAvailable:", 0) == 0) {
+      size_t kb = 0;
+      std::sscanf(line.c_str(), "MemAvailable: %zu", &kb);
+      return kb * 1024;  // convert kB to bytes
+    }
+  }
+  return 0;
+#else
+  return 0;
+#endif
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  MEMORYSTATUSEX mem_info;
+  mem_info.dwLength = sizeof(mem_info);
+  GlobalMemoryStatusEx(&mem_info);
+  return static_cast<size_t>(mem_info.ullAvailPhys);
+#else
+  return 0;
+#endif
+}
+
+CpuTimes SystemInfo::GetCpuTimes() {
+  CpuTimes ct = {};
+#if HSHM_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  std::ifstream stat("/proc/stat");
+  if (stat.is_open()) {
+    std::string cpu_label;
+    stat >> cpu_label >> ct.user >> ct.nice >> ct.system >> ct.idle
+         >> ct.iowait >> ct.irq >> ct.softirq >> ct.steal;
+  }
+#endif
+#endif
+  return ct;
+}
+
 void SystemInfo::YieldThread() {
 #if HSHM_ENABLE_PROCFS_SYSINFO
   sched_yield();
@@ -300,8 +356,11 @@ void SystemInfo::YieldThread() {
 
 bool SystemInfo::CreateTls(ThreadLocalKey &key, void *data) {
 #if HSHM_ENABLE_PROCFS_SYSINFO
-  key.pthread_key_ = pthread_key_create(&key.pthread_key_, nullptr);
-  return key.pthread_key_ == 0;
+  int ret = pthread_key_create(&key.pthread_key_, nullptr);
+  if (ret != 0) {
+    return false;
+  }
+  return SetTls(key, data);
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
   key.windows_key_ = TlsAlloc();
   if (key.windows_key_ == TLS_OUT_OF_INDEXES) {
@@ -327,22 +386,27 @@ void *SystemInfo::GetTls(const ThreadLocalKey &key) {
 #endif
 }
 
-#if HSHM_ENABLE_PROCFS_SYSINFO && __linux__
-static const char *kMemfdDir = "/tmp/chimaera_memfd";
+std::string SystemInfo::GetMemfdDir() {
+  const char *user = getenv("USER");
+  if (!user) user = "unknown";
+  return std::string("/tmp/chimaera_") + user;
+}
 
-static std::string GetMemfdPath(const std::string &name) {
+std::string SystemInfo::GetMemfdPath(const std::string &name) {
   // Strip leading '/' from name if present
   const char *base = name.c_str();
   if (base[0] == '/') {
     base++;
   }
-  return std::string(kMemfdDir) + "/" + base;
+  return GetMemfdDir() + "/" + base;
 }
 
-static void EnsureMemfdDir() {
-  mkdir(kMemfdDir, 0777);
-}
+void SystemInfo::EnsureMemfdDir() {
+  std::string dir = GetMemfdDir();
+#if HSHM_ENABLE_PROCFS_SYSINFO && __linux__
+  mkdir(dir.c_str(), 0700);
 #endif
+}
 
 bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
                                        size_t size) {
@@ -430,14 +494,22 @@ void SystemInfo::DestroySharedMemory(const std::string &name) {
 void *SystemInfo::MapPrivateMemory(size_t size) {
 #if HSHM_ENABLE_PROCFS_SYSINFO
 #if __APPLE__ || __OpenBSD__
-  return mmap(nullptr, size, PROT_READ | PROT_WRITE,
-              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #else
-  return mmap64(nullptr, size, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *ptr = mmap64(nullptr, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 #endif
+  if (ptr != MAP_FAILED && ptr != nullptr) {
+    HSHM_MSAN_UNPOISON(ptr, size);
+  }
+  return ptr;
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
-  return VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
+  void *ptr = VirtualAlloc(nullptr, size, MEM_COMMIT, PAGE_READWRITE);
+  if (ptr) {
+    HSHM_MSAN_UNPOISON(ptr, size);
+  }
+  return ptr;
 #endif
 }
 
@@ -449,6 +521,7 @@ void *SystemInfo::MapSharedMemory(const File &fd, size_t size, i64 off) {
     perror("mmap");
     return nullptr;
   }
+  HSHM_MSAN_UNPOISON(ptr, size);
   return ptr;
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
   // Convert i64 to low and high dwords
@@ -487,6 +560,7 @@ void *SystemInfo::MapMixedMemory(const File &fd, size_t private_size,
     perror("MapMixedMemory: initial mmap failed");
     return nullptr;
   }
+  HSHM_MSAN_UNPOISON(ptr, total_size);
 
   // Step 2: Remap the shared portion using MAP_FIXED
   // This replaces the shared portion with actual shared memory from the fd
@@ -510,6 +584,7 @@ void *SystemInfo::MapMixedMemory(const File &fd, size_t private_size,
     munmap(ptr, total_size);
     return nullptr;
   }
+  HSHM_MSAN_UNPOISON(shared_ptr, shared_size);
 
   // Success: we now have [private_size bytes private | shared_size bytes shared]
   return ptr;

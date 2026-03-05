@@ -11,12 +11,12 @@ class Iowarp(CMakePackage):
     context-transport-primitives, context-transfer-engine,
     context-assimilation-engine, and context-exploration-engine."""
 
-    homepage = "https://github.com/iowarp/core"
-    git = "https://github.com/iowarp/core.git"
+    homepage = "https://github.com/iowarp/clio-core"
+    git = "https://github.com/iowarp/clio-core.git"
 
     # Branch versions
     version('main', branch='main', submodules=True, preferred=True)
-    version('dev', branch='123-integrate-adios2-gray-scott-into-iowarp', submodules=True)
+    version('dev', branch='74-fix-context-transport-primitives-for-the-gpu', submodules=True)
 
     # Build variants
     variant('debug', default=False, description='Build in Debug mode')
@@ -52,6 +52,7 @@ class Iowarp(CMakePackage):
     depends_on('yaml-cpp')
     depends_on('doxygen')
     depends_on('cereal')
+    depends_on('msgpack-c')
     depends_on('libaio')
     depends_on('libzmq', when='+zmq')
 
@@ -59,6 +60,9 @@ class Iowarp(CMakePackage):
     depends_on('python')
     depends_on('py-pip')
     depends_on('py-setuptools')
+    depends_on('py-pyyaml', when='+python')
+    depends_on('py-msgpack', when='+python')
+    depends_on('py-flask', when='+python')
 
     # Conditional core dependencies
     depends_on('libelf', when='+elf')

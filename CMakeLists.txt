@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 1.0.0 LANGUAGES C CXX)
+project(iowarp-core VERSION 1.0.3 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # Project Options
@@ -41,7 +41,7 @@ option(WRP_CORE_STATIC_DEPS "Link external dependencies statically (for self-con
 # - For Conda builds: Set CMAKE_INSTALL_PREFIX via -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX
 # - For custom installs: Set CMAKE_INSTALL_PREFIX to desired root directory
 # Libraries install to ${CMAKE_INSTALL_PREFIX}/lib
-# Python bindings install to ${CMAKE_INSTALL_PREFIX}/lib/pythonX.Y/site-packages
+# Python bindings install to the detected Python's site-packages (venv, conda, or system)
 
 #------------------------------------------------------------------------------
 # Conda Environment Configuration (Explicit)
@@ -273,6 +273,31 @@ if(cereal_FOUND)
     message(STATUS "found cereal at ${cereal_DIR}")
 endif()
 
+# MessagePack C library (pure C, no Boost dependency)
+# Prefer static linkage so pip wheels don't need libmsgpack-c.so at runtime.
+# Try msgpack-c first (v6+, post C/C++ split), then msgpack (v3.x, pre-split).
+find_package(msgpack-c CONFIG QUIET)
+if(NOT msgpack-c_FOUND)
+  find_package(msgpack REQUIRED CONFIG)
+  message(STATUS "found msgpack (legacy v3.x) at ${msgpack_DIR}")
+  # Create alias targets matching the msgpack-c v6+ naming convention
+  if(TARGET msgpackc-static AND NOT TARGET msgpack-c-static)
+    add_library(msgpack-c-static ALIAS msgpackc-static)
+  endif()
+  if(TARGET msgpackc AND NOT TARGET msgpack-c)
+    add_library(msgpack-c ALIAS msgpackc)
+  endif()
+else()
+  message(STATUS "found msgpack-c at ${msgpack-c_DIR}")
+endif()
+if(TARGET msgpack-c-static)
+  set(MSGPACK_TARGET msgpack-c-static)
+  message(STATUS "  using static msgpack-c")
+else()
+  set(MSGPACK_TARGET msgpack-c)
+  message(STATUS "  using shared msgpack-c (static not available)")
+endif()
+
 # MPICH (only find when explicitly enabled)
 if(WRP_CORE_ENABLE_MPI)
     find_package(MPI REQUIRED COMPONENTS C CXX)
@@ -307,6 +332,9 @@ endif()
 if(WRP_CORE_ENABLE_CEREAL)
     set(SERIALIZATION_LIBS cereal::cereal ${SERIALIZATION_LIBS})
 endif()
+
+# Add msgpack-c to serialization libs (always enabled)
+set(SERIALIZATION_LIBS ${MSGPACK_TARGET} ${SERIALIZATION_LIBS})
 
 # Thread support
 find_package(Threads REQUIRED)
@@ -593,13 +621,30 @@ if(WRP_CORE_ENABLE_PYTHON)
   # Find Python for nanobind
   find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
-  # Add nanobind as subdirectory (git submodule)
-  add_subdirectory(external/nanobind)
+  # Fetch nanobind (no submodule needed)
+  include(FetchContent)
+  FetchContent_Declare(nanobind
+      GIT_REPOSITORY https://github.com/wjakob/nanobind.git
+      GIT_TAG        v2.9.2
+      GIT_SHALLOW    ON
+  )
+  FetchContent_MakeAvailable(nanobind)
+
+  # Determine the real site-packages directory for the detected Python.
+  # Python_SITEARCH is an absolute path (works for venv, conda, and system Python).
+  # Fall back to a relative path under CMAKE_INSTALL_PREFIX if unavailable.
+  if(Python_SITEARCH)
+      set(PYTHON_SITE_PACKAGES "${Python_SITEARCH}" CACHE PATH
+          "Python site-packages directory (absolute)")
+  else()
+      set(PYTHON_SITE_PACKAGES
+          "${CMAKE_INSTALL_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages"
+          CACHE PATH "Python site-packages directory (fallback)")
+  endif()
 
   message(STATUS "Python bindings enabled:")
   message(STATUS "  Install prefix:     ${CMAKE_INSTALL_PREFIX}")
-  message(STATUS "  Python bindings:    ${CMAKE_INSTALL_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
-  message(STATUS "  Python_SITEARCH:    ${Python_SITEARCH} (for reference only)")
+  message(STATUS "  Site-packages:      ${PYTHON_SITE_PACKAGES}")
 else()
   message(STATUS "Python bindings disabled")
 endif()
@@ -616,8 +661,16 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   add_compile_options(-fcoroutines)
   message(STATUS "GCC detected - enabling coroutines with -fcoroutines")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-  # Clang 14+ supports coroutines in C++20 mode natively
-  message(STATUS "Clang detected - coroutines enabled via C++20 mode")
+  # GCC's libstdc++ <coroutine> header guards itself with __cpp_impl_coroutine,
+  # which GCC sets via -fcoroutines. Clang does not pass that flag automatically.
+  # Clang 16+ accepts -fcoroutines as an alias; older clang needs a -D instead.
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16")
+    add_compile_options(-fcoroutines)
+    message(STATUS "Clang ${CMAKE_CXX_COMPILER_VERSION} detected - enabling coroutines with -fcoroutines")
+  else()
+    add_compile_definitions(__cpp_impl_coroutine=1)
+    message(STATUS "Clang ${CMAKE_CXX_COMPILER_VERSION} detected - enabling coroutines with -D__cpp_impl_coroutine=1 (libstdc++ compat)")
+  endif()
 endif()
 
 # Export compile commands for IDE integration - Applied to all subdirectories
@@ -626,6 +679,16 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Position Independent Code - Applied to all subdirectories
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# ccache — accelerate rebuilds by caching compiled objects
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    message(STATUS "ccache enabled: ${CCACHE_PROGRAM}")
+else()
+    message(STATUS "ccache not found — install ccache for faster rebuilds")
+endif()
+
 # RPATH configuration - Uses $ORIGIN-relative paths for portability
 # This ensures binaries and libraries can find their dependencies regardless
 # of where the installation is located (works for system installs, pip wheels,
@@ -633,7 +696,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(WRP_CORE_ENABLE_RPATH)
     set(CMAKE_SKIP_BUILD_RPATH FALSE)
     set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
-    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH FALSE)
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
     if(APPLE)
         set(CMAKE_MACOSX_RPATH TRUE)
@@ -695,8 +758,9 @@ if(NOT MSVC)
         endif()
         message(STATUS "MemorySanitizer (MSan) enabled for iowarp-core")
         message(WARNING "MSan requires all dependencies to be built with -fsanitize=memory; false-positives are expected from uninstrumented libs")
-        add_compile_options(-fsanitize=memory -fno-omit-frame-pointer -fno-sanitize-recover=memory
-                            -fsanitize-memory-track-origins=2)
+        add_compile_options(-fsanitize=memory -fno-omit-frame-pointer -fsanitize-recover=memory
+                            -fsanitize-memory-track-origins=2
+                            -fsanitize-ignorelist=${CMAKE_SOURCE_DIR}/CI/msan_ignorelist.txt)
         add_link_options(-fsanitize=memory)
     endif()
 
@@ -752,10 +816,11 @@ if(WRP_CORE_ENABLE_TESTS)
     add_test(
         NAME chimaera_pre_test_cleanup
         COMMAND bash -c
-            "fuser -k 9413/tcp 9414/tcp 9416/tcp 2>/dev/null; \
+            "fuser -k 5555/tcp 5558/tcp 9413/tcp 9414/tcp 9416/tcp 2>/dev/null; \
              rm -f /tmp/chimaera_*.ipc 2>/dev/null; \
              rm -f /tmp/chimaera_server_timing.log 2>/dev/null; \
              rm -rf /tmp/chimaera_memfd 2>/dev/null; \
+             rm -rf /tmp/chimaera_${USER} 2>/dev/null; \
              rm -f /dev/shm/sm_segment.* 2>/dev/null; \
              exit 0"
     )
@@ -836,12 +901,74 @@ else()
     message(STATUS "Context-exploration-engine component disabled")
 endif()
 
+# Context Visualizer (pure Python web dashboard)
+if(WRP_CORE_ENABLE_PYTHON)
+    message(STATUS "Building context-visualizer component (Python)")
+    add_subdirectory(context-visualizer)
+else()
+    message(STATUS "Context-visualizer component disabled (requires WRP_CORE_ENABLE_PYTHON)")
+endif()
+
 # Gray-Scott Example Application
 if(WRP_CORE_ENABLE_GRAY_SCOTT)
     message(STATUS "Building Gray-Scott ADIOS2 example")
     add_subdirectory(external/iowarp-gray-scott)
 else()
     message(STATUS "Gray-Scott example disabled")
+endif()
+
+#------------------------------------------------------------------------------
+# Serialize Chimaera runtime tests to prevent port 9413 conflicts
+#------------------------------------------------------------------------------
+# All tests that start a Chimaera server compete for the same default port
+# (9413). Under parallel ctest execution (e.g. ctest -j4) this causes
+# "Address already in use" failures. RESOURCE_LOCK ensures only one such
+# test runs at a time. CTP tests (context-transport-primitives) use different
+# ports or no server, so they are intentionally excluded here.
+#
+# get_directory_property(TESTS) only returns tests from the exact directory
+# scope, not from nested subdirectories. We therefore recurse through the
+# full SUBDIRECTORIES tree of each component to apply the lock.
+if(WRP_CORE_ENABLE_TESTS)
+    # Build the LSAN_OPTIONS value when ASan or combined sanitize is enabled,
+    # so that ctest (run standalone or via run_sanitizers.sh) always finds the
+    # suppressions file and does not falsely fail on known architectural leaks.
+    set(_lsan_opts "")
+    if(WRP_CORE_ENABLE_ASAN AND NOT WRP_CORE_ENABLE_MSAN)
+        set(_lsan_opts
+            "detect_leaks=1:halt_on_error=0:print_stacktrace=1:symbolize=1:suppressions=${CMAKE_SOURCE_DIR}/CI/lsan_suppressions.txt")
+    endif()
+
+    function(_chimaera_lock_tests_recursive dir lsan_opts)
+        get_directory_property(_tests DIRECTORY "${dir}" TESTS)
+        if(_tests)
+            set_tests_properties(${_tests}
+                DIRECTORY "${dir}"
+                PROPERTIES RESOURCE_LOCK "chimaera_runtime_port")
+            if(lsan_opts)
+                set_tests_properties(${_tests}
+                    DIRECTORY "${dir}"
+                    PROPERTIES ENVIRONMENT_MODIFICATION
+                        "LSAN_OPTIONS=set:${lsan_opts}")
+            endif()
+        endif()
+        get_directory_property(_subdirs DIRECTORY "${dir}" SUBDIRECTORIES)
+        foreach(_sub ${_subdirs})
+            _chimaera_lock_tests_recursive("${_sub}" "${lsan_opts}")
+        endforeach()
+    endfunction()
+
+    foreach(_component_dir
+            context-runtime
+            context-transfer-engine
+            context-assimilation-engine
+            context-exploration-engine)
+        if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
+            _chimaera_lock_tests_recursive(
+                "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}"
+                "${_lsan_opts}")
+        endif()
+    endforeach()
 endif()
 
 #------------------------------------------------------------------------------
@@ -953,6 +1080,13 @@ if(TARGET chimaera)
   install(TARGETS chimaera
     COMPONENT pip_package
     RUNTIME DESTINATION ${PIP_PKG_DIR}/bin)
+  # Also install to PYTHON_SITE_PACKAGES/iowarp_core/bin/ so that
+  # `sudo make install` keeps the binary in sync with the Python package,
+  # matching how chimaera_runtime_ext.so is installed directly to site-packages.
+  if(WRP_CORE_ENABLE_PYTHON AND PYTHON_SITE_PACKAGES)
+    install(TARGETS chimaera
+      RUNTIME DESTINATION "${PYTHON_SITE_PACKAGES}/iowarp_core/bin")
+  endif()
 endif()
 
 # Python extensions -> iowarp_core/ext/
@@ -967,12 +1101,27 @@ if(WRP_CORE_ENABLE_PYTHON)
       COMPONENT pip_package
       LIBRARY DESTINATION ${PIP_PKG_DIR}/ext)
   endif()
+  # Context Visualizer -> iowarp_core/visualizer/
+  install(DIRECTORY context-visualizer/context_visualizer/
+    COMPONENT pip_package
+    DESTINATION ${PIP_PKG_DIR}/visualizer
+    FILES_MATCHING
+      PATTERN "*.py"
+      PATTERN "*.html"
+      PATTERN "*.css"
+      PATTERN "*.js")
 endif()
 
 # Default config -> iowarp_core/data/
 install(FILES context-runtime/config/chimaera_default.yaml
   COMPONENT pip_package
   DESTINATION ${PIP_PKG_DIR}/data)
+
+# .pth file at site-packages root so "import wrp_cee" works without
+# explicitly importing iowarp_core first (triggers _setup() at startup).
+install(FILES installers/pip/iowarp_core.pth
+  COMPONENT pip_package
+  DESTINATION .)
 
 #------------------------------------------------------------------------------
 # CPack Configuration

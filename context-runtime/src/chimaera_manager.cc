@@ -45,10 +45,18 @@
 // Global pointer variable definition for Chimaera manager singleton
 HSHM_DEFINE_GLOBAL_PTR_VAR_CC(chi::Chimaera, g_chimaera_manager);
 
+static void ChimaeraCleanupAtExit() {
+  if (g_chimaera_manager) {
+    delete g_chimaera_manager;
+    g_chimaera_manager = nullptr;
+  }
+}
+
 namespace chi {
 
 // HSHM Thread-local storage key definitions
 hshm::ThreadLocalKey chi_cur_worker_key_;
+bool chi_cur_worker_key_created_ = false;
 hshm::ThreadLocalKey chi_task_counter_key_;
 hshm::ThreadLocalKey chi_is_client_thread_key_;
 
@@ -81,7 +89,6 @@ TaskId CreateTaskId() {
         // new unique from counter
         TaskId new_id = current_task->task_id_;
         new_id.unique_ = counter->GetNext();
-        new_id.node_id_ = node_id;
         return new_id;
       }
     }
@@ -100,26 +107,27 @@ TaskId CreateTaskId() {
 
   return TaskId(
       pid, tid, major, 0, major,
-      node_id); // replica_id_ starts at 0, unique = major for root tasks
+      node_id);  // replica_id_ starts at 0, unique = major for root tasks
 }
 
 Chimaera::~Chimaera() {
   if (is_initialized_) {
-    // Always finalize client components if client mode was initialized
-    if (is_client_mode_) {
-      ClientFinalize();
-    }
-
-    // Only finalize server components if runtime mode was initialized
+    // Finalize server first (stops worker threads that may be processing tasks)
     if (is_runtime_mode_) {
       ServerFinalize();
+    }
+
+    // Then finalize client (closes DEALER socket on the shared ZMQ context)
+    if (is_client_mode_) {
+      ClientFinalize();
     }
   }
 }
 
 bool Chimaera::ClientInit() {
   HLOG(kInfo, "Chimaera::ClientInit");
-  if (is_client_initialized_ || client_is_initializing_ || runtime_is_initializing_) {
+  if (is_client_initialized_ || client_is_initializing_ ||
+      runtime_is_initializing_) {
     return true;
   }
 
@@ -155,22 +163,27 @@ bool Chimaera::ClientInit() {
   // IMPORTANT: Check g_admin directly, NOT CHI_ADMIN macro
   // CHI_ADMIN uses GetGlobalPtrVar which auto-creates with default constructor!
   if (g_admin == nullptr) {
-    HLOG(kInfo, "ClientInit: Creating admin client with kAdminPoolId={}", chi::kAdminPoolId);
+    HLOG(kInfo, "ClientInit: Creating admin client with kAdminPoolId={}",
+         chi::kAdminPoolId);
     g_admin = new chimaera::admin::Client(chi::kAdminPoolId);
-    HLOG(kInfo, "ClientInit: Admin client created, pool_id_={}", g_admin->pool_id_);
+    HLOG(kInfo, "ClientInit: Admin client created, pool_id_={}",
+         g_admin->pool_id_);
   } else {
-    HLOG(kInfo, "ClientInit: g_admin already exists, pool_id_={}", g_admin->pool_id_);
+    HLOG(kInfo, "ClientInit: g_admin already exists, pool_id_={}",
+         g_admin->pool_id_);
   }
 
   is_client_initialized_ = true;
   is_initialized_ = true;
   client_is_initializing_ = false;
+  std::atexit(ChimaeraCleanupAtExit);
 
   return true;
 }
 
 bool Chimaera::ServerInit() {
-  if (is_runtime_initialized_ || runtime_is_initializing_ || client_is_initializing_) {
+  if (is_runtime_initialized_ || runtime_is_initializing_ ||
+      client_is_initializing_) {
     return true;
   }
 
@@ -195,7 +208,7 @@ bool Chimaera::ServerInit() {
   }
 
   HLOG(kDebug, "Host identification successful: {}",
-        ipc_manager->GetCurrentHostname());
+       ipc_manager->GetCurrentHostname());
 
   // Initialize module manager first (needed for admin chimod)
   auto *module_manager = CHI_MODULE_MANAGER;
@@ -232,7 +245,7 @@ bool Chimaera::ServerInit() {
   const auto &compose_config = config_manager->GetComposeConfig();
   if (!compose_config.pools_.empty()) {
     HLOG(kInfo, "Processing compose configuration with {} pools",
-          compose_config.pools_.size());
+         compose_config.pools_.size());
 
     // Get admin client to process compose
     auto *admin_client = CHI_ADMIN;
@@ -242,9 +255,15 @@ bool Chimaera::ServerInit() {
     }
 
     // Iterate over each pool configuration and create asynchronously
-    for (const auto& pool_config : compose_config.pools_) {
-      HLOG(kInfo, "Compose: Creating pool {} (module: {})",
-            pool_config.pool_name_, pool_config.mod_name_);
+    for (auto pool_config : compose_config.pools_) {
+      // On restart, force restart_=true so containers call Restart() instead of
+      // Init()
+      if (is_restart_) {
+        pool_config.restart_ = true;
+      }
+
+      HLOG(kInfo, "Compose: Creating pool {} (module: {}, restart: {})",
+           pool_config.pool_name_, pool_config.mod_name_, pool_config.restart_);
 
       // Create pool asynchronously and wait
       auto task = admin_client->AsyncCompose(pool_config);
@@ -253,24 +272,34 @@ bool Chimaera::ServerInit() {
       // Check return code
       u32 return_code = task->GetReturnCode();
       if (return_code != 0) {
-        HLOG(kError, "Compose: Failed to create pool {} (module: {}), return code: {}",
-              pool_config.pool_name_, pool_config.mod_name_, return_code);
+        HLOG(kError,
+             "Compose: Failed to create pool {} (module: {}), return code: {}",
+             pool_config.pool_name_, pool_config.mod_name_, return_code);
         return false;
       }
 
       HLOG(kInfo, "Compose: Successfully created pool {} (module: {})",
-            pool_config.pool_name_, pool_config.mod_name_);
+           pool_config.pool_name_, pool_config.mod_name_);
 
       // Cleanup task
     }
 
-    HLOG(kInfo, "Compose: All {} pools created successfully", compose_config.pools_.size());
+    HLOG(kInfo, "Compose: All {} pools created successfully",
+         compose_config.pools_.size());
+
+    // After compose, replay WAL to recover address table state from before
+    // crash
+    if (is_restart_) {
+      HLOG(kInfo, "Replaying address table WAL for restart recovery...");
+      pool_manager->ReplayAddressTableWAL();
+    }
   }
 
   // Start local server last - after all other initialization is complete
   // This ensures clients can connect only when runtime is fully ready
   if (!ipc_manager->StartLocalServer()) {
-    HLOG(kError, "Failed to start local server - runtime initialization failed");
+    HLOG(kError,
+         "Failed to start local server - runtime initialization failed");
     is_runtime_mode_ = false;
     runtime_is_initializing_ = false;
     return false;
@@ -279,6 +308,7 @@ bool Chimaera::ServerInit() {
   is_runtime_initialized_ = true;
   is_initialized_ = true;
   runtime_is_initializing_ = false;
+  std::atexit(ChimaeraCleanupAtExit);
 
   return true;
 }
@@ -355,4 +385,4 @@ bool Chimaera::IsInitializing() const {
   return client_is_initializing_ || runtime_is_initializing_;
 }
 
-} // namespace chi
+}  // namespace chi

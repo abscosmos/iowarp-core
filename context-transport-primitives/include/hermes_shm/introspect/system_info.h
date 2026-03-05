@@ -84,6 +84,23 @@ union File {
   HANDLE windows_fd_;
 };
 
+/** Aggregate CPU tick counts from /proc/stat */
+struct CpuTimes {
+  uint64_t user;
+  uint64_t nice;
+  uint64_t system;
+  uint64_t idle;
+  uint64_t iowait;
+  uint64_t irq;
+  uint64_t softirq;
+  uint64_t steal;
+
+  uint64_t TotalActive() const {
+    return user + nice + system + irq + softirq + steal;
+  }
+  uint64_t Total() const { return TotalActive() + idle + iowait; }
+};
+
 /** A unification of certain OS system calls */
 class SystemInfo {
  public:
@@ -149,6 +166,18 @@ class SystemInfo {
 
   HSHM_DLL static size_t GetRamCapacity();
 
+  HSHM_DLL static size_t GetRamAvailable();
+
+  HSHM_DLL static CpuTimes GetCpuTimes();
+
+  static float ComputeCpuUtilization(const CpuTimes &prev,
+                                     const CpuTimes &curr) {
+    uint64_t total_d = curr.Total() - prev.Total();
+    if (total_d == 0) return 0.0f;
+    uint64_t active_d = curr.TotalActive() - prev.TotalActive();
+    return static_cast<float>(active_d) / static_cast<float>(total_d) * 100.0f;
+  }
+
   HSHM_DLL static void YieldThread();
 
   HSHM_DLL static bool CreateTls(ThreadLocalKey &key, void *data);
@@ -207,6 +236,15 @@ class SystemInfo {
                               int overwrite);
 
   HSHM_DLL static void Unsetenv(const char *name);
+
+  /** Get the per-user chimaera tmp directory path (/tmp/chimaera_$USER) */
+  HSHM_DLL static std::string GetMemfdDir();
+
+  /** Get the full path for a named file in the memfd directory */
+  HSHM_DLL static std::string GetMemfdPath(const std::string &name);
+
+  /** Ensure the per-user memfd directory exists */
+  HSHM_DLL static void EnsureMemfdDir();
 
   HSHM_DLL static bool IsProcessAlive(int pid);
 

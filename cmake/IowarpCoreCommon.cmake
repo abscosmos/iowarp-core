@@ -410,7 +410,7 @@ function(add_chimod_client)
   add_library(${TARGET_NAME} SHARED ${ARG_SOURCES})
 
   # Set C++ standard
-  set(CHIMAERA_CXX_STANDARD 17)
+  set(CHIMAERA_CXX_STANDARD 20)
   target_compile_features(${TARGET_NAME} PUBLIC cxx_std_${CHIMAERA_CXX_STANDARD})
 
   # Common compile definitions
@@ -507,6 +507,12 @@ function(add_chimod_client)
     )
   endif()
 
+  # Precompiled headers for faster builds
+  target_precompile_headers(${TARGET_NAME} PRIVATE
+      <string> <vector> <memory> <unordered_map>
+      <functional> <algorithm> <cstdint> <cstring> <iostream>
+  )
+
   # Export module info to parent scope
   set(CHIMAERA_MODULE_CLIENT_TARGET ${TARGET_NAME} PARENT_SCOPE)
   set(CHIMAERA_MODULE_NAME ${CHIMAERA_MODULE_NAME} PARENT_SCOPE)
@@ -552,7 +558,7 @@ function(add_chimod_runtime)
   add_library(${TARGET_NAME} SHARED ${ARG_SOURCES})
 
   # Set C++ standard
-  set(CHIMAERA_CXX_STANDARD 17)
+  set(CHIMAERA_CXX_STANDARD 20)
   target_compile_features(${TARGET_NAME} PUBLIC cxx_std_${CHIMAERA_CXX_STANDARD})
 
   # Common compile definitions
@@ -739,6 +745,12 @@ check_required_components(${MODULE_PACKAGE_NAME})
     message(STATUS "  Targets: ${INSTALLED_TARGETS}")
     message(STATUS "  Aliases: ${CHIMAERA_NAMESPACE}::${CHIMAERA_MODULE_NAME}_client, ${CHIMAERA_NAMESPACE}::${CHIMAERA_MODULE_NAME}_runtime")
   endif()
+
+  # Precompiled headers for faster builds
+  target_precompile_headers(${TARGET_NAME} PRIVATE
+      <string> <vector> <memory> <unordered_map>
+      <functional> <algorithm> <cstdint> <cstring> <iostream>
+  )
 
   # Export module info to parent scope
   set(CHIMAERA_MODULE_RUNTIME_TARGET ${TARGET_NAME} PARENT_SCOPE)

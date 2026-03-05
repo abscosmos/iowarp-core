@@ -65,7 +65,10 @@ bool WorkOrchestrator::Init() {
   }
 
   // Initialize HSHM TLS key for workers
-  HSHM_THREAD_MODEL->CreateTls<class Worker>(chi_cur_worker_key_, nullptr);
+  if (!chi_cur_worker_key_created_) {
+    HSHM_THREAD_MODEL->CreateTls<class Worker>(chi_cur_worker_key_, nullptr);
+    chi_cur_worker_key_created_ = true;
+  }
 
   // Initialize scheduling state
   next_worker_index_for_scheduling_.store(0);
@@ -160,17 +163,18 @@ void WorkOrchestrator::StopWorkers() {
 
   HLOG(kDebug, "Stopping {} worker threads...", all_workers_.size());
 
-  // Signal all workers to stop and wake them if blocked in epoll_wait
-  pid_t my_pid = static_cast<pid_t>(getpid());
+  // Stop all workers and wake them from epoll_wait
+  pid_t runtime_pid = getpid();
   for (auto *worker : all_workers_) {
-    if (!worker) continue;
-    worker->Stop();
-    // Wake up the worker if it's blocked in epoll_wait via SIGUSR1
-    TaskLane *lane = worker->GetLane();
-    if (lane) {
-      pid_t tid = lane->GetTid();
-      if (tid != 0) {
-        hshm::lbm::EventManager::Signal(my_pid, tid);
+    if (worker) {
+      worker->Stop();
+      // Wake worker from epoll_wait so it can observe is_running_ == false
+      TaskLane *lane = worker->GetLane();
+      if (lane) {
+        pid_t tid = lane->GetTid();
+        if (tid > 0) {
+          hshm::lbm::EventManager::Signal(runtime_pid, tid);
+        }
       }
     }
   }

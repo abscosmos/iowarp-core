@@ -40,7 +40,7 @@ target_link_libraries(${COMPOSE_TEST_TARGET}
 )
 
 set_target_properties(${COMPOSE_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -67,7 +67,7 @@ target_link_libraries(${TASK_ARCHIVE_TEST_TARGET}
 )
 
 set_target_properties(${TASK_ARCHIVE_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -92,7 +92,7 @@ target_link_libraries(${SUBMIT_BATCH_TEST_TARGET}
 )
 
 set_target_properties(${SUBMIT_BATCH_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -243,6 +243,24 @@ if(WRP_CORE_ENABLE_TESTS)
     PROPERTIES
       TIMEOUT 180
       ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1"
+  )
+
+  # Mark all admin tests as msan_skip (they use ZMQ which is uninstrumented)
+  set_tests_properties(
+    cr_task_archive_basic_tests
+    cr_task_archive_bulk_transfer_tests
+    cr_task_archive_non_task_tests
+    cr_task_archive_task_base_tests
+    cr_task_archive_admin_tasks_tests
+    cr_task_archive_bidirectional_tests
+    cr_task_archive_container_tests
+    cr_task_archive_error_handling_tests
+    cr_task_archive_performance_tests
+    cr_task_archive_integration_tests
+    cr_all_task_archive_tests
+    cr_compose_tests
+    cr_submit_batch_tests
+    PROPERTIES LABELS "msan_skip"
   )
 endif()
 

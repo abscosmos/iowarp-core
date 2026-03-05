@@ -64,8 +64,8 @@ using namespace chi;
 void CleanupSharedMemory() {
   const char *user = std::getenv("USER");
   std::string memfd_path =
-      std::string("/tmp/chimaera_memfd/chi_main_segment_") +
-      (user ? user : "");
+      std::string("/tmp/chimaera_") + (user ? user : "unknown") +
+      "/chi_main_segment_" + (user ? user : "");
   unlink(memfd_path.c_str());
 }
 
@@ -103,8 +103,8 @@ pid_t StartServerProcess() {
 bool WaitForServer(int max_attempts = 50) {
   const char *user = std::getenv("USER");
   std::string memfd_path =
-      std::string("/tmp/chimaera_memfd/chi_main_segment_") +
-      (user ? user : "");
+      std::string("/tmp/chimaera_") + (user ? user : "unknown") +
+      "/chi_main_segment_" + (user ? user : "");
 
   for (int i = 0; i < max_attempts; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -200,10 +200,10 @@ void TestServerRestart(const std::string &mode) {
   REQUIRE(ready);
   INFO("New server started");
 
-  // 7. ClientReconnect to re-attach to new server
-  bool reconnected = CHI_IPC->ClientReconnect();
+  // 7. ReconnectToOriginalHost to re-attach to new server
+  bool reconnected = CHI_IPC->ReconnectToOriginalHost();
   REQUIRE(reconnected);
-  INFO("ClientReconnect succeeded for mode " + mode);
+  INFO("ReconnectToOriginalHost succeeded for mode " + mode);
 
   // 8. Submit a second task with different pool name/ID
   {
@@ -306,7 +306,7 @@ TEST_CASE("ClientRetry - Server Restart TCP", "[client_retry][tcp]") {
 
 TEST_CASE("ClientRetry - Server Restart IPC", "[client_retry][ipc]") {
   // IPC (Unix domain socket) transport does not auto-reconnect after server
-  // death. ClientReconnect needs socket transport reconnection support.
+  // death. ReconnectToOriginalHost needs socket transport reconnection support.
   INFO("SKIPPED: IPC socket transport reconnection not yet implemented");
 }
 
@@ -348,5 +348,7 @@ int main(int argc, char* argv[]) {
   if (argc > 1) {
     filter = argv[1];
   }
-  return SimpleTest::run_all_tests(filter);
+  int rc = SimpleTest::run_all_tests(filter);
+  chi::CHIMAERA_FINALIZE();
+  return rc;
 }
