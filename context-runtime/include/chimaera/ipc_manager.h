@@ -2249,8 +2249,7 @@ HSHM_CROSS_FUN Future<TaskT, AllocT>::~Future() {
       CHI_IPC->FreeBuffer(buffer_shm);
       future_shm_.SetNull();
     }
-    // Auto-free the task (only when consumed to avoid double-free
-    // from runtime-internal Future copies in event queues / RunContext)
+    // Free the heap-allocated task object
     DelTask();
   }
 }
