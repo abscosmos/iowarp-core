@@ -84,6 +84,12 @@ enum class NetQueuePriority : u32 {
   kClientSendIpc = 3,  ///< Priority 3: Client response via IPC
 };
 
+/** Result of RouteTask: whether task stays local (GPU/CPU) or goes over network */
+enum class RouteResult : u32 {
+  Local = 0,    ///< Task stays on the current processor (GPU stays on GPU)
+  Network = 1,  ///< Task must be sent over the network or CPU↔GPU boundary
+};
+
 /**
  * Network queue for storing Future<SendTask> objects
  * One lane with two priorities (SendIn and SendOut)
