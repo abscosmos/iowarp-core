@@ -122,6 +122,15 @@ struct RingBufferEntry {
   void SetReady() { flags_.SetBits(1); }
 
   /**
+   * Mark entry as ready with system-scope atomics (GPU→CPU signal).
+   * Issues __threadfence_system() before atomicOr_system so that all
+   * prior GPU writes (entry.data_) are globally visible to the CPU
+   * before the ready flag is observed.
+   */
+  HSHM_INLINE_CROSS_FUN
+  void SetReadySystem() { flags_.SetBitsSystem(1); }
+
+  /**
    * Clear ready flag
    */
   HSHM_INLINE_CROSS_FUN
@@ -410,6 +419,52 @@ class ring_buffer : public ShmContainer<AllocT> {
    */
   HSHM_CROSS_FUN
   bool Push(const T& val) { return Emplace(val); }
+
+  /**
+   * Push with system-scope atomics for GPU→CPU visibility.
+   *
+   * Use this when a GPU thread pushes to a ring buffer that a CPU thread
+   * will poll. Device-scope atomics (used by Push/Emplace) are NOT
+   * guaranteed visible to CPU on platforms where
+   * cudaDevAttrHostNativeAtomicSupported == 0 (e.g. PCIe GPUs).
+   * System-scope atomics (atomicAdd_system, atomicOr_system) bypass the
+   * GPU L2 cache and are coherent with CPU accesses on UVM/managed memory.
+   *
+   * @param val The value to push
+   * @return True if push succeeded, false if buffer is full
+   */
+  HSHM_CROSS_FUN
+  bool PushSystem(const T& val) {
+    // System-scope fetch_add: CPU sees the tail increment immediately
+    u64 head = head_.load_system();
+    u64 tail = tail_.fetch_add_system(1);
+    entry_vector& queue = queue_;
+
+    // Wait for space using system-scope head load
+    if constexpr (WaitForSpace) {
+      size_t size = tail - head + 1;
+      while (size >= queue.size()) {
+        head = head_.load_system();
+        size = tail - head + 1;
+      }
+    } else if constexpr (ErrorOnNoSpace) {
+      size_t size = tail - head + 1;
+      if (size >= queue.size()) {
+        tail_.fetch_add_system(static_cast<u64>(-1));
+        return false;
+      }
+    }
+
+    // Write data then signal readiness with system-scope OR.
+    // SetReadySystem() issues __threadfence_system() before atomicOr_system,
+    // ensuring entry.data_ is globally visible before the ready flag.
+    size_t idx = tail % queue.size();
+    auto& entry = queue[idx];
+    entry.data_ = val;
+    entry.SetReadySystem();
+
+    return true;
+  }
 
   /**
    * Try to push an element (alias for Push)

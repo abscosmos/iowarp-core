@@ -60,13 +60,13 @@ struct BuddyPage : public pre::slist_node {
 
   static constexpr size_t kFreeMask = (size_t)1 << (sizeof(size_t) * 8 - 1);
 
-  BuddyPage() : pre::slist_node(), size_(0) {}
-  explicit BuddyPage(size_t size) : pre::slist_node(), size_(size) {}
+  HSHM_INLINE_CROSS_FUN BuddyPage() : pre::slist_node(), size_(0) {}
+  HSHM_INLINE_CROSS_FUN explicit BuddyPage(size_t size) : pre::slist_node(), size_(size) {}
 
-  inline void MarkFree()      { size_ |=  kFreeMask; }
-  inline void MarkAllocated() { size_ &= ~kFreeMask; }
-  inline bool IsFree()  const { return (size_ & kFreeMask) != 0; }
-  inline size_t GetSize() const { return size_ & ~kFreeMask; }
+  HSHM_INLINE_CROSS_FUN void MarkFree()      { size_ |=  kFreeMask; }
+  HSHM_INLINE_CROSS_FUN void MarkAllocated() { size_ &= ~kFreeMask; }
+  HSHM_INLINE_CROSS_FUN bool IsFree()  const { return (size_ & kFreeMask) != 0; }
+  HSHM_INLINE_CROSS_FUN size_t GetSize() const { return size_ & ~kFreeMask; }
 };
 
 /**
@@ -290,7 +290,7 @@ class _BuddyAllocator : public Allocator {
 
     // Get the BuddyPage header (offset points after header)
     size_t page_offset = offset.load() - sizeof(BuddyPage);
-    hipc::FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(page_offset));
+    hipc::FullPtr<BuddyPage> page(this, page_offset);
     size_t old_size = page.ptr_->GetSize();  // Size without header
 
     // If new size fits in existing allocation, reuse it
@@ -305,8 +305,8 @@ class _BuddyAllocator : public Allocator {
     }
 
     // Copy old data to new location
-    hipc::FullPtr<char> old_data(this, OffsetPtr<char>(offset.load()));
-    hipc::FullPtr<char> new_data(this, OffsetPtr<char>(new_offset.load()));
+    hipc::FullPtr<char> old_data(this, offset.load());
+    hipc::FullPtr<char> new_data(this, new_offset.load());
     memcpy(new_data.ptr_, old_data.ptr_, old_size);
 
     // Free old allocation
@@ -335,7 +335,7 @@ class _BuddyAllocator : public Allocator {
   HSHM_CROSS_FUN void FreeOffsetNoNullCheck(OffsetPtr<> offset) {
     // Get the BuddyPage header (offset points after header)
     size_t page_offset = offset.load() - sizeof(BuddyPage);
-    hipc::FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(page_offset));
+    hipc::FullPtr<BuddyPage> page(this, page_offset);
     size_t data_size = page.ptr_->GetSize();  // Size without header
     page.ptr_->MarkFree();
 
@@ -345,24 +345,24 @@ class _BuddyAllocator : public Allocator {
       size_t list_idx = GetSmallPageListIndexForFree(data_size);
 
       // Initialize BuddyPage as a free list node
-      hipc::FullPtr<BuddyPage> free_page(this, OffsetPtr<BuddyPage>(page_offset));
+      hipc::FullPtr<BuddyPage> free_page(this, page_offset);
       free_page.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node
       // size_ already contains data_size|kFreeMask, keep it as-is
 
       // Add to free list - BuddyPage inherits from slist_node
-      FullPtr<BuddyPage> node_ptr(this, OffsetPtr<BuddyPage>(page_offset));
+      FullPtr<BuddyPage> node_ptr(this, page_offset);
       small_pages_[list_idx].emplace(this, node_ptr);
     } else {
       // Large page - add to large_pages_ list
       size_t list_idx = GetLargePageListIndexForFree(data_size);
 
       // Initialize BuddyPage as a free list node
-      hipc::FullPtr<BuddyPage> free_page(this, OffsetPtr<BuddyPage>(page_offset));
+      hipc::FullPtr<BuddyPage> free_page(this, page_offset);
       free_page.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node
       // size_ already contains data_size|kFreeMask, keep it as-is
 
       // Add to free list - BuddyPage inherits from slist_node
-      FullPtr<BuddyPage> node_ptr(this, OffsetPtr<BuddyPage>(page_offset));
+      FullPtr<BuddyPage> node_ptr(this, page_offset);
       large_pages_[list_idx].emplace(this, node_ptr);
     }
   }
@@ -383,7 +383,7 @@ class _BuddyAllocator : public Allocator {
     if (region_size <= sizeof(BuddyPage)) {
       return;
     }
-    FullPtr<BuddyPage> node(this, OffsetPtr<BuddyPage>(region.load()));
+    FullPtr<BuddyPage> node(this, region.load());
     node->size_ = region_size;
     regions_.emplace(this, node);
     region += sizeof(BuddyPage);
@@ -488,6 +488,10 @@ class _BuddyAllocator : public Allocator {
     // Step 3: Try allocating from small_arena_
     size_t total_size = size + sizeof(BuddyPage);
     size_t arena_offset = small_arena_.Allocate(total_size);
+#if HSHM_IS_GPU
+    printf("GPU[AS]: step3 arena_off=%lu total=%lu\n",
+           (unsigned long)arena_offset, (unsigned long)total_size);
+#endif
     if (arena_offset != 0) {
       return FinalizeAllocation(arena_offset, size);
     }
@@ -530,7 +534,7 @@ class _BuddyAllocator : public Allocator {
     for (size_t i = list_idx; i < kMaxLargePages; ++i) {
         size_t found_offset = FindFirstFit(i, total_size);
         if (found_offset != 0) {
-        hipc::FullPtr<FreeLargeBuddyPage> free_page(this, OffsetPtr<FreeLargeBuddyPage>(found_offset));
+        hipc::FullPtr<FreeLargeBuddyPage> free_page(this, found_offset);
         size_t page_data_size = free_page.ptr_->GetSize();
         size_t page_total_size = page_data_size + sizeof(BuddyPage);
 
@@ -572,7 +576,7 @@ class _BuddyAllocator : public Allocator {
     for (auto it = large_pages_[list_idx].begin(this);
          it != large_pages_[list_idx].end(); ++it) {
       hipc::FullPtr<FreeLargeBuddyPage> free_page(
-          this, OffsetPtr<FreeLargeBuddyPage>(it.GetCurrent().load()));
+          this, it.GetCurrent().load());
 
       // Check if this page size (including header) is large enough
       size_t page_total_size = free_page.ptr_->GetSize() + sizeof(BuddyPage);
@@ -614,7 +618,7 @@ class _BuddyAllocator : public Allocator {
         size_t offset = FindFirstFit(list_idx, arena_size);
         if (offset != 0) {
           // Read original page size before overwriting with new arena bounds
-          FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(offset));
+          FullPtr<BuddyPage> page(this, offset);
           size_t page_total_size = page.ptr_->size_ + sizeof(BuddyPage);
 
           small_arena_.Init(offset, offset + arena_size);
@@ -660,7 +664,7 @@ class _BuddyAllocator : public Allocator {
 
       while (remaining_size >= page_total_size) {
         // Create a free page
-        hipc::FullPtr<BuddyPage> free_page(this, OffsetPtr<BuddyPage>(remaining_offset));
+        hipc::FullPtr<BuddyPage> free_page(this, remaining_offset);
         if (free_page.IsNull()) {
           break;
         }
@@ -669,7 +673,7 @@ class _BuddyAllocator : public Allocator {
         free_page.ptr_->MarkFree();
 
         // Add to free list
-        FullPtr<BuddyPage> node_ptr(this, OffsetPtr<BuddyPage>(remaining_offset));
+        FullPtr<BuddyPage> node_ptr(this, remaining_offset);
         small_pages_[i].emplace(this, node_ptr);
 
         remaining_offset += page_total_size;
@@ -699,23 +703,23 @@ class _BuddyAllocator : public Allocator {
       // Small remainder - use exact size match (round down)
       size_t rem_list_idx = GetSmallPageListIndexForFree(data_size);
 
-      hipc::FullPtr<BuddyPage> remainder(this, OffsetPtr<BuddyPage>(page_offset));
+      hipc::FullPtr<BuddyPage> remainder(this, page_offset);
       remainder.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node
       remainder.ptr_->size_ = data_size;  // Data size excluding header
       remainder.ptr_->MarkFree();
 
-      FullPtr<BuddyPage> rem_node(this, OffsetPtr<BuddyPage>(page_offset));
+      FullPtr<BuddyPage> rem_node(this, page_offset);
       small_pages_[rem_list_idx].emplace(this, rem_node);
     } else {
       // Large remainder - use exact size match
       size_t rem_list_idx = GetLargePageListIndexForFree(data_size);
 
-      hipc::FullPtr<BuddyPage> remainder(this, OffsetPtr<BuddyPage>(page_offset));
+      hipc::FullPtr<BuddyPage> remainder(this, page_offset);
       remainder.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node
       remainder.ptr_->size_ = data_size;  // Data size excluding header
       remainder.ptr_->MarkFree();
 
-      FullPtr<BuddyPage> rem_node(this, OffsetPtr<BuddyPage>(page_offset));
+      FullPtr<BuddyPage> rem_node(this, page_offset);
       large_pages_[rem_list_idx].emplace(this, rem_node);
     }
   }
@@ -728,12 +732,12 @@ class _BuddyAllocator : public Allocator {
    * @return Offset pointer to usable memory (after BuddyPage header)
    */
   HSHM_CROSS_FUN OffsetPtr<> FinalizeAllocation(size_t page_offset, size_t user_size) {
-    hipc::FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(page_offset));
-    page.ptr_->size_ = user_size;   // Store size without header
-    page.ptr_->MarkAllocated();     // Clear free bit
-
-    size_t result_offset = page_offset + sizeof(BuddyPage);
-    return OffsetPtr<>(result_offset);
+    // Use raw pointer arithmetic to bypass FullPtr/ContainsPtr on GPU
+    char *base = GetBackendData();
+    BuddyPage *bp = reinterpret_cast<BuddyPage*>(base + page_offset);
+    bp->size_ = user_size;
+    bp->MarkAllocated();
+    return OffsetPtr<>(page_offset + sizeof(BuddyPage));
   }
 
   /**

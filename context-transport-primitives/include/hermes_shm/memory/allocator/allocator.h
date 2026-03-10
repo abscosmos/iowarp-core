@@ -1183,8 +1183,11 @@ class BaseAllocator : public CoreAllocT {
   template <typename T = void>
   HSHM_INLINE_CROSS_FUN FullPtr<T> Allocate(size_t size) {
     auto offset_ptr = AllocateOffset(size);
+    if (offset_ptr.IsNull()) {
+      return FullPtr<T>();
+    }
     auto *alloc_ptr = static_cast<Allocator *>(this);
-    return FullPtr<T>(alloc_ptr, OffsetPtr<T>(offset_ptr.load()));
+    return FullPtr<T>(alloc_ptr, offset_ptr.load());
   }
 
   /**

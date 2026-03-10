@@ -654,7 +654,7 @@ class basic_string {
    *
    * @param alloc Pointer to allocator instance for memory management
    */
-  explicit basic_string(AllocT* alloc)
+  HSHM_CROSS_FUN explicit basic_string(AllocT* alloc)
     : size_(0), using_sso_(true), alloc_(alloc) {
     storage_.buffer_[0] = T();
   }
@@ -677,7 +677,7 @@ class basic_string {
    * @param alloc Pointer to allocator instance
    * @param s The C-style string (null-terminated)
    */
-  basic_string(AllocT* alloc, const T* s)
+  HSHM_CROSS_FUN basic_string(AllocT* alloc, const T* s)
     : size_(0), using_sso_(true), alloc_(alloc) {
     if (s != nullptr) {
       size_type len = 0;

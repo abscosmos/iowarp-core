@@ -97,6 +97,12 @@ struct nonatomic {
     return orig_x;
   }
 
+  /** System-scope fetch_add (same as fetch_add for nonatomic) */
+  template <typename U>
+  HSHM_INLINE_CROSS_FUN T fetch_add_system(U count) {
+    return fetch_add(count);
+  }
+
   /** Atomic fetch_sub wrapper*/
   template <typename U>
   HSHM_INLINE_CROSS_FUN T
@@ -360,6 +366,27 @@ struct rocm_atomic {
     T old = x;
     x += static_cast<T>(count);
     return old;
+#endif
+  }
+
+  /** System-scope atomic fetch_add: atomicAdd_system for cross-device
+   *  visibility. Use when GPU must increment a counter visible to CPU
+   *  (e.g., tail_ of a GPU→CPU ring buffer in managed/UVM memory). */
+  template <typename U>
+  HSHM_INLINE_CROSS_FUN T
+  fetch_add_system(U count) {
+#if HSHM_IS_GPU
+    if constexpr (sizeof(T) == 8) {
+      return (T)atomicAdd_system(
+          reinterpret_cast<unsigned long long*>(&x),
+          static_cast<unsigned long long>(static_cast<T>(count)));
+    } else {
+      return (T)atomicAdd_system(
+          reinterpret_cast<unsigned int*>(&x),
+          static_cast<unsigned int>(static_cast<T>(count)));
+    }
+#else
+    return x.fetch_add(static_cast<T>(count), std::memory_order_seq_cst);
 #endif
   }
 
@@ -759,6 +786,12 @@ struct std_atomic {
   HSHM_INLINE T fetch_add(U count,
                           std::memory_order order = std::memory_order_seq_cst) {
     return x.fetch_add(count, order);
+  }
+
+  /** System-scope fetch_add (same as seq_cst fetch_add for std_atomic) */
+  template <typename U>
+  HSHM_INLINE T fetch_add_system(U count) {
+    return x.fetch_add(count, std::memory_order_seq_cst);
   }
 
   /** Atomic fetch_sub wrapper*/
