@@ -333,16 +333,27 @@ class LocalSaveTaskArchive : public LocalLbmBase {
   template <typename T>
   HSHM_CROSS_FUN void bulk(hipc::ShmPtr<T> ptr, size_t size, uint32_t flags) {
     if (!ptr.alloc_id_.IsNull()) {
+      // mode=0: SHM-offset-based pointer
       uint8_t mode = 0;
       serializer_ << mode;
       size_t off = ptr.off_.load();
       serializer_ << off << ptr.alloc_id_.major_ << ptr.alloc_id_.minor_;
+    } else if (ptr.off_.load() != 0) {
+      // mode=3: Raw UVA pointer (e.g., UVM buffer accessible to CPU and GPU).
+      // Stores only the pointer address — avoids copying bulk data through the
+      // ring buffer. The receiver resolves the address directly.
+      uint8_t mode = 3;
+      serializer_ << mode;
+      size_t raw_ptr = ptr.off_.load();
+      serializer_ << raw_ptr;
     } else if (flags & BULK_XFER) {
+      // mode=1: null-alloc_id null-ptr with BULK_XFER — copy zero bytes
       uint8_t mode = 1;
       serializer_ << mode;
       char *raw_ptr = reinterpret_cast<char *>(ptr.off_.load());
       serializer_.write_binary(raw_ptr, size);
     } else {
+      // mode=2: null pointer, BULK_EXPOSE only
       uint8_t mode = 2;
       serializer_ << mode;
     }
@@ -704,20 +715,42 @@ class LocalLoadTaskArchive : public LocalLbmBase {
    * @param flags Transfer flags
    */
   template <typename T>
-  void bulk(hipc::ShmPtr<T> &ptr, size_t size, uint32_t flags) {
+  HSHM_CROSS_FUN void bulk(hipc::ShmPtr<T> &ptr, size_t size, uint32_t flags) {
     (void)flags;
     uint8_t mode = 0;
     deserializer_ >> mode;
     if (mode == 1) {
+      // BULK_XFER: allocate buffer and copy bytes from archive.
+      // On GPU this path is not reached: LocalSaveTaskArchive uses mode=3
+      // for any non-null UVA pointer, so mode=1 only occurs for null ptrs.
+#if HSHM_IS_GPU
+      ptr.alloc_id_.SetNull();
+      ptr.off_ = 0;
+#else
       hipc::FullPtr<char> buf = HSHM_MALLOC->AllocateObjs<char>(size);
       deserializer_.read_binary(buf.ptr_, size);
       ptr.off_ = buf.shm_.off_.load();
       ptr.alloc_id_ = buf.shm_.alloc_id_;
+#endif
     } else if (mode == 2) {
+      // BULK_EXPOSE: allocate buffer without copying.
+      // On GPU this path is not reached (see mode=1 note above).
+#if HSHM_IS_GPU
+      ptr.alloc_id_.SetNull();
+      ptr.off_ = 0;
+#else
       hipc::FullPtr<char> buf = HSHM_MALLOC->AllocateObjs<char>(size);
       ptr.off_ = buf.shm_.off_.load();
       ptr.alloc_id_ = buf.shm_.alloc_id_;
+#endif
+    } else if (mode == 3) {
+      // Raw UVA pointer — restore directly (UVM visible to both CPU and GPU)
+      size_t raw_ptr = 0;
+      deserializer_ >> raw_ptr;
+      ptr.off_ = raw_ptr;
+      ptr.alloc_id_.SetNull();
     } else {
+      // mode == 0: SHM-offset-based pointer
       size_t off = 0;
       u32 major = 0, minor = 0;
       deserializer_ >> off >> major >> minor;
@@ -768,7 +801,7 @@ class LocalLoadTaskArchive : public LocalLbmBase {
    * @param flags Transfer flags
    */
   template <typename T>
-  void bulk(T *ptr, size_t size, uint32_t flags) {
+  HSHM_CROSS_FUN void bulk(T *ptr, size_t size, uint32_t flags) {
     (void)flags;
     deserializer_.read_binary(reinterpret_cast<char *>(ptr), size);
   }

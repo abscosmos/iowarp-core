@@ -295,11 +295,22 @@ hipc::FullPtr<TaskQueue> gpu::InitQueueOnDevice(char *device_data,
                                                   u32 queue_depth) {
   // Allocate output slot in pinned memory for the queue offset
   size_t *d_out_off = nullptr;
-  cudaMalloc(&d_out_off, sizeof(size_t));
+  cudaError_t err = cudaMalloc(&d_out_off, sizeof(size_t));
+  if (err != cudaSuccess) {
+    HLOG(kError, "InitQueueOnDevice: cudaMalloc for d_out_off failed: {}",
+         cudaGetErrorString(err));
+    return hipc::FullPtr<TaskQueue>::GetNull();
+  }
 
   gpu_init_queue_kernel<<<1, 1>>>(device_data, capacity, queue_depth,
                                    d_out_off);
-  cudaDeviceSynchronize();
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    HLOG(kError, "InitQueueOnDevice: kernel launch failed: {}",
+         cudaGetErrorString(err));
+    cudaFree(d_out_off);
+    return hipc::FullPtr<TaskQueue>::GetNull();
+  }
 
   size_t off = static_cast<size_t>(-1);
   cudaMemcpy(&off, d_out_off, sizeof(size_t), cudaMemcpyDeviceToHost);

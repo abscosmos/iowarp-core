@@ -1112,7 +1112,6 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
         HLOG(kError, "ClientRecv: Failed to deserialize task");
         continue;
       }
-
       // Create FutureShm for the task (server-side)
       hipc::FullPtr<chi::FutureShm> future_shm =
           ipc_manager->NewObj<chi::FutureShm>();
@@ -1156,8 +1155,6 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
 
       did_work = true;
       task->tasks_received_++;
-      HLOG(kDebug, "[ClientRecv] Received task pool_id={}, method={}, mode={}",
-           pool_id, method_id, mode_idx == 0 ? "tcp" : "ipc");
     }
   }
 

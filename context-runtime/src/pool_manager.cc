@@ -595,6 +595,11 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
                                                         gpu_container_ptr);
       }
       ipc_manager2->ResumeGpuOrchestrator();
+      // Allow container to send GPU-init tasks now that the GPU container
+      // is registered and the orchestrator is running.
+      if (gpu_container_ptr) {
+        container->PostGpuContainerCreate();
+      }
     }
 #endif
 

@@ -594,7 +594,6 @@ public:
   template <class Archive> void load(Archive &ar) {
     std::string stream_data;
     ar(send, recv, task_infos_, msg_type_, stream_data);
-
     // Reinitialize stream with deserialized data
     data_ = stream_data;
     stream_ = std::make_unique<std::istringstream>(data_);

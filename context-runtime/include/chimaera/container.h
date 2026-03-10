@@ -364,6 +364,15 @@ class Container {
   }
 
   /**
+   * Called after the GPU container for this pool has been allocated and
+   * registered with the GPU work orchestrator (and the orchestrator has been
+   * resumed). Override to send GPU-init tasks that must arrive after the
+   * GPU container is registered (e.g., bdev's UpdateTask).
+   * Default implementation is a no-op.
+   */
+  virtual void PostGpuContainerCreate() {}
+
+  /**
    * Serialize task parameters for network transfer (unified method)
    * Must be implemented by derived classes
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization

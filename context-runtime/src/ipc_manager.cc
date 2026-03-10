@@ -2409,9 +2409,9 @@ void IpcManager::BeginTask(Future<Task> &future, Container *container,
                            TaskLane *lane) {
   FullPtr<Task> task_ptr = future.GetTaskPtr();
   if (task_ptr.IsNull()) {
+    HLOG(kError, "BeginTask: task_ptr is null!");
     return;
   }
-
 #if HSHM_IS_HOST
   Worker *worker = CHI_CUR_WORKER;
 

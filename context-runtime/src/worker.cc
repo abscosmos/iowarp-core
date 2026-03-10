@@ -219,8 +219,6 @@ void Worker::Run() {
   if (!is_initialized_) {
     return;
   }
-  HLOG(kInfo, "Worker {}: Running", worker_id_);
-
   // Set current worker once for the entire thread duration
   SetAsCurrentWorker();
   is_running_ = true;
@@ -231,8 +229,6 @@ void Worker::Run() {
     assigned_lane_->SetTid(tid);
   }
   event_manager_.AddSignalEvent(nullptr);
-  HLOG(kInfo, "Worker {}: EventManager signal event added, tid={}", worker_id_,
-       tid);
 
   // Main worker loop - process tasks from assigned lane
   while (is_running_) {
@@ -426,8 +422,10 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
 
   // Route task using consolidated routing function
   // RouteTask handles Retry/Dne internally via AddToRetryQueue
-  if (CHI_IPC->RouteTask(future) == RouteResult::ExecHere) {
+  RouteResult route_result = CHI_IPC->RouteTask(future);
+  if (route_result == RouteResult::ExecHere) {
 #if HSHM_IS_HOST
+    // Re-fetch task pointer from future in case RouteTask changed it
     RunContext *run_ctx = task_full_ptr->run_ctx_.get();
     bool is_started = task_full_ptr->task_flags_.Any(TASK_STARTED);
     ExecTask(task_full_ptr, run_ctx, is_started);
@@ -694,7 +692,7 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
 
   // Check if task is null or run context is null
   if (task_ptr.IsNull() || !run_ctx) {
-    return;  // Consider null tasks as completed
+    return;
   }
 
   // Resolve the container fresh each time (may change during migration)

@@ -224,6 +224,51 @@ function(add_cuda_library TARGET SHARED DO_COPY)
             list(APPEND INCLUDE_FLAGS "-I${DIR}")
         endforeach()
 
+        # Collect compile definitions that NVCC targets get from linked
+        # INTERFACE libraries (hshm::cuda_cxx, hshm::thread_all, etc.).
+        # The Clang custom command cannot inherit target_compile_definitions,
+        # so we pass them explicitly via -D flags.
+        set(CLANG_CUDA_DEFS "")
+        if(WRP_CORE_ENABLE_CUDA)
+            list(APPEND CLANG_CUDA_DEFS "-DHSHM_ENABLE_CUDA=1" "-DHSHM_ENABLE_ROCM=0")
+        elseif(WRP_CORE_ENABLE_ROCM)
+            list(APPEND CLANG_CUDA_DEFS "-DHSHM_ENABLE_CUDA=0" "-DHSHM_ENABLE_ROCM=1")
+        endif()
+        # Thread model definitions (mirroring hshm::thread_all)
+        if(HSHM_ENABLE_PTHREADS)
+            list(APPEND CLANG_CUDA_DEFS
+                "-DHSHM_DEFAULT_THREAD_MODEL=hshm::thread::Pthread"
+                "-DHSHM_ENABLE_PTHREADS=1")
+        else()
+            list(APPEND CLANG_CUDA_DEFS
+                "-DHSHM_DEFAULT_THREAD_MODEL=hshm::thread::StdThread"
+                "-DHSHM_ENABLE_PTHREADS=0")
+        endif()
+        if(WRP_CORE_ENABLE_CUDA)
+            list(APPEND CLANG_CUDA_DEFS
+                "-DHSHM_DEFAULT_THREAD_MODEL_GPU=hshm::thread::Cuda")
+        elseif(WRP_CORE_ENABLE_ROCM)
+            list(APPEND CLANG_CUDA_DEFS
+                "-DHSHM_DEFAULT_THREAD_MODEL_GPU=hshm::thread::Rocm")
+        else()
+            list(APPEND CLANG_CUDA_DEFS
+                "-DHSHM_DEFAULT_THREAD_MODEL_GPU=hshm::thread::StdThread")
+        endif()
+        # Core HSHM definitions (mirroring hshm_target_compile_definitions)
+        list(APPEND CLANG_CUDA_DEFS
+            "-DHSHM_DEFAULT_ALLOC_T=hipc::ThreadLocalAllocator"
+            "-DHSHM_ENABLE_WINDOWS_THREADS=0"
+            "-DHSHM_ENABLE_PROCFS_SYSINFO=1"
+            "-DHSHM_ENABLE_WINDOWS_SYSINFO=0"
+            "-DHSHM_COMPILER_MSVC=0"
+            "-DHSHM_COMPILER_GNU=0"
+            "-DHSHM_ENABLE_DOXYGEN=0"
+            "-DHSHM_DEBUG_LOCK=0"
+            "-DHSHM_LOG_LEVEL=${HSHM_LOG_LEVEL}"
+            "-DHSHM_ENABLE_DLL_EXPORT=0"
+            "-DHSHM_ENABLE_MPI=0"
+        )
+
         set(OBJECT_FILES "")
         foreach(SRC IN LISTS SRC_FILES)
             get_filename_component(SRC_NAME ${SRC} NAME_WE)
@@ -240,6 +285,7 @@ function(add_cuda_library TARGET SHARED DO_COPY)
                     ${GPU_ARCH_FLAGS}
                     -Wno-unknown-cuda-version
                     -fPIC
+                    ${CLANG_CUDA_DEFS}
                     ${INCLUDE_FLAGS}
                     -c ${SRC_ABS}
                     -o ${OBJ_FILE}

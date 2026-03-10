@@ -149,6 +149,22 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * Update GPU container with device/pinned memory pointers - asynchronous.
+   * The CPU runtime fills in the actual pointers; callers pass zeros.
+   * Primarily used to explicitly trigger GPU container initialization after
+   * creating a kHbm or kPinned bdev pool.
+   */
+  chi::Future<UpdateTask> AsyncUpdate(const chi::PoolQuery &pool_query) {
+    auto *ipc_manager = CHI_IPC;
+    auto task = ipc_manager->NewTask<UpdateTask>(
+        chi::CreateTaskId(), pool_id_, pool_query,
+        /*hbm_ptr=*/0, /*pinned_ptr=*/0,
+        /*hbm_size=*/0, /*pinned_size=*/0,
+        /*total_size=*/0, /*bdev_type=*/0, /*alignment=*/0);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Monitor container state - asynchronous
    */
   chi::Future<MonitorTask> AsyncMonitor(const chi::PoolQuery &pool_query,
