@@ -96,19 +96,19 @@ struct coroutine_handle<void> {
    * Resume the suspended coroutine.
    * Must be called from device code only.
    */
-  __device__ void resume() const { __builtin_coro_resume(frame_); }
+  __host__ __device__ void resume() const { __builtin_coro_resume(frame_); }
 
   /**
    * Destroy the coroutine frame and free its memory.
    * Calls promise_type::operator delete if defined.
    */
-  __device__ void destroy() const { __builtin_coro_destroy(frame_); }
+  __host__ __device__ void destroy() const { __builtin_coro_destroy(frame_); }
 
   /**
    * Check if the coroutine has reached its final suspension point.
    * @return true if the coroutine is done
    */
-  __device__ bool done() const { return __builtin_coro_done(frame_); }
+  __host__ __device__ bool done() const { return __builtin_coro_done(frame_); }
 
   __host__ __device__ friend constexpr bool
   operator==(coroutine_handle a, coroutine_handle b) noexcept {
@@ -147,7 +147,7 @@ struct coroutine_handle : coroutine_handle<void> {
    * @param p Reference to the promise object
    * @return A typed coroutine_handle
    */
-  __device__ static coroutine_handle from_promise(Promise &p) noexcept {
+  __host__ __device__ static coroutine_handle from_promise(Promise &p) noexcept {
     coroutine_handle h;
     h.frame_ = __builtin_coro_promise(&p, alignof(Promise), true);
     return h;
@@ -159,7 +159,7 @@ struct coroutine_handle : coroutine_handle<void> {
    * promise address from the frame pointer.
    * @return Reference to the promise object
    */
-  __device__ Promise &promise() const {
+  __host__ __device__ Promise &promise() const {
     return *static_cast<Promise *>(
         __builtin_coro_promise(frame_, alignof(Promise), false));
   }
@@ -177,7 +177,7 @@ struct coroutine_handle<__noop_coro_promise> : coroutine_handle<void> {
    * Construct a handle to the builtin noop coroutine.
    * The noop coroutine's resume() and destroy() are no-ops.
    */
-  __device__ coroutine_handle() noexcept {
+  __host__ __device__ coroutine_handle() noexcept {
     frame_ = __builtin_coro_noop();
   }
 };
@@ -188,7 +188,7 @@ using noop_coroutine_handle = coroutine_handle<__noop_coro_promise>;
  * Get a handle to the noop coroutine.
  * @return A noop_coroutine_handle whose resume/destroy are no-ops
  */
-__device__ inline noop_coroutine_handle noop_coroutine() noexcept {
+__host__ __device__ inline noop_coroutine_handle noop_coroutine() noexcept {
   return noop_coroutine_handle{};
 }
 

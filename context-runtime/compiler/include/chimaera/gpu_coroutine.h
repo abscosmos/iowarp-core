@@ -38,11 +38,9 @@
  * @file gpu_coroutine.h
  * @brief C++20 coroutine support for CUDA device code, compiled with Clang.
  *
- * Provides chi::TaskResume, chi::RunContext, and chi::yield() -- the same
- * API surface as the CPU-side coroutine primitives in task.h.  Module code
- * written against this API is source-portable between CPU and GPU: the same
- * function returning chi::TaskResume and using co_await chi::yield() compiles
- * on both targets.
+ * Provides chi::gpu::TaskResume, chi::gpu::RunContext, and chi::gpu::yield()
+ * for GPU-side coroutine execution.  Types live in the chi::gpu namespace to
+ * coexist with the CPU-side chi::TaskResume / chi::RunContext from task.h.
  *
  * === Memory Allocation ===
  *
@@ -59,13 +57,14 @@
  */
 
 // Must be included first -- blocks libstdc++ <coroutine> and provides
-// GPU-compatible std::coroutine_handle with __device__ annotations.
+// GPU-compatible std::coroutine_handle with __host__ __device__ annotations.
 #include "chimaera/gpu_coroutine_handle.h"
 
 #include <cstdint>
 #include <cstddef>
 
 namespace chi {
+namespace gpu {
 
 /** Unsigned 32-bit integer (self-contained, no dependency on hshm types) */
 using u32 = uint32_t;
@@ -94,9 +93,9 @@ using GpuFreeFn = void (*)(void *ptr, void *alloc_ctx);
 // ============================================================================
 
 /**
- * GPU-side execution context, matching the chi::RunContext interface from
- * task.h.  Coroutine methods receive RunContext& as a parameter; the
- * promise_type captures it so that yield() can access it without TLS.
+ * GPU-side execution context for coroutine-based task methods.
+ * Coroutine methods receive RunContext& as a parameter; the promise_type
+ * captures it so that yield() can access it without TLS.
  *
  * Layout is GPU-friendly: no STL, no virtual functions, trivially copyable.
  */
@@ -170,27 +169,22 @@ struct RunContext {
  * Prepended to every coroutine frame allocation.  Stores the free function
  * and context so that promise_type::operator delete can deallocate without
  * access to the RunContext (which doesn't exist at delete time).
- *
- * When the runtime uses CHI_IPC, it stores the FullPtr data in
- * opaque_[0..23] so FreeBuffer can be called without recomputing offsets.
  */
 struct FrameHeader {
   GpuFreeFn free_fn_;
   void *alloc_ctx_;
-  /** Opaque storage for runtime allocator metadata (e.g., hipc::FullPtr).
-   *  The runtime's alloc/free callbacks interpret this data. */
+  /** Opaque storage for runtime allocator metadata (e.g., hipc::FullPtr). */
   alignas(8) char opaque_[24];
 };
 
 // ============================================================================
-// TaskResume -- the coroutine return type (same name as CPU side)
+// TaskResume -- the coroutine return type for GPU task methods
 // ============================================================================
 
 /**
- * Coroutine return type for GPU task methods, API-compatible with the
- * CPU-side chi::TaskResume.  A container method returning TaskResume is
- * a C++20 coroutine that can co_await chi::yield() or co_await another
- * TaskResume (nested coroutines).
+ * Coroutine return type for GPU task methods.  A container method returning
+ * TaskResume is a C++20 coroutine that can co_await chi::gpu::yield() or
+ * co_await another TaskResume (nested coroutines).
  */
 class TaskResume {
  public:
@@ -206,12 +200,6 @@ class TaskResume {
     __device__ promise_type()
         : run_ctx_(nullptr), caller_handle_(nullptr) {}
 
-    /**
-     * Allocate coroutine frame via RunContext's allocator.
-     * C++20 allows operator new to take the coroutine function parameters.
-     * A FrameHeader is prepended to store the free function for operator
-     * delete, which doesn't have access to the RunContext.
-     */
     template <typename... Args>
     __device__ static void *operator new(size_t size, RunContext &ctx,
                                          Args &&...) noexcept {
@@ -224,7 +212,6 @@ class TaskResume {
       return raw + sizeof(FrameHeader);
     }
 
-    /** Fallback for coroutines without RunContext (shouldn't happen). */
     __device__ static void *operator new(size_t size) noexcept {
       size_t total = sizeof(FrameHeader) + size;
       char *raw = static_cast<char *>(malloc(total));
@@ -235,10 +222,6 @@ class TaskResume {
       return raw + sizeof(FrameHeader);
     }
 
-    /**
-     * Free coroutine frame.  Recovers the FrameHeader stored before
-     * the frame and calls the allocator's free function.
-     */
     __device__ static void operator delete(void *ptr, size_t) {
       char *raw = static_cast<char *>(ptr) - sizeof(FrameHeader);
       auto *header = reinterpret_cast<FrameHeader *>(raw);
@@ -362,14 +345,6 @@ class TaskResume {
 // YieldAwaiter / yield() -- same API as CPU side
 // ============================================================================
 
-/**
- * Awaitable that yields control from a coroutine back to the worker.
- * Obtains the RunContext from the promise, matching the CPU-side pattern.
- *
- * Usage:
- *   co_await chi::yield();       // Yield, resume next iteration
- *   co_await chi::yield(10);     // Yield, skip 10 poll iterations
- */
 class YieldAwaiter {
  private:
   u32 spin_count_;
@@ -379,12 +354,6 @@ class YieldAwaiter {
 
   __device__ bool await_ready() const noexcept { return false; }
 
-  /**
-   * Suspend the coroutine and mark context as yielded.
-   * Clang type-erases the handle to coroutine_handle<void> for custom
-   * awaiters, so we recover the typed handle via from_address() to access
-   * the promise and its RunContext.
-   */
   __device__ void
   await_suspend(std::coroutine_handle<> handle) noexcept {
     auto typed = std::coroutine_handle<TaskResume::promise_type>::from_address(
@@ -421,14 +390,6 @@ struct CoroutineEntry {
       : handle_(nullptr), occupied_(false) {}
 };
 
-/**
- * Fixed-capacity scheduler for suspended coroutines.
- * One per GPU block.  Manages yield/resume lifecycle.
- *
- * Entries are allocated via RunContext::Alloc (CHI_IPC->AllocateBuffer
- * in the runtime, device malloc in standalone tests).  This avoids
- * placing ~1.5KB on the CUDA kernel stack.
- */
 class CoroutineScheduler {
  public:
   static constexpr u32 kMaxSuspended = 32;
@@ -442,11 +403,6 @@ class CoroutineScheduler {
   __host__ __device__ CoroutineScheduler()
       : entries_(nullptr), capacity_(0), count_(0) {}
 
-  /**
-   * Initialize with externally-allocated entries buffer.
-   * @param entries Pointer to array of CoroutineEntry (allocated by caller)
-   * @param capacity Number of entries in the array
-   */
   __host__ __device__ void Init(CoroutineEntry *entries, u32 capacity) {
     entries_ = entries;
     capacity_ = capacity;
@@ -457,11 +413,6 @@ class CoroutineScheduler {
     }
   }
 
-  /**
-   * Allocate entries from RunContext's allocator and initialize.
-   * @param ctx RunContext whose allocator to use
-   * @param capacity Number of entries (default kMaxSuspended)
-   */
   __device__ void Init(RunContext &ctx, u32 capacity = kMaxSuspended) {
     entries_ = static_cast<CoroutineEntry *>(
         ctx.Alloc(sizeof(CoroutineEntry) * capacity));
@@ -473,9 +424,6 @@ class CoroutineScheduler {
     }
   }
 
-  /**
-   * Free entries using RunContext's allocator.
-   */
   __device__ void Destroy(RunContext &ctx) {
     if (entries_) {
       ctx.Free(entries_);
@@ -533,6 +481,7 @@ class CoroutineScheduler {
   __host__ __device__ bool HasSuspended() const { return count_ > 0; }
 };
 
+}  // namespace gpu
 }  // namespace chi
 
 #endif  // CHIMAERA_COMPILER_INCLUDE_CHIMAERA_GPU_COROUTINE_H_

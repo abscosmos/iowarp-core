@@ -35,12 +35,12 @@
  * @file test_gpu_coroutine.cu
  * @brief Unit tests for GPU C++20 coroutines compiled with Clang.
  *
- * Uses the unified chi::TaskResume / chi::yield() API -- the same names
- * as the CPU-side coroutines in task.h.
+ * Uses the chi::gpu::TaskResume / chi::gpu::yield() API for GPU-side
+ * coroutines.
  *
  * Tests verify:
  * 1. Basic coroutine creation and completion
- * 2. Yielding with co_await chi::yield()
+ * 2. Yielding with co_await chi::gpu::yield()
  * 3. Nested coroutines via co_await TaskResume
  * 4. CoroutineScheduler with spin-based yield
  * 5. Multiple concurrent suspended coroutines
@@ -49,9 +49,9 @@
 #include <chimaera/gpu_coroutine.h>
 #include <cstdio>
 
-using chi::RunContext;
-using chi::CoroutineScheduler;
-using chi::TaskResume;
+using chi::gpu::RunContext;
+using chi::gpu::CoroutineScheduler;
+using chi::gpu::TaskResume;
 
 // ============================================================================
 // Test 1: Basic coroutine -- create, resume, complete
@@ -74,9 +74,9 @@ __global__ void test_basic(int *result) {
 
 __device__ TaskResume yielding_coro(RunContext &ctx, int *counter) {
   (*counter)++;  // 0 -> 1
-  co_await chi::yield();
+  co_await chi::gpu::yield();
   (*counter)++;  // 1 -> 2
-  co_await chi::yield();
+  co_await chi::gpu::yield();
   (*counter)++;  // 2 -> 3
   co_return;
 }
@@ -132,7 +132,7 @@ __global__ void test_nested_sync(int *result) {
 
 __device__ TaskResume spin_coro(RunContext &ctx, int *counter) {
   (*counter)++;
-  co_await chi::yield(2);  // Skip 2 poll iterations
+  co_await chi::gpu::yield(2);  // Skip 2 poll iterations
   (*counter)++;
   co_return;
 }
@@ -176,7 +176,7 @@ __global__ void test_scheduler(int *result) {
 
 __device__ TaskResume multi_coro(RunContext &ctx, int *val, int increment) {
   *val += increment;
-  co_await chi::yield();
+  co_await chi::gpu::yield();
   *val += increment;
   co_return;
 }

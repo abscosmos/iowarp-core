@@ -51,7 +51,8 @@ namespace gpu {
  * for incoming tasks, deserializes inputs, dispatches to GPU containers,
  * serializes outputs, and signals completion.
  *
- * No STL, no coroutines, no TLS — all HSHM_GPU_FUN.
+ * No STL, no TLS — all HSHM_GPU_FUN.  Container::Run() returns
+ * chi::gpu::TaskResume (a C++20 coroutine) enabling cooperative yielding.
  */
 class Worker {
  public:
@@ -61,7 +62,7 @@ class Worker {
   TaskQueue *gpu2gpu_queue_;         /**< GPU → GPU queue (GPU work orchestrator polls) */
   PoolManager *pool_mgr_;            /**< GPU-side container lookup table */
   char *queue_backend_base_;         /**< Base of queue backend for ShmPtr resolution */
-  GpuRunContext rctx_;               /**< Reused run context per task */
+  RunContext rctx_;               /**< Reused run context per task */
 
   /**
    * Initialize the worker with queue and pool manager pointers.
@@ -84,9 +85,9 @@ class Worker {
     queue_backend_base_ = queue_backend_base;
     is_running_ = true;
 #if HSHM_IS_GPU_COMPILER
-    rctx_ = GpuRunContext(blockIdx.x, threadIdx.x);
+    rctx_ = RunContext(blockIdx.x, threadIdx.x);
 #else
-    rctx_ = GpuRunContext(0, 0);
+    rctx_ = RunContext(0, 0);
 #endif
   }
 
@@ -205,8 +206,14 @@ class Worker {
     task_ptr.shm_.off_ = fshm->client_task_vaddr_;
     task_ptr.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
 
-    // Execute the task — results are written into task_ptr in-place
-    container->Run(method_id, task_ptr, rctx_);
+    // Execute the task — results are written into task_ptr in-place.
+    // Run() returns a TaskResume coroutine; resume it to execute the body,
+    // then let the destructor clean up the coroutine frame.
+    {
+      TaskResume coro = container->Run(method_id, task_ptr, rctx_);
+      coro.resume();
+      // TODO: handle yielding coroutines (coro.done() == false)
+    }
 
     // System-scope OR: fence + atomicOr_system ensures all results written
     // above are globally visible to CPU before FUTURE_COMPLETE is observed.
@@ -255,8 +262,12 @@ class Worker {
       return;
     }
 
-    // Step 3: Execute the task
-    container->Run(method_id, task_ptr, rctx_);
+    // Step 3: Execute the task (coroutine: resume + destroy)
+    {
+      TaskResume coro = container->Run(method_id, task_ptr, rctx_);
+      coro.resume();
+      // TODO: handle yielding coroutines (coro.done() == false)
+    }
 
     // Step 4: Serialize output into FutureShm ring buffer
     hshm::lbm::LbmContext out_ctx;

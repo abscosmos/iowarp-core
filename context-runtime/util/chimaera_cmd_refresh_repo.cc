@@ -613,8 +613,8 @@ class ChiModGenerator {
     oss << "\n";
 
     // Generate Run override
-    oss << "HSHM_GPU_FUN void Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,\n";
-    oss << "                       chi::gpu::GpuRunContext &rctx) override {\n";
+    oss << "HSHM_GPU_FUN chi::gpu::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,\n";
+    oss << "                       chi::gpu::RunContext &rctx) override {\n";
     if (!gpu_methods.empty()) {
       oss << "  switch (method) {\n";
       for (const auto& method : gpu_methods) {
@@ -630,6 +630,7 @@ class ChiModGenerator {
     } else {
       oss << "  (void)method; (void)task_ptr; (void)rctx;\n";
     }
+    oss << "  co_return;\n";
     oss << "}\n";
     oss << "\n";
 

@@ -25,7 +25,7 @@ namespace chimaera::bdev {
 // ---------------------------------------------------------------------------
 
 HSHM_GPU_FUN void GpuRuntime::Update(hipc::FullPtr<UpdateTask> task,
-                                      chi::gpu::GpuRunContext &rctx) {
+                                      chi::gpu::RunContext &rctx) {
   hbm_ptr_    = task->hbm_ptr_;
   pinned_ptr_ = task->pinned_ptr_;
   hbm_size_   = task->hbm_size_;
@@ -45,7 +45,7 @@ HSHM_GPU_FUN void GpuRuntime::Update(hipc::FullPtr<UpdateTask> task,
 
 HSHM_GPU_FUN void GpuRuntime::AllocateBlocks(
     hipc::FullPtr<AllocateBlocksTask> task,
-    chi::gpu::GpuRunContext &rctx) {
+    chi::gpu::RunContext &rctx) {
   chi::u64 req = task->size_;
   if (req == 0 || total_size_ == 0) {
     task->return_code_ = 0;
@@ -86,7 +86,7 @@ HSHM_GPU_FUN void GpuRuntime::AllocateBlocks(
 // ---------------------------------------------------------------------------
 
 HSHM_GPU_FUN void GpuRuntime::FreeBlocks(hipc::FullPtr<FreeBlocksTask> task,
-                                           chi::gpu::GpuRunContext &rctx) {
+                                           chi::gpu::RunContext &rctx) {
   // GPU bump allocator does not support per-block free.
   // Memory is reclaimed when the bdev pool is destroyed.
   task->return_code_ = 0;
@@ -98,7 +98,7 @@ HSHM_GPU_FUN void GpuRuntime::FreeBlocks(hipc::FullPtr<FreeBlocksTask> task,
 // ---------------------------------------------------------------------------
 
 HSHM_GPU_FUN void GpuRuntime::Write(hipc::FullPtr<WriteTask> task,
-                                     chi::gpu::GpuRunContext &rctx) {
+                                     chi::gpu::RunContext &rctx) {
   static constexpr chi::u32 kHbm    = static_cast<chi::u32>(BdevType::kHbm);
   static constexpr chi::u32 kPinned = static_cast<chi::u32>(BdevType::kPinned);
 
@@ -136,7 +136,7 @@ HSHM_GPU_FUN void GpuRuntime::Write(hipc::FullPtr<WriteTask> task,
 // ---------------------------------------------------------------------------
 
 HSHM_GPU_FUN void GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
-                                    chi::gpu::GpuRunContext &rctx) {
+                                    chi::gpu::RunContext &rctx) {
   static constexpr chi::u32 kHbm    = static_cast<chi::u32>(BdevType::kHbm);
   static constexpr chi::u32 kPinned = static_cast<chi::u32>(BdevType::kPinned);
 

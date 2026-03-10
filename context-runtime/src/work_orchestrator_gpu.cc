@@ -45,6 +45,10 @@
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 
+// Must be included first — blocks libstdc++ <coroutine> and provides
+// GPU-compatible std::coroutine_handle for Clang CUDA compilation.
+#include "chimaera/gpu_coroutine_handle.h"
+
 #include "chimaera/ipc_manager.h"
 #include "chimaera/gpu_work_orchestrator.h"
 #include "chimaera/gpu_container.h"

@@ -50,7 +50,7 @@ namespace chimaera::MOD_NAME {
  * @param rctx GPU run context (unused).
  */
 HSHM_GPU_FUN void GpuRuntime::GpuSubmit(hipc::FullPtr<GpuSubmitTask> task,
-                                          chi::gpu::GpuRunContext &rctx) {
+                                          chi::gpu::RunContext &rctx) {
   (void)rctx;
 #if HSHM_IS_GPU
   printf("[GpuSubmit] blk=%d thr=%d test_value_=%u gpu_id_=%u\n",
