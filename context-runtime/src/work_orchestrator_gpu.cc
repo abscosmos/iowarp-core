@@ -146,6 +146,7 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
   // Set GPU stack size. 32KB per thread for deep dispatch + serialization.
   // Only thread 0 per block runs the worker loop, so actual usage is modest.
   cudaDeviceSetLimit(cudaLimitStackSize, 32768);
+  cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 8 * 1024 * 1024);
 
   // Create dedicated stream
   stream_ = hshm::GpuApi::CreateStream();
@@ -154,9 +155,18 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
   blocks_ = blocks;
   threads_per_block_ = threads_per_block;
 
+  // Zero the heap_ready_ flag in the shared GPU heap backend so that
+  // non-zero blocks spin-wait until block 0 finishes initialization.
+  // heap_ready_ is the first field of _ThreadAllocator (after Allocator base).
+  if (gpu_info.gpu_heap_backend.data_ != nullptr) {
+    cudaMemset(gpu_info.gpu_heap_backend.data_, 0,
+               sizeof(hipc::ThreadAllocator));
+  }
+
   // Launch persistent GPU work orchestrator.
   // All threads call CHIMAERA_GPU_ORCHESTRATOR_INIT for correct memory layout,
   // then only block 0, thread 0 runs the worker loop; all others exit early.
+  // Block 0 initializes the shared GPU heap; others wait via WaitReady().
   HLOG(kInfo, "Launching GPU work orchestrator with {} blocks, {} threads/block",
        blocks, threads_per_block);
   chimaera_gpu_orchestrator<<<blocks, threads_per_block, 0,

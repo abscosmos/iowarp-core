@@ -178,7 +178,7 @@ class LocalSerialize {
   HSHM_INLINE_CROSS_FUN
   LocalSerialize &write_binary(const char *data, size_t size) {
     size_t off = data_.size();
-    data_.resize(off + size);
+    data_.resize_no_init(off + size);
     if (size > 0) {
       memcpy(data_.data() + off, data, size);
     }

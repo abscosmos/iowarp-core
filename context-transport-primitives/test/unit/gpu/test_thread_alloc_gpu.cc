@@ -55,25 +55,21 @@ using hshm::ipc::MemoryBackendId;
  */
 __global__ void ThreadAllocInitKernel(
     char *backend_base,
-    size_t total_capacity,
+    size_t data_capacity,
     hipc::MemoryBackendId backend_id,
-    int max_threads,
-    size_t thread_unit) {
+    int max_threads) {
 
   auto *alloc = reinterpret_cast<hipc::_ThreadAllocator*>(backend_base);
   new (alloc) hipc::_ThreadAllocator();
 
   hipc::MemoryBackend sub_backend;
   sub_backend.data_ = backend_base;
-  sub_backend.data_capacity_ = total_capacity;
+  sub_backend.data_capacity_ = data_capacity;
   sub_backend.id_ = backend_id;
 
+  size_t thread_unit = (data_capacity - sizeof(hipc::_ThreadAllocator)) /
+                       max_threads;
   alloc->shm_init(sub_backend, 0, max_threads, thread_unit);
-
-  // Pre-initialize all thread blocks so work kernel never hits the mutex path
-  for (int i = 0; i < max_threads; ++i) {
-    alloc->LazyInitThread(i);
-  }
 }
 
 /**
@@ -121,14 +117,15 @@ __global__ void ThreadAllocWorkKernel(
   int tid = static_cast<int>(blockIdx.x);
   auto *alloc = reinterpret_cast<hipc::_ThreadAllocator*>(backend_base);
 
-  // Verify the thread block was pre-initialized
-  auto *block = alloc->GetThreadBlock(tid);
-  if (block == nullptr || static_cast<int>(block->initialized_) != 1) {
+  // Lazily initialize this thread's partition
+  if (!alloc->LazyInitThread(tid)) {
     d_results[tid] = -1;
     return;
   }
 
-  // Allocate directly from the thread block's BuddyAllocator (bypass LazyInit)
+  auto *block = alloc->GetThreadBlock(tid);
+
+  // Allocate from this thread block's BuddyAllocator
   int count = 0;
   while (count < 100) {
     hipc::OffsetPtr<> off = block->alloc_.AllocateOffset(sizeof(TestObj128));
@@ -153,12 +150,114 @@ __global__ void ThreadAllocWorkKernel(
   d_results[tid] = count;
 }
 
+/**
+ * Cross-block free test: 2 blocks, each with 1 thread.
+ * Block 0 allocates kNumObjs objects and stores offsets in shared array.
+ * Block 1 frees them all via the ThreadAllocator's FreeOffsetNoNullCheck,
+ * which should route each free back to block 0's buddy allocator.
+ * Then block 0 re-allocates to prove its partition reclaimed the memory.
+ *
+ * d_offsets: pinned host array for passing offsets between kernels.
+ * d_results[0]: block 0 alloc count (phase 1)
+ * d_results[1]: block 1 free count
+ * d_results[2]: block 0 re-alloc count (phase 2)
+ * d_results[3]: data integrity check (0=ok, -2=corruption)
+ */
+static constexpr int kCrossBlockObjs = 32;
+
+/** Phase 1: block 0 allocates objects and stores offsets. */
+__global__ void CrossBlockAllocKernel(
+    char *backend_base,
+    unsigned long long *d_offsets,
+    int *d_results) {
+
+  int tid = static_cast<int>(blockIdx.x);
+  if (tid != 0) return;
+
+  auto *alloc = reinterpret_cast<hipc::_ThreadAllocator*>(backend_base);
+  if (!alloc->LazyInitThread(0)) {
+    d_results[0] = -1;
+    return;
+  }
+  auto *block = alloc->GetThreadBlock(0);
+
+  int count = 0;
+  for (int i = 0; i < kCrossBlockObjs; ++i) {
+    hipc::OffsetPtr<> off = block->alloc_.AllocateOffset(sizeof(TestObj128));
+    if (off.IsNull()) break;
+
+    auto *obj = reinterpret_cast<TestObj128*>(backend_base + off.load());
+    obj->Init(0, static_cast<hshm::u32>(i));
+    d_offsets[i] = off.load();
+    ++count;
+  }
+  d_results[0] = count;
+}
+
+/** Phase 2: block 1 frees block 0's allocations via ThreadAllocator. */
+__global__ void CrossBlockFreeKernel(
+    char *backend_base,
+    unsigned long long *d_offsets,
+    int num_to_free,
+    int *d_results) {
+
+  int tid = static_cast<int>(blockIdx.x);
+  if (tid != 1) return;
+
+  auto *alloc = reinterpret_cast<hipc::_ThreadAllocator*>(backend_base);
+
+  int count = 0;
+  for (int i = 0; i < num_to_free; ++i) {
+    hipc::OffsetPtr<> off(d_offsets[i]);
+    // Verify data before freeing
+    auto *obj = reinterpret_cast<TestObj128*>(backend_base + off.load());
+    if (!obj->Check(0, static_cast<hshm::u32>(i))) {
+      d_results[3] = -2;
+      return;
+    }
+    alloc->FreeOffsetNoNullCheck(off);
+    ++count;
+  }
+  d_results[1] = count;
+}
+
+/** Phase 3: block 0 re-allocates to prove memory was reclaimed. */
+__global__ void CrossBlockReallocKernel(
+    char *backend_base,
+    int *d_results) {
+
+  int tid = static_cast<int>(blockIdx.x);
+  if (tid != 0) return;
+
+  auto *alloc = reinterpret_cast<hipc::_ThreadAllocator*>(backend_base);
+  if (!alloc->LazyInitThread(0)) {
+    d_results[2] = -1;
+    return;
+  }
+  auto *block = alloc->GetThreadBlock(0);
+
+  int count = 0;
+  for (int i = 0; i < kCrossBlockObjs; ++i) {
+    hipc::OffsetPtr<> off = block->alloc_.AllocateOffset(sizeof(TestObj128));
+    if (off.IsNull()) break;
+
+    auto *obj = reinterpret_cast<TestObj128*>(backend_base + off.load());
+    obj->Init(99, static_cast<hshm::u32>(i));
+
+    if (!obj->Check(99, static_cast<hshm::u32>(i))) {
+      d_results[3] = -2;
+      return;
+    }
+
+    block->alloc_.FreeOffsetNoNullCheck(off);
+    ++count;
+  }
+  d_results[2] = count;
+}
+
 TEST_CASE("ThreadAllocatorGpu", "[gpu][allocator]") {
   SECTION("MultiBlockAllocFree") {
     constexpr int kNumBlocks = 16;
-    constexpr size_t kThreadUnit = 512u * 1024u;  // 512 KB per thread
-    // Need space for: allocator header + thread table + global buddy overhead
-    // + kNumBlocks * (TaThreadBlock + kThreadUnit)
     constexpr size_t kBackendSize = 64u * 1024u * 1024u;  // 64 MB
 
     cudaDeviceSetLimit(cudaLimitStackSize, 16384);
@@ -168,13 +267,12 @@ TEST_CASE("ThreadAllocatorGpu", "[gpu][allocator]") {
     REQUIRE(backend.shm_init(backend_id, kBackendSize,
                              "/test_thread_alloc_gpu", 0));
 
-    // Init kernel: set up the allocator
+    // Init kernel: set up the allocator (uses backend.data_capacity_)
     ThreadAllocInitKernel<<<1, 1>>>(
         backend.data_,
-        kBackendSize,
+        backend.data_capacity_,
         backend_id,
-        kNumBlocks,
-        kThreadUnit);
+        kNumBlocks);
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
     REQUIRE(cudaGetLastError() == cudaSuccess);
 
@@ -198,6 +296,64 @@ TEST_CASE("ThreadAllocatorGpu", "[gpu][allocator]") {
       REQUIRE(d_results[i] >= 10);
     }
 
+    cudaFreeHost(d_results);
+  }
+
+  SECTION("CrossBlockFree") {
+    constexpr int kNumBlocks = 4;
+    constexpr size_t kBackendSize = 64u * 1024u * 1024u;
+
+    cudaDeviceSetLimit(cudaLimitStackSize, 16384);
+
+    GpuShmMmap backend;
+    MemoryBackendId backend_id(100, 0);
+    REQUIRE(backend.shm_init(backend_id, kBackendSize,
+                             "/test_thread_alloc_crossfree", 0));
+
+    // Init kernel: set up allocator (uses backend.data_capacity_)
+    ThreadAllocInitKernel<<<1, 1>>>(
+        backend.data_, backend.data_capacity_, backend_id, kNumBlocks);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE(cudaGetLastError() == cudaSuccess);
+
+    // Allocate result + offset arrays (pinned host for GPU access)
+    int *d_results = nullptr;
+    cudaMallocHost(&d_results, 4 * sizeof(int));
+    REQUIRE(d_results != nullptr);
+    memset(d_results, 0, 4 * sizeof(int));
+
+    unsigned long long *d_offsets = nullptr;
+    cudaMallocHost(&d_offsets, kCrossBlockObjs * sizeof(unsigned long long));
+    REQUIRE(d_offsets != nullptr);
+    memset(d_offsets, 0, kCrossBlockObjs * sizeof(unsigned long long));
+
+    // Phase 1: block 0 allocates objects
+    CrossBlockAllocKernel<<<1, 1>>>(backend.data_, d_offsets, d_results);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE(cudaGetLastError() == cudaSuccess);
+    INFO("Phase 1 alloc count: " << d_results[0]);
+    REQUIRE(d_results[0] == kCrossBlockObjs);
+
+    // Phase 2: block 1 frees block 0's allocations
+    CrossBlockFreeKernel<<<2, 1>>>(
+        backend.data_, d_offsets, d_results[0], d_results);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE(cudaGetLastError() == cudaSuccess);
+    INFO("Phase 2 free count: " << d_results[1]);
+    INFO("Data integrity: " << d_results[3]);
+    REQUIRE(d_results[3] == 0);  // no corruption
+    REQUIRE(d_results[1] == kCrossBlockObjs);
+
+    // Phase 3: block 0 re-allocates — memory should be reclaimed
+    CrossBlockReallocKernel<<<1, 1>>>(backend.data_, d_results);
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    REQUIRE(cudaGetLastError() == cudaSuccess);
+    INFO("Phase 3 realloc count: " << d_results[2]);
+    INFO("Data integrity: " << d_results[3]);
+    REQUIRE(d_results[3] == 0);  // no corruption
+    REQUIRE(d_results[2] == kCrossBlockObjs);
+
+    cudaFreeHost(d_offsets);
     cudaFreeHost(d_results);
   }
 }

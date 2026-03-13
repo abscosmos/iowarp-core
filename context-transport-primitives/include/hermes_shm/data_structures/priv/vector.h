@@ -1359,6 +1359,20 @@ class vector {
   }
 
   /**
+   * Resize vector without initializing new elements.
+   * Use only when caller will immediately overwrite the new region.
+   *
+   * @param new_size New size
+   */
+  HSHM_INLINE_CROSS_FUN
+  void resize_no_init(size_type new_size) {
+    if (new_size > capacity_) {
+      reserve(new_size);
+    }
+    size_ = new_size;
+  }
+
+  /**
    * Resize vector to specified size.
    * Grows or shrinks the vector to the new size, default-initializing new elements.
    *

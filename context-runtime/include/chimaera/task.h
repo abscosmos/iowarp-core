@@ -457,6 +457,8 @@ struct FutureShm {
       4; /**< Task needs to be copied from client serialization */
   static constexpr u32 FUTURE_WAS_COPIED =
       8; /**< Task was already copied from client (don't re-copy) */
+  static constexpr u32 FUTURE_DEVICE_SCOPE =
+      16; /**< GPU→GPU path: use device-scope atomics (no system fence) */
 
   // Origin constants: how the client submitted this task
   static constexpr u32 FUTURE_CLIENT_SHM = 0; /**< Client used shared memory */

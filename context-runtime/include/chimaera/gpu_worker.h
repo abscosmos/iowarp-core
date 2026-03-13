@@ -138,11 +138,15 @@ class Worker {
   HSHM_GPU_FUN bool ProcessNewTask(TaskQueue *queue) {
     if (!queue) return false;
 
+    bool is_gpu2gpu = (queue == gpu2gpu_queue_);
+
     // Try to pop from lane (0, 0)
     auto &lane = queue->GetLane(0, 0);
     Future<Task> future;
-    if (!lane.Pop(future)) {
-      return false;
+    if (is_gpu2gpu) {
+      if (!lane.PopDevice(future)) return false;
+    } else {
+      if (!lane.Pop(future)) return false;
     }
 
     // Resolve FutureShm: queue-dependent resolution
@@ -152,7 +156,7 @@ class Worker {
     }
     size_t off = sptr.off_.load();
     FutureShm *fshm;
-    if (queue == cpu2gpu_queue_) {
+    if (!is_gpu2gpu) {
       // CPU→GPU (SendToGpu): relative offset from queue backend (pinned host)
       fshm = reinterpret_cast<FutureShm *>(queue_backend_base_ + off);
     } else {
@@ -169,14 +173,18 @@ class Worker {
     Container *container = pool_mgr_->GetContainer(pool_id);
     if (!container) {
       // No container registered — mark complete with no output
-      fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+      if (is_gpu2gpu) {
+        fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+      } else {
+        fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+      }
       return true;
     }
 
     if (fshm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT)) {
-      DispatchTask(fshm, container, method_id);
+      DispatchTask(fshm, container, method_id, is_gpu2gpu);
     } else {
-      DispatchTaskDirect(fshm, container, method_id);
+      DispatchTaskDirect(fshm, container, method_id, is_gpu2gpu);
     }
     return true;
   }
@@ -193,7 +201,7 @@ class Worker {
    * @param method_id Method to dispatch
    */
   HSHM_GPU_FUN void DispatchTaskDirect(FutureShm *fshm, Container *container,
-                                        u32 method_id) {
+                                        u32 method_id, bool is_gpu2gpu) {
     auto *ipc = CHI_IPC;
     auto *alloc = ipc->gpu_alloc_table_[ipc->GetGpuThreadId()];
 
@@ -207,22 +215,18 @@ class Worker {
     task_ptr.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
 
     // Execute the task — results are written into task_ptr in-place.
-    // Run() returns a TaskResume coroutine; resume it to execute the body,
-    // then let the destructor clean up the coroutine frame.
     {
       TaskResume coro = container->Run(method_id, task_ptr, rctx_);
       coro.resume();
-      // TODO: handle yielding coroutines (coro.done() == false)
     }
 
-    // System-scope OR: fence + atomicOr_system ensures all results written
-    // above are globally visible to CPU before FUTURE_COMPLETE is observed.
-    fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+    // Signal completion with appropriate scope
+    if (is_gpu2gpu) {
+      fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+    } else {
+      fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+    }
 
-    // Reset the orchestrator's arena. For the forward (in-place) path, the
-    // task lives in the client's memory (task_ptr is a UVA pointer, not in
-    // this arena), so there is no arena-allocated task to worry about.
-    // NOTE: safe only when one task is processed per thread at a time.
     alloc->Reset();
   }
 
@@ -234,7 +238,7 @@ class Worker {
    * @param method_id Method to dispatch
    */
   HSHM_GPU_FUN void DispatchTask(FutureShm *fshm, Container *container,
-                                  u32 method_id) {
+                                  u32 method_id, bool is_gpu2gpu) {
 #if !HSHM_IS_HOST
     // Step 1: Deserialize input from FutureShm ring buffer
     hshm::lbm::LbmContext in_ctx;
@@ -249,7 +253,11 @@ class Worker {
     container->gpu_alloc_ = alloc;
 
     LocalLoadTaskArchive load_ar(CHI_GPU_HEAP);
-    hshm::lbm::ShmTransport::Recv(load_ar, in_ctx);
+    if (is_gpu2gpu) {
+      hshm::lbm::ShmTransport::RecvDevice(load_ar, in_ctx);
+    } else {
+      hshm::lbm::ShmTransport::Recv(load_ar, in_ctx);
+    }
     load_ar.SetMsgType(LocalMsgType::kSerializeIn);
 
     // Step 2: Allocate and load the task via container
@@ -257,7 +265,11 @@ class Worker {
         container->LocalAllocLoadTask(method_id, load_ar);
 
     if (task_ptr.IsNull()) {
-      fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+      if (is_gpu2gpu) {
+        fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+      } else {
+        fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+      }
       alloc->Reset();
       return;
     }
@@ -276,13 +288,21 @@ class Worker {
     auto *heap = CHI_GPU_HEAP;
     LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeOut, heap);
     container->LocalSaveTask(method_id, save_ar, task_ptr);
-    hshm::lbm::ShmTransport::Send(save_ar, out_ctx);
+    if (is_gpu2gpu) {
+      hshm::lbm::ShmTransport::SendDevice(save_ar, out_ctx);
+    } else {
+      hshm::lbm::ShmTransport::Send(save_ar, out_ctx);
+    }
 
     // Step 5: Destroy task
     task_ptr.ptr_->~Task();
 
     // Step 6: Signal completion
-    fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+    if (is_gpu2gpu) {
+      fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+    } else {
+      fshm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+    }
 
     // Step 7: Reset arena
     alloc->Reset();

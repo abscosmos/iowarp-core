@@ -36,7 +36,6 @@
 
 #include "hermes_shm/memory/allocator/allocator.h"
 #include "hermes_shm/memory/allocator/buddy_allocator.h"
-#include "hermes_shm/thread/lock/mutex.h"
 
 namespace hshm::ipc {
 
@@ -61,7 +60,10 @@ struct TaThreadBlock {
   bool shm_init(const MemoryBackend &backend, size_t region_size) {
     size_t alloc_region_size = region_size - sizeof(TaThreadBlock);
     alloc_.shm_init(backend, alloc_region_size);
-    initialized_ = 1;
+    initialized_.store(1);
+#ifndef HSHM_IS_HOST
+    __threadfence();
+#endif
     return true;
   }
 };
@@ -70,10 +72,10 @@ struct TaThreadBlock {
  * Thread allocator with per-thread BuddyAllocator partitions.
  *
  * Designed for single-process, multi-threaded (or multi-GPU-block) use.
- * Each thread/block gets its own BuddyAllocator partition, lazily initialized
- * on first use. A global BuddyAllocator serves as the backing store from
- * which thread partitions are carved, and as a fallback when a thread
- * partition is exhausted.
+ * Each thread/block gets its own BuddyAllocator partition, lazily
+ * initialized on first use. Partitions are pre-allocated as a contiguous
+ * fixed-size table during shm_init — no dynamic allocation is needed
+ * at runtime.
  *
  * Thread ID mapping:
  *   CPU: caller-provided tid (e.g., thread_local counter)
@@ -81,25 +83,29 @@ struct TaThreadBlock {
  *
  * Memory layout (within the backend region):
  *   [_ThreadAllocator header]
- *   [OffsetPtr<TaThreadBlock>[max_threads_] table]   (allocated from global)
- *   [BuddyAllocator global heap ...]
- *   [TaThreadBlock partitions lazily carved from global heap ...]
+ *   [TaThreadBlock partition 0 (thread_unit_ bytes)]
+ *   [TaThreadBlock partition 1 (thread_unit_ bytes)]
+ *   ...
+ *   [TaThreadBlock partition N-1 (thread_unit_ bytes)]
  */
 class _ThreadAllocator : public Allocator {
  public:
+  hipc::atomic<int> heap_ready_;  /**< 0=not ready, 1=ready (grid-level sync) */
   int max_threads_;               /**< Fixed thread count (set at init) */
   size_t thread_unit_;            /**< Bytes per thread partition */
-  hshm::Mutex lock_;              /**< Protects global allocator + lazy init */
-  OffsetPtr<> thread_table_off_;  /**< Offset to OffsetPtr<TaThreadBlock>[max_threads_] */
-  BuddyAllocator alloc_;         /**< Global fallback allocator (MUST BE LAST) */
 
  public:
   HSHM_CROSS_FUN
   _ThreadAllocator()
-      : max_threads_(0), thread_unit_(0) {}
+      : heap_ready_(0), max_threads_(0), thread_unit_(0) {}
 
   /**
    * Initialize the thread allocator.
+   *
+   * Divides the region after the header into max_threads fixed-size
+   * partitions of thread_unit bytes each. No allocation happens here —
+   * each partition's BuddyAllocator is lazily initialized on first use
+   * by the owning thread.
    *
    * @param backend Memory backend
    * @param region_size Size of region (0 = entire backend)
@@ -117,60 +123,43 @@ class _ThreadAllocator : public Allocator {
     }
 
     SetBackend(backend);
+    this_ = reinterpret_cast<char *>(this) -
+            reinterpret_cast<char *>(backend.data_);
     alloc_header_size_ = sizeof(_ThreadAllocator);
     data_start_ = sizeof(_ThreadAllocator);
     region_size_ = region_size;
     max_threads_ = max_threads;
-    thread_unit_ = thread_unit;
-    lock_.Init();
+    // Align thread_unit down to 16 bytes so partition starts stay aligned
+    // for GPU atomics (atomicExch requires 4-byte alignment minimum)
+    thread_unit_ = thread_unit & ~(size_t)15;
 
-    // Initialize global buddy allocator over remaining space
-    size_t available_size = region_size - sizeof(_ThreadAllocator);
-    alloc_.shm_init(backend, available_size);
-
-    // Allocate thread table from global allocator
-    size_t table_size = sizeof(OffsetPtr<TaThreadBlock>) * max_threads_;
-    OffsetPtr<> table_off = alloc_.AllocateOffset(table_size);
-    if (table_off.IsNull()) {
-      return false;
-    }
-    thread_table_off_ = table_off;
-
-    // Null-init all table entries
-    auto *table = reinterpret_cast<OffsetPtr<TaThreadBlock>*>(
-        GetBackendData() + table_off.load());
+    // Zero-init all partition headers so initialized_ starts at 0
+    char *base = GetBackendData();
     for (int i = 0; i < max_threads_; ++i) {
-      table[i] = OffsetPtr<TaThreadBlock>::GetNull();
+      char *part = base + sizeof(_ThreadAllocator) +
+                   static_cast<size_t>(i) * thread_unit_;
+      auto *block = reinterpret_cast<TaThreadBlock *>(part);
+      block->initialized_.store(0);
     }
 
     return true;
   }
 
   /**
-   * Get the thread table pointer array.
-   */
-  HSHM_INLINE_CROSS_FUN
-  OffsetPtr<TaThreadBlock>* GetThreadTable() {
-    return reinterpret_cast<OffsetPtr<TaThreadBlock>*>(
-        GetBackendData() + thread_table_off_.load());
-  }
-
-  /**
    * Get a TaThreadBlock by tid.
+   * O(1) — computed directly from the fixed partition layout.
    */
   HSHM_INLINE_CROSS_FUN
   TaThreadBlock* GetThreadBlock(int tid) {
-    auto *table = GetThreadTable();
-    if (table[tid].IsNull()) {
-      return nullptr;
-    }
-    return reinterpret_cast<TaThreadBlock*>(
-        GetBackendData() + table[tid].load());
+    char *base = GetBackendData();
+    char *part = base + sizeof(_ThreadAllocator) +
+                 static_cast<size_t>(tid) * thread_unit_;
+    return reinterpret_cast<TaThreadBlock *>(part);
   }
 
   /**
-   * Lazily initialize thread partition for the given tid.
-   * Thread-safe via double-checked locking with mutex.
+   * Lazily initialize the thread partition for the given tid.
+   * No mutex needed — each tid is only initialized by its owning thread.
    */
   HSHM_CROSS_FUN
   bool LazyInitThread(int tid) {
@@ -178,40 +167,15 @@ class _ThreadAllocator : public Allocator {
       return false;
     }
 
-    // Fast path: already initialized
     TaThreadBlock *block = GetThreadBlock(tid);
-    if (block != nullptr && static_cast<int>(block->initialized_) == 1) {
+    if (block->initialized_.load() == 1) {
       return true;
     }
 
-    // Slow path: lock and initialize
-    ScopedMutex scoped_lock(lock_, 0);
-
-    // Double-check after acquiring lock
-    block = GetThreadBlock(tid);
-    if (block != nullptr && static_cast<int>(block->initialized_) == 1) {
-      return true;
-    }
-
-    // Allocate a region for the TaThreadBlock + its BuddyAllocator data
-    FullPtr<TaThreadBlock> tblock_ptr =
-        alloc_.AllocateRegion<TaThreadBlock>(thread_unit_);
-    if (tblock_ptr.IsNull()) {
-      return false;
-    }
-
-    // Initialize the thread block's BuddyAllocator
+    // Initialize in-place
+    new (block) TaThreadBlock();
     MemoryBackend backend = GetBackend();
-    tblock_ptr.ptr_->shm_init(backend, thread_unit_);
-
-    // Store in table
-    auto *table = GetThreadTable();
-    table[tid] = OffsetPtr<TaThreadBlock>(tblock_ptr.shm_.off_.load());
-
-#ifndef HSHM_IS_HOST
-    __threadfence();
-#endif
-
+    block->shm_init(backend, thread_unit_);
     return true;
   }
 
@@ -231,8 +195,6 @@ class _ThreadAllocator : public Allocator {
 
   /**
    * Allocate memory with auto-detected tid.
-   * On GPU, automatically uses blockIdx.x % max_threads_.
-   * On CPU, defaults to tid=0.
    */
   HSHM_CROSS_FUN
   OffsetPtr<> AllocateOffset(size_t size) {
@@ -241,31 +203,14 @@ class _ThreadAllocator : public Allocator {
 
   /**
    * Allocate memory with explicit tid.
-   *
-   * @param size Size in bytes
-   * @param tid Thread/block ID
-   * @return Offset pointer to allocated memory
    */
   HSHM_CROSS_FUN
   OffsetPtr<> AllocateOffset(size_t size, int tid) {
     if (!LazyInitThread(tid)) {
       return OffsetPtr<>::GetNull();
     }
-
-    // Try thread-local allocator first (lock-free for single writer)
-    TaThreadBlock *block = GetThreadBlock(tid);
-    if (block != nullptr) {
-      OffsetPtr<> ptr = block->alloc_.AllocateOffset(size);
-      if (!ptr.IsNull()) {
-        return ptr;
-      }
-    }
-
-    // Fallback: allocate from global allocator (with lock)
-    ScopedMutex scoped_lock(lock_, 0);
-    return alloc_.AllocateOffset(size);
+    return GetThreadBlock(tid)->alloc_.AllocateOffset(size);
   }
-
 
   /**
    * Reallocate memory (not supported — allocate new + copy manually).
@@ -280,34 +225,24 @@ class _ThreadAllocator : public Allocator {
   /**
    * Free memory.
    *
-   * Determines which thread block owns the offset by address range,
-   * and frees to that allocator. Falls back to global if not found.
+   * Computes the owning thread partition in O(1) by address arithmetic,
+   * then frees to that partition's BuddyAllocator.
    */
   HSHM_CROSS_FUN
   void FreeOffsetNoNullCheck(OffsetPtr<> p) {
     char *base = GetBackendData();
     char *ptr_addr = base + p.load();
-
-    // Check each thread block's range
-    auto *table = GetThreadTable();
-    for (int i = 0; i < max_threads_; ++i) {
-      if (table[i].IsNull()) continue;
-      TaThreadBlock *block = reinterpret_cast<TaThreadBlock*>(
-          base + table[i].load());
-      if (static_cast<int>(block->initialized_) != 1) continue;
-      if (block->alloc_.ContainsPtr(ptr_addr)) {
-        block->alloc_.FreeOffsetNoNullCheck(p);
-        return;
-      }
+    char *partitions_base = base + sizeof(_ThreadAllocator);
+    size_t offset_in_partitions =
+        static_cast<size_t>(ptr_addr - partitions_base);
+    int owner = static_cast<int>(offset_in_partitions / thread_unit_);
+    if (owner >= 0 && owner < max_threads_) {
+      GetThreadBlock(owner)->alloc_.FreeOffsetNoNullCheck(p);
     }
-
-    // Not in any thread block — free to global
-    ScopedMutex scoped_lock(lock_, 0);
-    alloc_.FreeOffsetNoNullCheck(p);
   }
 
   /**
-   * Free memory with explicit offset (calls FreeOffsetNoNullCheck).
+   * Free memory (null-safe wrapper).
    */
   HSHM_CROSS_FUN
   void FreeOffset(OffsetPtr<> p) {
@@ -323,6 +258,28 @@ class _ThreadAllocator : public Allocator {
   template <typename HEADER_T>
   HSHM_INLINE_CROSS_FUN HEADER_T *GetSharedHeader() {
     return nullptr;
+  }
+
+  /**
+   * Mark the allocator as ready (grid-level sync).
+   * Call after shm_init completes on the initializing thread.
+   */
+  HSHM_CROSS_FUN void MarkReady() {
+    heap_ready_.store(1);
+#ifndef HSHM_IS_HOST
+    __threadfence();
+#endif
+  }
+
+  /**
+   * Spin-wait until the allocator is marked ready.
+   * Used by non-initializing GPU blocks to wait for block 0.
+   */
+  HSHM_CROSS_FUN void WaitReady() {
+#ifndef HSHM_IS_HOST
+    while (heap_ready_.load() != 1) {}
+    __threadfence();
+#endif
   }
 };
 

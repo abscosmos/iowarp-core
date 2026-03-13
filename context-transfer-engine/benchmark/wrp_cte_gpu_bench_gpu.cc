@@ -82,8 +82,9 @@ __global__ void gpu_bench_kernel(
     GpuBenchParams params,
     char **block_put_buffers,
     char **block_get_buffers,
-    GpuBenchResult *results) {
-  CHIMAERA_GPU_INIT(gpu_info);
+    GpuBenchResult *results,
+    chi::u32 num_blocks) {
+  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
 
   if (threadIdx.x != 0) return;
 
@@ -165,9 +166,12 @@ extern "C" int run_gpu_bench(
     GpuBenchResult *results) {
 
   // Create GPU memory backend for client kernel allocations
+  // Scale with num_blocks: 4 MB per block (min 64 MB)
   hipc::MemoryBackendId backend_id(20, 0);
   hipc::GpuShmMmap gpu_backend;
-  size_t backend_size = static_cast<size_t>(64) * 1024 * 1024;  // 64 MB
+  size_t backend_size = std::max(
+      static_cast<size_t>(64) * 1024 * 1024,
+      static_cast<size_t>(num_blocks) * 4 * 1024 * 1024);
   if (!gpu_backend.shm_init(backend_id, backend_size,
                              "/cte_gpu_bench", 0))
     return -100;
@@ -175,10 +179,12 @@ extern "C" int run_gpu_bench(
   CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
-  // GPU heap for serialization
+  // GPU heap for serialization: 1 MB per block (min 16 MB)
   hipc::MemoryBackendId heap_id(21, 0);
   hipc::GpuMalloc gpu_heap;
-  size_t heap_size = static_cast<size_t>(16) * 1024 * 1024;  // 16 MB
+  size_t heap_size = std::max(
+      static_cast<size_t>(16) * 1024 * 1024,
+      static_cast<size_t>(num_blocks) * 1024 * 1024);
   if (!gpu_heap.shm_init(heap_id, heap_size, "", 0))
     return -102;
 
@@ -217,13 +223,17 @@ extern "C" int run_gpu_bench(
   params.io_count = io_count;
   params.mode = mode;
 
+  // Set GPU stack size for deep serialization paths (PutGet needs more)
+  cudaDeviceSetLimit(cudaLimitStackSize, 32768);
+
   // Pause orchestrator, launch client kernel, resume
   CHI_IPC->PauseGpuOrchestrator();
 
   void *stream = hshm::GpuApi::CreateStream();
   gpu_bench_kernel<<<num_blocks, num_threads, 0,
       static_cast<cudaStream_t>(stream)>>>(
-      gpu_info, params, d_put_ptrs, d_get_ptrs, results);
+      gpu_info, params, d_put_ptrs, d_get_ptrs, results,
+      static_cast<chi::u32>(num_blocks));
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {

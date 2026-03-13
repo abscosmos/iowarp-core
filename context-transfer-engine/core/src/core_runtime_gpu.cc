@@ -165,41 +165,41 @@ struct GpuMetadata {
 // Helper: build compound key "major.minor.blob_name"
 //==============================================================================
 
+/**
+ * Append the decimal digits of a u32 to a priv::string.
+ */
+HSHM_GPU_FUN static void AppendU32(chi::priv::string &s, chi::u32 val) {
+  if (val == 0) {
+    s.push_back('0');
+    return;
+  }
+  // Find digit count
+  int ndigits = 0;
+  chi::u32 tmp = val;
+  while (tmp > 0) { ++ndigits; tmp /= 10; }
+  // Append digits in forward order
+  size_t start = s.size();
+  s.resize(start + ndigits);
+  for (int i = ndigits - 1; i >= 0; --i) {
+    s[start + i] = '0' + static_cast<char>(val % 10);
+    val /= 10;
+  }
+}
+
 HSHM_GPU_FUN static chi::priv::string MakeCompoundKey(
     const TagId &tag_id, const char *blob_name, int blob_name_len) {
-  // Build into a stack buffer then construct string
-  char buf[128];
-  int pos = 0;
-
-  // Convert major to string
-  chi::u32 major = tag_id.major_;
-  if (major == 0) {
-    buf[pos++] = '0';
-  } else {
-    char tmp[16]; int tlen = 0;
-    while (major > 0) { tmp[tlen++] = '0' + (major % 10); major /= 10; }
-    for (int i = tlen - 1; i >= 0; --i) buf[pos++] = tmp[i];
+  // Build directly into heap-backed priv::string (no stack buffers)
+  chi::priv::string ck(CHI_PRIV_ALLOC);
+  // Reserve: up to 10+1+10+1+blob_name_len
+  ck.reserve(22 + blob_name_len);
+  AppendU32(ck, tag_id.major_);
+  ck.push_back('.');
+  AppendU32(ck, tag_id.minor_);
+  ck.push_back('.');
+  for (int i = 0; i < blob_name_len; ++i) {
+    ck.push_back(blob_name[i]);
   }
-  buf[pos++] = '.';
-
-  // Convert minor to string
-  chi::u32 minor = tag_id.minor_;
-  if (minor == 0) {
-    buf[pos++] = '0';
-  } else {
-    char tmp[16]; int tlen = 0;
-    while (minor > 0) { tmp[tlen++] = '0' + (minor % 10); minor /= 10; }
-    for (int i = tlen - 1; i >= 0; --i) buf[pos++] = tmp[i];
-  }
-  buf[pos++] = '.';
-
-  // Append blob_name
-  for (int i = 0; i < blob_name_len && pos < 127; ++i) {
-    buf[pos++] = blob_name[i];
-  }
-  buf[pos] = '\0';
-
-  return chi::priv::string(CHI_PRIV_ALLOC, buf);
+  return ck;
 }
 
 //==============================================================================

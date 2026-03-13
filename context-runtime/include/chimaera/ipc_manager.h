@@ -262,7 +262,8 @@ class IpcManager {
    * @param num_threads Total number of GPU threads in this block
    */
   HSHM_CROSS_FUN
-  void ClientInitGpu(IpcManagerGpuInfo &gpu_info, int num_threads) {
+  void ClientInitGpu(IpcManagerGpuInfo &gpu_info, int num_threads,
+                     int num_blocks = 1) {
     // Store queue pointers
     gpu2gpu_queue_ = gpu_info.gpu2gpu_queue;
     gpu2gpu_queue_base_ = gpu_info.gpu2gpu_queue_base;
@@ -287,11 +288,13 @@ class IpcManager {
     if (gpu_info.gpu_heap_backend.data_ != nullptr) {
       gpu_heap_backend_ = gpu_info.gpu_heap_backend;
       if (gpu_info.skip_heap_init) {
-        // Resume path: ThreadAllocator persists across pause/resume.
+        // Skip path (resume or non-initializing block):
+        // ThreadAllocator already initialized, just set the pointer and wait.
         gpu_heap_alloc_ =
             reinterpret_cast<CHI_GPU_HEAP_T *>(gpu_heap_backend_.data_);
+        gpu_heap_alloc_->WaitReady();
       } else {
-        InitHeapAllocator(gpu_heap_backend_, num_threads, &gpu_heap_alloc_);
+        InitHeapAllocator(gpu_heap_backend_, num_blocks, &gpu_heap_alloc_);
       }
     }
   }
@@ -357,15 +360,14 @@ class IpcManager {
     sub_backend.data_capacity_ = data_capacity;
     sub_backend.id_ = backend.id_;
 
-    // Calculate per-thread partition size (leave room for allocator header + table)
-    size_t overhead = sizeof(CHI_GPU_HEAP_T) + 4096;  // header + table slack
+    // Calculate per-thread partition size (leave room for allocator header)
+    size_t overhead = sizeof(CHI_GPU_HEAP_T);
     size_t thread_unit = (data_capacity - overhead) / num_threads;
     alloc->shm_init(sub_backend, 0, num_threads, thread_unit);
 
-    // Pre-initialize all thread partitions so GPU kernels don't need the mutex
-    for (int i = 0; i < num_threads; ++i) {
-      alloc->LazyInitThread(i);
-    }
+    // Signal that the allocator layout is ready (grid-level sync).
+    // Each thread/block lazily initializes its own partition on first use.
+    alloc->MarkReady();
 
     *alloc_out = alloc;
   }
@@ -2527,8 +2529,13 @@ HSHM_GPU_FUN inline hipc::ThreadAllocator *GetPrivAllocGpu() {
       block_info.gpu2cpu_backend.data_capacity_ = per_block2;                  \
     }                                                                           \
     /* gpu_heap_backend is NOT split per-block: ThreadAllocator handles */      \
-    /* per-block partitioning internally via blockIdx.x % max_threads_ */      \
-    g_ipc_manager_ptr->ClientInitGpu(block_info, num_threads);                 \
+    /* per-block partitioning internally via blockIdx.x % max_threads_.  */    \
+    /* Only block 0 initializes the shared heap; others spin-wait via   */    \
+    /* WaitReady() in ClientInitGpu's skip_heap_init path.              */    \
+    if (blockIdx.x != 0) {                                                     \
+      block_info.skip_heap_init = true;                                        \
+    }                                                                           \
+    g_ipc_manager_ptr->ClientInitGpu(block_info, num_threads, num_blocks);     \
   }                                                                             \
   __syncthreads();                                                              \
   chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr

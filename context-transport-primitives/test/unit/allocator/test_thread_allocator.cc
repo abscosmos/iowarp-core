@@ -43,12 +43,12 @@ using hipc::ThreadAllocator;
 
 static ThreadAllocator* MakeThreadAllocator(hipc::PosixMmap &backend,
                                              size_t heap_size,
-                                             int max_threads = 32,
-                                             size_t thread_unit = 1024 * 1024) {
-  size_t alloc_size = sizeof(ThreadAllocator);
-  backend.shm_init(hipc::MemoryBackendId(0, 0), alloc_size + heap_size);
+                                             int max_threads = 32) {
+  size_t total_size = sizeof(ThreadAllocator) + heap_size;
+  backend.shm_init(hipc::MemoryBackendId(0, 0), total_size);
   auto *alloc = backend.Cast<ThreadAllocator>();
   new (alloc) ThreadAllocator();
+  size_t thread_unit = (total_size - sizeof(ThreadAllocator)) / max_threads;
   alloc->shm_init(backend, 0, max_threads, thread_unit);
   return alloc;
 }
@@ -105,8 +105,7 @@ TEST_CASE("ThreadAllocator - MultiThreadedAlloc", "[ThreadAllocator][multithread
   hipc::PosixMmap backend;
   size_t heap_size = 256 * 1024 * 1024;  // 256 MB
   int num_threads = 8;
-  auto *alloc = MakeThreadAllocator(backend, heap_size, num_threads,
-                                     4 * 1024 * 1024);  // 4MB per thread
+  auto *alloc = MakeThreadAllocator(backend, heap_size, num_threads);
   // Access the core allocator for the 2-arg AllocateOffset
   auto *core = static_cast<hipc::_ThreadAllocator*>(alloc);
 
@@ -148,38 +147,33 @@ TEST_CASE("ThreadAllocator - LazyInit", "[ThreadAllocator]") {
   hipc::PosixMmap backend;
   size_t heap_size = 64 * 1024 * 1024;  // 64 MB
   int max_threads = 8;
-  auto *alloc = MakeThreadAllocator(backend, heap_size, max_threads,
-                                     2 * 1024 * 1024);
+  auto *alloc = MakeThreadAllocator(backend, heap_size, max_threads);
+
+  auto *core = static_cast<hipc::_ThreadAllocator*>(alloc);
 
   // Initially no thread blocks should be initialized
   for (int i = 0; i < max_threads; ++i) {
-    auto *block = alloc->GetThreadBlock(i);
-    REQUIRE(block == nullptr);
+    REQUIRE(core->GetThreadBlock(i)->initialized_.load() == 0);
   }
-
-  auto *core = static_cast<hipc::_ThreadAllocator*>(alloc);
 
   // Allocate using tid=0 — only thread 0 should be initialized
   auto ptr = core->AllocateOffset(256, 0);
   REQUIRE(!ptr.IsNull());
-  REQUIRE(core->GetThreadBlock(0) != nullptr);
   REQUIRE(core->GetThreadBlock(0)->initialized_.load() == 1);
 
   // Other threads still uninitialized
   for (int i = 1; i < max_threads; ++i) {
-    auto *block = core->GetThreadBlock(i);
-    REQUIRE(block == nullptr);
+    REQUIRE(core->GetThreadBlock(i)->initialized_.load() == 0);
   }
 
   // Allocate using tid=3
   auto ptr2 = core->AllocateOffset(256, 3);
   REQUIRE(!ptr2.IsNull());
-  REQUIRE(core->GetThreadBlock(3) != nullptr);
   REQUIRE(core->GetThreadBlock(3)->initialized_.load() == 1);
 
   // tid=1, 2, 4..7 still uninitialized
-  REQUIRE(core->GetThreadBlock(1) == nullptr);
-  REQUIRE(core->GetThreadBlock(2) == nullptr);
+  REQUIRE(core->GetThreadBlock(1)->initialized_.load() == 0);
+  REQUIRE(core->GetThreadBlock(2)->initialized_.load() == 0);
 
   core->FreeOffset(ptr);
   core->FreeOffset(ptr2);

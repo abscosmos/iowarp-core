@@ -560,6 +560,32 @@ class ring_buffer : public ShmContainer<AllocT> {
   }
 
   /**
+   * Pop with device-scope atomics for GPU→GPU communication.
+   * Use when both producer and consumer are on the same GPU device.
+   * Device-scope atomics are ~10x faster than system-scope.
+   */
+  HSHM_CROSS_FUN
+  bool PopDevice(T& val) {
+    u64 head = head_.load();
+    u64 tail = tail_.load();
+    if (head >= tail) {
+      return false;
+    }
+    size_t idx = head % queue_.size();
+    entry_type& entry = queue_[idx];
+    if (!entry.IsReady()) {
+      return false;
+    }
+    u32 expected = 1u;
+    if (!entry.flags_.bits_.compare_exchange_strong(expected, 0u)) {
+      return false;
+    }
+    val = entry.data_;
+    head_.store(head + 1);
+    return true;
+  }
+
+  /**
    * Try to pop an element (alias for Pop)
    *
    * @param val Reference to store the popped value

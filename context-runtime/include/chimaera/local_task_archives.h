@@ -183,7 +183,13 @@ class LocalSaveTaskArchive : public LocalLbmBase {
         task_infos_(CHI_PRIV_ALLOC),
         msg_type_(msg_type),
         buffer_(CHI_PRIV_ALLOC),
-        serializer_(buffer_) {}
+        serializer_(buffer_) {
+    // Pre-allocate to avoid repeated allocator calls during serialization.
+    // Without this, the vector grows from 0 through ~8 capacity doublings,
+    // each triggering a BuddyAllocator alloc+free on GPU (~1.5M clocks).
+    buffer_.reserve(256);
+    task_infos_.reserve(4);
+  }
 
   /**
    * Constructor with external buffer and allocator.
@@ -196,7 +202,10 @@ class LocalSaveTaskArchive : public LocalLbmBase {
         task_infos_(alloc),
         msg_type_(msg_type),
         buffer_(alloc),
-        serializer_(buffer_) {}
+        serializer_(buffer_) {
+    buffer_.reserve(256);
+    task_infos_.reserve(4);
+  }
 
   /** Move constructor */
   HSHM_CROSS_FUN LocalSaveTaskArchive(LocalSaveTaskArchive &&other) noexcept
@@ -445,7 +454,10 @@ class LocalLoadTaskArchive : public LocalLbmBase {
         owned_data_(CHI_PRIV_ALLOC),
         data_(nullptr),
         deserializer_(GetEmptyBuffer()),
-        current_task_index_(0) {}
+        current_task_index_(0) {
+    owned_data_.reserve(256);
+    task_infos_.reserve(4);
+  }
 
   /**
    * Constructor with explicit allocator pointer.
@@ -458,7 +470,10 @@ class LocalLoadTaskArchive : public LocalLbmBase {
         owned_data_(alloc),
         data_(nullptr),
         deserializer_(GetEmptyBuffer()),
-        current_task_index_(0) {}
+        current_task_index_(0) {
+    owned_data_.reserve(256);
+    task_infos_.reserve(4);
+  }
 
   /**
    * Constructor from serialized data (uses chi::priv::vector)
