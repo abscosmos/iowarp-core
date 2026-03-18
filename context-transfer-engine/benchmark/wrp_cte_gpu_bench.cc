@@ -32,25 +32,24 @@
  */
 
 /**
- * CTE GPU Benchmark Application
+ * CTE GPU Benchmark — CPU driver
  *
- * Measures the performance of GPU-initiated PutBlob/GetBlob operations.
- * GPU client kernels create tasks using the Client API and submit them
- * via the GPU->GPU queue. The GPU orchestrator dispatches to GpuRuntime.
+ * Measures the performance of GPU-initiated PutBlob operations through CTE.
+ * Supports three modes:
+ *   putblob     — GPU client → CTE via GPU→CPU path (ToLocalCpu)
+ *   putblob_gpu — GPU client → CTE via GPU-local path (Local)
+ *   direct      — GPU kernel writes directly to pinned host memory (baseline)
  *
  * Usage:
- *   wrp_cte_gpu_bench <test_case> <client_blocks> <client_threads>
- *                     <runtime_blocks> <runtime_threads>
- *                     <io_size> <io_count>
+ *   wrp_cte_gpu_bench [options]
  *
- * Parameters:
- *   test_case:       Put, Get, or PutGet
- *   client_blocks:   Number of GPU blocks for client kernels
- *   client_threads:  Threads per block for client kernels (only thread 0 works)
- *   runtime_blocks:  Number of GPU blocks for the orchestrator
- *   runtime_threads: Threads per block for the orchestrator
- *   io_size:         Size of each I/O (supports k/K, m/M, g/G suffixes)
- *   io_count:        Number of I/O operations per client block
+ * Options:
+ *   --test-case <case>       putblob, putblob_gpu, or direct (default: putblob)
+ *   --rt-blocks <N>          GPU runtime orchestrator blocks (default: 1)
+ *   --rt-threads <N>         GPU runtime threads per block (default: 32)
+ *   --client-blocks <N>      GPU client kernel blocks (default: 1)
+ *   --client-threads <N>     GPU client kernel threads per block (default: 32)
+ *   --io-size <bytes>        Total I/O size (default: 64M, supports k/m/g)
  */
 
 #include <chimaera/chimaera.h>
@@ -59,126 +58,121 @@
 #include <hermes_shm/util/logging.h>
 #include <hermes_shm/util/gpu_api.h>
 
-#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <iomanip>
-#include <iostream>
 #include <string>
 #include <thread>
-#include <vector>
 
-/**
- * Per-block result from the GPU kernel.
- */
-struct GpuBenchResult {
-  int status;
-  long long elapsed_ns;  // GPU clock cycles (not wall-clock ns)
-  long long send_clocks;
-  long long wait_clocks;
-};
+using namespace std::chrono_literals;
 
-extern "C" int run_gpu_bench(
-    chi::PoolId pool_id,
+extern "C" int run_cte_gpu_bench_putblob(
+    chi::PoolId cte_pool_id,
     wrp_cte::core::TagId tag_id,
-    chi::u64 io_size,
-    chi::u64 preallocate,
-    int io_count,
-    int mode,
-    int num_blocks,
-    int num_threads,
-    GpuBenchResult *results);
+    chi::u32 rt_blocks,
+    chi::u32 rt_threads,
+    chi::u32 client_blocks,
+    chi::u32 client_threads,
+    chi::u64 total_bytes,
+    bool to_cpu,
+    float *out_elapsed_ms);
+
+extern "C" int run_cte_gpu_bench_direct(
+    chi::u32 client_blocks,
+    chi::u32 client_threads,
+    chi::u64 total_bytes,
+    float *out_elapsed_ms);
+
+extern "C" int run_cte_gpu_bench_cudamemcpy(
+    chi::u64 total_bytes,
+    float *out_elapsed_ms);
+
+enum class TestCase { kPutBlob, kPutBlobGpu, kDirect, kCudaMemcpy };
+
+struct BenchConfig {
+  TestCase test_case = TestCase::kPutBlob;
+  chi::u32 rt_blocks = 1;
+  chi::u32 rt_threads = 32;
+  chi::u32 client_blocks = 1;
+  chi::u32 client_threads = 32;
+  chi::u64 total_bytes = 64 * 1024 * 1024;
+};
 
 namespace {
 
-chi::u64 ParseSize(const std::string &size_str) {
-  double size = 0.0;
-  chi::u64 multiplier = 1;
-  std::string num_str;
+chi::u64 ParseSize(const std::string &s) {
+  double val = 0.0;
+  chi::u64 mult = 1;
+  std::string num;
   char suffix = 0;
-
-  for (char c : size_str) {
-    if (std::isdigit(c) || c == '.') {
-      num_str += c;
-    } else if (c == 'k' || c == 'K' || c == 'm' || c == 'M' ||
-               c == 'g' || c == 'G') {
-      suffix = std::tolower(c);
-      break;
-    }
+  for (char c : s) {
+    if (std::isdigit(c) || c == '.') num += c;
+    else { suffix = std::tolower(c); break; }
   }
-  if (num_str.empty()) return 0;
-  size = std::stod(num_str);
-
+  if (num.empty()) return 0;
+  val = std::stod(num);
   switch (suffix) {
-    case 'k': multiplier = 1024; break;
-    case 'm': multiplier = 1024 * 1024; break;
-    case 'g': multiplier = 1024ULL * 1024 * 1024; break;
+    case 'k': mult = 1024; break;
+    case 'm': mult = 1024 * 1024; break;
+    case 'g': mult = 1024ULL * 1024 * 1024; break;
     default: break;
   }
-  return static_cast<chi::u64>(size * multiplier);
+  return static_cast<chi::u64>(val * mult);
 }
 
-std::string FormatSize(chi::u64 bytes) {
-  if (bytes >= 1024ULL * 1024 * 1024)
-    return std::to_string(bytes / (1024ULL * 1024 * 1024)) + " GB";
-  if (bytes >= 1024 * 1024)
-    return std::to_string(bytes / (1024 * 1024)) + " MB";
-  if (bytes >= 1024)
-    return std::to_string(bytes / 1024) + " KB";
-  return std::to_string(bytes) + " B";
+void PrintUsage(const char *prog) {
+  HIPRINT("Usage: {} [options]", prog);
+  HIPRINT("Options:");
+  HIPRINT("  --test-case <case>     putblob, putblob_gpu, direct, or cudamemcpy (default: putblob)");
+  HIPRINT("  --rt-blocks <N>        GPU runtime orchestrator blocks (default: 1)");
+  HIPRINT("  --rt-threads <N>       GPU runtime threads/block (default: 32)");
+  HIPRINT("  --client-blocks <N>    GPU client kernel blocks (default: 1)");
+  HIPRINT("  --client-threads <N>   GPU client kernel threads/block (default: 32)");
+  HIPRINT("  --io-size <bytes>      Total I/O size (default: 64M, supports k/m/g suffixes)");
+  HIPRINT("  --help, -h             Show this help");
 }
 
-double CalcBandwidth(chi::u64 total_bytes, double seconds) {
-  if (seconds <= 0.0) return 0.0;
-  return static_cast<double>(total_bytes) / (1024.0 * 1024.0) / seconds;
-}
-
-int ModeFromString(const std::string &s) {
-  if (s == "Put") return 0;
-  if (s == "Get") return 1;
-  if (s == "PutGet") return 2;
-  return -1;
+bool ParseArgs(int argc, char **argv, BenchConfig &cfg) {
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--help" || arg == "-h") {
+      PrintUsage(argv[0]);
+      return false;
+    } else if (arg == "--test-case" && i + 1 < argc) {
+      std::string tc = argv[++i];
+      if (tc == "putblob") cfg.test_case = TestCase::kPutBlob;
+      else if (tc == "putblob_gpu") cfg.test_case = TestCase::kPutBlobGpu;
+      else if (tc == "direct") cfg.test_case = TestCase::kDirect;
+      else if (tc == "cudamemcpy") cfg.test_case = TestCase::kCudaMemcpy;
+      else {
+        HLOG(kError, "Unknown test case '{}'; use putblob, putblob_gpu, direct, or cudamemcpy", tc);
+        return false;
+      }
+    } else if (arg == "--rt-blocks" && i + 1 < argc) {
+      cfg.rt_blocks = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--rt-threads" && i + 1 < argc) {
+      cfg.rt_threads = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--client-blocks" && i + 1 < argc) {
+      cfg.client_blocks = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--client-threads" && i + 1 < argc) {
+      cfg.client_threads = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--io-size" && i + 1 < argc) {
+      cfg.total_bytes = ParseSize(argv[++i]);
+    } else {
+      HLOG(kError, "Unknown option: {}", arg);
+      PrintUsage(argv[0]);
+      return false;
+    }
+  }
+  return true;
 }
 
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 9) {
-    HLOG(kError,
-         "Usage: {} <test_case> <client_blocks> <client_threads>"
-         " <runtime_blocks> <runtime_threads> <io_size> <io_count>"
-         " <preallocate>",
-         argv[0]);
-    HLOG(kError, "  test_case:       Put, Get, or PutGet");
-    HLOG(kError, "  client_blocks:   GPU blocks for client kernels");
-    HLOG(kError, "  client_threads:  Threads/block for client kernels");
-    HLOG(kError, "  runtime_blocks:  GPU blocks for orchestrator");
-    HLOG(kError, "  runtime_threads: Threads/block for orchestrator");
-    HLOG(kError, "  io_size:         I/O size (e.g., 4k, 1m)");
-    HLOG(kError, "  io_count:        I/Os per client block");
-    HLOG(kError, "  preallocate:     Preallocation hint per blob (e.g., 128k, 0)");
-    return 1;
-  }
+  BenchConfig cfg;
+  if (!ParseArgs(argc, argv, cfg)) return 1;
 
-  std::string test_case = argv[1];
-  int client_blocks = std::atoi(argv[2]);
-  int client_threads = std::atoi(argv[3]);
-  int runtime_blocks = std::atoi(argv[4]);
-  int runtime_threads = std::atoi(argv[5]);
-  chi::u64 io_size = ParseSize(argv[6]);
-  int io_count = std::atoi(argv[7]);
-  chi::u64 preallocate = ParseSize(argv[8]);
-
-  int mode = ModeFromString(test_case);
-  if (mode < 0 || client_blocks <= 0 || client_threads <= 0 ||
-      runtime_blocks <= 0 || runtime_threads <= 0 ||
-      io_size == 0 || io_count <= 0) {
-    HLOG(kError, "Invalid parameters");
-    return 1;
-  }
-
-  // Check GPU availability
   int num_gpus = hshm::GpuApi::GetDeviceCount();
   if (num_gpus == 0) {
     HLOG(kError, "No GPUs available");
@@ -187,7 +181,6 @@ int main(int argc, char **argv) {
 
   // Load GPU config if CHI_SERVER_CONF is not already set
   if (!std::getenv("CHI_SERVER_CONF")) {
-    // Use the GPU benchmark config bundled with the benchmark
     std::string config_dir = std::string(__FILE__);
     config_dir = config_dir.substr(0, config_dir.rfind('/'));
     std::string gpu_config = config_dir + "/cte_config_gpu.yaml";
@@ -195,161 +188,128 @@ int main(int argc, char **argv) {
     HLOG(kInfo, "Using GPU benchmark config: {}", gpu_config);
   }
 
-  // Initialize Chimaera with embedded runtime (fork mode)
-  // GPU orchestrator launches automatically during runtime init
+  // Initialize Chimaera runtime
   HLOG(kInfo, "Initializing Chimaera runtime...");
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
     HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  std::this_thread::sleep_for(500ms);
 
-  // Create a separate CTE pool with a unique ID so that CreatePool
-  // goes through the full path including GPU container allocation.
-  // (The compose-config pool is reused by WRP_CTE_CLIENT_INIT and skips
-  // GPU container registration.)
-  chi::PoolId gpu_pool_id(wrp_cte::core::kCtePoolId.major_ + 1,
-                           wrp_cte::core::kCtePoolId.minor_);
-  wrp_cte::core::Client cte_client_obj(gpu_pool_id);
-  wrp_cte::core::CreateParams params;
-  auto create_task = cte_client_obj.AsyncCreate(
-      chi::PoolQuery::Dynamic(),
-      "cte_gpu_bench_pool", gpu_pool_id, params);
-  create_task.Wait();
-  if (create_task->GetReturnCode() != 0) {
-    HLOG(kError, "Failed to create CTE GPU pool: {}", create_task->GetReturnCode());
-    return 1;
+  const char *tc_name = (cfg.test_case == TestCase::kPutBlob) ? "putblob" :
+                         (cfg.test_case == TestCase::kPutBlobGpu) ? "putblob_gpu" :
+                         (cfg.test_case == TestCase::kCudaMemcpy) ? "cudamemcpy" :
+                         "direct";
+
+  HIPRINT("\n=== CTE GPU Benchmark ===");
+  HIPRINT("Test case:           {}", tc_name);
+  HIPRINT("RT blocks:           {}", cfg.rt_blocks);
+  HIPRINT("RT threads/block:    {}", cfg.rt_threads);
+  HIPRINT("Client blocks:       {}", cfg.client_blocks);
+  HIPRINT("Client threads/block:{}", cfg.client_threads);
+  HIPRINT("Total I/O size:      {} bytes ({} MB)", cfg.total_bytes,
+          cfg.total_bytes / (1024 * 1024));
+
+  float elapsed_ms = 0;
+  int rc = 0;
+
+  if (cfg.test_case == TestCase::kCudaMemcpy) {
+    // cudaMemcpy baseline — theoretical PCIe maximum
+    rc = run_cte_gpu_bench_cudamemcpy(cfg.total_bytes, &elapsed_ms);
+  } else if (cfg.test_case == TestCase::kDirect) {
+    // Direct kernel memcpy baseline — no CTE, no serialization
+    rc = run_cte_gpu_bench_direct(cfg.client_blocks, cfg.client_threads,
+                                   cfg.total_bytes, &elapsed_ms);
+  } else {
+    // CTE putblob path — need pool, target, and tag setup
+    // Create a separate CTE pool
+    chi::PoolId gpu_pool_id(wrp_cte::core::kCtePoolId.major_ + 1,
+                             wrp_cte::core::kCtePoolId.minor_);
+    wrp_cte::core::Client cte_client(gpu_pool_id);
+    wrp_cte::core::CreateParams params;
+    auto create_task = cte_client.AsyncCreate(
+        chi::PoolQuery::Dynamic(),
+        "cte_gpu_bench_pool", gpu_pool_id, params);
+    create_task.Wait();
+    if (create_task->GetReturnCode() != 0) {
+      HLOG(kError, "Failed to create CTE GPU pool: {}", create_task->GetReturnCode());
+      return 1;
+    }
+    std::this_thread::sleep_for(200ms);
+
+    // Register pinned-memory bdev target (CPU side)
+    chi::PoolId bdev_pool_id(800, 0);
+    auto reg_task = cte_client.AsyncRegisterTarget(
+        "pinned::cte_gpu_bench_target",
+        chimaera::bdev::BdevType::kPinned,
+        256ULL * 1024 * 1024,
+        chi::PoolQuery::Local(),
+        bdev_pool_id);
+    reg_task.Wait();
+    if (reg_task->GetReturnCode() != 0) {
+      HLOG(kError, "Failed to register target (CPU): {}", reg_task->GetReturnCode());
+      return 1;
+    }
+    std::this_thread::sleep_for(200ms);
+
+    // Register target on GPU side
+    auto gpu_reg_task = cte_client.AsyncRegisterTarget(
+        "pinned::cte_gpu_bench_target",
+        chimaera::bdev::BdevType::kPinned,
+        256ULL * 1024 * 1024,
+        chi::PoolQuery::Local(),
+        bdev_pool_id,
+        chi::PoolQuery::LocalGpuBcast());
+    gpu_reg_task.Wait();
+    if (gpu_reg_task->GetReturnCode() != 0) {
+      HLOG(kError, "Failed to register target (GPU): {}", gpu_reg_task->GetReturnCode());
+      return 1;
+    }
+    std::this_thread::sleep_for(200ms);
+
+    // Create tag (CPU side)
+    auto tag_task = cte_client.AsyncGetOrCreateTag(
+        "gpu_bench_tag", wrp_cte::core::TagId::GetNull(),
+        chi::PoolQuery::Local());
+    tag_task.Wait();
+    if (tag_task->GetReturnCode() != 0) {
+      HLOG(kError, "Failed to create tag");
+      return 1;
+    }
+    wrp_cte::core::TagId tag_id = tag_task->tag_id_;
+
+    // Create tag on GPU side
+    auto gpu_tag_task = cte_client.AsyncGetOrCreateTag(
+        "gpu_bench_tag", tag_id, chi::PoolQuery::LocalGpuBcast());
+    gpu_tag_task.Wait();
+    if (gpu_tag_task->GetReturnCode() != 0) {
+      HLOG(kError, "Failed to create tag on GPU: {}", gpu_tag_task->GetReturnCode());
+      return 1;
+    }
+    std::this_thread::sleep_for(200ms);
+
+    HIPRINT("Pool ID: {}.{}", gpu_pool_id.major_, gpu_pool_id.minor_);
+    HIPRINT("Tag ID:  {}.{}", tag_id.major_, tag_id.minor_);
+
+    bool to_cpu = (cfg.test_case == TestCase::kPutBlob);
+    rc = run_cte_gpu_bench_putblob(
+        cte_client.pool_id_, tag_id,
+        cfg.rt_blocks, cfg.rt_threads,
+        cfg.client_blocks, cfg.client_threads,
+        cfg.total_bytes, to_cpu, &elapsed_ms);
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-  // Register a pinned-memory bdev target (GPU-accessible)
-  chi::PoolId bdev_pool_id(800, 0);
-  auto reg_task = cte_client_obj.AsyncRegisterTarget(
-      "pinned::cte_gpu_bench_target",
-      chimaera::bdev::BdevType::kPinned,
-      256ULL * 1024 * 1024,
-      chi::PoolQuery::Local(),
-      bdev_pool_id);
-  reg_task.Wait();
-  if (reg_task->GetReturnCode() != 0) {
-    HLOG(kError, "Failed to register target (CPU): {}", reg_task->GetReturnCode());
-    return 1;
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-  // Register the same target on the GPU side
-  auto gpu_reg_task = cte_client_obj.AsyncRegisterTarget(
-      "pinned::cte_gpu_bench_target",
-      chimaera::bdev::BdevType::kPinned,
-      256ULL * 1024 * 1024,
-      chi::PoolQuery::Local(),
-      bdev_pool_id,
-      chi::PoolQuery::LocalGpuBcast());
-  gpu_reg_task.Wait();
-  if (gpu_reg_task->GetReturnCode() != 0) {
-    HLOG(kError, "Failed to register target (GPU): {}", gpu_reg_task->GetReturnCode());
-    return 1;
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-  // Create tag via CPU-path Local()
-  auto *cte_client = &cte_client_obj;
-  auto tag_task = cte_client->AsyncGetOrCreateTag(
-      "gpu_bench_tag", wrp_cte::core::TagId::GetNull(),
-      chi::PoolQuery::Local());
-  tag_task.Wait();
-  if (tag_task->GetReturnCode() != 0) {
-    HLOG(kError, "Failed to create tag");
-    return 1;
-  }
-  wrp_cte::core::TagId tag_id = tag_task->tag_id_;
-
-  // Create the same tag on the GPU side so GpuRuntime::PutBlob can find it
-  auto gpu_tag_task = cte_client->AsyncGetOrCreateTag(
-      "gpu_bench_tag", tag_id, chi::PoolQuery::LocalGpuBcast());
-  gpu_tag_task.Wait();
-  if (gpu_tag_task->GetReturnCode() != 0) {
-    HLOG(kError, "Failed to create tag on GPU: {}", gpu_tag_task->GetReturnCode());
-    return 1;
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-  HLOG(kInfo, "Pool ID: {}.{}", gpu_pool_id.major_, gpu_pool_id.minor_);
-  HLOG(kInfo, "Tag created: {}.{}", tag_id.major_, tag_id.minor_);
-
-  // Print benchmark info
-  int total_ios = client_blocks * io_count;
-  int ops_multiplier = (mode == 2) ? 2 : 1;
-  chi::u64 total_bytes = static_cast<chi::u64>(total_ios) * io_size * ops_multiplier;
-
-  HLOG(kInfo, "=== CTE GPU Benchmark ===");
-  HLOG(kInfo, "Test case: {}", test_case);
-  HLOG(kInfo, "Client: {} blocks x {} threads", client_blocks, client_threads);
-  HLOG(kInfo, "Runtime: {} blocks x {} threads", runtime_blocks, runtime_threads);
-  HLOG(kInfo, "I/O size: {}", FormatSize(io_size));
-  HLOG(kInfo, "I/O count per block: {}", io_count);
-  HLOG(kInfo, "Preallocate per blob: {}", preallocate > 0 ? FormatSize(preallocate) : "disabled");
-  HLOG(kInfo, "Total I/Os: {} ({} ops)", total_ios,
-       total_ios * ops_multiplier);
-  HLOG(kInfo, "Total data: {}", FormatSize(total_bytes));
-  HLOG(kInfo, "=========================");
-
-  // Allocate pinned results array
-  GpuBenchResult *results = nullptr;
-  cudaMallocHost(reinterpret_cast<void**>(&results),
-                 client_blocks * sizeof(GpuBenchResult));
-  if (!results) {
-    HLOG(kError, "Failed to allocate results array");
-    return 1;
-  }
-
-  // Run benchmark with wall-clock timing
-  auto start = std::chrono::high_resolution_clock::now();
-
-  int rc = run_gpu_bench(
-      cte_client->pool_id_, tag_id,
-      io_size, preallocate, io_count, mode,
-      client_blocks, client_threads,
-      results);
-
-  auto end = std::chrono::high_resolution_clock::now();
-  double wall_seconds = std::chrono::duration<double>(end - start).count();
 
   if (rc != 0) {
-    HLOG(kError, "GPU benchmark failed with error: {}", rc);
-    for (int i = 0; i < client_blocks; ++i) {
-      if (results[i].status != 1) {
-        HLOG(kError, "  Block {}: status={}", i, results[i].status);
-      }
-    }
+    HLOG(kError, "Benchmark failed with error: {}", rc);
     return 1;
   }
 
-  // Print results
-  double bw = CalcBandwidth(total_bytes, wall_seconds);
-  double iops = static_cast<double>(total_ios * ops_multiplier) / wall_seconds;
+  double bw_gbps = (cfg.total_bytes / 1e9) / (elapsed_ms / 1e3);
 
-  HLOG(kInfo, "");
-  HLOG(kInfo, "=== {} Results ===", test_case);
-  HLOG(kInfo, "Wall time: {} s", wall_seconds);
-  HLOG(kInfo, "Bandwidth: {} MB/s", bw);
-  HLOG(kInfo, "IOPS: {}", iops);
-  HLOG(kInfo, "Latency (avg): {} us/op",
-       (wall_seconds * 1e6) / (total_ios * ops_multiplier));
-  HLOG(kInfo, "==================");
-
-  // Per-block GPU clock breakdown
-  HLOG(kInfo, "");
-  HLOG(kInfo, "=== Per-block GPU clock breakdown ===");
-  for (int i = 0; i < client_blocks; ++i) {
-    long long total = results[i].elapsed_ns;
-    long long send = results[i].send_clocks;
-    long long wait = results[i].wait_clocks;
-    int send_pct = total > 0 ? static_cast<int>(100 * send / total) : 0;
-    int wait_pct = total > 0 ? static_cast<int>(100 * wait / total) : 0;
-    HLOG(kInfo, "  Block {}: total={} send={} ({}%) wait={} ({}%)",
-         i, total, send, send_pct, wait, wait_pct);
-  }
+  printf("\n=== %s Results ===\n", tc_name);
+  printf("Elapsed:             %.3f ms\n", static_cast<double>(elapsed_ms));
+  printf("Bandwidth:           %.3f GB/s\n", bw_gbps);
+  printf("=========================\n");
 
   return 0;
 }

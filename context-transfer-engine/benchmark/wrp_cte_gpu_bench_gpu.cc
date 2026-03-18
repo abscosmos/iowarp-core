@@ -32,12 +32,14 @@
  */
 
 /**
- * GPU benchmark kernels for CTE PutBlob/GetBlob.
+ * GPU benchmark kernels for CTE PutBlob data placement.
  *
- * Each GPU block acts as an independent worker thread, issuing
- * AsyncPutBlob / AsyncGetBlob via the Client API (NewTask + Send ->
- * SendGpu -> gpu2gpu queue). The GPU orchestrator processes tasks
- * on separate blocks.
+ * Each warp in the client kernel:
+ *   1. memsets its slice of a pre-allocated device array
+ *   2. Lane 0 calls AsyncPutBlob to store the slice via CTE
+ *   3. Signals completion via atomicAdd on a pinned done counter
+ *
+ * Supports both GPU->CPU (ToLocalCpu) and GPU-local (Local) routing.
  *
  * Compiled via add_cuda_library (clang-cuda dual-pass).
  */
@@ -56,309 +58,371 @@
 #include <chrono>
 
 /**
- * Benchmark parameters passed to the kernel.
+ * Poll the pinned done flag until all warps complete or timeout.
  */
-struct GpuBenchParams {
-  chi::PoolId pool_id;
-  wrp_cte::core::TagId tag_id;
-  chi::u64 io_size;
-  chi::u64 preallocate;  // Preallocation hint per blob (0 = disabled)
-  int io_count;      // Per-block I/O count
-  int mode;          // 0=Put, 1=Get, 2=PutGet
-};
-
-/**
- * Per-block result written to pinned memory.
- */
-struct GpuBenchResult {
-  int status;              // 1=success, negative=error
-  long long elapsed_ns;    // Nanoseconds elapsed for this block
-  long long send_clocks;   // Total clocks in AsyncPutBlob/AsyncGetBlob (send side)
-  long long wait_clocks;   // Total clocks in future.Wait() (receive side)
-};
-
-/**
- * GPU kernel: each block runs io_count Put and/or Get operations.
- * Only thread 0 of each block does work (matches orchestrator pattern).
- */
-__global__ void gpu_bench_kernel(
-    chi::IpcManagerGpuInfo gpu_info,
-    GpuBenchParams params,
-    GpuBenchResult *results,
-    chi::u32 num_blocks) {
-  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
-
-  if (threadIdx.x != 0) return;
-
-  int block_id = blockIdx.x;
-  GpuBenchResult *my_result = &results[block_id];
-
-  wrp_cte::core::Client client(params.pool_id);
-
-  // Debug: check allocator state
-  auto *alloc = CHI_IPC->gpu_alloc_;
-  if (!CHI_IPC->gpu_backend_initialized_ || !alloc) {
-    my_result->status = -50 - block_id;
-    return;
+static bool PollDone(volatile int *d_done, int total_warps, int timeout_us) {
+  int elapsed_us = 0;
+  while (*d_done < total_warps && elapsed_us < timeout_us) {
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+    elapsed_us += 100;
   }
-  int tid = alloc->GetAutoTid();
-  int max_t = alloc->max_threads_;
-  int ready = *reinterpret_cast<volatile int *>(&alloc->heap_ready_);
-  bool lazy_ok = alloc->LazyInitThread(tid);
-  if (!lazy_ok) {
-    // Encode: -(10000 + block_id*1000 + tid*100 + max_t*10 + ready)
-    my_result->status = -(10000 + block_id * 1000 + tid * 100 + max_t * 10 + ready);
-    return;
-  }
-
-  // Allocate put/get buffers from GPU device memory
-  auto put_full = CHI_IPC->AllocateDeviceData(params.io_size);
-  if (put_full.IsNull()) {
-    // Encode tid and max_threads in error: -(80 + block_id*100 + tid*10 + max_threads)
-    my_result->status = -(1000 + block_id * 100 + tid * 10 + alloc->max_threads_);
-    return;
-  }
-  auto get_full = CHI_IPC->AllocateDeviceData(params.io_size);
-  if (get_full.IsNull()) { my_result->status = -11; return; }
-
-  // Fill put buffer with pattern
-  char *put_buf = put_full.ptr_;
-  char *get_buf = get_full.ptr_;
-  memset(put_buf, 0xAB, params.io_size);
-  memset(get_buf, 0x00, params.io_size);
-
-  // Use raw UVA pointers so the orchestrator can resolve them without
-  // needing the client kernel's allocator (which it doesn't know about).
-  hipc::ShmPtr<> put_shm = hipc::ShmPtr<>::FromRaw(put_buf);
-  hipc::ShmPtr<> get_shm = hipc::ShmPtr<>::FromRaw(get_buf);
-
-  // Build per-block blob name: "blob_0", "blob_1", etc.
-  char blob_name[32];
-  int name_len = 0;
-  const char *prefix = "blob_";
-  for (int i = 0; prefix[i]; ++i) blob_name[name_len++] = prefix[i];
-  // Convert block_id to string digits
-  char digits[16];
-  int num_digits = 0;
-  int tmp = block_id;
-  if (tmp == 0) { digits[num_digits++] = '0'; }
-  else { while (tmp > 0) { digits[num_digits++] = '0' + (tmp % 10); tmp /= 10; } }
-  for (int i = num_digits - 1; i >= 0; --i) blob_name[name_len++] = digits[i];
-  blob_name[name_len] = '\0';
-
-  // Use GPU clock for timing
-  long long start_clock = clock64();
-  long long total_send = 0, total_wait = 0;
-
-  if (params.mode == 0 || params.mode == 2) {
-    // Put phase
-    for (int i = 0; i < params.io_count; ++i) {
-      // Debug: encode block_id and io iteration in status
-      // -100 - block_id*10 - i = "sending io #i from block block_id"
-      my_result->status = -100 - block_id * 10 - i;
-      long long t0 = clock64();
-      wrp_cte::core::Context ctx;
-      if (params.preallocate > 0) {
-        ctx.preallocate_ = params.preallocate;
-      }
-      auto future = client.AsyncPutBlob(
-          params.tag_id, blob_name,
-          chi::u64(0), params.io_size,
-          put_shm, 0.5f,
-          ctx,
-          chi::u32(0),
-          chi::PoolQuery::Local());
-      long long t1 = clock64();
-      total_send += (t1 - t0);
-      if (future.IsNull()) {
-        my_result->status = -2;
-        return;
-      }
-      // Debug: encode "waiting" state
-      my_result->status = -200 - block_id * 10 - i;
-      future.Wait();
-      long long t2 = clock64();
-      total_wait += (t2 - t1);
-    }
-  }
-
-  if (params.mode == 1 || params.mode == 2) {
-    // Get phase
-    for (int i = 0; i < params.io_count; ++i) {
-      long long t0 = clock64();
-      auto future = client.AsyncGetBlob(
-          params.tag_id, blob_name,
-          chi::u64(0), params.io_size,
-          chi::u32(0),
-          get_shm,
-          chi::PoolQuery::Local());
-      long long t1 = clock64();
-      total_send += (t1 - t0);
-      if (future.IsNull()) {
-        my_result->status = -3;
-        return;
-      }
-      future.Wait();
-      long long t2 = clock64();
-      total_wait += (t2 - t1);
-    }
-  }
-
-  long long end_clock = clock64();
-  my_result->elapsed_ns = end_clock - start_clock;
-  my_result->send_clocks = total_send;
-  my_result->wait_clocks = total_wait;
-  my_result->status = 1;
+  return *d_done >= total_warps;
 }
 
 /**
- * Host entry point: sets up GPU backends, launches benchmark kernel,
- * and collects timing results.
- *
- * @param pool_id      CTE core pool ID
- * @param tag_id       Tag ID for blob operations
- * @param io_size      Size of each I/O in bytes
- * @param io_count     Number of I/Os per block
- * @param mode         0=Put, 1=Get, 2=PutGet
- * @param num_blocks   Number of GPU client blocks
- * @param num_threads  Threads per block (only thread 0 does work)
- * @param results      Output array (num_blocks entries, pinned memory)
- * @return 0 on success, negative on error
+ * Kernel 1: Initialize a BuddyAllocator over device memory and allocate
+ * a contiguous array of `total_bytes` bytes.  Returns the FullPtr via
+ * pinned host memory so the CPU can read it.
  */
-extern "C" int run_gpu_bench(
-    chi::PoolId pool_id,
+__global__ void gpu_putblob_alloc_kernel(
+    hipc::MemoryBackend data_backend,
+    chi::u64 total_bytes,
+    hipc::FullPtr<char> *d_out_ptr) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+  using AllocT = hipc::PrivateBuddyAllocator;
+  auto *alloc = data_backend.MakeAlloc<AllocT>(data_backend.data_capacity_);
+  if (!alloc) {
+    d_out_ptr->SetNull();
+    return;
+  }
+  auto result = alloc->AllocateObjs<char>(total_bytes);
+  *d_out_ptr = result;
+}
+
+/**
+ * Kernel 2: Each warp memsets its slice of A to a constant, then calls
+ * AsyncPutBlob to store that slice as a blob via the CTE runtime.
+ * Only the warp scheduler (lane 0) submits the PutBlob task.
+ */
+__global__ void gpu_putblob_kernel(
+    chi::IpcManagerGpu gpu_info,
+    chi::PoolId cte_pool_id,
     wrp_cte::core::TagId tag_id,
-    chi::u64 io_size,
-    chi::u64 preallocate,
-    int io_count,
-    int mode,
-    int num_blocks,
-    int num_threads,
-    GpuBenchResult *results) {
+    chi::u32 num_blocks,
+    hipc::FullPtr<char> array_ptr,
+    hipc::AllocatorId data_alloc_id,
+    chi::u64 total_bytes,
+    chi::u32 total_warps,
+    bool to_cpu,
+    int *d_done) {
+  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
 
-  // Create GPU memory backend for client kernel allocations
-  // Backend is split into (num_blocks * num_threads) BuddyAllocator partitions.
-  // Only thread 0 per block allocates, but all threads need a partition.
-  hipc::MemoryBackendId backend_id(20, 0);
-  hipc::GpuShmMmap gpu_backend;
-  size_t per_thread = std::max(
-      static_cast<size_t>(4) * 1024 * 1024,
-      static_cast<size_t>(8) * io_size);
-  size_t backend_size = std::max(
-      static_cast<size_t>(64) * 1024 * 1024,
-      static_cast<size_t>(num_blocks * num_threads) * per_thread);
-  if (!gpu_backend.shm_init(backend_id, backend_size,
-                             "/cte_gpu_bench", 0))
-    return -100;
+  chi::u32 warp_id = chi::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::IpcManager::GetLaneId();
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                 gpu_backend.data_capacity_);
+  if (warp_id < total_warps) {
+    // Compute this warp's slice of the array
+    chi::u64 slice_size = total_bytes / total_warps;
+    chi::u64 my_offset = static_cast<chi::u64>(warp_id) * slice_size;
+    char *my_data = array_ptr.ptr_ + my_offset;
 
-  // GPU heap for serialization: 1 MB per block (min 16 MB)
-  hipc::MemoryBackendId heap_id(21, 0);
-  hipc::GpuMalloc gpu_heap;
-  size_t heap_size = std::max(
-      static_cast<size_t>(16) * 1024 * 1024,
-      static_cast<size_t>(num_blocks) * 1024 * 1024);
-  if (!gpu_heap.shm_init(heap_id, heap_size, "", 0))
-    return -102;
+    // All lanes participate in memset
+    for (chi::u64 i = lane_id; i < slice_size; i += 32) {
+      my_data[i] = static_cast<char>(warp_id & 0xFF);
+    }
+    __syncwarp();
 
-  // Zero ThreadAllocator headers so WaitReady() doesn't see stale data.
-  // Block 0 initializes each allocator; other blocks spin on heap_ready_.
-  // Without zeroing, heap_ready_ may contain garbage that looks "ready".
-  cudaMemset(gpu_backend.data_, 0, sizeof(hipc::_ThreadAllocator));
-  cudaMemset(gpu_heap.data_, 0, sizeof(hipc::_ThreadAllocator));
+    // Only lane 0 submits PutBlob
+    if (chi::IpcManager::IsWarpScheduler()) {
+      wrp_cte::core::Client cte_client(cte_pool_id);
 
-  chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
-  gpu_info.backend = gpu_backend;
-  gpu_info.gpu_heap_backend = gpu_heap;
+      // Build ShmPtr referencing the data allocator backend
+      hipc::ShmPtr<> blob_shm;
+      blob_shm.alloc_id_ = data_alloc_id;
+      // offset = distance from backend base
+      size_t base_off = array_ptr.shm_.off_.load();
+      blob_shm.off_.exchange(base_off + my_offset);
 
-  // Initialize results
-  for (int i = 0; i < num_blocks; ++i) {
-    results[i].status = 0;
-    results[i].elapsed_ns = 0;
+      // Build blob name: "w_<id>"
+      char name_buf[32];
+      int pos = 0;
+      name_buf[pos++] = 'w';
+      name_buf[pos++] = '_';
+      chi::u32 wid = warp_id;
+      char digits[10];
+      int nd = 0;
+      do { digits[nd++] = '0' + (wid % 10); wid /= 10; } while (wid > 0);
+      for (int d = nd - 1; d >= 0; --d) name_buf[pos++] = digits[d];
+      name_buf[pos] = '\0';
+
+      auto future = cte_client.AsyncPutBlob(
+          tag_id, name_buf,
+          /*offset=*/0, /*size=*/slice_size,
+          blob_shm, /*score=*/-1.0f,
+          wrp_cte::core::Context(), /*flags=*/0,
+          to_cpu ? chi::PoolQuery::ToLocalCpu()
+                 : chi::PoolQuery::Local());
+
+      future.Wait();
+    }
   }
 
-  GpuBenchParams params;
-  params.pool_id = pool_id;
-  params.tag_id = tag_id;
-  params.io_size = io_size;
-  params.preallocate = preallocate;
-  params.io_count = io_count;
-  params.mode = mode;
+  __syncwarp();
+  if (chi::IpcManager::IsWarpScheduler()) {
+    __threadfence();
+    int prev = atomicAdd(d_done, 1);
+    if (prev == static_cast<int>(total_warps) - 1) {
+      __threadfence_system();
+    }
+  }
+}
 
-  // Set GPU stack size for deep serialization paths (PutGet needs more)
-  cudaDeviceSetLimit(cudaLimitStackSize, 32768);
+/**
+ * Kernel 3: Direct memcpy baseline — all threads cooperatively copy from
+ * device memory to a pinned host buffer without going through CTE.
+ * Uses 4-byte stores for safe pinned memory access.
+ */
+__global__ void gpu_direct_memcpy_kernel(
+    const char *d_src,
+    char *h_dst,
+    chi::u64 total_bytes) {
+  chi::u32 global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  chi::u32 total_threads = gridDim.x * blockDim.x;
 
-  // Pause orchestrator, launch client kernel, resume
+  // Use 4-byte stores for safe, aligned access to pinned host memory
+  chi::u64 n_words = total_bytes / 4;
+  const unsigned int *src4 = reinterpret_cast<const unsigned int *>(d_src);
+  unsigned int *dst4 = reinterpret_cast<unsigned int *>(h_dst);
+
+  for (chi::u64 i = global_tid; i < n_words; i += total_threads) {
+    dst4[i] = src4[i];
+  }
+
+  // Handle tail bytes
+  chi::u64 tail_start = n_words * 4;
+  if (global_tid == 0) {
+    for (chi::u64 i = tail_start; i < total_bytes; ++i) {
+      h_dst[i] = d_src[i];
+    }
+  }
+}
+
+/**
+ * CPU-side launcher for the PutBlob data placement benchmark.
+ *
+ * 1. Allocates a device memory backend + BuddyAllocator
+ * 2. Runs alloc kernel to allocate array A
+ * 3. Registers backend with runtime
+ * 4. Launches data placement kernel (memset + PutBlob per warp)
+ */
+extern "C" int run_cte_gpu_bench_putblob(
+    chi::PoolId cte_pool_id,
+    wrp_cte::core::TagId tag_id,
+    chi::u32 rt_blocks,
+    chi::u32 rt_threads,
+    chi::u32 client_blocks,
+    chi::u32 client_threads,
+    chi::u64 total_bytes,
+    bool to_cpu,
+    float *out_elapsed_ms) {
+  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+
+  // Pause GPU orchestrator before any cudaDeviceSynchronize / GPU init.
   CHI_IPC->PauseGpuOrchestrator();
 
+  // --- 1. Data backend: device memory for array A ---
+  hipc::MemoryBackendId data_backend_id(200, 0);
+  hipc::GpuMalloc data_backend;
+  size_t data_backend_size = total_bytes + 4 * 1024 * 1024;
+  if (!data_backend.shm_init(data_backend_id, data_backend_size, "", 0)) {
+    CHI_IPC->ResumeGpuOrchestrator();
+    return -1;
+  }
+
+  // --- 2. Client scratch backend (for FutureShm, serialization) ---
+  constexpr size_t kPerBlockBytes = 10 * 1024 * 1024;
+  size_t scratch_size = static_cast<size_t>(client_blocks) * kPerBlockBytes;
+  hipc::MemoryBackendId scratch_id(201, 0);
+  hipc::GpuMalloc scratch_backend;
+  if (!scratch_backend.shm_init(scratch_id, scratch_size, "", 0)) {
+    CHI_IPC->ResumeGpuOrchestrator();
+    return -1;
+  }
+
+  // --- 3. GPU heap backend (for ThreadAllocator) ---
+  constexpr size_t kPerBlockHeapBytes = 4 * 1024 * 1024;
+  size_t heap_size = static_cast<size_t>(client_blocks) * kPerBlockHeapBytes;
+  hipc::MemoryBackendId heap_id(202, 0);
+  hipc::GpuMalloc heap_backend;
+  if (!heap_backend.shm_init(heap_id, heap_size, "", 0)) {
+    CHI_IPC->ResumeGpuOrchestrator();
+    return -1;
+  }
+
+  // --- 4. Run alloc kernel to initialize allocator + allocate A ---
+  hipc::FullPtr<char> *d_array_ptr;
+  cudaMallocHost(&d_array_ptr, sizeof(hipc::FullPtr<char>));
+  d_array_ptr->SetNull();
+
+  gpu_putblob_alloc_kernel<<<1, 1>>>(
+      static_cast<hipc::MemoryBackend &>(data_backend),
+      total_bytes, d_array_ptr);
+  cudaDeviceSynchronize();
+
+  if (d_array_ptr->IsNull()) {
+    cudaFreeHost(d_array_ptr);
+    return -2;
+  }
+
+  hipc::FullPtr<char> array_ptr = *d_array_ptr;
+  cudaFreeHost(d_array_ptr);
+
+  // --- 5. Register data backend with runtime for ShmPtr resolution ---
+  CHI_IPC->RegisterGpuAllocator(data_backend_id, data_backend.data_,
+                                 data_backend.data_capacity_);
+
+  // --- 6. Build GPU info and launch data placement kernel ---
+  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  gpu_info.backend = scratch_backend;
+  gpu_info.gpu_heap_backend = heap_backend;
+
+  chi::u32 total_warps = (client_blocks * client_threads) / 32;
+  if (total_warps == 0) total_warps = 1;
+
+  int *d_done;
+  cudaMallocHost(&d_done, sizeof(int));
+  *d_done = 0;
+
   void *stream = hshm::GpuApi::CreateStream();
-  gpu_bench_kernel<<<num_blocks, num_threads, 0,
+  cudaGetLastError();
+
+  gpu_putblob_kernel<<<
+      client_blocks, client_threads, 0,
       static_cast<cudaStream_t>(stream)>>>(
-      gpu_info, params, results,
-      static_cast<chi::u32>(num_blocks));
+      gpu_info, cte_pool_id, tag_id, client_blocks,
+      array_ptr,
+      hipc::AllocatorId(data_backend_id.major_, data_backend_id.minor_),
+      total_bytes, total_warps, to_cpu, d_done);
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
     CHI_IPC->ResumeGpuOrchestrator();
+    cudaFreeHost(d_done);
     hshm::GpuApi::DestroyStream(stream);
-    return -201;
+    return -3;
   }
 
   CHI_IPC->ResumeGpuOrchestrator();
+  auto t_start = std::chrono::high_resolution_clock::now();
 
-  // Wait for the orchestrator to signal it's running
-  {
-    auto *orch = static_cast<chi::gpu::WorkOrchestrator *>(
-        CHI_IPC->gpu_orchestrator_);
-    if (orch && orch->control_) {
-      int wait_ms = 0;
-      while (orch->control_->running_flag == 0 && wait_ms < 5000) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        ++wait_ms;
-      }
-      fprintf(stderr, "[DEBUG] Orchestrator running_flag=%d after %d ms\n",
-              orch->control_->running_flag, wait_ms);
-    } else {
-      fprintf(stderr, "[DEBUG] No orchestrator or control struct!\n");
-    }
-  }
+  constexpr int kTimeoutUs = 60000000;  // 60s
+  bool completed = PollDone(d_done, static_cast<int>(total_warps), kTimeoutUs);
 
-  // Poll pinned memory for all blocks to complete
-  int timeout_us = 10000000;  // 10 seconds
-  int elapsed_us = 0;
-  int last_print_us = 0;
-  while (elapsed_us < timeout_us) {
-    bool all_done = true;
-    for (int i = 0; i < num_blocks; ++i) {
-      if (results[i].status == 0) {
-        all_done = false;
-        break;
-      }
-    }
-    if (all_done) break;
-    // Print debug status every 2 seconds
-    if (elapsed_us - last_print_us >= 2000000) {
-      fprintf(stderr, "[DEBUG %ds] Block statuses:", elapsed_us / 1000000);
-      for (int i = 0; i < num_blocks; ++i) {
-        fprintf(stderr, " b%d=%d", i, results[i].status);
-      }
-      fprintf(stderr, "\n");
-      last_print_us = elapsed_us;
-    }
-    std::this_thread::sleep_for(std::chrono::microseconds(100));
-    elapsed_us += 100;
-  }
+  auto t_end = std::chrono::high_resolution_clock::now();
+  double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          t_end - t_start).count();
+  *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
 
+  hshm::GpuApi::Synchronize(stream);
+  CHI_IPC->PauseGpuOrchestrator();
+
+  cudaFreeHost(d_done);
   hshm::GpuApi::DestroyStream(stream);
 
-  // Check for errors
-  for (int i = 0; i < num_blocks; ++i) {
-    if (results[i].status != 1) {
-      return results[i].status == 0 ? -4 : results[i].status;
-    }
+  return completed ? 0 : -4;
+}
+
+/**
+ * CPU-side launcher for the direct memcpy baseline benchmark.
+ *
+ * Allocates device memory, fills it, then launches a kernel that copies
+ * directly to pinned host memory — no CTE, no serialization, no queues.
+ */
+extern "C" int run_cte_gpu_bench_direct(
+    chi::u32 client_blocks,
+    chi::u32 client_threads,
+    chi::u64 total_bytes,
+    float *out_elapsed_ms) {
+  // Pause GPU orchestrator to allow cudaDeviceSynchronize
+  CHI_IPC->PauseGpuOrchestrator();
+
+  // Allocate device source buffer
+  char *d_src = nullptr;
+  cudaError_t err = cudaMalloc(&d_src, total_bytes);
+  if (err != cudaSuccess || !d_src) {
+    CHI_IPC->ResumeGpuOrchestrator();
+    return -1;
   }
+
+  // Fill with pattern
+  cudaMemset(d_src, 0xAB, total_bytes);
+
+  // Allocate pinned host destination buffer
+  char *h_dst = nullptr;
+  err = cudaMallocHost(reinterpret_cast<void **>(&h_dst), total_bytes);
+  if (err != cudaSuccess || !h_dst) {
+    cudaFree(d_src);
+    CHI_IPC->ResumeGpuOrchestrator();
+    return -2;
+  }
+  memset(h_dst, 0, total_bytes);
+
+  void *stream = hshm::GpuApi::CreateStream();
+  cudaGetLastError();
+
+  gpu_direct_memcpy_kernel<<<
+      client_blocks, client_threads, 0,
+      static_cast<cudaStream_t>(stream)>>>(
+      d_src, h_dst, total_bytes);
+
+  cudaError_t launch_err = cudaGetLastError();
+  if (launch_err != cudaSuccess) {
+    cudaFreeHost(h_dst);
+    cudaFree(d_src);
+    hshm::GpuApi::DestroyStream(stream);
+    CHI_IPC->ResumeGpuOrchestrator();
+    return -3;
+  }
+
+  auto t_start = std::chrono::high_resolution_clock::now();
+  cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+  auto t_end = std::chrono::high_resolution_clock::now();
+
+  double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          t_end - t_start).count();
+  *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
+
+  cudaFreeHost(h_dst);
+  cudaFree(d_src);
+  hshm::GpuApi::DestroyStream(stream);
+  CHI_IPC->ResumeGpuOrchestrator();
+
+  return 0;
+}
+
+/**
+ * CPU-side launcher for cudaMemcpyAsync baseline.
+ * This is the theoretical maximum for device→host transfer over PCIe.
+ */
+extern "C" int run_cte_gpu_bench_cudamemcpy(
+    chi::u64 total_bytes,
+    float *out_elapsed_ms) {
+  CHI_IPC->PauseGpuOrchestrator();
+
+  char *d_src = nullptr;
+  cudaMalloc(&d_src, total_bytes);
+  cudaMemset(d_src, 0xAB, total_bytes);
+
+  char *h_dst = nullptr;
+  cudaMallocHost(reinterpret_cast<void **>(&h_dst), total_bytes);
+
+  void *stream = hshm::GpuApi::CreateStream();
+
+  auto t_start = std::chrono::high_resolution_clock::now();
+  cudaMemcpyAsync(h_dst, d_src, total_bytes, cudaMemcpyDeviceToHost,
+                  static_cast<cudaStream_t>(stream));
+  cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+  auto t_end = std::chrono::high_resolution_clock::now();
+
+  double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          t_end - t_start).count();
+  *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
+
+  cudaFreeHost(h_dst);
+  cudaFree(d_src);
+  hshm::GpuApi::DestroyStream(stream);
+  CHI_IPC->ResumeGpuOrchestrator();
 
   return 0;
 }
