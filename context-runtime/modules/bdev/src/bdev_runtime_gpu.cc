@@ -121,38 +121,51 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
   // encoded as: alloc_id = null, off_ = raw pointer value.
   char *src = reinterpret_cast<char *>(task->data_.off_.load());
 
-  // Lane-striped block copy distribution across warp
-  chi::u64 offset_in_data = 0;
+  // Compute per-block copy ranges
   size_t num_blocks = task->blocks_.size();
-  for (size_t i = rctx.lane_id_; i < num_blocks; i += 32) {
-    // Compute offset_in_data for block i
-    chi::u64 blk_offset = 0;
-    for (size_t j = 0; j < i; ++j) {
-      chi::u64 rem = task->length_ - blk_offset;
-      if (rem == 0) break;
-      chi::u64 cs = (task->blocks_[j].size_ < rem) ? task->blocks_[j].size_ : rem;
-      blk_offset += cs;
-    }
-
+  chi::u64 data_off = 0;
+  for (size_t i = 0; i < num_blocks; ++i) {
     const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - blk_offset;
+    chi::u64 remaining = task->length_ - data_off;
     if (remaining == 0) break;
     chi::u64 copy_size = (block.size_ < remaining) ? block.size_ : remaining;
 
-    memcpy(dst_base + block.offset_, src + blk_offset, (size_t)copy_size);
-  }
+    char *dst = dst_base + block.offset_;
+    const char *block_src = src + data_off;
 
-  // Lane 0 computes total bytes written
-  if (rctx.lane_id_ == 0) {
-    offset_in_data = 0;
-    for (size_t i = 0; i < num_blocks; ++i) {
-      chi::u64 remaining = task->length_ - offset_in_data;
-      if (remaining == 0) break;
-      chi::u64 copy_size = (task->blocks_[i].size_ < remaining) ?
-          task->blocks_[i].size_ : remaining;
-      offset_in_data += copy_size;
+    // All 32 lanes cooperate on each block using wide stores
+    bool aligned = ((reinterpret_cast<uintptr_t>(block_src) % 4) == 0) &&
+                   ((reinterpret_cast<uintptr_t>(dst) % 4) == 0);
+    if (aligned) {
+      chi::u64 n4 = copy_size / 4;
+      const unsigned int *src4 =
+          reinterpret_cast<const unsigned int *>(block_src);
+      unsigned int *dst4 =
+          reinterpret_cast<unsigned int *>(dst);
+      for (chi::u64 w = rctx.lane_id_; w < n4; w += 32) {
+        dst4[w] = src4[w];
+      }
+      // Lane 0 handles tail bytes
+      if (rctx.lane_id_ == 0) {
+        chi::u64 tail = n4 * 4;
+        for (chi::u64 b = tail; b < copy_size; ++b) {
+          dst[b] = block_src[b];
+        }
+      }
+    } else {
+      // Unaligned fallback: all lanes cooperate byte-by-byte
+      for (chi::u64 b = rctx.lane_id_; b < copy_size; b += 32) {
+        dst[b] = block_src[b];
+      }
     }
-    task->bytes_written_ = offset_in_data;
+
+    data_off += copy_size;
+  }
+  __syncwarp();
+
+  // Lane 0 records total bytes written
+  if (rctx.lane_id_ == 0) {
+    task->bytes_written_ = data_off;
     task->return_code_ = 0;
   }
   co_return;
@@ -179,37 +192,49 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
   // data_ carries the GPU-accessible destination pointer (UVA absolute address)
   char *dst = reinterpret_cast<char *>(task->data_.off_.load());
 
-  // Lane-striped block copy distribution across warp
+  // Compute per-block copy ranges
   size_t num_blocks = task->blocks_.size();
-  for (size_t i = rctx.lane_id_; i < num_blocks; i += 32) {
-    // Compute offset_in_data for block i
-    chi::u64 blk_offset = 0;
-    for (size_t j = 0; j < i; ++j) {
-      chi::u64 rem = task->length_ - blk_offset;
-      if (rem == 0) break;
-      chi::u64 cs = (task->blocks_[j].size_ < rem) ? task->blocks_[j].size_ : rem;
-      blk_offset += cs;
-    }
-
+  chi::u64 data_off = 0;
+  for (size_t i = 0; i < num_blocks; ++i) {
     const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - blk_offset;
+    chi::u64 remaining = task->length_ - data_off;
     if (remaining == 0) break;
     chi::u64 copy_size = (block.size_ < remaining) ? block.size_ : remaining;
 
-    memcpy(dst + blk_offset, src_base + block.offset_, (size_t)copy_size);
-  }
+    const char *block_src = src_base + block.offset_;
+    char *block_dst = dst + data_off;
 
-  // Lane 0 computes total bytes read
-  if (rctx.lane_id_ == 0) {
-    chi::u64 offset_in_data = 0;
-    for (size_t i = 0; i < num_blocks; ++i) {
-      chi::u64 remaining = task->length_ - offset_in_data;
-      if (remaining == 0) break;
-      chi::u64 copy_size = (task->blocks_[i].size_ < remaining) ?
-          task->blocks_[i].size_ : remaining;
-      offset_in_data += copy_size;
+    // All 32 lanes cooperate using wide loads/stores
+    bool aligned = ((reinterpret_cast<uintptr_t>(block_src) % 4) == 0) &&
+                   ((reinterpret_cast<uintptr_t>(block_dst) % 4) == 0);
+    if (aligned) {
+      chi::u64 n4 = copy_size / 4;
+      const unsigned int *src4 =
+          reinterpret_cast<const unsigned int *>(block_src);
+      unsigned int *dst4 =
+          reinterpret_cast<unsigned int *>(block_dst);
+      for (chi::u64 w = rctx.lane_id_; w < n4; w += 32) {
+        dst4[w] = src4[w];
+      }
+      if (rctx.lane_id_ == 0) {
+        chi::u64 tail = n4 * 4;
+        for (chi::u64 b = tail; b < copy_size; ++b) {
+          block_dst[b] = block_src[b];
+        }
+      }
+    } else {
+      for (chi::u64 b = rctx.lane_id_; b < copy_size; b += 32) {
+        block_dst[b] = block_src[b];
+      }
     }
-    task->bytes_read_ = offset_in_data;
+
+    data_off += copy_size;
+  }
+  __syncwarp();
+
+  // Lane 0 records total bytes read
+  if (rctx.lane_id_ == 0) {
+    task->bytes_read_ = data_off;
     task->return_code_ = 0;
   }
   co_return;
