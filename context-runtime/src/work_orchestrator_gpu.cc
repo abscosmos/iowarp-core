@@ -38,6 +38,10 @@
  * dispatches them to GPU-side containers via gpu::Worker / gpu::PoolManager,
  * and communicates results back through FutureShm completion flags.
  *
+ * Execution model: warp-level dispatch. Each warp gets one Worker instance.
+ * Lane 0 of each warp acts as the scheduler (queue polling, deserialization,
+ * serialization), while all 32 threads synchronize via __syncwarp().
+ *
  * All GPU containers are allocated within this CUDA module's context, so
  * virtual function dispatch (vtables) works correctly. No companion .so
  * files or function pointer fixups are needed.
@@ -63,6 +67,7 @@ namespace chi {
 
 /**
  * GPU Work Orchestrator - persistent kernel for GPU task execution.
+ * Uses warp-level dispatch: one Worker per warp, lane 0 schedules.
  */
 __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
                                            gpu::WorkOrchestratorControl *control,
@@ -72,27 +77,38 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
   // num_blocks is used to partition the backend memory among blocks.
   CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
 
-  // Compute this thread's global lane ID
-  u32 lane_id = blockIdx.x * blockDim.x + threadIdx.x;
+  u32 warp_id = IpcManager::GetWarpId();
+  u32 lane_id = IpcManager::GetLaneId();
+
+  // Shared pointer-per-warp: lane 0 sets its warp's pointer to a heap-allocated
+  // GpuRunContext[32] array. All lanes read it after __syncwarp().
+  constexpr u32 kMaxWarpsPerBlock = 32;  // 1024 threads / 32
+  __shared__ gpu::GpuRunContext *s_active_ptrs[kMaxWarpsPerBlock];
+  u32 warp_in_block = threadIdx.x / 32;
+  if (threadIdx.x == 0) {
+    memset(s_active_ptrs, 0, sizeof(s_active_ptrs));
+  }
+  __syncthreads();
 
   // Thread 0 of block 0 signals that the orchestrator is running
   if (blockIdx.x == 0 && threadIdx.x == 0) {
     control->running_flag = 1;
   }
 
-  // Each thread polls its own lane from the gpu2gpu queue
+  // Each warp polls its own lane from the gpu2gpu queue
   gpu::Worker worker;
-  worker.Init(lane_id,
-              lane_id,
+  worker.Init(warp_id,
+              warp_id,
               gpu_info.cpu2gpu_queue,
               gpu_info.gpu2gpu_queue,
               pool_mgr,
               gpu_info.cpu2gpu_queue_base,
-              control);
+              control,
+              &s_active_ptrs[warp_in_block]);
 
-  // Poll until exit signal; yield when idle so client warps can be scheduled
+  // Poll until exit signal
   while (!control->exit_flag) {
-    worker.PollOnce();
+    worker.PollOnce(lane_id);
   }
 
   worker.Finalize();
@@ -154,12 +170,16 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
                sizeof(hipc::ThreadAllocator));
   }
 
+  // Update gpu2gpu_num_lanes to use warp count instead of thread count
+  IpcManagerGpuInfo launch_info = gpu_info;
+  launch_info.gpu2gpu_num_lanes = (blocks * threads_per_block) / 32;
+
   // Launch persistent GPU work orchestrator.
-  HLOG(kInfo, "Launching GPU work orchestrator with {} blocks, {} threads/block",
-       blocks, threads_per_block);
+  HLOG(kInfo, "Launching GPU work orchestrator with {} blocks, {} threads/block ({} warps)",
+       blocks, threads_per_block, launch_info.gpu2gpu_num_lanes);
   chimaera_gpu_orchestrator<<<blocks, threads_per_block, 0,
       static_cast<cudaStream_t>(stream_)>>>(
-      d_pm, control_, gpu_info, blocks);
+      d_pm, control_, launch_info, blocks);
 
   is_launched_ = true;
   HLOG(kInfo, "GPU work orchestrator launched successfully");
@@ -236,6 +256,7 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
   // container allocations.
   IpcManagerGpuInfo resume_info = gpu_info;
   resume_info.skip_heap_init = true;
+  resume_info.gpu2gpu_num_lanes = (blocks_ * threads_per_block_) / 32;
 
   auto *d_pm = static_cast<gpu::PoolManager *>(d_pool_mgr_);
   chimaera_gpu_orchestrator<<<blocks_, threads_per_block_, 0,
@@ -251,8 +272,8 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
   }
 
   is_launched_ = true;
-  HLOG(kInfo, "GPU work orchestrator resumed with {} blocks, {} threads/block",
-       blocks_, threads_per_block_);
+  HLOG(kInfo, "GPU work orchestrator resumed with {} blocks, {} threads/block ({} warps)",
+       blocks_, threads_per_block_, resume_info.gpu2gpu_num_lanes);
 }
 
 /**

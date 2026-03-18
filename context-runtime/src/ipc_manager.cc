@@ -698,7 +698,7 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
   ConfigManager *config = CHI_CONFIG_MANAGER;
   u32 gpu_blocks = config->GetGpuBlocks();
   u32 gpu_threads = config->GetGpuThreadsPerBlock();
-  u32 num_lanes = gpu_blocks * gpu_threads;
+  u32 num_lanes = (gpu_blocks * gpu_threads) / 32;  // One lane per warp
 
   // --- 1. GPU→GPU queue backend (device memory, GpuMalloc) ---
   // Device memory: CPU cannot directly dereference it. Use a GPU kernel

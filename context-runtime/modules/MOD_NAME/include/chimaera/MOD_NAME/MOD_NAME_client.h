@@ -198,10 +198,11 @@ class Client : public chi::ContainerClient {
    */
   HSHM_CROSS_FUN
   chi::Future<SubtaskTestTask> AsyncSubtaskTest(const chi::PoolQuery& pool_query,
-                                                chi::u32 test_value) {
+                                                chi::u32 test_value,
+                                                chi::u32 num_subtasks = 1) {
     auto* ipc_manager = CHI_IPC;
     auto task = ipc_manager->NewTask<SubtaskTestTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, test_value);
+        chi::CreateTaskId(), pool_id_, pool_query, test_value, num_subtasks);
     return ipc_manager->Send(task);
   }
 

@@ -478,18 +478,20 @@ struct GpuSubmitTask : public chi::Task {
  */
 struct SubtaskTestTask : public chi::Task {
   IN chi::u32 test_value_;
+  IN chi::u32 num_subtasks_;  /**< Number of subtasks to spawn (for benchmarking) */
   OUT chi::u32 result_value_;
 
   HSHM_CROSS_FUN SubtaskTestTask()
-      : chi::Task(), test_value_(0), result_value_(0) {}
+      : chi::Task(), test_value_(0), num_subtasks_(1), result_value_(0) {}
 
   HSHM_CROSS_FUN explicit SubtaskTestTask(
       const chi::TaskId &task_node,
       const chi::PoolId &pool_id,
       const chi::PoolQuery &pool_query,
-      chi::u32 test_value)
+      chi::u32 test_value,
+      chi::u32 num_subtasks = 1)
       : chi::Task(task_node, pool_id, pool_query, 10),
-        test_value_(test_value), result_value_(0) {
+        test_value_(test_value), num_subtasks_(num_subtasks), result_value_(0) {
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kSubtaskTest;
@@ -501,6 +503,7 @@ struct SubtaskTestTask : public chi::Task {
   HSHM_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(test_value_);
+    ar(num_subtasks_);
   }
 
   template <typename Archive>
@@ -512,6 +515,7 @@ struct SubtaskTestTask : public chi::Task {
   void Copy(const hipc::FullPtr<SubtaskTestTask> &other) {
     Task::Copy(other.template Cast<Task>());
     test_value_ = other->test_value_;
+    num_subtasks_ = other->num_subtasks_;
     result_value_ = other->result_value_;
   }
 

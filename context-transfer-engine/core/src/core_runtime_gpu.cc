@@ -399,6 +399,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetOrCreateTag(
     hipc::FullPtr<GetOrCreateTagTask<CreateParams>> task,
     chi::gpu::RunContext &rctx) {
   (void)rctx;
+  if (!chi::IpcManager::IsWarpScheduler()) co_return;
   EnsureMetaInit();
   hshm::ScopedMutex guard(meta_->tag_lock_, 0);
 
@@ -447,6 +448,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetTagSize(
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelTag(
     hipc::FullPtr<DelTagTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
+  if (!chi::IpcManager::IsWarpScheduler()) co_return;
   EnsureMetaInit();
   hshm::ScopedMutex tag_guard(meta_->tag_lock_, 0);
 
@@ -504,6 +506,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetContainedBlobs(
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::PutBlob(
     hipc::FullPtr<PutBlobTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
+  if (!chi::IpcManager::IsWarpScheduler()) co_return;
   EnsureMetaInit();
   TagId tag_id = task->tag_id_;
   const char *blob_name = task->blob_name_.data();
@@ -567,6 +570,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::PutBlob(
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetBlob(
     hipc::FullPtr<GetBlobTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
+  if (!chi::IpcManager::IsWarpScheduler()) co_return;
   EnsureMetaInit();
   TagId tag_id = task->tag_id_;
   const char *blob_name = task->blob_name_.data();
@@ -604,6 +608,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetBlob(
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::ReorganizeBlob(
     hipc::FullPtr<ReorganizeBlobTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
+  if (!chi::IpcManager::IsWarpScheduler()) co_return;
   EnsureMetaInit();
   TagId tag_id = task->tag_id_;
   const char *blob_name = task->blob_name_.data();
@@ -633,6 +638,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::ReorganizeBlob(
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::DelBlob(
     hipc::FullPtr<DelBlobTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
+  if (!chi::IpcManager::IsWarpScheduler()) co_return;
   EnsureMetaInit();
   TagId tag_id = task->tag_id_;
   const char *blob_name = task->blob_name_.data();

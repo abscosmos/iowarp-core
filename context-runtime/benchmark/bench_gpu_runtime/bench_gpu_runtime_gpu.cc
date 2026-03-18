@@ -89,23 +89,30 @@ __global__ void gpu_bench_client_kernel(
     chi::u32 num_blocks,
     chi::u32 total_tasks,
     int *d_done,
-    chi::u32 total_threads) {
+    chi::u32 total_warps) {
   // Partition backend per block; initialize block-local IpcManager
   CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
 
-  chimaera::MOD_NAME::Client client(pool_id);
+  // Only lane 0 of each warp submits tasks (warp-level dispatch model).
+  // The allocator is partitioned per-warp, so only one thread per warp
+  // should allocate to avoid contention.
+  if (chi::IpcManager::IsWarpScheduler()) {
+    chimaera::MOD_NAME::Client client(pool_id);
 
-  for (chi::u32 i = 0; i < total_tasks; ++i) {
-    auto future = client.AsyncGpuSubmit(chi::PoolQuery::Local(), 0, i);
-    future.Wait();
+    for (chi::u32 i = 0; i < total_tasks; ++i) {
+      auto future = client.AsyncGpuSubmit(chi::PoolQuery::Local(), 0, i);
+      future.Wait();
+    }
   }
 
-  // All threads atomically count down; last thread signals the CPU
-  __threadfence();
-  int prev = atomicAdd(d_done, 1);
-  if (prev == static_cast<int>(total_threads) - 1) {
-    __threadfence_system();
-    // d_done is now == total_threads; host polls for d_done >= total_threads
+  // All warps signal completion via lane 0
+  __syncwarp();
+  if (chi::IpcManager::IsWarpScheduler()) {
+    __threadfence();
+    int prev = atomicAdd(d_done, 1);
+    if (prev == static_cast<int>(total_warps) - 1) {
+      __threadfence_system();
+    }
   }
 }
 
@@ -122,21 +129,27 @@ __global__ void gpu_bench_coroutine_kernel(
     chi::PoolId pool_id,
     chi::u32 num_blocks,
     chi::u32 total_tasks,
+    chi::u32 subtasks,
     int *d_done,
-    chi::u32 total_threads) {
+    chi::u32 total_warps) {
   CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
 
-  chimaera::MOD_NAME::Client client(pool_id);
+  if (chi::IpcManager::IsWarpScheduler()) {
+    chimaera::MOD_NAME::Client client(pool_id);
 
-  for (chi::u32 i = 0; i < total_tasks; ++i) {
-    auto future = client.AsyncSubtaskTest(chi::PoolQuery::Local(), i);
-    future.Wait();
+    for (chi::u32 i = 0; i < total_tasks; ++i) {
+      auto future = client.AsyncSubtaskTest(chi::PoolQuery::Local(), i, subtasks);
+      future.Wait();
+    }
   }
 
-  __threadfence();
-  int prev = atomicAdd(d_done, 1);
-  if (prev == static_cast<int>(total_threads) - 1) {
-    __threadfence_system();
+  __syncwarp();
+  if (chi::IpcManager::IsWarpScheduler()) {
+    __threadfence();
+    int prev = atomicAdd(d_done, 1);
+    if (prev == static_cast<int>(total_warps) - 1) {
+      __threadfence_system();
+    }
   }
 }
 
@@ -896,7 +909,8 @@ extern "C" int run_gpu_bench_latency(
   cudaMallocHost(&d_done, sizeof(int));
   *d_done = 0;
 
-  chi::u32 total_threads = client_blocks * client_threads;
+  chi::u32 total_warps = (client_blocks * client_threads) / 32;
+  if (total_warps == 0) total_warps = 1;
 
   void *stream = hshm::GpuApi::CreateStream();
 
@@ -907,7 +921,7 @@ extern "C" int run_gpu_bench_latency(
   chi_bench::gpu_bench_client_kernel<<<
       client_blocks, client_threads, 0,
       static_cast<cudaStream_t>(stream)>>>(
-      gpu_info, pool_id, client_blocks, total_tasks, d_done, total_threads);
+      gpu_info, pool_id, client_blocks, total_tasks, d_done, total_warps);
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
@@ -921,9 +935,9 @@ extern "C" int run_gpu_bench_latency(
   CHI_IPC->ResumeGpuOrchestrator();
   auto t_start = std::chrono::high_resolution_clock::now();
 
-  // Poll for all threads to complete (60 s timeout)
+  // Poll for all warps to complete (60 s timeout)
   constexpr int kTimeoutUs = 60000000;
-  bool completed = PollDone(d_done, static_cast<int>(total_threads), kTimeoutUs);
+  bool completed = PollDone(d_done, static_cast<int>(total_warps), kTimeoutUs);
 
   auto t_end = std::chrono::high_resolution_clock::now();
   double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -961,6 +975,7 @@ extern "C" int run_gpu_bench_coroutine(
     chi::u32 client_blocks,
     chi::u32 client_threads,
     chi::u32 total_tasks,
+    chi::u32 subtasks,
     float *out_elapsed_ms) {
   CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
 
@@ -993,7 +1008,8 @@ extern "C" int run_gpu_bench_coroutine(
   cudaMallocHost(&d_done, sizeof(int));
   *d_done = 0;
 
-  chi::u32 total_threads = client_blocks * client_threads;
+  chi::u32 total_warps = (client_blocks * client_threads) / 32;
+  if (total_warps == 0) total_warps = 1;
 
   void *stream = hshm::GpuApi::CreateStream();
 
@@ -1003,7 +1019,7 @@ extern "C" int run_gpu_bench_coroutine(
   chi_bench::gpu_bench_coroutine_kernel<<<
       client_blocks, client_threads, 0,
       static_cast<cudaStream_t>(stream)>>>(
-      gpu_info, pool_id, client_blocks, total_tasks, d_done, total_threads);
+      gpu_info, pool_id, client_blocks, total_tasks, subtasks, d_done, total_warps);
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
@@ -1017,7 +1033,7 @@ extern "C" int run_gpu_bench_coroutine(
   auto t_start = std::chrono::high_resolution_clock::now();
 
   constexpr int kTimeoutUs = 60000000;
-  bool completed = PollDone(d_done, static_cast<int>(total_threads), kTimeoutUs);
+  bool completed = PollDone(d_done, static_cast<int>(total_warps), kTimeoutUs);
 
   auto t_end = std::chrono::high_resolution_clock::now();
   double elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(

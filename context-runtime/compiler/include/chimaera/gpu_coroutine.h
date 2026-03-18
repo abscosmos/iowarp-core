@@ -63,6 +63,17 @@
 #include <cstdint>
 #include <cstddef>
 
+// Set to 1 to enable verbose GPU coroutine debug printf (very slow)
+#ifndef CHI_GPU_CORO_DEBUG
+#define CHI_GPU_CORO_DEBUG 0
+#endif
+
+#if CHI_GPU_CORO_DEBUG
+#define GPU_CORO_DPRINTF(...) printf(__VA_ARGS__)
+#else
+#define GPU_CORO_DPRINTF(...) ((void)0)
+#endif
+
 namespace chi {
 namespace gpu {
 
@@ -132,6 +143,10 @@ struct RunContext {
   u32 block_id_;
   u32 thread_id_;
 
+  /** Warp-level identity */
+  u32 warp_id_;    /**< Warp index within the grid */
+  u32 lane_id_;    /**< Thread lane within the warp (0-31) */
+
   /**
    * Opaque pointer to the FutureShm being awaited (set by Future::await_suspend).
    * Non-null when suspended on co_await future. The Worker checks
@@ -164,6 +179,8 @@ struct RunContext {
         spins_remaining_(0),
         block_id_(0),
         thread_id_(0),
+        warp_id_(0),
+        lane_id_(0),
         awaited_fshm_(nullptr),
         awaited_task_(nullptr),
         alloc_fn_(nullptr),
@@ -177,6 +194,24 @@ struct RunContext {
         spins_remaining_(0),
         block_id_(block_id),
         thread_id_(thread_id),
+        warp_id_(0),
+        lane_id_(0),
+        awaited_fshm_(nullptr),
+        awaited_task_(nullptr),
+        alloc_fn_(nullptr),
+        free_fn_(nullptr),
+        alloc_ctx_(nullptr) {}
+
+  __host__ __device__ RunContext(u32 block_id, u32 thread_id,
+                                u32 warp_id, u32 lane_id)
+      : coro_handle_(nullptr),
+        is_yielded_(false),
+        yield_spin_count_(0),
+        spins_remaining_(0),
+        block_id_(block_id),
+        thread_id_(thread_id),
+        warp_id_(warp_id),
+        lane_id_(lane_id),
         awaited_fshm_(nullptr),
         awaited_task_(nullptr),
         alloc_fn_(nullptr),
@@ -289,7 +324,7 @@ class TaskResume {
        */
       __device__ std::coroutine_handle<>
       await_suspend(std::coroutine_handle<> h) noexcept {
-        printf("[FinalAwaiter] coroutine %p reached final_suspend, returning noop\n",
+        GPU_CORO_DPRINTF("[FinalAwaiter] coroutine %p reached final_suspend, returning noop\n",
                h.address());
         return std::noop_coroutine();
       }
@@ -401,9 +436,9 @@ class TaskResume {
     // We set it only after confirming inner suspended.
 
     // Manually resume the inner coroutine
-    printf("[TaskResume::await_suspend] resuming inner %p\n", handle_.address());
+    GPU_CORO_DPRINTF("[TaskResume::await_suspend] resuming inner %p\n", handle_.address());
     handle_.resume();
-    printf("[TaskResume::await_suspend] inner resumed, done=%d\n",
+    GPU_CORO_DPRINTF("[TaskResume::await_suspend] inner resumed, done=%d\n",
            (int)handle_.done());
 
     // Check if inner completed synchronously
@@ -416,7 +451,7 @@ class TaskResume {
     // Inner suspended (on co_await Future or yield).
     // NOW safe to set caller — inner will complete asynchronously.
     handle_.promise().set_caller(caller_handle);
-    printf("[TaskResume::await_suspend] set caller=%p on inner, returning true\n",
+    GPU_CORO_DPRINTF("[TaskResume::await_suspend] set caller=%p on inner, returning true\n",
            caller_handle.address());
     return true;  // Suspend caller
   }
@@ -429,12 +464,12 @@ class TaskResume {
    * The Worker chain-resumes callers explicitly.
    */
   __device__ void await_resume() noexcept {
-    printf("[TaskResume::await_resume] handle_=%p caller_handle_=%p\n",
+    GPU_CORO_DPRINTF("[TaskResume::await_resume] handle_=%p caller_handle_=%p\n",
            handle_ ? handle_.address() : nullptr,
            caller_handle_ ? caller_handle_.address() : nullptr);
     if (handle_) {
       auto *ctx = handle_.promise().get_run_context();
-      printf("[TaskResume::await_resume] destroying inner %p\n", handle_.address());
+      GPU_CORO_DPRINTF("[TaskResume::await_resume] destroying inner %p\n", handle_.address());
       handle_.destroy();
       handle_ = nullptr;
 
@@ -442,7 +477,7 @@ class TaskResume {
       // subsequent yields or co_awaits are tracked correctly.
       if (ctx && caller_handle_) {
         ctx->coro_handle_ = caller_handle_;
-        printf("[TaskResume::await_resume] updated coro_handle_ to caller %p\n",
+        GPU_CORO_DPRINTF("[TaskResume::await_resume] updated coro_handle_ to caller %p\n",
                caller_handle_.address());
       }
     }

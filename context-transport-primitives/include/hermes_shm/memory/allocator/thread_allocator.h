@@ -188,7 +188,7 @@ class _ThreadAllocator : public Allocator {
   HSHM_INLINE_CROSS_FUN
   int GetAutoTid() {
 #if HSHM_IS_GPU
-    return static_cast<int>(blockIdx.x) % max_threads_;
+    return static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / 32) % max_threads_;
 #else
     return 0;
 #endif

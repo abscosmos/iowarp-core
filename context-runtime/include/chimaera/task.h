@@ -117,6 +117,7 @@ struct TaskStat {
   size_t io_size_{0};  /**< I/O size in bytes */
   size_t compute_{0};  /**< Normalized compute time in microseconds */
   float wall_time_{0}; /**< Normalized wall time input for InferWallClockTime */
+  u32 parallelism{1};  /**< GPU warp parallelism: 1 (lane 0 only) or 32 (full warp) */
 };
 
 // Define macros for container template

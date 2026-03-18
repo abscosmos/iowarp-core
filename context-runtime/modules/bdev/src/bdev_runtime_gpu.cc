@@ -26,6 +26,7 @@ namespace chimaera::bdev {
 
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Update(hipc::FullPtr<UpdateTask> task,
                                       chi::gpu::RunContext &rctx) {
+  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; co_return; }
   hbm_ptr_    = task->hbm_ptr_;
   pinned_ptr_ = task->pinned_ptr_;
   hbm_size_   = task->hbm_size_;
@@ -47,6 +48,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Update(hipc::FullPtr<UpdateTask> t
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::AllocateBlocks(
     hipc::FullPtr<AllocateBlocksTask> task,
     chi::gpu::RunContext &rctx) {
+  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; co_return; }
   chi::u64 req = task->size_;
   if (req == 0 || total_size_ == 0) {
     task->return_code_ = 0;
@@ -89,6 +91,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::AllocateBlocks(
 
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::FreeBlocks(hipc::FullPtr<FreeBlocksTask> task,
                                            chi::gpu::RunContext &rctx) {
+  if (!chi::IpcManager::IsWarpScheduler()) { (void)task; (void)rctx; co_return; }
   // GPU bump allocator does not support per-block free.
   // Memory is reclaimed when the bdev pool is destroyed.
   task->return_code_ = 0;
@@ -118,20 +121,40 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
   // encoded as: alloc_id = null, off_ = raw pointer value.
   char *src = reinterpret_cast<char *>(task->data_.off_.load());
 
+  // Lane-striped block copy distribution across warp
   chi::u64 offset_in_data = 0;
-  for (size_t i = 0; i < task->blocks_.size(); ++i) {
+  size_t num_blocks = task->blocks_.size();
+  for (size_t i = rctx.lane_id_; i < num_blocks; i += 32) {
+    // Compute offset_in_data for block i
+    chi::u64 blk_offset = 0;
+    for (size_t j = 0; j < i; ++j) {
+      chi::u64 rem = task->length_ - blk_offset;
+      if (rem == 0) break;
+      chi::u64 cs = (task->blocks_[j].size_ < rem) ? task->blocks_[j].size_ : rem;
+      blk_offset += cs;
+    }
+
     const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - offset_in_data;
+    chi::u64 remaining = task->length_ - blk_offset;
     if (remaining == 0) break;
     chi::u64 copy_size = (block.size_ < remaining) ? block.size_ : remaining;
 
-    memcpy(dst_base + block.offset_, src + offset_in_data, (size_t)copy_size);
-    offset_in_data += copy_size;
+    memcpy(dst_base + block.offset_, src + blk_offset, (size_t)copy_size);
   }
 
-  task->bytes_written_ = offset_in_data;
-  task->return_code_ = 0;
-  (void)rctx;
+  // Lane 0 computes total bytes written
+  if (rctx.lane_id_ == 0) {
+    offset_in_data = 0;
+    for (size_t i = 0; i < num_blocks; ++i) {
+      chi::u64 remaining = task->length_ - offset_in_data;
+      if (remaining == 0) break;
+      chi::u64 copy_size = (task->blocks_[i].size_ < remaining) ?
+          task->blocks_[i].size_ : remaining;
+      offset_in_data += copy_size;
+    }
+    task->bytes_written_ = offset_in_data;
+    task->return_code_ = 0;
+  }
   co_return;
 }
 
@@ -156,20 +179,39 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
   // data_ carries the GPU-accessible destination pointer (UVA absolute address)
   char *dst = reinterpret_cast<char *>(task->data_.off_.load());
 
-  chi::u64 offset_in_data = 0;
-  for (size_t i = 0; i < task->blocks_.size(); ++i) {
+  // Lane-striped block copy distribution across warp
+  size_t num_blocks = task->blocks_.size();
+  for (size_t i = rctx.lane_id_; i < num_blocks; i += 32) {
+    // Compute offset_in_data for block i
+    chi::u64 blk_offset = 0;
+    for (size_t j = 0; j < i; ++j) {
+      chi::u64 rem = task->length_ - blk_offset;
+      if (rem == 0) break;
+      chi::u64 cs = (task->blocks_[j].size_ < rem) ? task->blocks_[j].size_ : rem;
+      blk_offset += cs;
+    }
+
     const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - offset_in_data;
+    chi::u64 remaining = task->length_ - blk_offset;
     if (remaining == 0) break;
     chi::u64 copy_size = (block.size_ < remaining) ? block.size_ : remaining;
 
-    memcpy(dst + offset_in_data, src_base + block.offset_, (size_t)copy_size);
-    offset_in_data += copy_size;
+    memcpy(dst + blk_offset, src_base + block.offset_, (size_t)copy_size);
   }
 
-  task->bytes_read_ = offset_in_data;
-  task->return_code_ = 0;
-  (void)rctx;
+  // Lane 0 computes total bytes read
+  if (rctx.lane_id_ == 0) {
+    chi::u64 offset_in_data = 0;
+    for (size_t i = 0; i < num_blocks; ++i) {
+      chi::u64 remaining = task->length_ - offset_in_data;
+      if (remaining == 0) break;
+      chi::u64 copy_size = (task->blocks_[i].size_ < remaining) ?
+          task->blocks_[i].size_ : remaining;
+      offset_in_data += copy_size;
+    }
+    task->bytes_read_ = offset_in_data;
+    task->return_code_ = 0;
+  }
   co_return;
 }
 

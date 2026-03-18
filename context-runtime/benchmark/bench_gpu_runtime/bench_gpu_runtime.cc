@@ -80,6 +80,7 @@ extern "C" int run_gpu_bench_coroutine(chi::PoolId pool_id,
                                         chi::u32 client_blocks,
                                         chi::u32 client_threads,
                                         chi::u32 total_tasks,
+                                        chi::u32 subtasks,
                                         float *out_elapsed_ms);
 extern "C" int run_gpu_bench_alloc(chi::PoolId pool_id,
                                     chi::u32 client_blocks,
@@ -101,7 +102,7 @@ extern "C" __attribute__((weak)) int run_gpu_bench_latency(
 }
 extern "C" __attribute__((weak)) int run_gpu_bench_coroutine(
     chi::PoolId, chi::u32, chi::u32, chi::u32, chi::u32,
-    chi::u32, float *) {
+    chi::u32, chi::u32, float *) {
   return -200;  // No GPU support compiled
 }
 extern "C" __attribute__((weak)) int run_gpu_bench_alloc(
@@ -135,6 +136,7 @@ struct BenchmarkConfig {
   chi::u32 client_threads = 32; /**< GPU client kernel threads per block */
   chi::u32 batch_size = 1;      /**< Tasks per batch per GPU thread */
   chi::u32 total_tasks = 100;   /**< Total tasks per GPU thread */
+  chi::u32 subtasks = 1;        /**< Subtasks per coroutine task (coroutine test) */
 };
 
 /**
@@ -152,6 +154,7 @@ static void PrintHelp(const char *prog) {
   HIPRINT("  --client-threads <N>   GPU client kernel threads/block (default: 32)");
   HIPRINT("  --batch-size <N>       Tasks per batch per GPU thread (default: 1)");
   HIPRINT("  --total-tasks <N>      Total tasks per GPU thread (default: 100)");
+  HIPRINT("  --subtasks <N>         Subtasks per coroutine task (default: 1)");
   HIPRINT("  --help, -h             Show this help");
 }
 
@@ -197,6 +200,8 @@ static bool ParseArgs(int argc, char **argv, BenchmarkConfig &cfg) {
       cfg.batch_size = static_cast<chi::u32>(std::stoul(argv[++i]));
     } else if (arg == "--total-tasks" && i + 1 < argc) {
       cfg.total_tasks = static_cast<chi::u32>(std::stoul(argv[++i]));
+    } else if (arg == "--subtasks" && i + 1 < argc) {
+      cfg.subtasks = static_cast<chi::u32>(std::stoul(argv[++i]));
     } else {
       HLOG(kError, "Unknown argument: {}", arg);
       return false;
@@ -230,11 +235,12 @@ static bool CreateBenchPool(const chi::PoolId &pool_id) {
  * @param elapsed_ms  Total elapsed time in ms
  */
 static void PrintResults(const BenchmarkConfig &cfg, float elapsed_ms) {
-  chi::u64 num_threads = static_cast<chi::u64>(cfg.client_blocks) *
-                          static_cast<chi::u64>(cfg.client_threads);
-  chi::u64 total_ops = num_threads * static_cast<chi::u64>(cfg.total_tasks);
+  chi::u64 num_warps = (static_cast<chi::u64>(cfg.client_blocks) *
+                         static_cast<chi::u64>(cfg.client_threads)) / 32;
+  if (num_warps == 0) num_warps = 1;
+  chi::u64 total_ops = num_warps * static_cast<chi::u64>(cfg.total_tasks);
   double throughput = (total_ops * 1000.0) / elapsed_ms;   // tasks/sec
-  double latency_us = (elapsed_ms * 1000.0) / cfg.total_tasks; // us per task per thread
+  double latency_us = (elapsed_ms * 1000.0) / cfg.total_tasks; // us per task per warp
 
   const char *tc_name = (cfg.test_case == TestCase::kSerde) ? "serde" :
                          (cfg.test_case == TestCase::kAlloc) ? "alloc" :
@@ -247,12 +253,15 @@ static void PrintResults(const BenchmarkConfig &cfg, float elapsed_ms) {
   HIPRINT("Client blocks:       {}", cfg.client_blocks);
   HIPRINT("Client threads/block:{}", cfg.client_threads);
   HIPRINT("Batch size:          {}", cfg.batch_size);
-  HIPRINT("Total tasks/thread:  {}", cfg.total_tasks);
-  HIPRINT("GPU client threads:  {}", num_threads);
+  HIPRINT("Total tasks/warp:    {}", cfg.total_tasks);
+  if (cfg.test_case == TestCase::kCoroutine) {
+    HIPRINT("Subtasks/task:       {}", cfg.subtasks);
+  }
+  HIPRINT("GPU client warps:    {}", num_warps);
   HIPRINT("Total task ops:      {}", total_ops);
   printf("Elapsed time:        %.3f ms\n", elapsed_ms);
   printf("Throughput:          %.0f tasks/sec\n", throughput);
-  printf("Avg latency:         %.3f us/task/thread\n", latency_us);
+  printf("Avg latency:         %.3f us/task/warp\n", latency_us);
 }
 
 /**
@@ -309,7 +318,8 @@ static int RunBenchmark(const BenchmarkConfig &cfg) {
       rc = run_gpu_bench_coroutine(pool_id,
                                     cfg.rt_blocks, cfg.rt_threads,
                                     cfg.client_blocks, cfg.client_threads,
-                                    cfg.total_tasks, &elapsed_ms);
+                                    cfg.total_tasks, cfg.subtasks,
+                                    &elapsed_ms);
     } else {
       const chi::u32 method_id = chimaera::MOD_NAME::Method::kGpuSubmit;
       rc = run_gpu_bench_latency(pool_id, method_id,

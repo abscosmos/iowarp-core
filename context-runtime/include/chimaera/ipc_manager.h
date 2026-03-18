@@ -317,11 +317,11 @@ class IpcManager {
 
   /**
    * Initialize a single ThreadAllocator from a MemoryBackend.
-   * The ThreadAllocator manages per-block BuddyAllocator partitions internally,
+   * The ThreadAllocator manages per-warp BuddyAllocator partitions internally,
    * eliminating the need for a separate pointer table.
    *
    * @param backend GpuMalloc backend (device memory)
-   * @param num_threads Number of GPU blocks (used as max_threads for partitioning)
+   * @param num_threads Number of GPU warps (used as max_threads for partitioning)
    * @param alloc_out Output: pointer to the ThreadAllocator
    */
   HSHM_CROSS_FUN
@@ -406,6 +406,26 @@ class IpcManager {
   static HSHM_GPU_FUN inline int GetGpuNumThreads() {
     return blockDim.x * blockDim.y * blockDim.z;
   }
+
+  /** Get the global warp ID within the grid */
+  static HSHM_GPU_FUN inline u32 GetWarpId() {
+    return (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  }
+
+  /** Get the lane ID (0-31) within the warp */
+  static HSHM_GPU_FUN inline u32 GetLaneId() {
+    return threadIdx.x % 32;
+  }
+
+  /** Whether this thread is the warp scheduler (lane 0) */
+  static HSHM_GPU_FUN inline bool IsWarpScheduler() {
+    return GetLaneId() == 0;
+  }
+#else
+  /** Host-side stubs for warp utilities (always lane 0 / warp 0) */
+  static inline u32 GetWarpId() { return 0; }
+  static inline u32 GetLaneId() { return 0; }
+  static inline bool IsWarpScheduler() { return true; }
 #endif
 
   /**
@@ -692,12 +712,12 @@ class IpcManager {
     LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeIn);
     task_ptr->SerializeIn(save_ar);
 
-    // Distribute across orchestrator lanes using client's global thread ID
+    // Distribute across orchestrator lanes using client's warp ID
     u32 lane_id = 0;
 #if HSHM_IS_GPU
     if (!to_cpu && gpu2gpu_num_lanes_ > 1) {
-      u32 global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-      lane_id = (global_tid + 1) % gpu2gpu_num_lanes_;
+      u32 warp_id = GetWarpId();
+      lane_id = (warp_id + 1) % gpu2gpu_num_lanes_;
     }
 #endif
     auto &lane = queue->GetLane(lane_id, 0);
@@ -760,12 +780,12 @@ class IpcManager {
         reinterpret_cast<FutureShm *>(buffer.ptr_));
     Future<TaskT> future(fshmptr, task_ptr);
 
-    // Distribute across orchestrator lanes
+    // Distribute across orchestrator lanes using client's warp ID
     u32 lane_id = 0;
 #if HSHM_IS_GPU
     if (gpu2gpu_num_lanes_ > 1) {
-      u32 global_tid = blockIdx.x * blockDim.x + threadIdx.x;
-      lane_id = (global_tid + 1) % gpu2gpu_num_lanes_;
+      u32 warp_id = GetWarpId();
+      lane_id = (warp_id + 1) % gpu2gpu_num_lanes_;
     }
 #endif
     auto &lane = gpu2gpu_queue_->GetLane(lane_id, 0);
@@ -2608,15 +2628,17 @@ HSHM_GPU_FUN inline hipc::ThreadAllocator *GetPrivAllocGpu() {
   chi::IpcManager *g_ipc_manager_ptr = chi::IpcManager::GetBlockIpcManager(); \
   int thread_id = chi::IpcManager::GetGpuThreadId();                          \
   int num_threads = chi::IpcManager::GetGpuNumThreads();                      \
+  /* Use warp count for ThreadAllocator partitioning */                        \
+  int num_warps = (int)(num_blocks) * (num_threads / 32);                     \
   if (thread_id == 0) {                                                        \
     chi::IpcManagerGpuInfo block_info = gpu_info;                              \
     /* backend, gpu2cpu_backend, and gpu_heap_backend are NOT split per-block: */ \
-    /* ThreadAllocator handles per-block partitioning internally via blockIdx.x */ \
+    /* ThreadAllocator handles per-warp partitioning internally via GetAutoTid */ \
     /* Only block 0 initializes; others spin-wait via WaitReady() in ClientInitGpu */ \
     if (blockIdx.x != 0) {                                                     \
       block_info.skip_heap_init = true;                                        \
     }                                                                           \
-    g_ipc_manager_ptr->ClientInitGpu(block_info, num_threads, num_blocks);     \
+    g_ipc_manager_ptr->ClientInitGpu(block_info, num_threads, num_warps);      \
   }                                                                             \
   __syncthreads();                                                              \
   chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr

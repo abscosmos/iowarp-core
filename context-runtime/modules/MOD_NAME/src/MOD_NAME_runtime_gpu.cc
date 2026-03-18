@@ -47,25 +47,31 @@ namespace chimaera::MOD_NAME {
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::SubtaskTest(
     hipc::FullPtr<SubtaskTestTask> task,
     chi::gpu::RunContext &rctx) {
-  // Spawn a child GpuSubmit task on ourselves via gpu2gpu queue
+  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; co_return; }
   auto *ipc = CHI_IPC;
-  auto sub = ipc->NewTask<GpuSubmitTask>(
-      chi::CreateTaskId(), pool_id_, chi::PoolQuery::Local(),
-      /*gpu_id=*/chi::u32(0), task->test_value_);
-  auto future = ipc->SendGpuDirect(sub);
+  chi::u32 num_subtasks = task->num_subtasks_;
+  chi::u32 last_result = 0;
 
-  co_await future;
+  for (chi::u32 s = 0; s < num_subtasks; ++s) {
+    auto sub = ipc->NewTask<GpuSubmitTask>(
+        chi::CreateTaskId(), pool_id_, chi::PoolQuery::Local(),
+        /*gpu_id=*/chi::u32(0), task->test_value_);
+    auto future = ipc->SendGpuDirect(sub);
 
-  auto *result = future.get();
-  if (result && result->return_code_ == 0) {
-    // GpuSubmit computes: result = test_value * 3 + gpu_id
-    // We add 1 to distinguish from the leaf path
-    task->result_value_ = result->result_value_ + 1;
-    task->return_code_ = 0;
-  } else {
-    task->result_value_ = 0;
-    task->return_code_ = 1;
+    co_await future;
+
+    auto *result = future.get();
+    if (result && result->return_code_ == 0) {
+      last_result = result->result_value_;
+    } else {
+      task->result_value_ = 0;
+      task->return_code_ = 1;
+      co_return;
+    }
   }
+
+  task->result_value_ = last_result + 1;
+  task->return_code_ = 0;
   (void)rctx;
   co_return;
 }
