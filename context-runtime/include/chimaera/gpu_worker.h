@@ -556,6 +556,12 @@ class Worker {
    * Prepare a copy-path task: deserialize input, allocate contexts.
    * Sets *active_tasks_ptr_ on success.
    */
+  HSHM_GPU_FUN void DbgStep(unsigned int step) {
+    if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
+      dbg_ctrl_->dbg_dispatch_step[worker_id_] = step;
+    }
+  }
+
   HSHM_GPU_FUN bool PrepareTaskCopy(FutureShm *fshm, Container *container,
                                       u32 method_id, bool is_gpu2gpu) {
 #if !HSHM_IS_HOST
@@ -576,7 +582,6 @@ class Worker {
     GPU_WORKER_DPRINTF("[W%u] PrepCopy: deserializing\n", worker_id_);
     auto *heap = CHI_GPU_HEAP;
     if (!heap) {
-      printf("[W%u] PrepCopy: CHI_GPU_HEAP is NULL!\n", worker_id_);
       if (is_gpu2gpu) {
         fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
       } else {
@@ -588,9 +593,6 @@ class Worker {
     size_t tw = fshm->input_.total_written_.load_device();
     size_t cs = fshm->input_.copy_space_size_.load_device();
     if (tw == 0 || tw > cs) {
-      printf("[W%u] PrepCopy: BAD input: tw=%llu cs=%llu fshm=%p\n",
-             worker_id_, (unsigned long long)tw, (unsigned long long)cs,
-             (void*)fshm);
       if (is_gpu2gpu) {
         fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
       } else {

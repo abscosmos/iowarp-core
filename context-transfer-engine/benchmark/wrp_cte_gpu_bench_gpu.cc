@@ -335,6 +335,8 @@ extern "C" int run_cte_gpu_bench_putblob(
     memset((void*)ctrl->dbg_input_cs, 0, sizeof(ctrl->dbg_input_cs));
     memset((void*)ctrl->dbg_dispatch_step, 0, sizeof(ctrl->dbg_dispatch_step));
     memset((void*)ctrl->dbg_ser_total_written, 0, sizeof(ctrl->dbg_ser_total_written));
+    memset((void*)ctrl->dbg_resume_checks, 0, sizeof(ctrl->dbg_resume_checks));
+    memset((void*)ctrl->dbg_ser_method, 0, sizeof(ctrl->dbg_ser_method));
   }
 
   CHI_IPC->ResumeGpuOrchestrator();

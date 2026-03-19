@@ -103,7 +103,7 @@ struct BenchConfig {
   chi::u32 rt_threads = 32;
   chi::u32 client_blocks = 1;
   chi::u32 client_threads = 32;
-  chi::u64 total_bytes = 64 * 1024 * 1024;
+  chi::u64 warp_bytes = 64 * 1024 * 1024;  // per-warp I/O size
 };
 
 namespace {
@@ -136,7 +136,7 @@ void PrintUsage(const char *prog) {
   HIPRINT("  --rt-threads <N>       GPU runtime threads/block (default: 32)");
   HIPRINT("  --client-blocks <N>    GPU client kernel blocks (default: 1)");
   HIPRINT("  --client-threads <N>   GPU client kernel threads/block (default: 32)");
-  HIPRINT("  --io-size <bytes>      Total I/O size (default: 64M, supports k/m/g suffixes)");
+  HIPRINT("  --io-size <bytes>      Per-warp I/O size (default: 64M, supports k/m/g suffixes)");
   HIPRINT("  --help, -h             Show this help");
 }
 
@@ -166,7 +166,7 @@ bool ParseArgs(int argc, char **argv, BenchConfig &cfg) {
     } else if (arg == "--client-threads" && i + 1 < argc) {
       cfg.client_threads = static_cast<chi::u32>(std::stoul(argv[++i]));
     } else if (arg == "--io-size" && i + 1 < argc) {
-      cfg.total_bytes = ParseSize(argv[++i]);
+      cfg.warp_bytes = ParseSize(argv[++i]);
     } else {
       HLOG(kError, "Unknown option: {}", arg);
       PrintUsage(argv[0]);
@@ -217,8 +217,15 @@ int main(int argc, char **argv) {
   HIPRINT("RT threads/block:    {}", cfg.rt_threads);
   HIPRINT("Client blocks:       {}", cfg.client_blocks);
   HIPRINT("Client threads/block:{}", cfg.client_threads);
-  HIPRINT("Total I/O size:      {} bytes ({} MB)", cfg.total_bytes,
-          cfg.total_bytes / (1024 * 1024));
+  HIPRINT("Per-warp I/O size:   {} bytes ({} MB)", cfg.warp_bytes,
+          cfg.warp_bytes / (1024 * 1024));
+
+  // Compute total I/O: fixed per-warp size × number of client warps
+  chi::u32 client_warps = (cfg.client_blocks * cfg.client_threads) / 32;
+  if (client_warps == 0) client_warps = 1;
+  chi::u64 total_bytes = cfg.warp_bytes * client_warps;
+  HIPRINT("Total I/O size:      {} bytes ({} MB)", total_bytes,
+          total_bytes / (1024 * 1024));
 
   float elapsed_ms = 0;
   int rc = 0;
@@ -227,13 +234,13 @@ int main(int argc, char **argv) {
     // Managed memory: GPU write + prefetch to host
     float write_ms = 0, prefetch_ms = 0, total_ms = 0;
     rc = run_cte_gpu_bench_managed(cfg.client_blocks, cfg.client_threads,
-                                    cfg.total_bytes,
+                                    total_bytes,
                                     &write_ms, &prefetch_ms, &total_ms);
     if (rc != 0) {
       HLOG(kError, "Benchmark failed with error: {}", rc);
       return 1;
     }
-    double bytes = cfg.total_bytes;
+    double bytes = total_bytes;
     printf("\n=== %s Results ===\n", tc_name);
     printf("GPU write:           %.3f ms  (%.3f GB/s)\n",
            static_cast<double>(write_ms), (bytes / 1e9) / (write_ms / 1e3));
@@ -245,11 +252,11 @@ int main(int argc, char **argv) {
     return 0;
   } else if (cfg.test_case == TestCase::kCudaMemcpy) {
     // cudaMemcpy baseline — theoretical PCIe maximum
-    rc = run_cte_gpu_bench_cudamemcpy(cfg.total_bytes, &elapsed_ms);
+    rc = run_cte_gpu_bench_cudamemcpy(total_bytes, &elapsed_ms);
   } else if (cfg.test_case == TestCase::kDirect) {
     // Direct kernel memcpy baseline — no CTE, no serialization
     rc = run_cte_gpu_bench_direct(cfg.client_blocks, cfg.client_threads,
-                                   cfg.total_bytes, &elapsed_ms);
+                                   total_bytes, &elapsed_ms);
   } else {
     // CTE putblob path — need pool, target, and tag setup
     // Create a separate CTE pool
@@ -269,10 +276,12 @@ int main(int argc, char **argv) {
 
     // Register pinned-memory bdev target (CPU side)
     chi::PoolId bdev_pool_id(800, 0);
+    chi::u64 bdev_size = std::max(total_bytes + 64ULL * 1024 * 1024,
+                                    256ULL * 1024 * 1024);
     auto reg_task = cte_client.AsyncRegisterTarget(
         "pinned::cte_gpu_bench_target",
         chimaera::bdev::BdevType::kPinned,
-        256ULL * 1024 * 1024,
+        bdev_size,
         chi::PoolQuery::Local(),
         bdev_pool_id);
     reg_task.Wait();
@@ -286,7 +295,7 @@ int main(int argc, char **argv) {
     auto gpu_reg_task = cte_client.AsyncRegisterTarget(
         "pinned::cte_gpu_bench_target",
         chimaera::bdev::BdevType::kPinned,
-        256ULL * 1024 * 1024,
+        bdev_size,
         chi::PoolQuery::Local(),
         bdev_pool_id,
         chi::PoolQuery::LocalGpuBcast());
@@ -327,7 +336,7 @@ int main(int argc, char **argv) {
         cte_client.pool_id_, tag_id,
         cfg.rt_blocks, cfg.rt_threads,
         cfg.client_blocks, cfg.client_threads,
-        cfg.total_bytes, to_cpu, &elapsed_ms);
+        total_bytes, to_cpu, &elapsed_ms);
   }
 
   if (rc != 0) {
@@ -335,7 +344,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  double bw_gbps = (cfg.total_bytes / 1e9) / (elapsed_ms / 1e3);
+  double bw_gbps = (total_bytes / 1e9) / (elapsed_ms / 1e3);
 
   printf("\n=== %s Results ===\n", tc_name);
   printf("Elapsed:             %.3f ms\n", static_cast<double>(elapsed_ms));

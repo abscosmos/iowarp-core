@@ -62,7 +62,7 @@ struct TaThreadBlock {
     alloc_.shm_init(backend, alloc_region_size);
     initialized_.store(1);
 #ifndef HSHM_IS_HOST
-    __threadfence();
+    __threadfence_system();
 #endif
     return true;
   }
@@ -91,9 +91,11 @@ struct TaThreadBlock {
 class _ThreadAllocator : public Allocator {
  public:
   hipc::atomic<int> heap_ready_;  /**< 0=not ready, 1=ready (grid-level sync) */
-  int max_threads_;               /**< Fixed thread count (set at init) */
-  size_t thread_unit_;            /**< Bytes per thread partition */
-  char * __restrict__ base_;                    /**< Cached base pointer */
+  volatile int max_threads_;     /**< Fixed thread count (set at init).
+                                      Volatile: cross-block reads must bypass L1
+                                      after WaitReady to see block 0's shm_init. */
+  volatile size_t thread_unit_;  /**< Bytes per thread partition (volatile: same) */
+  char * volatile base_;         /**< Cached base pointer (volatile: same) */
 
  public:
   HSHM_CROSS_FUN
@@ -153,8 +155,10 @@ class _ThreadAllocator : public Allocator {
    */
   HSHM_INLINE_CROSS_FUN
   TaThreadBlock* GetThreadBlock(int tid) {
-    char *part = base_ + sizeof(_ThreadAllocator) +
-                 static_cast<size_t>(tid) * thread_unit_;
+    char *b = base_;  // volatile read (bypasses L1)
+    size_t tu = thread_unit_;  // volatile read
+    char *part = b + sizeof(_ThreadAllocator) +
+                 static_cast<size_t>(tid) * tu;
     return reinterpret_cast<TaThreadBlock *>(part);
   }
 
@@ -169,7 +173,10 @@ class _ThreadAllocator : public Allocator {
     }
 
     TaThreadBlock *block = GetThreadBlock(tid);
-    if (block->initialized_.load() == 1) {
+    // Use load_device() to bypass L1 cache — the initialized_ flag may have
+    // been set by a different SM (block 0's shm_init) or be stale from a
+    // previous kernel launch on this SM.
+    if (block->initialized_.load_device() == 1) {
       return true;
     }
 
@@ -287,7 +294,7 @@ class _ThreadAllocator : public Allocator {
   HSHM_CROSS_FUN void MarkReady() {
     heap_ready_.store(1);
 #ifndef HSHM_IS_HOST
-    __threadfence();
+    __threadfence_system();
 #endif
   }
 
@@ -298,12 +305,10 @@ class _ThreadAllocator : public Allocator {
   HSHM_CROSS_FUN void WaitReady() {
 #ifndef HSHM_IS_HOST
     // Use load_device() (atomicAdd-based) to bypass per-SM L1 cache.
-    // Block 0's MarkReady() writes to L2 via atomicExch, but blocks on
-    // other SMs would read a stale L1 copy with volatile load().
     while (heap_ready_.load_device() != 1) {
       __nanosleep(100);
     }
-    __threadfence();
+    __threadfence_system();
 #endif
   }
 };
