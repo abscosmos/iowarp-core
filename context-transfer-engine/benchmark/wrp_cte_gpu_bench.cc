@@ -193,11 +193,8 @@ __global__ void gpu_putblob_kernel(
 
   __syncwarp();
   if (chi::IpcManager::IsWarpScheduler()) {
-    __threadfence();
-    int prev = atomicAdd(d_done, 1);
-    if (prev == static_cast<int>(total_warps) - 1) {
-      __threadfence_system();
-    }
+    atomicAdd_system(d_done, 1);
+    __threadfence_system();
   }
 }
 
@@ -252,11 +249,8 @@ __global__ void gpu_alloc_test_kernel(
     }
 
     d_progress[warp_id] = 10;  // all done
+    atomicAdd_system(d_done, 1);
     __threadfence_system();
-    int prev = atomicAdd(d_done, 1);
-    if (prev == static_cast<int>(total_warps) - 1) {
-      __threadfence_system();
-    }
   }
 }
 
@@ -290,8 +284,8 @@ __global__ void gpu_direct_memcpy_kernel(
     }
   }
 
+  atomicAdd_system(d_done, 1);
   __threadfence_system();
-  atomicAdd(d_done, 1);
 }
 
 /**
@@ -319,8 +313,8 @@ __global__ void gpu_managed_write_kernel(
     __syncwarp();
 
     if (lane_id == 0) {
-      __threadfence();
-      atomicAdd(d_done, 1);
+      atomicAdd_system(d_done, 1);
+      __threadfence_system();
     }
   }
 }
@@ -333,13 +327,15 @@ __global__ void gpu_managed_write_kernel(
 #include <cereal/types/vector.hpp>
 #include <cereal/types/string.hpp>
 
-static bool PollDone(volatile int *d_done, int total_warps, int timeout_us) {
+static bool PollDone(int *d_done, int total_warps, int timeout_us) {
   int elapsed_us = 0;
-  while (*d_done < total_warps && elapsed_us < timeout_us) {
+  int cur = __atomic_load_n(d_done, __ATOMIC_ACQUIRE);
+  while (cur < total_warps && elapsed_us < timeout_us) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));
     elapsed_us += 100;
+    cur = __atomic_load_n(d_done, __ATOMIC_ACQUIRE);
   }
-  return *d_done >= total_warps;
+  return cur >= total_warps;
 }
 
 //==============================================================================
@@ -421,6 +417,7 @@ static int run_cte_gpu_bench_putblob(
   chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
   gpu_info.gpu_heap_backend = heap_backend;
+  gpu_info.gpu_heap_partitions = total_warps;
 
   int *d_done;
   cudaMallocHost(&d_done, sizeof(int));
@@ -490,22 +487,17 @@ static int run_cte_gpu_bench_putblob(
     }
   }
 
-  constexpr int kTimeoutUs = 30000000;  // 30s
+  constexpr int kTimeoutUs = 60000000;  // 60s
   bool completed = PollDone(d_done, static_cast<int>(total_warps), kTimeoutUs);
 
-  // Wait for end event and compute GPU-side elapsed time
-  cudaEventSynchronize(ev_end);
   float gpu_elapsed_ms = 0;
-  cudaEventElapsedTime(&gpu_elapsed_ms, ev_start, ev_end);
-  *out_elapsed_ms = gpu_elapsed_ms;
-  cudaEventDestroy(ev_start);
-  cudaEventDestroy(ev_end);
 
-  // On timeout: pause orchestrator FIRST to flush GPU printf, then sync client
+  // On timeout: print diagnostics and bail
   if (!completed) {
     if (ctrl) {
       fprintf(stderr, "TIMEOUT: d_done=%d/%u running_flag=%d\n",
-              *d_done, total_warps, ctrl->running_flag);
+              __atomic_load_n(d_done, __ATOMIC_ACQUIRE), total_warps,
+              ctrl->running_flag);
       for (chi::u32 i = 0; i < (rt_blocks * rt_threads) / 32 && i < 32; ++i) {
         fprintf(stderr, "  warp[%u]: polls=%llu qpop=%u pop=%u done=%u "
                 "state=%u step=%u method=%u pool=%u.%u "
@@ -530,12 +522,22 @@ static int run_cte_gpu_bench_putblob(
       fprintf(stderr, "  warp[%u]: %d\n", i, d_progress[i]);
     }
     fflush(stderr);
+    // Skip cudaEventSynchronize — kernel may still be running
     CHI_IPC->PauseGpuOrchestrator();
-    hshm::GpuApi::DestroyStream(stream);
-    cudaFreeHost(d_done);
-    cudaFreeHost((void*)d_progress);
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_end);
+    *out_elapsed_ms = 0;
     return -4;
   }
+
+  // Success: get GPU-side timing
+  cudaError_t ev_err = cudaEventQuery(ev_end);
+  if (ev_err == cudaSuccess) {
+    cudaEventElapsedTime(&gpu_elapsed_ms, ev_start, ev_end);
+  }
+  *out_elapsed_ms = gpu_elapsed_ms;
+  cudaEventDestroy(ev_start);
+  cudaEventDestroy(ev_end);
 
   hshm::GpuApi::Synchronize(stream);
   CHI_IPC->PauseGpuOrchestrator();
@@ -544,7 +546,7 @@ static int run_cte_gpu_bench_putblob(
   cudaFreeHost((void*)d_progress);
   hshm::GpuApi::DestroyStream(stream);
 
-  return completed ? 0 : -4;
+  return 0;
 }
 
 static int run_cte_gpu_bench_direct(

@@ -40,6 +40,15 @@ set(GPU_SUBMISSION_TEST_GPU_SOURCES
   test_gpu_submission_gpu.cc
 )
 
+# GPU Queue Stress test executable
+set(GPU_QUEUE_STRESS_TEST_TARGET chimaera_gpu_queue_stress_tests)
+set(GPU_QUEUE_STRESS_TEST_CPU_SOURCES
+  test_gpu_queue_stress_cpu.cc
+)
+set(GPU_QUEUE_STRESS_TEST_GPU_SOURCES
+  test_gpu_queue_stress_gpu.cc
+)
+
 # Create flush correctness test executable
 add_executable(${FLUSH_TEST_TARGET} ${FLUSH_TEST_SOURCES})
 
@@ -682,6 +691,103 @@ add_custom_target(test_gpu_submission
   DEPENDS ${GPU_SUBMISSION_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   COMMENT "Running Chimaera Part 3 GPU submission tests"
+)
+
+# GPU Queue Stress test build rules
+if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
+  # GPU kernels compiled as CUDA
+  set(GPU_QUEUE_STRESS_CUDA_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/cuda/${GPU_QUEUE_STRESS_TEST_GPU_SOURCES})
+  configure_file(${GPU_QUEUE_STRESS_TEST_GPU_SOURCES} ${GPU_QUEUE_STRESS_CUDA_SOURCE} COPYONLY)
+  set_source_files_properties(${GPU_QUEUE_STRESS_CUDA_SOURCE} PROPERTIES LANGUAGE CUDA)
+
+  add_library(${GPU_QUEUE_STRESS_TEST_TARGET}_gpu_kernels OBJECT ${GPU_QUEUE_STRESS_CUDA_SOURCE})
+  target_include_directories(${GPU_QUEUE_STRESS_TEST_TARGET}_gpu_kernels PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/modules/admin/include
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+  )
+  target_link_libraries(${GPU_QUEUE_STRESS_TEST_TARGET}_gpu_kernels PRIVATE hshm::cuda_cxx)
+  set_target_properties(${GPU_QUEUE_STRESS_TEST_TARGET}_gpu_kernels PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_STANDARD 17
+  )
+  target_compile_options(${GPU_QUEUE_STRESS_TEST_TARGET}_gpu_kernels PUBLIC
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+
+  add_executable(${GPU_QUEUE_STRESS_TEST_TARGET}
+    ${GPU_QUEUE_STRESS_TEST_CPU_SOURCES}
+    $<TARGET_OBJECTS:${GPU_QUEUE_STRESS_TEST_TARGET}_gpu_kernels>
+  )
+
+  set_source_files_properties(${GPU_QUEUE_STRESS_TEST_CPU_SOURCES} PROPERTIES
+    COMPILE_OPTIONS "-UHSHM_ENABLE_CUDA;-DHSHM_ENABLE_CUDA=0"
+  )
+
+  target_include_directories(${GPU_QUEUE_STRESS_TEST_TARGET} PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/test
+    ${CHIMAERA_ROOT}/modules/admin/include
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  target_link_libraries(${GPU_QUEUE_STRESS_TEST_TARGET}
+    chimaera_admin_runtime
+    chimaera_admin_client
+    chimaera_MOD_NAME_runtime
+    chimaera_MOD_NAME_client
+    hshm::cxx
+    hshm::cuda_cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  set_target_properties(${GPU_QUEUE_STRESS_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_SEPARABLE_COMPILATION ON
+    LINKER_LANGUAGE CUDA
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+
+  message(STATUS "Building GPU queue stress tests with CUDA support")
+else()
+  add_executable(${GPU_QUEUE_STRESS_TEST_TARGET} ${GPU_QUEUE_STRESS_TEST_CPU_SOURCES})
+
+  target_include_directories(${GPU_QUEUE_STRESS_TEST_TARGET} PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/test
+    ${CHIMAERA_ROOT}/modules/admin/include
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+  )
+
+  target_link_libraries(${GPU_QUEUE_STRESS_TEST_TARGET}
+    chimaera_admin_runtime
+    chimaera_admin_client
+    chimaera_MOD_NAME_runtime
+    chimaera_MOD_NAME_client
+    hshm::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+
+  set_target_properties(${GPU_QUEUE_STRESS_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+
+  message(STATUS "Building GPU queue stress tests without CUDA support (CPU-only)")
+endif()
+
+add_custom_target(test_gpu_queue_stress
+  COMMAND ${GPU_QUEUE_STRESS_TEST_TARGET}
+  DEPENDS ${GPU_QUEUE_STRESS_TEST_TARGET}
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  COMMENT "Running GPU queue stress tests (64 client warps vs 1 RT warp)"
 )
 
 add_custom_target(test_gpu_client_process

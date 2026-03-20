@@ -105,7 +105,7 @@ class Worker {
    */
   GpuRunContext **active_tasks_ptr_;
 
-  static constexpr u32 kMaxSuspended = 16;
+  static constexpr u32 kMaxSuspended = 128;
 
   /** State for a suspended warp-task */
   struct SuspendedTask {

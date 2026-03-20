@@ -1,0 +1,49 @@
+# CTE GPU Benchmark — Full Scaling Study (Pipeline Test)
+#
+# Cartesian product of three independent dimensions:
+#   1. Client warps:   1, 4, 16, 32, 64  (blocks×threads zipped)
+#   2. I/O size/warp:  4k, 64k, 128k, 256k, 1m
+#   3. Runtime warps:  1, 4, 16  (scale via blocks, max 128 threads/block)
+#
+# Total: 5 × 5 × 3 = 75 configs × 3 repeats = 225 runs
+#
+# Requirements: wrp_cte_gpu_bench in PATH, CUDA-capable GPU
+#
+# Usage:
+#   jarvis pipeline test gpu/cte_gpu_scaling_test.yaml
+
+config:
+  name: cte_gpu_scaling
+  pkgs:
+    - pkg_type: jarvis_iowarp.wrp_cte_gpu_bench
+      pkg_name: bench
+      test_case: "putblob_gpu"
+      client_blocks: 1
+      client_threads: 512
+      rt_blocks: 1
+      rt_threads: 32
+      io_size: "128k"
+      iterations: 16
+
+vars:
+  # Client warp count (blocks × threads / 32)
+  #   1×32=1w, 1×128=4w, 1×512=16w, 4×256=32w, 8×256=64w
+  bench.client_blocks:  [1, 1,   1,   4,   8  ]
+  bench.client_threads: [32, 128, 512, 256, 256]
+
+  # Per-warp I/O size
+  bench.io_size: ["1k", "4k", "64k", "128k", "256k", "1m"]
+
+  # Runtime orchestrator warp count (blocks × threads / 32)
+  # Max ~128 threads/block due to 32KB stack per thread.
+  # Scale via blocks: 1×32=1w, 1×128=4w, 4×128=16w
+  bench.rt_blocks:  [1, 1,   4  ]
+  bench.rt_threads: [32, 128, 128]
+
+loop:
+  - [bench.client_blocks, bench.client_threads]
+  - [bench.io_size]
+  - [bench.rt_blocks, bench.rt_threads]
+
+repeat: 3
+output: "${HOME}/cte_gpu_scaling_results"

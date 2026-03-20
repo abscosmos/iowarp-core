@@ -29,6 +29,9 @@ from jarvis_cd.shell import Exec, LocalExecInfo
 from jarvis_cd.shell.process import Which
 import os
 import re
+import signal
+import subprocess
+import time
 
 
 class WrpCteGpuBench(Application):
@@ -100,7 +103,6 @@ class WrpCteGpuBench(Application):
 
     def _configure(self, **kwargs):
         os.makedirs(self.config['output_dir'], exist_ok=True)
-        self.setenv('CHI_WITH_RUNTIME', '0')
 
         warps = (self.config['client_blocks'] *
                  self.config['client_threads']) // 32
@@ -113,7 +115,36 @@ class WrpCteGpuBench(Application):
         self.log(f"  IO/warp:        {self.config['io_size']}")
         self.log(f"  Iterations:     {self.config['iterations']}")
 
+    def _kill_stale_processes(self):
+        """Kill any leftover wrp_cte_gpu_bench or chimaera processes and
+        free port 9413 so the next run can start cleanly."""
+        for proc_name in ['wrp_cte_gpu_bench', 'chimaera']:
+            try:
+                subprocess.run(
+                    ['pkill', '-9', '-f', proc_name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        # Also kill anything holding port 9413
+        try:
+            result = subprocess.run(
+                ['lsof', '-ti', ':9413'],
+                capture_output=True, text=True)
+            for pid in result.stdout.strip().split('\n'):
+                if pid.strip():
+                    try:
+                        os.kill(int(pid.strip()), signal.SIGKILL)
+                    except (ProcessLookupError, ValueError):
+                        pass
+        except Exception:
+            pass
+        time.sleep(2)
+
     def start(self):
+        # Kill stale processes from previous runs before starting
+        self._kill_stale_processes()
+
         Which('wrp_cte_gpu_bench', LocalExecInfo(env=self.mod_env)).run()
 
         output_file = os.path.join(
@@ -209,7 +240,7 @@ class WrpCteGpuBench(Application):
         self.log(f"Plots saved to {output_dir}")
 
     def stop(self):
-        pass
+        self._kill_stale_processes()
 
     def clean(self):
         output_dir = self.config['output_dir']
