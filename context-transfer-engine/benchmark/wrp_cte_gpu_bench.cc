@@ -162,31 +162,23 @@ __global__ void gpu_putblob_kernel(
         blob_shm.off_.exchange(base_off + my_offset);
 
         // Build blob name: "w_<warp_id>_<iter>"
+        using StrT = hshm::priv::basic_string<char, CHI_PRIV_ALLOC_T>;
         char name_buf[32];
         int pos = 0;
         name_buf[pos++] = 'w';
         name_buf[pos++] = '_';
-        chi::u32 wid = warp_id;
-        char digits[10];
-        int nd = 0;
-        do { digits[nd++] = '0' + (wid % 10); wid /= 10; } while (wid > 0);
-        for (int d = nd - 1; d >= 0; --d) name_buf[pos++] = digits[d];
+        pos += StrT::NumberToStr(name_buf + pos, 32 - pos, warp_id);
         name_buf[pos++] = '_';
-        chi::u32 it = iter;
-        nd = 0;
-        do { digits[nd++] = '0' + (it % 10); it /= 10; } while (it > 0);
-        for (int d = nd - 1; d >= 0; --d) name_buf[pos++] = digits[d];
+        pos += StrT::NumberToStr(name_buf + pos, 32 - pos, iter);
         name_buf[pos] = '\0';
 
-        auto *ipc = CHI_IPC;
-        auto task = ipc->NewTask<wrp_cte::core::PutBlobTask>(
-            chi::CreateTaskId(), cte_pool_id,
-            to_cpu ? chi::PoolQuery::ToLocalCpu() : chi::PoolQuery::Local(),
+        auto pool_query = to_cpu ? chi::PoolQuery::ToLocalCpu()
+                                 : chi::PoolQuery::Local();
+        auto future = cte_client.AsyncPutBlob(
             tag_id, name_buf,
             (chi::u64)0, warp_bytes,
             blob_shm, -1.0f,
-            wrp_cte::core::Context(), (chi::u32)0);
-        auto future = ipc->Send(task);
+            wrp_cte::core::Context(), (chi::u32)0, pool_query);
         future.Wait();
       }
       __syncwarp();

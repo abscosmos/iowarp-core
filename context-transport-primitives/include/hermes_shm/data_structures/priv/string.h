@@ -2127,6 +2127,144 @@ class basic_string {
   HSHM_INLINE_CROSS_FUN void load(Archive& ar) {
     hshm::ipc::load_string(ar, *this);
   }
+  /**
+   * Convert an integer to a string.
+   *
+   * @param alloc Allocator to use
+   * @param val Integer value to convert
+   * @return basic_string containing the decimal representation
+   */
+  template <typename IntT,
+            typename = std::enable_if_t<std::is_integral_v<IntT>>>
+  HSHM_CROSS_FUN
+  static basic_string FromNumber(AllocT *alloc, IntT val) {
+    T buf[32];
+    size_type len = NumberToStr(buf, sizeof(buf), val);
+    return basic_string(alloc, buf, len);
+  }
+
+  /**
+   * Convert a floating-point number to a string.
+   *
+   * @param alloc Allocator to use
+   * @param val Float/double value to convert
+   * @param precision Number of decimal digits (default: 6)
+   * @return basic_string containing the decimal representation
+   */
+  template <typename FloatT,
+            typename = std::enable_if_t<std::is_floating_point_v<FloatT>>,
+            typename = void>
+  HSHM_CROSS_FUN
+  static basic_string FromNumber(AllocT *alloc, FloatT val,
+                                 int precision = 6) {
+    T buf[64];
+    size_type len = NumberToStr(buf, sizeof(buf), val, precision);
+    return basic_string(alloc, buf, len);
+  }
+
+ private:
+  /**
+   * Convert an unsigned integer to a char buffer (GPU-compatible).
+   * Returns the number of characters written (excluding null terminator).
+   */
+  template <typename UIntT>
+  HSHM_CROSS_FUN
+  static size_type UintToStr(T *buf, size_type buf_size, UIntT val) {
+    if (buf_size == 0) return 0;
+    if (val == 0) {
+      buf[0] = '0';
+      if (buf_size > 1) buf[1] = T();
+      return 1;
+    }
+    // Write digits in reverse
+    T tmp[32];
+    size_type nd = 0;
+    while (val > 0 && nd < 32) {
+      tmp[nd++] = '0' + static_cast<T>(val % 10);
+      val /= 10;
+    }
+    size_type len = (nd < buf_size) ? nd : buf_size - 1;
+    for (size_type i = 0; i < len; ++i) {
+      buf[i] = tmp[nd - 1 - i];
+    }
+    if (len < buf_size) buf[len] = T();
+    return len;
+  }
+
+ public:
+  /**
+   * Convert an integer to a char buffer (GPU-compatible).
+   * Handles signed and unsigned types.
+   *
+   * @param buf Output buffer
+   * @param buf_size Size of output buffer
+   * @param val Integer value
+   * @return Number of characters written (excluding null terminator)
+   */
+  template <typename IntT,
+            typename = std::enable_if_t<std::is_integral_v<IntT>>>
+  HSHM_CROSS_FUN
+  static size_type NumberToStr(T *buf, size_type buf_size, IntT val) {
+    if (buf_size == 0) return 0;
+    if constexpr (std::is_signed_v<IntT>) {
+      if (val < 0) {
+        buf[0] = '-';
+        using UIntT = std::make_unsigned_t<IntT>;
+        // Handle INT_MIN: cast to unsigned first to avoid UB
+        UIntT uval = static_cast<UIntT>(0) - static_cast<UIntT>(val);
+        size_type len = UintToStr(buf + 1, buf_size - 1, uval);
+        return 1 + len;
+      }
+    }
+    using UIntT = std::make_unsigned_t<IntT>;
+    return UintToStr(buf, buf_size, static_cast<UIntT>(val));
+  }
+
+  /**
+   * Convert a floating-point number to a char buffer (GPU-compatible).
+   *
+   * @param buf Output buffer
+   * @param buf_size Size of output buffer
+   * @param val Float/double value
+   * @param precision Number of decimal digits (default: 6)
+   * @return Number of characters written (excluding null terminator)
+   */
+  template <typename FloatT,
+            typename = std::enable_if_t<std::is_floating_point_v<FloatT>>,
+            typename = void>
+  HSHM_CROSS_FUN
+  static size_type NumberToStr(T *buf, size_type buf_size, FloatT val,
+                               int precision = 6) {
+    if (buf_size == 0) return 0;
+    size_type pos = 0;
+
+    // Handle negative
+    if (val < 0) {
+      buf[pos++] = '-';
+      val = -val;
+    }
+
+    // Integer part
+    auto int_part = static_cast<unsigned long long>(val);
+    size_type int_len = UintToStr(buf + pos, buf_size - pos, int_part);
+    pos += int_len;
+
+    if (precision > 0 && pos + 1 < buf_size) {
+      buf[pos++] = '.';
+
+      // Fractional part
+      FloatT frac = val - static_cast<FloatT>(int_part);
+      for (int d = 0; d < precision && pos < buf_size - 1; ++d) {
+        frac *= 10;
+        int digit = static_cast<int>(frac);
+        buf[pos++] = '0' + static_cast<T>(digit);
+        frac -= digit;
+      }
+    }
+
+    if (pos < buf_size) buf[pos] = T();
+    return pos;
+  }
 };
 
 /**
