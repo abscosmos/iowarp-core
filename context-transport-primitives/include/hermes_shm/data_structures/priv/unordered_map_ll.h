@@ -34,349 +34,349 @@
 #ifndef HSHM_DATA_STRUCTURES_PRIV_UNORDERED_MAP_LL_H_
 #define HSHM_DATA_STRUCTURES_PRIV_UNORDERED_MAP_LL_H_
 
-#include <vector>
-#include <list>
-#include <functional>
-#include <utility>
-#include <algorithm>
+#include "hermes_shm/data_structures/priv/vector.h"
+#include "hermes_shm/types/hash.h"
+#include "hermes_shm/memory/allocator/malloc_allocator.h"
 
 namespace hshm::priv {
 
+/** Result of insert / insert_or_assign operations */
+template <typename T>
+struct InsertResult {
+  bool inserted;
+  T *value;
+};
+
 /**
- * Unordered map implementation using vector of lists
+ * GPU-compatible unordered map using open addressing with linear probing.
  *
- * This map partitions the hash space into multiple buckets (vector elements).
- * Each bucket contains a list of key-value pairs.
+ * Backed by a single priv::vector of slots. Each slot is either empty,
+ * occupied, or a tombstone. The map does not auto-rehash; callers must
+ * ensure the capacity is sufficient for their workload.
+ *
  * External locking is required for thread safety.
  *
- * Template parameters:
- * @tparam Key Key type
- * @tparam T Mapped value type
- * @tparam Hash Hash function type (defaults to std::hash<Key>)
- * @tparam KeyEqual Key equality comparison (defaults to std::equal_to<Key>)
+ * @tparam Key      Key type (must support copy/move and operator==)
+ * @tparam T        Mapped value type
+ * @tparam AllocT   Allocator type (e.g., BuddyAllocator, ThreadAllocator)
+ * @tparam Hash     Hash functor (defaults to hshm::hash<Key>)
+ * @tparam KeyEqual Equality functor (defaults to hshm::equal_to<Key>)
  */
-template<typename Key, typename T, typename Hash = std::hash<Key>,
-         typename KeyEqual = std::equal_to<Key>>
+template <typename Key, typename T,
+          typename AllocT = hshm::ipc::MallocAllocator,
+          typename Hash = hshm::hash<Key>,
+          typename KeyEqual = hshm::equal_to<Key>>
 class unordered_map_ll {
-public:
+ public:
   using key_type = Key;
   using mapped_type = T;
-  using value_type = std::pair<const Key, T>;
   using size_type = std::size_t;
   using hasher = Hash;
   using key_equal = KeyEqual;
 
-private:
-  // Each bucket contains a list of key-value pairs
-  struct Bucket {
-    std::list<value_type> entries;
+ private:
+  static constexpr uint32_t kEmpty = 0;
+  static constexpr uint32_t kOccupied = 1;
+  static constexpr uint32_t kTombstone = 2;
 
-    Bucket() = default;
-    Bucket(const Bucket&) = default;
-    Bucket& operator=(const Bucket&) = default;
-    Bucket(Bucket&&) noexcept = default;
-    Bucket& operator=(Bucket&&) noexcept = default;
+  struct Slot {
+    uint32_t state_;
+    Key key_;
+    T value_;
+
+    HSHM_CROSS_FUN Slot() : state_(kEmpty), key_(), value_() {}
+    HSHM_CROSS_FUN Slot(const Slot &o)
+        : state_(o.state_), key_(o.key_), value_(o.value_) {}
+    HSHM_CROSS_FUN Slot &operator=(const Slot &o) {
+      if (this != &o) {
+        state_ = o.state_;
+        key_ = o.key_;
+        value_ = o.value_;
+      }
+      return *this;
+    }
   };
 
-  std::vector<Bucket> buckets_;
+  vector<Slot, AllocT> slots_;
+  size_type size_;
+  AllocT *alloc_;
   Hash hash_fn_;
   KeyEqual key_eq_;
 
-  /**
-   * Get bucket index for a given key
-   * @param key Key to hash
-   * @return Bucket index
-   */
-  size_type get_bucket_index(const Key& key) const {
-    return hash_fn_(key) % buckets_.size();
+  /** Find the slot index for a key (returns capacity if not found) */
+  HSHM_INLINE_CROSS_FUN
+  size_type find_slot(const Key &key) const {
+    size_type cap = slots_.size();
+    if (cap == 0) return cap;
+    size_type h = hash_fn_(key) % cap;
+    for (size_type i = 0; i < cap; ++i) {
+      size_type idx = (h + i) % cap;
+      if (slots_[idx].state_ == kEmpty) return cap;
+      if (slots_[idx].state_ == kOccupied && key_eq_(slots_[idx].key_, key)) {
+        return idx;
+      }
+    }
+    return cap;
   }
 
-  /**
-   * Find entry in a bucket
-   * @param bucket Bucket to search
-   * @param key Key to find
-   * @return Iterator to the entry, or bucket.entries.end() if not found
-   */
-  typename std::list<value_type>::iterator
-  find_entry_in_bucket(Bucket& bucket, const Key& key) {
-    return std::find_if(bucket.entries.begin(), bucket.entries.end(),
-                        [this, &key](const value_type& item) {
-                          return key_eq_(item.first, key);
-                        });
+  /** Find the first available slot (empty or tombstone) for insertion.
+   *  Also checks for existing key. Returns {found_idx, is_existing}. */
+  HSHM_INLINE_CROSS_FUN
+  void find_insert_slot(const Key &key, size_type &out_idx,
+                        bool &out_existing) const {
+    size_type cap = slots_.size();
+    size_type h = hash_fn_(key) % cap;
+    size_type first_avail = cap;
+    out_existing = false;
+    out_idx = cap;
+    for (size_type i = 0; i < cap; ++i) {
+      size_type idx = (h + i) % cap;
+      if (slots_[idx].state_ == kOccupied && key_eq_(slots_[idx].key_, key)) {
+        out_idx = idx;
+        out_existing = true;
+        return;
+      }
+      if (slots_[idx].state_ != kOccupied && first_avail == cap) {
+        first_avail = idx;
+      }
+      if (slots_[idx].state_ == kEmpty) {
+        break;
+      }
+    }
+    out_idx = first_avail;
   }
 
+ public:
   /**
-   * Find entry in a bucket (const version)
-   * @param bucket Bucket to search
-   * @param key Key to find
-   * @return Const iterator to the entry, or bucket.entries.end() if not found
+   * Constructor (host-only, uses global MallocAllocator)
+   * @param capacity Initial number of slots (hash table size)
    */
-  typename std::list<value_type>::const_iterator
-  find_entry_in_bucket(const Bucket& bucket, const Key& key) const {
-    return std::find_if(bucket.entries.begin(), bucket.entries.end(),
-                        [this, &key](const value_type& item) {
-                          return key_eq_(item.first, key);
-                        });
+#if HSHM_IS_HOST
+  explicit unordered_map_ll(size_type capacity = 16)
+      : slots_(HSHM_MALLOC), size_(0), alloc_(HSHM_MALLOC), hash_fn_(), key_eq_() {
+    slots_.resize(capacity);
+  }
+#endif
+
+  /**
+   * Constructor with explicit allocator
+   * @param alloc Allocator for the backing vector
+   * @param capacity Initial number of slots (hash table size)
+   */
+  HSHM_CROSS_FUN
+  explicit unordered_map_ll(AllocT *alloc, size_type capacity = 16)
+      : slots_(alloc), size_(0), alloc_(alloc), hash_fn_(), key_eq_() {
+    slots_.resize(capacity);
   }
 
-public:
-  /**
-   * Constructor
-   * @param max_concurrency Number of buckets (determines maximum useful concurrency)
-   * @param hash Hash function
-   * @param equal Key equality function
-   */
-  explicit unordered_map_ll(size_type max_concurrency = 16,
-                           const Hash& hash = Hash(),
-                           const KeyEqual& equal = KeyEqual())
-      : buckets_(max_concurrency), hash_fn_(hash), key_eq_(equal) {}
+  HSHM_CROSS_FUN ~unordered_map_ll() = default;
 
-  /**
-   * Destructor
-   */
-  ~unordered_map_ll() = default;
+  /** Rehash the map to a new capacity, re-inserting all occupied entries.
+   *  Returns false if allocation fails; the map is left unchanged. */
+  HSHM_CROSS_FUN
+  bool rehash(size_type new_cap) {
+    // Try to allocate new slots first (before destroying old)
+    vector<Slot, AllocT> new_slots(alloc_);
+    if (!new_slots.resize(new_cap)) {
+      return false;  // Allocation failed; keep existing map intact
+    }
 
-  // Copyable and movable
-  unordered_map_ll(const unordered_map_ll&) = default;
-  unordered_map_ll& operator=(const unordered_map_ll&) = default;
-  unordered_map_ll(unordered_map_ll&&) noexcept = default;
-  unordered_map_ll& operator=(unordered_map_ll&&) noexcept = default;
+    // Move old slots out; slots_ becomes empty after move
+    vector<Slot, AllocT> old_slots(static_cast<vector<Slot, AllocT>&&>(slots_));
+    size_type old_size = old_slots.size();
+    // Install the new (empty) slots
+    slots_ = static_cast<vector<Slot, AllocT>&&>(new_slots);
+    size_ = 0;
+    for (size_type i = 0; i < old_size; ++i) {
+      if (old_slots[i].state_ == kOccupied) {
+        insert_no_rehash(old_slots[i].key_, old_slots[i].value_);
+      }
+    }
+    return true;
+  }
 
-  /**
-   * Insert or update a key-value pair
-   * @param key Key to insert/update
-   * @param value Value to insert/update
-   * @return Pair of iterator to the element and bool indicating if insertion occurred
-   */
-  std::pair<bool, T*> insert_or_assign(const Key& key, const T& value) {
-    size_type bucket_idx = get_bucket_index(key);
-    Bucket& bucket = buckets_[bucket_idx];
-
-    auto it = find_entry_in_bucket(bucket, key);
-    if (it != bucket.entries.end()) {
-      // Key exists, update value
-      it->second = value;
-      return {false, &it->second};
-    } else {
-      // Key doesn't exist, insert new entry
-      bucket.entries.emplace_back(key, value);
-      return {true, &bucket.entries.back().second};
+ private:
+  /** Check load factor and rehash if needed (>75% full).
+   *  Silently skips rehash if allocation fails. */
+  HSHM_INLINE_CROSS_FUN
+  void maybe_rehash() {
+    // Rehash when load factor > 75%: size * 4 > capacity * 3
+    if (size_ * 4 > slots_.size() * 3) {
+      rehash(slots_.size() * 2);  // Best-effort; map degrades on failure
     }
   }
 
-  /**
-   * Insert a key-value pair (only if key doesn't exist)
-   * @param key Key to insert
-   * @param value Value to insert
-   * @return Pair of bool indicating success and pointer to value (or nullptr)
-   */
-  std::pair<bool, T*> insert(const Key& key, const T& value) {
-    size_type bucket_idx = get_bucket_index(key);
-    Bucket& bucket = buckets_[bucket_idx];
-
-    auto it = find_entry_in_bucket(bucket, key);
-    if (it != bucket.entries.end()) {
-      // Key exists, insertion failed
-      return {false, &it->second};
-    } else {
-      // Key doesn't exist, insert new entry
-      bucket.entries.emplace_back(key, value);
-      return {true, &bucket.entries.back().second};
+  /** Insert without rehash check (used internally by rehash) */
+  HSHM_CROSS_FUN
+  InsertResult<T> insert_no_rehash(const Key &key, const T &value) {
+    size_type idx;
+    bool existing;
+    find_insert_slot(key, idx, existing);
+    if (idx >= slots_.size()) {
+      return {false, nullptr};
     }
-  }
-
-  /**
-   * Emplace a key-value pair
-   * @param args Arguments to construct the key-value pair
-   * @return Pair of bool indicating success and pointer to value (or nullptr)
-   */
-  template<typename... Args>
-  std::pair<bool, T*> emplace(Args&&... args) {
-    value_type temp(std::forward<Args>(args)...);
-    return insert(temp.first, temp.second);
-  }
-
-  /**
-   * Access element with given key (creates if doesn't exist)
-   * @param key Key to access
-   * @return Reference to the mapped value
-   */
-  T& operator[](const Key& key) {
-    size_type bucket_idx = get_bucket_index(key);
-    Bucket& bucket = buckets_[bucket_idx];
-
-    auto it = find_entry_in_bucket(bucket, key);
-    if (it != bucket.entries.end()) {
-      return it->second;
-    } else {
-      // Insert default-constructed value
-      bucket.entries.emplace_back(key, T());
-      return bucket.entries.back().second;
+    if (existing) {
+      return {false, &slots_[idx].value_};
     }
+    slots_[idx].state_ = kOccupied;
+    slots_[idx].key_ = key;
+    slots_[idx].value_ = value;
+    ++size_;
+    return {true, &slots_[idx].value_};
   }
 
-  /**
-   * Access element with given key (const version, throws if not found)
-   * @param key Key to access
-   * @return Const reference to the mapped value
-   * @throws std::out_of_range if key not found
-   */
-  const T& at(const Key& key) const {
-    size_type bucket_idx = get_bucket_index(key);
-    const Bucket& bucket = buckets_[bucket_idx];
-
-    auto it = find_entry_in_bucket(bucket, key);
-    if (it != bucket.entries.end()) {
-      return it->second;
-    } else {
-      throw std::out_of_range("unordered_map_ll::at: key not found");
+ public:
+  /** Insert or update a key-value pair */
+  HSHM_CROSS_FUN
+  InsertResult<T> insert_or_assign(const Key &key, const T &value) {
+    size_type idx;
+    bool existing;
+    find_insert_slot(key, idx, existing);
+    if (existing) {
+      slots_[idx].value_ = value;
+      return {false, &slots_[idx].value_};
     }
-  }
-
-  /**
-   * Access element with given key (non-const version, throws if not found)
-   * @param key Key to access
-   * @return Reference to the mapped value
-   * @throws std::out_of_range if key not found
-   */
-  T& at(const Key& key) {
-    size_type bucket_idx = get_bucket_index(key);
-    Bucket& bucket = buckets_[bucket_idx];
-
-    auto it = find_entry_in_bucket(bucket, key);
-    if (it != bucket.entries.end()) {
-      return it->second;
-    } else {
-      throw std::out_of_range("unordered_map_ll::at: key not found");
+    if (idx >= slots_.size()) {
+      if (!rehash(slots_.size() * 2)) return {false, nullptr};
+      return insert_or_assign(key, value);
     }
+    slots_[idx].state_ = kOccupied;
+    slots_[idx].key_ = key;
+    slots_[idx].value_ = value;
+    ++size_;
+    maybe_rehash();
+    return {true, &slots_[idx].value_};
   }
 
-  /**
-   * Find an element
-   * @param key Key to find
-   * @return Pointer to the value if found, nullptr otherwise
-   */
-  T* find(const Key& key) {
-    size_type bucket_idx = get_bucket_index(key);
-    Bucket& bucket = buckets_[bucket_idx];
-
-    auto it = find_entry_in_bucket(bucket, key);
-    if (it != bucket.entries.end()) {
-      return &it->second;
+  /** Insert a key-value pair (only if key doesn't exist) */
+  HSHM_CROSS_FUN
+  InsertResult<T> insert(const Key &key, const T &value) {
+    size_type idx;
+    bool existing;
+    find_insert_slot(key, idx, existing);
+    if (existing) {
+      return {false, &slots_[idx].value_};
     }
-    return nullptr;
+    if (idx >= slots_.size()) {
+      if (!rehash(slots_.size() * 2)) return {false, nullptr};
+      return insert(key, value);
+    }
+    slots_[idx].state_ = kOccupied;
+    slots_[idx].key_ = key;
+    slots_[idx].value_ = value;
+    ++size_;
+    maybe_rehash();
+    return {true, &slots_[idx].value_};
   }
 
-  /**
-   * Find an element (const version)
-   * @param key Key to find
-   * @return Const pointer to the value if found, nullptr otherwise
-   */
-  const T* find(const Key& key) const {
-    size_type bucket_idx = get_bucket_index(key);
-    const Bucket& bucket = buckets_[bucket_idx];
+  /** Access element (creates with default value if absent) */
+  HSHM_CROSS_FUN
+  T &operator[](const Key &key) {
+    size_type idx;
+    bool existing;
+    find_insert_slot(key, idx, existing);
+    if (existing) {
+      return slots_[idx].value_;
+    }
+    if (idx >= slots_.size()) {
+      rehash(slots_.size() * 2);
+      return operator[](key);
+    }
+    slots_[idx].state_ = kOccupied;
+    slots_[idx].key_ = key;
+    slots_[idx].value_ = T();
+    ++size_;
+    maybe_rehash();
+    return slots_[idx].value_;
+  }
 
-    auto it = find_entry_in_bucket(bucket, key);
-    if (it != bucket.entries.end()) {
-      return &it->second;
+  /** Find an element */
+  HSHM_CROSS_FUN
+  T *find(const Key &key) {
+    size_type idx = find_slot(key);
+    if (idx < slots_.size()) {
+      return &slots_[idx].value_;
     }
     return nullptr;
   }
 
-  /**
-   * Check if key exists
-   * @param key Key to check
-   * @return true if key exists, false otherwise
-   */
-  bool contains(const Key& key) const {
+  /** Find an element (const) */
+  HSHM_CROSS_FUN
+  const T *find(const Key &key) const {
+    size_type idx = find_slot(key);
+    if (idx < slots_.size()) {
+      return &slots_[idx].value_;
+    }
+    return nullptr;
+  }
+
+  /** Check if key exists */
+  HSHM_CROSS_FUN
+  bool contains(const Key &key) const {
     return find(key) != nullptr;
   }
 
-  /**
-   * Count occurrences of key (always 0 or 1)
-   * @param key Key to count
-   * @return 1 if key exists, 0 otherwise
-   */
-  size_type count(const Key& key) const {
+  /** Count occurrences (0 or 1) */
+  HSHM_CROSS_FUN
+  size_type count(const Key &key) const {
     return contains(key) ? 1 : 0;
   }
 
-  /**
-   * Erase element with given key
-   * @param key Key to erase
-   * @return Number of elements erased (0 or 1)
-   */
-  size_type erase(const Key& key) {
-    size_type bucket_idx = get_bucket_index(key);
-    Bucket& bucket = buckets_[bucket_idx];
-
-    auto it = find_entry_in_bucket(bucket, key);
-    if (it != bucket.entries.end()) {
-      bucket.entries.erase(it);
+  /** Erase element by key */
+  HSHM_CROSS_FUN
+  size_type erase(const Key &key) {
+    size_type idx = find_slot(key);
+    if (idx < slots_.size()) {
+      slots_[idx].state_ = kTombstone;
+      slots_[idx].key_ = Key();
+      slots_[idx].value_ = T();
+      --size_;
       return 1;
     }
     return 0;
   }
 
-  /**
-   * Clear all elements
-   */
+  /** Clear all elements */
+  HSHM_CROSS_FUN
   void clear() {
-    for (auto& bucket : buckets_) {
-      bucket.entries.clear();
+    for (size_type i = 0; i < slots_.size(); ++i) {
+      if (slots_[i].state_ == kOccupied) {
+        slots_[i].key_ = Key();
+        slots_[i].value_ = T();
+      }
+      slots_[i].state_ = kEmpty;
     }
+    size_ = 0;
   }
 
-  /**
-   * Get total number of elements
-   * @return Total number of elements
-   */
-  size_type size() const {
-    size_type total = 0;
-    for (const auto& bucket : buckets_) {
-      total += bucket.entries.size();
-    }
-    return total;
-  }
+  /** Total number of elements */
+  HSHM_INLINE_CROSS_FUN
+  size_type size() const { return size_; }
 
-  /**
-   * Check if map is empty
-   * @return true if empty, false otherwise
-   */
-  bool empty() const {
-    return size() == 0;
-  }
+  /** Check if empty */
+  HSHM_INLINE_CROSS_FUN
+  bool empty() const { return size_ == 0; }
 
-  /**
-   * Get number of buckets
-   * @return Number of buckets
-   */
-  size_type bucket_count() const {
-    return buckets_.size();
-  }
+  /** Number of slots */
+  HSHM_INLINE_CROSS_FUN
+  size_type bucket_count() const { return slots_.size(); }
 
-  /**
-   * Apply a function to each element
-   * @param fn Function to apply (takes const Key&, T&)
-   */
-  template<typename Func>
-  void for_each(Func fn) {
-    for (auto& bucket : buckets_) {
-      for (auto& entry : bucket.entries) {
-        fn(entry.first, entry.second);
+  /** Apply function to each occupied entry */
+  template <typename Func>
+  HSHM_CROSS_FUN void for_each(Func fn) {
+    for (size_type i = 0; i < slots_.size(); ++i) {
+      if (slots_[i].state_ == kOccupied) {
+        fn(slots_[i].key_, slots_[i].value_);
       }
     }
   }
 
-  /**
-   * Apply a function to each element (const version)
-   * @param fn Function to apply (takes const Key&, const T&)
-   */
-  template<typename Func>
-  void for_each(Func fn) const {
-    for (const auto& bucket : buckets_) {
-      for (const auto& entry : bucket.entries) {
-        fn(entry.first, entry.second);
+  /** Apply function to each occupied entry (const) */
+  template <typename Func>
+  HSHM_CROSS_FUN void for_each(Func fn) const {
+    for (size_type i = 0; i < slots_.size(); ++i) {
+      if (slots_[i].state_ == kOccupied) {
+        fn(slots_[i].key_, slots_[i].value_);
       }
     }
   }

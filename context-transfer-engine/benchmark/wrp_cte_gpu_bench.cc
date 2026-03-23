@@ -390,8 +390,10 @@ static int run_cte_gpu_bench_putblob(
   }
 
   // --- 2. Client scratch backend (for FutureShm, serialization) ---
-  constexpr size_t kPerBlockBytes = 10 * 1024 * 1024;
-  size_t scratch_size = static_cast<size_t>(client_blocks) * kPerBlockBytes;
+  // Each warp has at most 1 in-flight PutBlob at a time (Wait() before next).
+  // Scratch holds task metadata + serialization buffers, not the actual blob data.
+  constexpr size_t kPerWarpScratch = 1 * 1024 * 1024;  // 1MB per warp
+  size_t scratch_size = static_cast<size_t>(total_warps) * kPerWarpScratch;
   hipc::MemoryBackendId scratch_id(201, 0);
   hipc::GpuMalloc scratch_backend;
   if (!scratch_backend.shm_init(scratch_id, scratch_size, "", 0)) {
@@ -400,8 +402,9 @@ static int run_cte_gpu_bench_putblob(
   }
 
   // --- 3. GPU heap backend (for ThreadAllocator) ---
-  constexpr size_t kPerBlockHeapBytes = 4 * 1024 * 1024;
-  size_t heap_size = static_cast<size_t>(client_blocks) * kPerBlockHeapBytes;
+  // Holds blob_map entries, coroutine frames, and strings.
+  constexpr size_t kPerWarpHeap = 1 * 1024 * 1024;  // 1MB per warp
+  size_t heap_size = static_cast<size_t>(total_warps) * kPerWarpHeap;
   hipc::MemoryBackendId heap_id(202, 0);
   hipc::GpuMalloc heap_backend;
   if (!heap_backend.shm_init(heap_id, heap_size, "", 0)) {
@@ -960,14 +963,14 @@ int main(int argc, char **argv) {
     chi::u32 tw = (cfg.client_blocks * cfg.client_threads) / 32;
     if (tw == 0) tw = 1;
 
-    // Scratch backend
-    size_t scratch_size = static_cast<size_t>(cfg.client_blocks) * 10 * 1024 * 1024;
+    // Scratch backend: 1MB per warp (alloc_test doesn't do I/O)
+    size_t scratch_size = static_cast<size_t>(tw) * 1024 * 1024;
     hipc::MemoryBackendId scratch_id(201, 0);
     hipc::GpuMalloc scratch_backend;
     scratch_backend.shm_init(scratch_id, scratch_size, "", 0);
 
-    // Heap backend
-    size_t heap_size = static_cast<size_t>(cfg.client_blocks) * 4 * 1024 * 1024;
+    // Heap backend: 1MB per warp (alloc_test doesn't do I/O)
+    size_t heap_size = static_cast<size_t>(tw) * 1024 * 1024;
     hipc::MemoryBackendId heap_id(202, 0);
     hipc::GpuMalloc heap_backend;
     heap_backend.shm_init(heap_id, heap_size, "", 0);

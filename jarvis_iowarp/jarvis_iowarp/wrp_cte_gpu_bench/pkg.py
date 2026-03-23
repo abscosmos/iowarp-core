@@ -170,9 +170,6 @@ class WrpCteGpuBench(Application):
 
     def _get_stat(self, stat_dict):
         output = self.exec.stdout['localhost']
-        elapsed = re.search(r'Elapsed:\s+([0-9.]+)\s+ms', output)
-        if elapsed:
-            stat_dict[f'{self.pkg_id}.elapsed_ms'] = float(elapsed.group(1))
         bandwidth = re.search(r'Bandwidth:\s+([0-9.]+)\s+GB/s', output)
         if bandwidth:
             stat_dict[f'{self.pkg_id}.bandwidth_gbps'] = float(bandwidth.group(1))
@@ -195,14 +192,11 @@ class WrpCteGpuBench(Application):
 
         # Find bandwidth column for this package
         bw_col = None
-        elapsed_col = None
         warps_col = None
         io_col = None
         for col in df.columns:
             if col.endswith('.bandwidth_gbps'):
                 bw_col = col
-            elif col.endswith('.elapsed_ms'):
-                elapsed_col = col
             elif col.endswith('.warps'):
                 warps_col = col
             elif col.endswith('.io_size'):

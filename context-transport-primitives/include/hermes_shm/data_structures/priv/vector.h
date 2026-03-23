@@ -643,7 +643,15 @@ class vector {
 
  public:
   /**
-   * Default constructor.
+   * Default constructor (no allocator).
+   * Creates an empty vector. Allocator is set via copy/move assignment.
+   */
+  HSHM_INLINE_CROSS_FUN
+  vector()
+    : data_(hipc::FullPtr<T>::GetNull()), size_(0), capacity_(0), alloc_(nullptr) {}
+
+  /**
+   * Constructor with allocator.
    * Creates an empty vector with zero capacity.
    *
    * @param alloc Pointer to allocator instance for memory management
@@ -1104,12 +1112,15 @@ class vector {
    * @param new_capacity Desired capacity
    */
   HSHM_INLINE_CROSS_FUN
-  void reserve(size_type new_capacity) {
+  bool reserve(size_type new_capacity) {
     if (new_capacity <= capacity_ || alloc_ == nullptr) {
-      return;
+      return true;
     }
 
     auto new_data = alloc_->template AllocateObjs<T>(new_capacity);
+    if (new_data.IsNull()) {
+      return false;
+    }
 
     if (!data_.IsNull()) {
       if constexpr (kIsPod) {
@@ -1125,6 +1136,7 @@ class vector {
 
     data_ = new_data;
     capacity_ = new_capacity;
+    return true;
   }
 
   /**
@@ -1366,11 +1378,12 @@ class vector {
    * @param new_size New size
    */
   HSHM_INLINE_CROSS_FUN
-  void resize_no_init(size_type new_size) {
+  bool resize_no_init(size_type new_size) {
     if (new_size > capacity_) {
-      reserve(new_size);
+      if (!reserve(new_size)) return false;
     }
     size_ = new_size;
+    return true;
   }
 
   /**
@@ -1378,12 +1391,13 @@ class vector {
    * Grows or shrinks the vector to the new size, default-initializing new elements.
    *
    * @param new_size New size
+   * @return true on success, false if allocation failed
    */
   HSHM_INLINE_CROSS_FUN
-  void resize(size_type new_size) {
+  bool resize(size_type new_size) {
     if (new_size > size_) {
       if (new_size > capacity_) {
-        reserve(new_size);
+        if (!reserve(new_size)) return false;
       }
       if constexpr (!kIsPod) {
         for (size_type i = size_; i < new_size; ++i) {
@@ -1397,6 +1411,7 @@ class vector {
       DestroyRange(new_size, size_);
       size_ = new_size;
     }
+    return true;
   }
 
   /**
@@ -1407,10 +1422,10 @@ class vector {
    * @param value Value to fill new elements with
    */
   HSHM_INLINE_CROSS_FUN
-  void resize(size_type new_size, const T& value) {
+  bool resize(size_type new_size, const T& value) {
     if (new_size > size_) {
       if (new_size > capacity_) {
-        reserve(new_size);
+        if (!reserve(new_size)) return false;
       }
       for (size_type i = size_; i < new_size; ++i) {
         ConstructCopy(i, value);
@@ -1420,6 +1435,7 @@ class vector {
       DestroyRange(new_size, size_);
       size_ = new_size;
     }
+    return true;
   }
 
   /**

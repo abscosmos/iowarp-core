@@ -649,6 +649,7 @@ bool IpcManager::ServerInitGpuQueues() {
 
     // Reserve per-GPU vectors
     gpu2gpu_queue_backends_.reserve(num_gpus);
+    internal_queue_backends_.reserve(num_gpus);
     gpu2cpu_queue_backends_.reserve(num_gpus);
     cpu2gpu_queue_backends_.reserve(num_gpus);
     gpu2cpu_copy_backends_.reserve(num_gpus);
@@ -656,6 +657,7 @@ bool IpcManager::ServerInitGpuQueues() {
     gpu_orchestrator_backends_.reserve(num_gpus);
     gpu_heap_backends_.reserve(num_gpus);
     gpu2gpu_queues_.reserve(num_gpus);
+    internal_queues_.reserve(num_gpus);
     gpu2cpu_queues_.reserve(num_gpus);
     cpu2gpu_queues_.reserve(num_gpus);
 
@@ -811,11 +813,18 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
   }
 
   // --- 6. Orchestrator scratch backend (pinned host, GpuShmMmap) ---
+  // Size must scale with block count: each block's ThreadAllocator partition
+  // must have enough room for BuddyAllocator free-list over many iterations.
+  // 4MB per block minimum to avoid fragmentation-induced deadlocks.
   {
+    size_t scratch_per_block = hshm::Unit<size_t>::Megabytes(4);
+    size_t scratch_total = std::max(
+        hshm::Unit<size_t>::Megabytes(64),
+        static_cast<size_t>(gpu_blocks) * scratch_per_block);
     hipc::MemoryBackendId bid(8000 + gpu_id, 0);
     std::string url = "/chi_gpu_orch_" + sid;
     auto backend = std::make_unique<hipc::GpuShmMmap>();
-    if (!backend->shm_init(bid, hshm::Unit<size_t>::Megabytes(64), url,
+    if (!backend->shm_init(bid, scratch_total, url,
                            gpu_id)) {
       HLOG(kError, "Failed to init orchestrator backend for GPU {}", gpu_id);
       return false;
@@ -830,11 +839,37 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
     hipc::MemoryBackendId bid(9000 + gpu_id, 0);
     std::string url = "/chi_gpu_heap_" + sid;
     auto backend = std::make_unique<hipc::GpuMalloc>();
-    if (!backend->shm_init(bid, hshm::Unit<size_t>::Megabytes(64), url, gpu_id)) {
+    if (!backend->shm_init(bid, hshm::Unit<size_t>::Megabytes(256), url, gpu_id)) {
       HLOG(kError, "Failed to init GPU heap backend for GPU {}", gpu_id);
       return false;
     }
     gpu_heap_backends_.push_back(std::move(backend));
+  }
+
+  // --- 8. Internal subtask queue backend (device memory, GpuMalloc) ---
+  // Separate queue for orchestrator subtasks to prevent deadlock with
+  // client tasks on the gpu2gpu queue.
+  {
+    hipc::MemoryBackendId bid(10000 + gpu_id, 0);
+    std::string url = "/chi_internal_q_" + sid;
+    auto backend = std::make_unique<hipc::GpuMalloc>();
+    size_t backend_size = std::max(
+        hshm::Unit<size_t>::Megabytes(4),
+        static_cast<size_t>(num_lanes) * queue_depth * 256 +
+            hshm::Unit<size_t>::Megabytes(1));
+    if (!backend->shm_init(bid, backend_size, url, gpu_id)) {
+      HLOG(kError, "Failed to init internal queue backend for GPU {}", gpu_id);
+      return false;
+    }
+    hipc::FullPtr<TaskQueue> q = gpu::InitQueueOnDevice(
+        backend->data_, backend->data_capacity_, num_lanes, queue_depth);
+    if (q.IsNull()) {
+      HLOG(kError, "Failed to init internal TaskQueue on device for GPU {}", gpu_id);
+      return false;
+    }
+    RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
+    internal_queues_.push_back(q);
+    internal_queue_backends_.push_back(std::move(backend));
   }
 
   HLOG(kInfo, "GPU {} backends initialized (queue_depth={})", gpu_id,
@@ -854,6 +889,9 @@ void IpcManager::BuildOrchestratorInfo(u32 gpu_id, u32 queue_depth) {
   gpu_orchestrator_info_.gpu2gpu_queue = gpu2gpu_queues_[gpu_id].ptr_;
   gpu_orchestrator_info_.gpu2gpu_queue_base =
       gpu2gpu_queue_backends_[gpu_id]->data_;
+  gpu_orchestrator_info_.internal_queue = internal_queues_[gpu_id].ptr_;
+  gpu_orchestrator_info_.internal_queue_base =
+      internal_queue_backends_[gpu_id]->data_;
   gpu_orchestrator_info_.cpu2gpu_queue = cpu2gpu_queues_[gpu_id].ptr_;
   gpu_orchestrator_info_.cpu2gpu_queue_base =
       cpu2gpu_copy_backends_[gpu_id]->data_;
@@ -954,6 +992,9 @@ bool IpcManager::PauseGpuOrchestrator() {
   if (new_lanes < 1) new_lanes = 1;
   if (new_lanes != gpu2gpu_num_lanes_ && !gpu2gpu_queue_backends_.empty()) {
     RebuildGpu2GpuQueue(0, new_lanes);
+    if (!internal_queue_backends_.empty()) {
+      RebuildInternalQueue(0, new_lanes);
+    }
   }
   return true;
 #else
@@ -1022,6 +1063,47 @@ void IpcManager::RebuildGpu2GpuQueue(u32 gpu_id, u32 new_lanes) {
       gpu2gpu_queue_backends_[gpu_id]->data_;
 
   HLOG(kInfo, "RebuildGpu2GpuQueue: Recreated gpu2gpu queue with {} lanes "
+       "(depth {})", new_lanes, queue_depth);
+}
+
+void IpcManager::RebuildInternalQueue(u32 gpu_id, u32 new_lanes) {
+  u32 queue_depth = gpu_orchestrator_info_.gpu_queue_depth;
+
+  // Destroy old internal queue backend
+  internal_queue_backends_[gpu_id].reset();
+  internal_queues_[gpu_id] = hipc::FullPtr<TaskQueue>::GetNull();
+
+  // Create new backend
+  hipc::MemoryBackendId bid(10000 + gpu_id, 0);
+  auto backend = std::make_unique<hipc::GpuMalloc>();
+  size_t backend_size = std::max(
+      hshm::Unit<size_t>::Megabytes(4),
+      static_cast<size_t>(new_lanes) * queue_depth * 256 +
+          hshm::Unit<size_t>::Megabytes(1));
+  if (!backend->shm_init(bid, backend_size, "", gpu_id)) {
+    HLOG(kError, "RebuildInternalQueue: Failed to create backend for {} lanes",
+         new_lanes);
+    return;
+  }
+
+  hipc::FullPtr<TaskQueue> q = gpu::InitQueueOnDevice(
+      backend->data_, backend->data_capacity_, new_lanes, queue_depth);
+  if (q.IsNull()) {
+    HLOG(kError, "RebuildInternalQueue: Failed to init queue with {} lanes",
+         new_lanes);
+    return;
+  }
+
+  RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
+  internal_queues_[gpu_id] = q;
+  internal_queue_backends_[gpu_id] = std::move(backend);
+
+  // Update orchestrator info with new queue pointers
+  gpu_orchestrator_info_.internal_queue = internal_queues_[gpu_id].ptr_;
+  gpu_orchestrator_info_.internal_queue_base =
+      internal_queue_backends_[gpu_id]->data_;
+
+  HLOG(kInfo, "RebuildInternalQueue: Recreated internal queue with {} lanes "
        "(depth {})", new_lanes, queue_depth);
 }
 #endif
