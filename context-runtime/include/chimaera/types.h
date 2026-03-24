@@ -455,10 +455,16 @@ constexpr PoolId kAdminPoolId =
 //         CHI_PRIV_ALLOC is only used for dynamic chi::priv operations in kernels)
 #define CHI_QUEUE_ALLOC_T hipc::BuddyAllocator
 
+/** Allocator scope for NewObj: private (warp-local) or shared (cross-warp) */
+enum class AllocScope { kPrivate, kShared };
+
 #if HSHM_IS_HOST
 #define CHI_TASK_ALLOC_T  hipc::MultiProcessAllocator
 #define CHI_PRIV_ALLOC_T  hipc::MallocAllocator
 #define CHI_PRIV_ALLOC    HSHM_MALLOC
+// On CPU, shared == private (single-threaded MallocAllocator)
+#define CHI_PRIV_SHARED_ALLOC_T hipc::MallocAllocator
+#define CHI_PRIV_SHARED_ALLOC   HSHM_MALLOC
 #else
 #define CHI_TASK_ALLOC_T  hipc::BuddyAllocator
 // GPU: CHI_PRIV_ALLOC uses a cached PrivateBuddyAllocator* per warp.
@@ -474,6 +480,13 @@ constexpr PoolId kAdminPoolId =
  */
 HSHM_GPU_FUN hipc::PrivateBuddyAllocator *GetPrivAllocGpu();
 #define CHI_PRIV_ALLOC    (::chi::GetPrivAllocGpu())
+// GPU: CHI_PRIV_SHARED_ALLOC returns the ThreadAllocator (PartitionedAllocator)
+// which dispatches allocations to the calling warp's partition via GetAutoTid().
+// Use for cross-warp data structures (shared maps, vectors) where multiple warps
+// may allocate/free concurrently.
+#define CHI_PRIV_SHARED_ALLOC_T hipc::ThreadAllocator
+HSHM_GPU_FUN hipc::ThreadAllocator *GetSharedAllocGpu();
+#define CHI_PRIV_SHARED_ALLOC   (::chi::GetSharedAllocGpu())
 #endif
 
 // Memory segment identifiers
@@ -584,6 +597,19 @@ using vector = hshm::priv::vector<T, CHI_PRIV_ALLOC_T>;
 
 template <typename Key, typename T>
 using unordered_map = hshm::priv::unordered_map_ll<Key, T, CHI_PRIV_ALLOC_T>;
+
+// Shared-scope types for cross-warp GPU data structures.
+// On CPU these are identical to the private types above.
+// On GPU, AllocT = ThreadAllocator which dispatches to the correct
+// warp partition, avoiding concurrent access to a single BuddyAllocator.
+typedef hshm::priv::string<CHI_PRIV_SHARED_ALLOC_T> shared_string;
+
+template <typename T>
+using shared_vector = hshm::priv::vector<T, CHI_PRIV_SHARED_ALLOC_T>;
+
+template <typename Key, typename T>
+using shared_unordered_map =
+    hshm::priv::unordered_map_ll<Key, T, CHI_PRIV_SHARED_ALLOC_T>;
 }  // namespace chi::priv
 
 namespace chi::ipc {

@@ -52,20 +52,22 @@
 namespace wrp_cte::core {
 
 /** Default number of blob map slots (open addressing) */
-static constexpr chi::u32 kDefaultBlobMapCapacity = 4096;
+static constexpr chi::u32 kDefaultBlobMapCapacity = 64;
 
 /**
  * GPU-side blob entry using chi::priv data structures.
+ * blocks_ uses the shared (PartitionedAllocator) scope because blob entries
+ * are stored in the cross-warp blob_map_ and may be modified by any warp.
  */
 struct GpuBlobEntry {
-  chi::priv::vector<BlobBlock> blocks_;  // Block allocations from bdev
+  chi::priv::shared_vector<BlobBlock> blocks_;
   chi::u64 size_;               // blob size in bytes
   float score_;
   Timestamp last_modified_;
   Timestamp last_read_;
 
   HSHM_CROSS_FUN GpuBlobEntry()
-      : blocks_(CHI_PRIV_ALLOC), size_(0), score_(0.0f),
+      : blocks_(CHI_PRIV_SHARED_ALLOC), size_(0), score_(0.0f),
         last_modified_(0), last_read_(0) {}
 
   HSHM_CROSS_FUN GpuBlobEntry(const GpuBlobEntry &other)
@@ -86,35 +88,37 @@ struct GpuBlobEntry {
   }
 };
 
-using GpuBlobMap = hshm::priv::unordered_map_ll<
-    chi::priv::string, GpuBlobEntry, CHI_PRIV_ALLOC_T>;
+/** Blob map: compound key → GpuBlobEntry (shared across warps) */
+using GpuBlobMap = chi::priv::shared_unordered_map<
+    chi::priv::string, GpuBlobEntry>;
 
-/** Tag map: TagId (as u64) → TagInfo */
-using GpuTagIdMap = hshm::priv::unordered_map_ll<
-    chi::u64, TagInfo, CHI_PRIV_ALLOC_T>;
+/** Tag map: TagId (as u64) → TagInfo (shared across warps) */
+using GpuTagIdMap = chi::priv::shared_unordered_map<
+    chi::u64, TagInfo>;
 
-/** Reverse tag index: tag name → TagId (as u64) */
-using GpuTagNameMap = hshm::priv::unordered_map_ll<
-    chi::priv::string, chi::u64, CHI_PRIV_ALLOC_T>;
+/** Reverse tag index: tag name → TagId (as u64) (shared across warps) */
+using GpuTagNameMap = chi::priv::shared_unordered_map<
+    chi::priv::string, chi::u64>;
 
 /** Default tag map capacity */
 static constexpr chi::u32 kDefaultTagMapCapacity = 64;
 
 /**
  * GPU-resident metadata store for CTE Core GpuRuntime.
- * Uses chi::priv data structures backed by ThreadAllocator.
+ * All maps and vectors use the shared allocator (PartitionedAllocator)
+ * so multiple warps can safely allocate/free map infrastructure concurrently.
  */
 struct GpuMetadata {
   GpuBlobMap blob_map_;
   GpuTagIdMap tag_id_map_;
   GpuTagNameMap tag_name_to_id_;
-  chi::priv::vector<TargetInfo> targets_;
+  chi::priv::shared_vector<TargetInfo> targets_;
 
   HSHM_GPU_FUN GpuMetadata()
-      : blob_map_(CHI_PRIV_ALLOC, kDefaultBlobMapCapacity),
-        tag_id_map_(CHI_PRIV_ALLOC, kDefaultTagMapCapacity),
-        tag_name_to_id_(CHI_PRIV_ALLOC, kDefaultTagMapCapacity),
-        targets_(CHI_PRIV_ALLOC) {
+      : blob_map_(CHI_PRIV_SHARED_ALLOC, kDefaultBlobMapCapacity),
+        tag_id_map_(CHI_PRIV_SHARED_ALLOC, kDefaultTagMapCapacity),
+        tag_name_to_id_(CHI_PRIV_SHARED_ALLOC, kDefaultTagMapCapacity),
+        targets_(CHI_PRIV_SHARED_ALLOC) {
   }
 };
 
@@ -210,17 +214,25 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::StatTargets(
 //==============================================================================
 
 HSHM_GPU_FUN void GpuRuntime::EnsureMetaInit() {
+  // Check if scratch was reinitialized (stale metadata)
+  chi::u32 cur_gen = CHI_IPC->scratch_gen_;
+  if (meta_ != nullptr && meta_gen_ != cur_gen) {
+    meta_ = nullptr;  // Force recreation
+    __threadfence();
+  }
   GpuMetadata *m = *reinterpret_cast<GpuMetadata *volatile *>(&meta_);
   if (m != nullptr) return;
   hshm::ScopedMutex guard(init_lock_, 0);
   m = *reinterpret_cast<GpuMetadata *volatile *>(&meta_);
   if (m != nullptr) return;
-  CHI_PRIV_ALLOC_T *alloc = CHI_PRIV_ALLOC;
-  hipc::FullPtr<GpuMetadata> ptr = alloc->template AllocateObjs<GpuMetadata>(1);
-  new (ptr.ptr_) GpuMetadata();
+  hipc::FullPtr<GpuMetadata> ptr =
+      CHI_IPC->NewObj<GpuMetadata>(chi::AllocScope::kShared);
   __threadfence();
   meta_ = ptr.ptr_;
+  meta_gen_ = cur_gen;
   __threadfence();
+  printf("[META] W%u init meta=%p gen=%u\n",
+         chi::IpcManager::GetWarpId(), (void*)meta_, cur_gen);
 }
 
 //==============================================================================
@@ -474,6 +486,14 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::PutBlob(
   {
     meta_->blob_map_.lock_key(ck);
 
+    // Re-find entry after co_await (pointer may be stale after rehash)
+    entry = meta_->blob_map_.find_locked(ck);
+    if (entry == nullptr) {
+      meta_->blob_map_.unlock_key(ck);
+      task->return_code_ = 11;
+      co_return;
+    }
+
     // Create BlobBlock structs from allocated blocks
     entry->blocks_.clear();
     for (size_t i = 0; i < alloc_task->blocks_.size(); ++i) {
@@ -548,7 +568,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetBlob(
   if (out_ptr.IsNull()) { task->return_code_ = 1; co_return; }
 
   // Get blob entry and blocks (copy blocks locally)
-  chi::priv::vector<BlobBlock> blocks(CHI_PRIV_ALLOC);
+  chi::priv::shared_vector<BlobBlock> blocks(CHI_PRIV_SHARED_ALLOC);
   chi::u64 blob_size = 0;
   {
     meta_->blob_map_.lock_key(ck);

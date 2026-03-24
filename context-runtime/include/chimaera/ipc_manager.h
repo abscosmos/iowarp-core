@@ -245,6 +245,9 @@ struct IpcManagerGpuInfo {
   /** Number of lanes in the warp group queue */
   u32 warp_group_num_lanes = 1;
 
+  /** Scratch allocator generation (from WorkOrchestratorControl) */
+  u32 scratch_gen = 0;
+
   HSHM_CROSS_FUN IpcManagerGpuInfo() = default;
 
   /** Convenience constructor: backend + gpu2gpu queue */
@@ -348,6 +351,9 @@ class IpcManager {
     for (u32 i = 0; i < gpu_info.num_gpu_allocs; ++i) {
       gpu_allocs_[i] = gpu_info.gpu_allocs[i];
     }
+
+    // Scratch generation — containers compare to detect stale metadata
+    scratch_gen_ = gpu_info.scratch_gen;
   }
 
   /**
@@ -407,6 +413,28 @@ class IpcManager {
     return nullptr;
 #else
     return nullptr;
+#endif
+  }
+
+  /**
+   * Allocate and construct an object with the given allocator scope.
+   * kPrivate: use the warp-local BuddyAllocator (CHI_PRIV_ALLOC)
+   * kShared:  use the PartitionedAllocator (CHI_PRIV_SHARED_ALLOC)
+   *           which dispatches to the calling warp's partition via GetAutoTid()
+   *
+   * DelObj is not needed — just use CHI_PRIV_ALLOC->DelObj() which routes
+   * frees to the correct partition by address arithmetic.
+   */
+  template <typename T, typename... Args>
+  HSHM_CROSS_FUN hipc::FullPtr<T> NewObj(AllocScope scope, Args&&... args) {
+#if HSHM_IS_GPU
+    if (scope == AllocScope::kShared) {
+      return gpu_alloc_->template NewObj<T>(std::forward<Args>(args)...);
+    }
+    return GetPrivAlloc()->template NewObj<T>(std::forward<Args>(args)...);
+#else
+    (void)scope;
+    return HSHM_MALLOC->template NewObj<T>(std::forward<Args>(args)...);
 #endif
   }
 
@@ -2506,6 +2534,11 @@ class IpcManager {
    *  SendGpu (serialization). Client kernels leave this false (default). */
   bool is_gpu_runtime_ = false;
 
+  /** Scratch allocator generation — incremented each time the scratch
+   *  ThreadAllocator is reinitialized (pause/resume).  GPU containers
+   *  compare this against a saved value to detect stale scratch pointers. */
+  volatile u32 scratch_gen_ = 0;
+
   /** Opaque pointer to gpu::WorkOrchestrator (defined in
    * work_orchestrator_gpu.cc) */
   void *gpu_orchestrator_ = nullptr;
@@ -2686,11 +2719,14 @@ HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
 #define CHI_IPC HSHM_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
 #endif
 
-// Define GetPrivAllocGpu now that CHI_IPC is available
+// Define GetPrivAllocGpu and GetSharedAllocGpu now that CHI_IPC is available
 #if !HSHM_IS_HOST
 namespace chi {
 HSHM_GPU_FUN inline hipc::PrivateBuddyAllocator *GetPrivAllocGpu() {
   return CHI_IPC->GetPrivAlloc();
+}
+HSHM_GPU_FUN inline hipc::ThreadAllocator *GetSharedAllocGpu() {
+  return CHI_IPC->gpu_alloc_;
 }
 }  // namespace chi
 #endif

@@ -47,6 +47,22 @@ RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86
     && rm -rf /var/lib/apt/lists/*
 
 #------------------------------------------------------------
+# Clang (CUDA-capable) Installation
+#------------------------------------------------------------
+
+# Install Clang 20 from the official LLVM apt repository.
+# Clang 20 can compile CUDA kernels directly (--cuda-gpu-arch).
+RUN wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+        > /etc/apt/trusted.gpg.d/apt.llvm.org.asc \
+    && echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble main" \
+        > /etc/apt/sources.list.d/llvm.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends clang-20 \
+    && update-alternatives --install /usr/bin/clang   clang   /usr/bin/clang-20   100 \
+    && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100 \
+    && rm -rf /var/lib/apt/lists/*
+
+#------------------------------------------------------------
 # CUDA Environment Configuration
 #------------------------------------------------------------
 

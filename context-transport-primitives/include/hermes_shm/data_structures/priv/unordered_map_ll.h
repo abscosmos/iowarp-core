@@ -328,14 +328,16 @@ class unordered_map_ll {
   HSHM_CROSS_FUN
   void lock_key(const Key &key) {
     size_type h = hash_fn_(key);
-    lock_stripe(stripe_of(h));
+    size_type s = stripe_of(h);
+    lock_stripe(s);
   }
 
   /** Unlock the stripe for a key. */
   HSHM_CROSS_FUN
   void unlock_key(const Key &key) {
     size_type h = hash_fn_(key);
-    unlock_stripe(stripe_of(h));
+    size_type s = stripe_of(h);
+    unlock_stripe(s);
   }
 
   /** Find an element (thread-safe, returns pointer valid while map lives) */

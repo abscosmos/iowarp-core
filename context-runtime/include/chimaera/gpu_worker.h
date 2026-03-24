@@ -485,6 +485,14 @@ class Worker {
         auto *awaited = reinterpret_cast<FutureShm *>(ctx->awaited_fshm_);
         if (!awaited->flags_.AnyDevice(FutureShm::FUTURE_COMPLETE)) {
           // Not ready — re-enqueue
+          if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
+            u32 raw_flags = awaited->flags_.bits_.load_device();
+            dbg_ctrl_->dbg_resume_checks[worker_id_]++;
+            if ((dbg_ctrl_->dbg_resume_checks[worker_id_] % 100000) == 1) {
+              printf("[W%u] awaiting fshm=%p flags=0x%x method=%u\n",
+                     worker_id_, (void*)awaited, raw_flags, ctx->method_id_);
+            }
+          }
           suspended_->Push(ctx);
           continue;
         }

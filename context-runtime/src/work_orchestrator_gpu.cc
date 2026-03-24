@@ -286,6 +286,10 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
 
   control_->exit_flag = 0;
   control_->running_flag = 0;
+  // Scratch allocator will be reinitialized — bump generation so GPU
+  // containers know their scratch-backed metadata (e.g. CTE GpuMetadata)
+  // is invalid and must be recreated.
+  control_->scratch_gen = control_->scratch_gen + 1;
 
   IpcManagerGpuInfo resume_info = gpu_info;
   resume_info.skip_scratch_init = false;  // re-partition scratch for new warp count
@@ -349,6 +353,7 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
 
   // Skip heap re-init — per-block allocators persist across pause/resume.
   resume_info.skip_heap_init = true;
+  resume_info.scratch_gen = control_->scratch_gen;
 
   // Zero scratch allocator headers so non-block-0 blocks spin-wait
   // until block 0 finishes re-initialization (prevents stale ready flags).

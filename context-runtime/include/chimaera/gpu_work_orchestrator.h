@@ -88,6 +88,12 @@ struct WorkOrchestratorControl {
   volatile unsigned int dbg_iq_pops[kMaxDebugWorkers];
   /** Debug: internal queue push counters (from SendGpu) */
   volatile unsigned int dbg_iq_pushes[kMaxDebugWorkers];
+
+  /** Scratch allocator generation — incremented every time scratch is
+   *  reinitialized (pause/resume).  GPU containers compare this against
+   *  a saved value to detect when their scratch-backed metadata became
+   *  invalid and needs to be recreated. */
+  volatile unsigned int scratch_gen;
 };
 
 /**

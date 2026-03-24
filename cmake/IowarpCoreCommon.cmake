@@ -548,7 +548,7 @@ endfunction()
 macro(wrp_core_find_clang_cuda)
     if(NOT WRP_CORE_CLANG_CUDA_COMPILER)
         find_program(WRP_CORE_CLANG_CUDA_COMPILER
-            NAMES clang++-18 clang++-19 clang++-20 clang++
+            NAMES clang++-20 clang++-19 clang++-18 clang++
             PATHS /usr/bin /usr/local/bin
             DOC "Clang compiler for CUDA compilation"
         )

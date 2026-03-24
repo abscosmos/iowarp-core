@@ -181,11 +181,6 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
   long long t_end = clock64();
 
   if (lane == 0) {
-    chi::u32 warp_id = chi::IpcManager::GetWarpId();
-    double ms = (double)(t_end - t_start) / 1.4e6;  // ~1.4 GHz SM clock
-    printf("[Write W%u blk%u tid%u] %llu bytes, %.2f ms\n",
-           warp_id, (unsigned)blockIdx.x, (unsigned)threadIdx.x,
-           (unsigned long long)data_off, ms);
     task->bytes_written_ = data_off;
     task->return_code_ = 0;
   }
@@ -277,11 +272,6 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
   __threadfence_system();
 
   if (lane == 0) {
-    chi::u32 warp_id = chi::IpcManager::GetWarpId();
-    double ms = (double)(t_end - t_start) / 1.4e6;  // ~1.4 GHz SM clock
-    printf("[Read  W%u blk%u tid%u] %llu bytes, %.2f ms\n",
-           warp_id, (unsigned)blockIdx.x, (unsigned)threadIdx.x,
-           (unsigned long long)data_off, ms);
     task->bytes_read_ = data_off;
     task->return_code_ = 0;
   }
