@@ -58,8 +58,9 @@ using MonitorTask = chimaera::admin::MonitorTask;
 enum class BdevType : chi::u32 {
   kFile = 0,    // File-based block device (default)
   kRam = 1,     // RAM-based block device
-  kHbm = 2,    // GPU High-Bandwidth Memory via cudaMalloc (device memory)
-  kPinned = 3  // Pinned host memory via cudaMallocHost
+  kHbm = 2,     // GPU High-Bandwidth Memory via cudaMalloc (device memory)
+  kPinned = 3,  // Pinned host memory via cudaMallocHost
+  kNoop = 4     // No-op backend for latency testing (no actual I/O)
 };
 
 /**
@@ -226,6 +227,12 @@ struct CreateParams {
         bdev_type_ = BdevType::kFile;
       } else if (type_str == "ram") {
         bdev_type_ = BdevType::kRam;
+      } else if (type_str == "hbm") {
+        bdev_type_ = BdevType::kHbm;
+      } else if (type_str == "pinned") {
+        bdev_type_ = BdevType::kPinned;
+      } else if (type_str == "noop") {
+        bdev_type_ = BdevType::kNoop;
       }
     }
 

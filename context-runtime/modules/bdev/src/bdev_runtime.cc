@@ -513,6 +513,13 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
     memset(pinned_buffer_, 0, pinned_size_);
     file_size_ = pinned_size_;
 #endif
+  } else if (bdev_type_ == BdevType::kNoop) {
+    // Noop backend: no storage buffer, just track allocatable size
+    if (params.total_size_ == 0) {
+      task->return_code_ = 4;
+      co_return;
+    }
+    file_size_ = params.total_size_;
   }
 
   // Initialize common parameters
@@ -688,12 +695,16 @@ chi::TaskResume Runtime::Write(hipc::FullPtr<WriteTask> task,
       break;
 #if HSHM_ENABLE_CUDA
     case BdevType::kHbm:
-      WriteToHbm(task);
+      co_await WriteToHbm(task, ctx);
       break;
     case BdevType::kPinned:
-      WriteToPinned(task);
+      co_await WriteToPinned(task, ctx);
       break;
 #endif
+    case BdevType::kNoop:
+      task->return_code_ = 0;
+      task->bytes_written_ = task->length_;
+      break;
     default:
       task->return_code_ = 1;
       task->bytes_written_ = 0;
@@ -713,12 +724,16 @@ chi::TaskResume Runtime::Read(hipc::FullPtr<ReadTask> task,
       break;
 #if HSHM_ENABLE_CUDA
     case BdevType::kHbm:
-      ReadFromHbm(task);
+      co_await ReadFromHbm(task, ctx);
       break;
     case BdevType::kPinned:
-      ReadFromPinned(task);
+      co_await ReadFromPinned(task, ctx);
       break;
 #endif
+    case BdevType::kNoop:
+      task->return_code_ = 0;
+      task->bytes_read_ = task->length_;
+      break;
     default:
       task->return_code_ = 1;
       task->bytes_read_ = 0;
@@ -863,12 +878,16 @@ chi::TaskResume Runtime::Update(hipc::FullPtr<UpdateTask> task,
 }
 
 #if HSHM_ENABLE_CUDA
-void Runtime::WriteToHbm(hipc::FullPtr<WriteTask> task) {
+chi::TaskResume Runtime::WriteToHbm(hipc::FullPtr<WriteTask> task,
+                                    chi::RunContext &ctx) {
   auto *ipc_mgr = CHI_IPC;
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
   chi::u64 total_bytes_written = 0;
   chi::u64 data_offset = 0;
+
+  cudaStream_t stream;
+  cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
@@ -877,38 +896,61 @@ void Runtime::WriteToHbm(hipc::FullPtr<WriteTask> task) {
     chi::u64 copy_size = std::min(remaining, block.size_);
 
     if (block.offset_ + copy_size > hbm_size_) {
+      cudaStreamDestroy(stream);
       task->return_code_ = 1;
       task->bytes_written_ = total_bytes_written;
-      return;
+      co_return;
     }
 
-    cudaError_t err = cudaMemcpy(
+    cudaError_t err = cudaMemcpyAsync(
         hbm_buffer_ + block.offset_,
         data_ptr.ptr_ + data_offset,
         copy_size,
-        cudaMemcpyDefault);
+        cudaMemcpyDefault,
+        stream);
     if (err != cudaSuccess) {
+      cudaStreamDestroy(stream);
       task->return_code_ = 2;
       task->bytes_written_ = total_bytes_written;
-      return;
+      co_return;
     }
 
     total_bytes_written += copy_size;
     data_offset += copy_size;
   }
 
+  // Poll for completion, yield if not ready
+  while (true) {
+    cudaError_t status = cudaStreamQuery(stream);
+    if (status == cudaSuccess) break;
+    if (status != cudaErrorNotReady) {
+      cudaStreamDestroy(stream);
+      task->return_code_ = 3;
+      task->bytes_written_ = 0;
+      co_return;
+    }
+    co_await chi::yield(5.0);
+  }
+
+  cudaStreamDestroy(stream);
   task->return_code_ = 0;
   task->bytes_written_ = total_bytes_written;
   total_writes_.fetch_add(1);
   total_bytes_written_.fetch_add(total_bytes_written);
+  (void)ctx;
+  co_return;
 }
 
-void Runtime::ReadFromHbm(hipc::FullPtr<ReadTask> task) {
+chi::TaskResume Runtime::ReadFromHbm(hipc::FullPtr<ReadTask> task,
+                                     chi::RunContext &ctx) {
   auto *ipc_mgr = CHI_IPC;
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
   chi::u64 total_bytes_read = 0;
   chi::u64 data_offset = 0;
+
+  cudaStream_t stream;
+  cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
@@ -917,38 +959,61 @@ void Runtime::ReadFromHbm(hipc::FullPtr<ReadTask> task) {
     chi::u64 copy_size = std::min(remaining, block.size_);
 
     if (block.offset_ + copy_size > hbm_size_) {
+      cudaStreamDestroy(stream);
       task->return_code_ = 1;
       task->bytes_read_ = total_bytes_read;
-      return;
+      co_return;
     }
 
-    cudaError_t err = cudaMemcpy(
+    cudaError_t err = cudaMemcpyAsync(
         data_ptr.ptr_ + data_offset,
         hbm_buffer_ + block.offset_,
         copy_size,
-        cudaMemcpyDefault);
+        cudaMemcpyDefault,
+        stream);
     if (err != cudaSuccess) {
+      cudaStreamDestroy(stream);
       task->return_code_ = 2;
       task->bytes_read_ = total_bytes_read;
-      return;
+      co_return;
     }
 
     total_bytes_read += copy_size;
     data_offset += copy_size;
   }
 
+  // Poll for completion, yield if not ready
+  while (true) {
+    cudaError_t status = cudaStreamQuery(stream);
+    if (status == cudaSuccess) break;
+    if (status != cudaErrorNotReady) {
+      cudaStreamDestroy(stream);
+      task->return_code_ = 3;
+      task->bytes_read_ = 0;
+      co_return;
+    }
+    co_await chi::yield(5.0);
+  }
+
+  cudaStreamDestroy(stream);
   task->return_code_ = 0;
   task->bytes_read_ = total_bytes_read;
   total_reads_.fetch_add(1);
   total_bytes_read_.fetch_add(total_bytes_read);
+  (void)ctx;
+  co_return;
 }
 
-void Runtime::WriteToPinned(hipc::FullPtr<WriteTask> task) {
+chi::TaskResume Runtime::WriteToPinned(hipc::FullPtr<WriteTask> task,
+                                       chi::RunContext &ctx) {
   auto *ipc_mgr = CHI_IPC;
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
   chi::u64 total_bytes_written = 0;
   chi::u64 data_offset = 0;
+
+  cudaStream_t stream;
+  cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
@@ -957,28 +1022,61 @@ void Runtime::WriteToPinned(hipc::FullPtr<WriteTask> task) {
     chi::u64 copy_size = std::min(remaining, block.size_);
 
     if (block.offset_ + copy_size > pinned_size_) {
+      cudaStreamDestroy(stream);
       task->return_code_ = 1;
       task->bytes_written_ = total_bytes_written;
-      return;
+      co_return;
     }
 
-    memcpy(pinned_buffer_ + block.offset_, data_ptr.ptr_ + data_offset, copy_size);
+    cudaError_t err = cudaMemcpyAsync(
+        pinned_buffer_ + block.offset_,
+        data_ptr.ptr_ + data_offset,
+        copy_size,
+        cudaMemcpyDefault,
+        stream);
+    if (err != cudaSuccess) {
+      cudaStreamDestroy(stream);
+      task->return_code_ = 2;
+      task->bytes_written_ = total_bytes_written;
+      co_return;
+    }
+
     total_bytes_written += copy_size;
     data_offset += copy_size;
   }
 
+  // Poll for completion, yield if not ready
+  while (true) {
+    cudaError_t status = cudaStreamQuery(stream);
+    if (status == cudaSuccess) break;
+    if (status != cudaErrorNotReady) {
+      cudaStreamDestroy(stream);
+      task->return_code_ = 3;
+      task->bytes_written_ = 0;
+      co_return;
+    }
+    co_await chi::yield(5.0);
+  }
+
+  cudaStreamDestroy(stream);
   task->return_code_ = 0;
   task->bytes_written_ = total_bytes_written;
   total_writes_.fetch_add(1);
   total_bytes_written_.fetch_add(total_bytes_written);
+  (void)ctx;
+  co_return;
 }
 
-void Runtime::ReadFromPinned(hipc::FullPtr<ReadTask> task) {
+chi::TaskResume Runtime::ReadFromPinned(hipc::FullPtr<ReadTask> task,
+                                        chi::RunContext &ctx) {
   auto *ipc_mgr = CHI_IPC;
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
   chi::u64 total_bytes_read = 0;
   chi::u64 data_offset = 0;
+
+  cudaStream_t stream;
+  cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
@@ -987,20 +1085,49 @@ void Runtime::ReadFromPinned(hipc::FullPtr<ReadTask> task) {
     chi::u64 copy_size = std::min(remaining, block.size_);
 
     if (block.offset_ + copy_size > pinned_size_) {
+      cudaStreamDestroy(stream);
       task->return_code_ = 1;
       task->bytes_read_ = total_bytes_read;
-      return;
+      co_return;
     }
 
-    memcpy(data_ptr.ptr_ + data_offset, pinned_buffer_ + block.offset_, copy_size);
+    cudaError_t err = cudaMemcpyAsync(
+        data_ptr.ptr_ + data_offset,
+        pinned_buffer_ + block.offset_,
+        copy_size,
+        cudaMemcpyDefault,
+        stream);
+    if (err != cudaSuccess) {
+      cudaStreamDestroy(stream);
+      task->return_code_ = 2;
+      task->bytes_read_ = total_bytes_read;
+      co_return;
+    }
+
     total_bytes_read += copy_size;
     data_offset += copy_size;
   }
 
+  // Poll for completion, yield if not ready
+  while (true) {
+    cudaError_t status = cudaStreamQuery(stream);
+    if (status == cudaSuccess) break;
+    if (status != cudaErrorNotReady) {
+      cudaStreamDestroy(stream);
+      task->return_code_ = 3;
+      task->bytes_read_ = 0;
+      co_return;
+    }
+    co_await chi::yield(5.0);
+  }
+
+  cudaStreamDestroy(stream);
   task->return_code_ = 0;
   task->bytes_read_ = total_bytes_read;
   total_reads_.fetch_add(1);
   total_bytes_read_.fetch_add(total_bytes_read);
+  (void)ctx;
+  co_return;
 }
 #endif  // HSHM_ENABLE_CUDA
 
@@ -1250,7 +1377,8 @@ void Runtime::PostGpuContainerCreate() {
   // service Write/Read tasks directly. Called after the GPU container is
   // registered with the GPU work orchestrator, so the task arrives when the
   // container is ready (avoids the race in Create()).
-  if (bdev_type_ == BdevType::kHbm || bdev_type_ == BdevType::kPinned) {
+  if (bdev_type_ == BdevType::kHbm || bdev_type_ == BdevType::kPinned ||
+      bdev_type_ == BdevType::kNoop) {
     auto *ipc = CHI_IPC;
     if (ipc) {
       chi::u64 hbm_ptr = reinterpret_cast<chi::u64>(hbm_buffer_);

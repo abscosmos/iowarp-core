@@ -474,16 +474,18 @@ class Runtime : public chi::Container {
   void ReadFromRam(hipc::FullPtr<ReadTask> task);
 
   /**
-   * Backend-specific HBM operations (GPU device memory, host-callable cudaMemcpy)
+   * Backend-specific HBM operations (GPU device memory, async cudaMemcpyAsync)
+   * Uses cudaMemcpyAsync + cudaStreamQuery polling with coroutine yield.
    */
-  void WriteToHbm(hipc::FullPtr<WriteTask> task);
-  void ReadFromHbm(hipc::FullPtr<ReadTask> task);
+  chi::TaskResume WriteToHbm(hipc::FullPtr<WriteTask> task, chi::RunContext &ctx);
+  chi::TaskResume ReadFromHbm(hipc::FullPtr<ReadTask> task, chi::RunContext &ctx);
 
   /**
-   * Backend-specific pinned-host-memory operations (synchronous memcpy)
+   * Backend-specific pinned-host-memory operations (async cudaMemcpyAsync)
+   * Uses cudaMemcpyAsync + cudaStreamQuery polling with coroutine yield.
    */
-  void WriteToPinned(hipc::FullPtr<WriteTask> task);
-  void ReadFromPinned(hipc::FullPtr<ReadTask> task);
+  chi::TaskResume WriteToPinned(hipc::FullPtr<WriteTask> task, chi::RunContext &ctx);
+  chi::TaskResume ReadFromPinned(hipc::FullPtr<ReadTask> task, chi::RunContext &ctx);
 
   /**
    * Update performance metrics

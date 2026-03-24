@@ -544,6 +544,7 @@ __global__ void gpu_bdev_read_write_kernel(
     if (chi::IpcManager::IsWarpScheduler()) {
       chimaera::bdev::Client bdev_client(bdev_pool_id);
       auto pool_query = chi::PoolQuery::Local();
+      auto pool_query_parallel = chi::PoolQuery::Local(32);
       long long write_acc = 0, read_acc = 0;
 
       // Allocate blocks once
@@ -578,7 +579,7 @@ __global__ void gpu_bdev_read_write_kernel(
           // Write (timed)
           long long t0 = clock64();
           auto write_future = bdev_client.AsyncWrite(
-              pool_query, alloc_future->blocks_, data_shm, warp_bytes);
+              pool_query_parallel, alloc_future->blocks_, data_shm, warp_bytes);
           if (write_future.GetFutureShmPtr().IsNull()) {
             d_progress[warp_id] = -(2000 + static_cast<int>(iter));
             __threadfence_system();
@@ -598,7 +599,7 @@ __global__ void gpu_bdev_read_write_kernel(
           // Read (timed)
           long long t2 = clock64();
           auto read_future = bdev_client.AsyncRead(
-              pool_query, alloc_future->blocks_, data_shm, warp_bytes);
+              pool_query_parallel, alloc_future->blocks_, data_shm, warp_bytes);
           if (read_future.GetFutureShmPtr().IsNull()) {
             d_progress[warp_id] = -(3000 + static_cast<int>(iter));
             __threadfence_system();
@@ -1665,8 +1666,9 @@ bool ParseArgs(int argc, char **argv, BenchConfig &cfg) {
       cfg.iterations = static_cast<chi::u32>(std::stoul(argv[++i]));
     } else if (arg == "--bdev-type" && i + 1 < argc) {
       cfg.bdev_type = argv[++i];
-      if (cfg.bdev_type != "pinned" && cfg.bdev_type != "hbm" && cfg.bdev_type != "ram") {
-        HLOG(kError, "Unknown bdev type '{}'; use pinned, hbm, or ram", cfg.bdev_type);
+      if (cfg.bdev_type != "pinned" && cfg.bdev_type != "hbm" &&
+          cfg.bdev_type != "ram" && cfg.bdev_type != "noop") {
+        HLOG(kError, "Unknown bdev type '{}'; use pinned, hbm, ram, or noop", cfg.bdev_type);
         return false;
       }
     } else if (arg == "--timeout" && i + 1 < argc) {
@@ -1835,6 +1837,7 @@ int main(int argc, char **argv) {
     chimaera::bdev::BdevType bdev_enum = chimaera::bdev::BdevType::kHbm;
     if (cfg.bdev_type == "pinned") bdev_enum = chimaera::bdev::BdevType::kPinned;
     else if (cfg.bdev_type == "ram") bdev_enum = chimaera::bdev::BdevType::kRam;
+    else if (cfg.bdev_type == "noop") bdev_enum = chimaera::bdev::BdevType::kNoop;
 
     chi::u64 bdev_size = std::max(cfg.warp_bytes * client_warps + 64ULL * 1024 * 1024,
                                     256ULL * 1024 * 1024);
@@ -1947,6 +1950,7 @@ int main(int argc, char **argv) {
     chimaera::bdev::BdevType bdev_enum = chimaera::bdev::BdevType::kPinned;
     if (cfg.bdev_type == "hbm") bdev_enum = chimaera::bdev::BdevType::kHbm;
     else if (cfg.bdev_type == "ram") bdev_enum = chimaera::bdev::BdevType::kRam;
+    else if (cfg.bdev_type == "noop") bdev_enum = chimaera::bdev::BdevType::kNoop;
     std::string target_name = cfg.bdev_type + "::cte_gpu_bench_target";
 
     auto reg_task = cte_client.AsyncRegisterTarget(

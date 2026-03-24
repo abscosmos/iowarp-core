@@ -202,6 +202,8 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
         bdev_type = chimaera::bdev::BdevType::kHbm;
       } else if (device.bdev_type_ == "pinned") {
         bdev_type = chimaera::bdev::BdevType::kPinned;
+      } else if (device.bdev_type_ == "noop") {
+        bdev_type = chimaera::bdev::BdevType::kNoop;
       }
 
       // Iterate over neighborhood nodes (container hashes from 0 to

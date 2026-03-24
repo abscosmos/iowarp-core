@@ -11,11 +11,11 @@ pkgs:
     # test_case: "putblob_gpu"
     test_case: "bdev_read_write"
     # test_case: "bdev_read_write"
-    rt_blocks: 1
+    rt_blocks: 4
     rt_threads: 32
-    client_blocks: 1
+    client_blocks: 4
     client_threads: 32
-    io_size: "128k"
-    iterations: 1024
+    io_size: "16m"
+    iterations: 8
     bdev_type: "hbm"
     timeout: 120

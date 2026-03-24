@@ -105,25 +105,32 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::FreeBlocks(hipc::FullPtr<FreeBlock
 
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> task,
                                      chi::gpu::RunContext &rctx) {
-  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; co_return; }
+  chi::u32 lane = chi::IpcManager::GetLaneId();
   static constexpr chi::u32 kHbm    = static_cast<chi::u32>(BdevType::kHbm);
   static constexpr chi::u32 kPinned = static_cast<chi::u32>(BdevType::kPinned);
+  static constexpr chi::u32 kNoop   = static_cast<chi::u32>(BdevType::kNoop);
+
+  // Noop: immediate success, no data movement
+  if (bdev_type_ == kNoop) {
+    if (lane == 0) {
+      task->bytes_written_ = task->length_;
+      task->return_code_ = 0;
+    }
+    co_return;
+  }
 
   if (bdev_type_ != kHbm && bdev_type_ != kPinned) {
-    task->return_code_ = 1;  // unsupported on GPU for other types
-    (void)rctx;
+    if (lane == 0) task->return_code_ = 1;
     co_return;
   }
 
   char *dst_base = reinterpret_cast<char *>(
       (bdev_type_ == kHbm) ? hbm_ptr_ : pinned_ptr_);
-
-  // Resolve data ShmPtr via IpcManager (handles both raw UVA and allocator-based)
   auto *ipc_mgr = CHI_IPC;
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
   char *src = data_ptr.ptr_;
 
-  // Sequential copy (lane 0 only; multi-lane coroutines not yet supported)
+  // Warp-wide copy across all blocks with yield for asynchronicity
   size_t num_blocks = task->blocks_.size();
   chi::u64 data_off = 0;
   for (size_t i = 0; i < num_blocks; ++i) {
@@ -134,13 +141,24 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
 
     char *dst = dst_base + block.offset_;
     const char *block_src = src + data_off;
-    memcpy(dst, block_src, copy_size);
+
+    // Each lane copies a contiguous chunk
+    chi::u64 chunk = copy_size / 32;
+    chi::u64 start = lane * chunk;
+    chi::u64 len = (lane == 31) ? (copy_size - start) : chunk;
+    memcpy(dst + start, block_src + start, len);
     data_off += copy_size;
+
+    // Yield between blocks to let other coroutines run
+    if (i + 1 < num_blocks) {
+      co_await chi::gpu::yield(2);
+    }
   }
 
-  task->bytes_written_ = data_off;
-  task->return_code_ = 0;
-  (void)rctx;
+  if (lane == 0) {
+    task->bytes_written_ = data_off;
+    task->return_code_ = 0;
+  }
   co_return;
 }
 
@@ -150,25 +168,32 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
 
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
                                     chi::gpu::RunContext &rctx) {
-  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; co_return; }
+  chi::u32 lane = chi::IpcManager::GetLaneId();
   static constexpr chi::u32 kHbm    = static_cast<chi::u32>(BdevType::kHbm);
   static constexpr chi::u32 kPinned = static_cast<chi::u32>(BdevType::kPinned);
+  static constexpr chi::u32 kNoop   = static_cast<chi::u32>(BdevType::kNoop);
+
+  // Noop: immediate success, no data movement
+  if (bdev_type_ == kNoop) {
+    if (lane == 0) {
+      task->bytes_read_ = task->length_;
+      task->return_code_ = 0;
+    }
+    co_return;
+  }
 
   if (bdev_type_ != kHbm && bdev_type_ != kPinned) {
-    task->return_code_ = 1;  // unsupported on GPU for other types
-    (void)rctx;
+    if (lane == 0) task->return_code_ = 1;
     co_return;
   }
 
   char *src_base = reinterpret_cast<char *>(
       (bdev_type_ == kHbm) ? hbm_ptr_ : pinned_ptr_);
-
-  // Resolve data ShmPtr via IpcManager (handles both raw UVA and allocator-based)
   auto *ipc_mgr = CHI_IPC;
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
   char *dst = data_ptr.ptr_;
 
-  // Sequential copy (lane 0 only; multi-lane coroutines not yet supported)
+  // Warp-wide copy across all blocks with yield for asynchronicity
   size_t num_blocks = task->blocks_.size();
   chi::u64 data_off = 0;
   for (size_t i = 0; i < num_blocks; ++i) {
@@ -179,17 +204,27 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
 
     const char *block_src = src_base + block.offset_;
     char *block_dst = dst + data_off;
-    memcpy(block_dst, block_src, copy_size);
+
+    // Each lane copies a contiguous chunk
+    chi::u64 chunk = copy_size / 32;
+    chi::u64 start = lane * chunk;
+    chi::u64 len = (lane == 31) ? (copy_size - start) : chunk;
+    memcpy(block_dst + start, block_src + start, len);
     data_off += copy_size;
+
+    // Yield between blocks to let other coroutines run
+    if (i + 1 < num_blocks) {
+      co_await chi::gpu::yield(2);
+    }
   }
 
-  // Ensure GPU writes to pinned host memory are visible to CPU before
-  // the task is marked complete.
+  // Ensure GPU writes to pinned host memory are visible to CPU
   __threadfence_system();
 
-  task->bytes_read_ = data_off;
-  task->return_code_ = 0;
-  (void)rctx;
+  if (lane == 0) {
+    task->bytes_read_ = data_off;
+    task->return_code_ = 0;
+  }
   co_return;
 }
 
