@@ -1,0 +1,281 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ * This file is part of IOWarp Core.
+ * See COPYING file in the top-level directory.
+ */
+
+/**
+ * GPU-side bdev container implementation.
+ *
+ * Compiled as CUDA device code (picked up by chimaera_cxx_gpu via the
+ * modules/<star>_gpu.cc glob in src/CMakeLists.txt).
+ *
+ * Implements Update, AllocateBlocks, FreeBlocks, Write, Read using
+ * device-resident atomics and memcpy.
+ */
+
+#include "chimaera/bdev/bdev_gpu_runtime.h"
+#include "chimaera/singletons.h"
+
+namespace chimaera::bdev {
+
+// ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+
+HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Update(hipc::FullPtr<UpdateTask> task,
+                                      chi::gpu::RunContext &rctx) {
+  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; co_return; }
+  hbm_ptr_    = task->hbm_ptr_;
+  pinned_ptr_ = task->pinned_ptr_;
+  hbm_size_   = task->hbm_size_;
+  pinned_size_ = task->pinned_size_;
+  total_size_  = task->total_size_;
+  bdev_type_   = task->bdev_type_;
+  alignment_   = (task->alignment_ > 0) ? task->alignment_ : 4096;
+  // Reset the bump allocator for the new memory region
+  gpu_heap_ = 0;
+  task->return_code_ = 0;
+  (void)rctx;
+  co_return;
+}
+
+// ---------------------------------------------------------------------------
+// AllocateBlocks
+// ---------------------------------------------------------------------------
+
+HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::AllocateBlocks(
+    hipc::FullPtr<AllocateBlocksTask> task,
+    chi::gpu::RunContext &rctx) {
+  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; co_return; }
+  chi::u64 req = task->size_;
+  if (req == 0 || total_size_ == 0) {
+    task->return_code_ = 0;
+    (void)rctx;
+    co_return;
+  }
+
+  // Align requested size
+  chi::u32 align = (alignment_ > 0) ? alignment_ : 4096;
+  chi::u64 aligned = ((req + (chi::u64)align - 1) / (chi::u64)align) * (chi::u64)align;
+
+  // Atomically bump the heap cursor
+  chi::u64 old_pos = (chi::u64)atomicAdd(
+      (unsigned long long *)&gpu_heap_,
+      (unsigned long long)aligned);
+
+  if (old_pos + aligned > total_size_) {
+    // Rollback
+    atomicAdd((unsigned long long *)&gpu_heap_,
+              (unsigned long long)(-(long long)aligned));
+    task->return_code_ = 1;  // out of space
+    (void)rctx;
+    co_return;
+  }
+
+  Block blk;
+  blk.offset_     = old_pos;
+  blk.size_       = aligned;
+  blk.block_type_ = 0;  // GPU bump allocator has no size categories
+  task->blocks_.push_back(blk);
+
+  task->return_code_ = 0;
+  (void)rctx;
+  co_return;
+}
+
+// ---------------------------------------------------------------------------
+// FreeBlocks — no-op for bump allocator
+// ---------------------------------------------------------------------------
+
+HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::FreeBlocks(hipc::FullPtr<FreeBlocksTask> task,
+                                           chi::gpu::RunContext &rctx) {
+  if (!chi::IpcManager::IsWarpScheduler()) { (void)task; (void)rctx; co_return; }
+  // GPU bump allocator does not support per-block free.
+  // Memory is reclaimed when the bdev pool is destroyed.
+  task->return_code_ = 0;
+  (void)task; (void)rctx;
+  co_return;
+}
+
+// ---------------------------------------------------------------------------
+// Write
+// ---------------------------------------------------------------------------
+
+HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> task,
+                                     chi::gpu::RunContext &rctx) {
+  chi::u32 lane = chi::IpcManager::GetLaneId();
+  static constexpr chi::u32 kHbm    = static_cast<chi::u32>(BdevType::kHbm);
+  static constexpr chi::u32 kPinned = static_cast<chi::u32>(BdevType::kPinned);
+  static constexpr chi::u32 kNoop   = static_cast<chi::u32>(BdevType::kNoop);
+
+  // Noop: immediate success, no data movement
+  if (bdev_type_ == kNoop) {
+    if (lane == 0) {
+      task->bytes_written_ = task->length_;
+      task->return_code_ = 0;
+    }
+    co_return;
+  }
+
+  if (bdev_type_ != kHbm && bdev_type_ != kPinned) {
+    if (lane == 0) task->return_code_ = 1;
+    co_return;
+  }
+
+  char *dst_base = reinterpret_cast<char *>(
+      (bdev_type_ == kHbm) ? hbm_ptr_ : pinned_ptr_);
+  auto *ipc_mgr = CHI_IPC;
+  hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
+  char *src = data_ptr.ptr_;
+
+  // Warp-wide coalesced copy across all blocks with yield for asynchronicity
+  size_t num_blocks = task->blocks_.size();
+  chi::u64 data_off = 0;
+  long long t_start = clock64();
+  for (size_t i = 0; i < num_blocks; ++i) {
+    const Block &block = task->blocks_[i];
+    chi::u64 remaining = task->length_ - data_off;
+    if (remaining == 0) break;
+    chi::u64 copy_size = (block.size_ < remaining) ? block.size_ : remaining;
+
+    char *dst = dst_base + block.offset_;
+    const char *block_src = src + data_off;
+
+    // Coalesced warp-wide copy. Use uint4 (16B) loads/stores when both
+    // pointers are 16-byte aligned, otherwise fall back to u32 (4B).
+    bool aligned16 = ((reinterpret_cast<uintptr_t>(dst) |
+                        reinterpret_cast<uintptr_t>(block_src)) & 15) == 0;
+    if (aligned16) {
+      chi::u64 vec_elems = copy_size / sizeof(uint4);
+      const uint4 *src4 = reinterpret_cast<const uint4 *>(block_src);
+      uint4 *dst4 = reinterpret_cast<uint4 *>(dst);
+      for (chi::u64 idx = lane; idx < vec_elems; idx += 32) {
+        dst4[idx] = src4[idx];
+      }
+      chi::u64 tail_start = vec_elems * sizeof(uint4);
+      for (chi::u64 b = tail_start + lane; b < copy_size; b += 32) {
+        dst[b] = block_src[b];
+      }
+    } else {
+      // 4-byte coalesced fallback (still 128B transactions per warp)
+      chi::u64 vec_elems = copy_size / sizeof(chi::u32);
+      const chi::u32 *src4 = reinterpret_cast<const chi::u32 *>(block_src);
+      chi::u32 *dst4 = reinterpret_cast<chi::u32 *>(dst);
+      for (chi::u64 idx = lane; idx < vec_elems; idx += 32) {
+        dst4[idx] = src4[idx];
+      }
+      chi::u64 tail_start = vec_elems * sizeof(chi::u32);
+      for (chi::u64 b = tail_start + lane; b < copy_size; b += 32) {
+        dst[b] = block_src[b];
+      }
+    }
+    data_off += copy_size;
+
+    // Yield between blocks to let other coroutines run
+    if (i + 1 < num_blocks) {
+      co_await chi::gpu::yield(2);
+    }
+  }
+  long long t_end = clock64();
+
+  if (lane == 0) {
+    task->bytes_written_ = data_off;
+    task->return_code_ = 0;
+  }
+  co_return;
+}
+
+// ---------------------------------------------------------------------------
+// Read
+// ---------------------------------------------------------------------------
+
+HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
+                                    chi::gpu::RunContext &rctx) {
+  chi::u32 lane = chi::IpcManager::GetLaneId();
+  static constexpr chi::u32 kHbm    = static_cast<chi::u32>(BdevType::kHbm);
+  static constexpr chi::u32 kPinned = static_cast<chi::u32>(BdevType::kPinned);
+  static constexpr chi::u32 kNoop   = static_cast<chi::u32>(BdevType::kNoop);
+
+  // Noop: immediate success, no data movement
+  if (bdev_type_ == kNoop) {
+    if (lane == 0) {
+      task->bytes_read_ = task->length_;
+      task->return_code_ = 0;
+    }
+    co_return;
+  }
+
+  if (bdev_type_ != kHbm && bdev_type_ != kPinned) {
+    if (lane == 0) task->return_code_ = 1;
+    co_return;
+  }
+
+  char *src_base = reinterpret_cast<char *>(
+      (bdev_type_ == kHbm) ? hbm_ptr_ : pinned_ptr_);
+  auto *ipc_mgr = CHI_IPC;
+  hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
+  char *dst = data_ptr.ptr_;
+
+  // Warp-wide coalesced copy across all blocks with yield for asynchronicity
+  size_t num_blocks = task->blocks_.size();
+  chi::u64 data_off = 0;
+  long long t_start = clock64();
+  for (size_t i = 0; i < num_blocks; ++i) {
+    const Block &block = task->blocks_[i];
+    chi::u64 remaining = task->length_ - data_off;
+    if (remaining == 0) break;
+    chi::u64 copy_size = (block.size_ < remaining) ? block.size_ : remaining;
+
+    const char *block_src = src_base + block.offset_;
+    char *block_dst = dst + data_off;
+
+    // Coalesced warp-wide copy. Use uint4 (16B) loads/stores when both
+    // pointers are 16-byte aligned, otherwise fall back to u32 (4B).
+    bool aligned16 = ((reinterpret_cast<uintptr_t>(block_dst) |
+                        reinterpret_cast<uintptr_t>(block_src)) & 15) == 0;
+    if (aligned16) {
+      chi::u64 vec_elems = copy_size / sizeof(uint4);
+      const uint4 *src4 = reinterpret_cast<const uint4 *>(block_src);
+      uint4 *dst4 = reinterpret_cast<uint4 *>(block_dst);
+      for (chi::u64 idx = lane; idx < vec_elems; idx += 32) {
+        dst4[idx] = src4[idx];
+      }
+      chi::u64 tail_start = vec_elems * sizeof(uint4);
+      for (chi::u64 b = tail_start + lane; b < copy_size; b += 32) {
+        block_dst[b] = block_src[b];
+      }
+    } else {
+      // 4-byte coalesced fallback (still 128B transactions per warp)
+      chi::u64 vec_elems = copy_size / sizeof(chi::u32);
+      const chi::u32 *src4 = reinterpret_cast<const chi::u32 *>(block_src);
+      chi::u32 *dst4 = reinterpret_cast<chi::u32 *>(block_dst);
+      for (chi::u64 idx = lane; idx < vec_elems; idx += 32) {
+        dst4[idx] = src4[idx];
+      }
+      chi::u64 tail_start = vec_elems * sizeof(chi::u32);
+      for (chi::u64 b = tail_start + lane; b < copy_size; b += 32) {
+        block_dst[b] = block_src[b];
+      }
+    }
+    data_off += copy_size;
+
+    // Yield between blocks to let other coroutines run
+    if (i + 1 < num_blocks) {
+      co_await chi::gpu::yield(2);
+    }
+  }
+  long long t_end = clock64();
+
+  // Ensure GPU writes to pinned host memory are visible to CPU
+  __threadfence_system();
+
+  if (lane == 0) {
+    task->bytes_read_ = data_off;
+    task->return_code_ = 0;
+  }
+  co_return;
+}
+
+}  // namespace chimaera::bdev
