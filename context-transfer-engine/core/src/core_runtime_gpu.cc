@@ -35,7 +35,7 @@
  * GPU implementation of CTE Core ChiMod methods.
  *
  * Uses chi::priv data structures (string, vector) backed by the
- * ThreadAllocator which provides per-block BuddyAllocator partitions,
+ * PartitionedAllocator which provides per-block BuddyAllocator partitions,
  * eliminating cross-block allocator contention (CUDA Error 700).
  *
  * Note: core_tasks.h is included here (not in the header) to keep GPU
@@ -466,9 +466,11 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::PutBlob(
     co_return;
   }
 
-  // Copy data to allocated blocks via bdev (outside locks)
+  // Copy data to allocated blocks via bdev (full-warp parallelism)
+  chi::PoolQuery warp_query = target_info.target_query_;
+  warp_query.SetParallelism(32);
   auto write_task = target_info.bdev_client_.AsyncWrite(
-      target_info.target_query_, alloc_task->blocks_, task->blob_data_, size);
+      warp_query, alloc_task->blocks_, task->blob_data_, size);
   co_await write_task;
 
   if (write_task->return_code_ != 0) {
@@ -596,9 +598,11 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::GetBlob(
   chimaera::bdev::Block blk(blocks[0].target_offset_, blocks[0].size_, 0);
   read_blocks.push_back(blk);
 
-  // Read the single block via bdev
+  // Read the single block via bdev (full-warp parallelism)
+  chi::PoolQuery warp_query = blocks[0].target_query_;
+  warp_query.SetParallelism(32);
   auto read_task = blocks[0].bdev_client_.AsyncRead(
-      blocks[0].target_query_, read_blocks, task->blob_data_, size);
+      warp_query, read_blocks, task->blob_data_, size);
   co_await read_task;
 
   if (read_task->return_code_ != 0) {

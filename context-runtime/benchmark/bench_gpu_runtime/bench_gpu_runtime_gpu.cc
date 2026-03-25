@@ -158,7 +158,7 @@ __global__ void gpu_bench_coroutine_kernel(
  * GPU alloc/free benchmark kernel.
  *
  * Each thread does total_tasks cycles of NewTask<PutBlobTask> + DelTask
- * through IpcManager, measuring pure ThreadAllocator throughput with no
+ * through IpcManager, measuring pure PartitionedAllocator throughput with no
  * runtime dispatch. No orchestrator needed.
  */
 __global__ void gpu_bench_alloc_kernel(
@@ -1018,7 +1018,7 @@ extern "C" int run_gpu_bench_latency(
   CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
 
   // Allocate primary GPU backend (GpuMalloc, device memory): 10 MB per block.
-  // Used by ThreadAllocator for FutureShm allocation on GPU→GPU path.
+  // Used by PartitionedAllocator for FutureShm allocation on GPU→GPU path.
   // Device memory avoids PCIe round-trips for gpu2gpu atomics.
   constexpr size_t kPerBlockBytes = 10 * 1024 * 1024;
   size_t backend_size = static_cast<size_t>(client_blocks) * kPerBlockBytes;
@@ -1176,7 +1176,7 @@ extern "C" int run_gpu_bench_coroutine(
  * Run the GPU alloc/free benchmark.
  *
  * No orchestrator needed — just initializes a GpuMalloc backend with
- * ThreadAllocator and runs NewTask/DelTask cycles on the GPU.
+ * PartitionedAllocator and runs NewTask/DelTask cycles on the GPU.
  */
 extern "C" int run_gpu_bench_alloc(
     chi::PoolId pool_id,
@@ -1327,7 +1327,7 @@ extern "C" int run_gpu_bench_alloc_serde(
     chi::u32 client_threads,
     chi::u32 total_tasks,
     float *out_elapsed_ms) {
-  // Primary backend for NewTask (ThreadAllocator)
+  // Primary backend for NewTask (PartitionedAllocator)
   constexpr size_t kPerBlockBytes = 10 * 1024 * 1024;
   size_t backend_size = static_cast<size_t>(client_blocks) * kPerBlockBytes;
 
@@ -1386,7 +1386,7 @@ extern "C" int run_gpu_bench_alloc_serde(
 /**
  * GPU string allocator comparison kernel.
  *
- * Compares ArenaAllocator, BuddyAllocator, SlabAllocator, and ThreadAllocator
+ * Compares ArenaAllocator, BuddyAllocator, SlabAllocator, and PartitionedAllocator
  * for allocating and freeing a heap-backed string (>SSO size) repeatedly.
  * Each allocator has its own dedicated GpuMalloc backend to avoid corruption.
  * Only thread 0 of block 0 runs the benchmark (single-thread comparison).
@@ -1410,7 +1410,7 @@ __global__ void gpu_bench_string_alloc_kernel(
   using ArenaAllocT = hshm::ipc::ArenaAllocator<false>;
   using BuddyAllocT = hipc::PrivateBuddyAllocator;
   using SlabAllocT = hipc::BaseAllocator<hipc::PrivateSlabAllocator>;
-  using ThreadAllocT = hipc::ThreadAllocator;
+  using ThreadAllocT = hipc::PartitionedAllocator;
 
   using ArenaString = hshm::priv::basic_string<char, ArenaAllocT>;
   using BuddyString = hshm::priv::basic_string<char, BuddyAllocT>;
@@ -1500,7 +1500,7 @@ __global__ void gpu_bench_string_alloc_kernel(
     }
   }
 
-  // --- ThreadAllocator ---
+  // --- PartitionedAllocator ---
   long long t_thread_alloc = 0, t_thread_free = 0;
   {
     auto *alloc = new (thread_backend.data_) ThreadAllocT();
@@ -1767,7 +1767,7 @@ extern "C" int run_gpu_bench_putblob(
     return -1;
   }
 
-  // --- 3. GPU heap backend (for ThreadAllocator) ---
+  // --- 3. GPU heap backend (for PartitionedAllocator) ---
   constexpr size_t kPerBlockHeapBytes = 4 * 1024 * 1024;
   size_t heap_size = static_cast<size_t>(client_blocks) * kPerBlockHeapBytes;
   hipc::MemoryBackendId heap_id(202, 0);

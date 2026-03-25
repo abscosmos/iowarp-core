@@ -42,6 +42,7 @@ namespace hshm::ipc {
 class _PartitionedAllocator;
 typedef BaseAllocator<_PartitionedAllocator> PartitionedAllocator;
 // Backward-compatibility typedef
+// ThreadAllocator is a legacy name; use PartitionedAllocator
 typedef PartitionedAllocator ThreadAllocator;
 
 /**
@@ -190,14 +191,16 @@ class _PartitionedAllocator : public Allocator {
   }
 
   /**
-   * Get the auto-detected thread ID.
-   * GPU: blockIdx.x % max_threads_
+   * Get the auto-detected partition ID (global warp index).
+   * GPU: global warp ID, or -1 if beyond max_threads_
    * CPU: 0 (caller should provide explicit tid for multi-threaded use)
    */
   HSHM_INLINE_CROSS_FUN
   int GetAutoTid() {
 #if HSHM_IS_GPU
-    return static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / 32) % max_threads_;
+    int tid = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) / 32);
+    if (tid >= max_threads_) return -1;
+    return tid;
 #else
     return 0;
 #endif
@@ -302,6 +305,13 @@ class _PartitionedAllocator : public Allocator {
   PrivateBuddyAllocator* GetWarpAllocator() {
     int tid = GetAutoTid();
     if (!LazyInitThread(tid)) return nullptr;
+    return &GetThreadBlock(tid)->alloc_;
+  }
+
+  /** Get the PrivateBuddyAllocator pointer for a specific tid (no init). */
+  HSHM_INLINE_CROSS_FUN
+  PrivateBuddyAllocator* GetWarpAllocatorByTid(int tid) {
+    if (tid < 0 || tid >= max_threads_) return nullptr;
     return &GetThreadBlock(tid)->alloc_;
   }
 

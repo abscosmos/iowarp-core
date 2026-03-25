@@ -152,9 +152,9 @@ extern "C" int run_gpu_queue_stress_test(
 
   // Zero allocator headers so non-block-0 blocks spin-wait correctly.
   if (scratch_backend.data_)
-    memset(scratch_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+    memset(scratch_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
   if (heap_backend.data_)
-    cudaMemset(heap_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+    cudaMemset(heap_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
 
   cudaEvent_t ev_start, ev_end;
   cudaEventCreate(&ev_start);

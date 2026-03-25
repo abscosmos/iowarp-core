@@ -466,10 +466,8 @@ class Worker {
   static constexpr u32 PERIODIC_QUEUE_SIZE = 1024;
   std::queue<RunContext *> periodic_queues_[NUM_PERIODIC_QUEUES];
 
-  // Worker spawn time and queue processing tracking
+  // Worker spawn time
   hshm::Timepoint spawn_time_;  // Time when worker was spawned
-  u64 last_long_queue_check_;   // Last time (in 10us units) long queue was
-                                // processed
 
   // Task completion counter (incremented in EndTask)
   u64 num_tasks_processed_;  // Total tasks completed by this worker

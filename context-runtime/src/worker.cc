@@ -76,7 +76,6 @@ Worker::Worker(u32 worker_id)
       current_run_context_(nullptr),
       assigned_lane_(nullptr),
       event_queue_(nullptr),
-      last_long_queue_check_(0),
       num_tasks_processed_(0),
       iteration_count_(0),
       idle_iterations_(0),

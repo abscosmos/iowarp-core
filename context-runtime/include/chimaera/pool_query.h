@@ -408,6 +408,9 @@ class PoolQuery {
    */
   HSHM_CROSS_FUN u32 GetParallelism() const { return parallelism_; }
 
+  /** Set the parallelism level for GPU task dispatch */
+  HSHM_CROSS_FUN void SetParallelism(u32 parallelism) { parallelism_ = parallelism; }
+
   /**
    * Serialization support for any archive type
    * @param ar Archive for serialization

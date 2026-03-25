@@ -352,7 +352,7 @@ TEST_F(UnorderedMapLLTest, ConcurrentInsertions) {
 
   // Each thread inserts unique keys
   for (int t = 0; t < num_threads; ++t) {
-    threads.emplace_back([&map, &map_mutex, &successful_insertions, t, insertions_per_thread]() {
+    threads.emplace_back([&map, &map_mutex, &successful_insertions, t]() {
       for (int i = 0; i < insertions_per_thread; ++i) {
         int key = t * insertions_per_thread + i;
         std::string value = "thread_" + std::to_string(t) + "_value_" + std::to_string(i);
@@ -392,7 +392,7 @@ TEST_F(UnorderedMapLLTest, ConcurrentInsertionsWithCollisions) {
 
   // All threads try to insert the same set of keys
   for (int t = 0; t < num_threads; ++t) {
-    threads.emplace_back([&map, &map_mutex, num_keys, t]() {
+    threads.emplace_back([&map, &map_mutex, t]() {
       for (int key = 0; key < num_keys; ++key) {
         std::lock_guard<std::mutex> lock(map_mutex);
         map.insert(key, t);  // Value is thread ID
@@ -433,7 +433,7 @@ TEST_F(UnorderedMapLLTest, ConcurrentMixedOperations) {
   std::mutex map_mutex;  // External mutex for thread safety
 
   for (int t = 0; t < num_threads; ++t) {
-    threads.emplace_back([&map, &map_mutex, t, operations_per_thread]() {
+    threads.emplace_back([&map, &map_mutex, t]() {
       for (int i = 0; i < operations_per_thread; ++i) {
         int key = (t * operations_per_thread + i) % 200;
 

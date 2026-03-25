@@ -155,11 +155,10 @@ class CalculateSizeTaskArchive {
 
  private:
   hshm::ipc::CalculateSizeArchive calc_;
-  LocalMsgType msg_type_;
 
  public:
-  HSHM_CROSS_FUN explicit CalculateSizeTaskArchive(LocalMsgType msg_type)
-      : msg_type_(msg_type) {}
+  HSHM_CROSS_FUN explicit CalculateSizeTaskArchive(LocalMsgType /*msg_type*/)
+      {}
 
   /** Get the total computed size */
   HSHM_INLINE_CROSS_FUN size_t size() const { return calc_.size(); }

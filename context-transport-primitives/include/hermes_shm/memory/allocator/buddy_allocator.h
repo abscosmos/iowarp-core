@@ -803,7 +803,7 @@ class _BuddyAllocator : public Allocator {
 /** Typedef for the complete BuddyAllocator with BaseAllocator wrapper */
 using BuddyAllocator = BaseAllocator<_BuddyAllocator<>>;
 
-/** Private-mode BuddyAllocator (raw pointers, cached base, for ThreadAllocator) */
+/** Private-mode BuddyAllocator (raw pointers, cached base, for PartitionedAllocator) */
 using PrivateBuddyAllocator = BaseAllocator<_BuddyAllocator<MemMode::kPrivate>>;
 
 }  // namespace hshm::ipc

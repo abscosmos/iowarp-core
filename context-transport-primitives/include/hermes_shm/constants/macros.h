@@ -280,7 +280,7 @@ namespace hipc = hshm::ipc;
   HSHM_MEMORY_MANAGER->template GetDefaultAllocator<HSHM_DEFAULT_ALLOC_T>()
 
 #ifndef HSHM_DEFAULT_ALLOC_GPU_T
-#define HSHM_DEFAULT_ALLOC_GPU_T hipc::ThreadAllocator
+#define HSHM_DEFAULT_ALLOC_GPU_T hipc::PartitionedAllocator
 #endif
 
 /** Default memory context macro (no longer used - kept for compatibility) */

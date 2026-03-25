@@ -69,7 +69,7 @@ struct ThreadId {
   hshm::u64 tid_;
 
   HSHM_INLINE_CROSS_FUN
-  ThreadId() = default;
+  ThreadId() {}
 
   HSHM_INLINE_CROSS_FUN
   explicit ThreadId(hshm::u64 tid) : tid_(tid) {}

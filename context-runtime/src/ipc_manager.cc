@@ -812,7 +812,7 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
   }
 
   // --- 6. Orchestrator scratch backend (pinned host, GpuShmMmap) ---
-  // Size must scale with block count: each block's ThreadAllocator partition
+  // Size must scale with block count: each block's PartitionedAllocator partition
   // must have enough room for BuddyAllocator free-list over many iterations.
   // 4MB per block minimum to avoid fragmentation-induced deadlocks.
   {

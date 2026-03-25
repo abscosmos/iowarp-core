@@ -14,6 +14,53 @@
 
 namespace chimaera::bdev {
 
+/** GPU block size categories: 4KB, 64KB, 128KB, 1MB */
+enum class GpuBlockSizeCategory : chi::u32 {
+  k4KB = 0,
+  k64KB = 1,
+  k128KB = 2,
+  k1MB = 3,
+  kNumCategories = 4
+};
+
+/** Block sizes in bytes for each GPU category */
+static constexpr chi::u64 kGpuBlockSizes[] = {
+    4096,       // 4KB
+    65536,      // 64KB
+    131072,     // 128KB
+    1048576     // 1MB
+};
+
+/** Per-warp free list for a single size category (simple stack) */
+struct GpuFreeList {
+  static constexpr chi::u32 kMaxFreeBlocks = 64;
+  Block blocks_[kMaxFreeBlocks];
+  chi::u32 count_;
+
+  HSHM_GPU_FUN GpuFreeList() : count_(0) {}
+
+  HSHM_GPU_FUN bool Push(const Block &blk) {
+    if (count_ >= kMaxFreeBlocks) return false;
+    blocks_[count_++] = blk;
+    return true;
+  }
+
+  HSHM_GPU_FUN bool Pop(Block &blk) {
+    if (count_ == 0) return false;
+    blk = blocks_[--count_];
+    return true;
+  }
+
+  HSHM_GPU_FUN bool Empty() const { return count_ == 0; }
+};
+
+/** Per-warp block cache: one free list per size category */
+struct GpuWarpBlockCache {
+  static constexpr chi::u32 kNumCategories =
+      static_cast<chi::u32>(GpuBlockSizeCategory::kNumCategories);
+  GpuFreeList lists_[kNumCategories];
+};
+
 /**
  * GPU-side container for the bdev module.
  *
@@ -39,15 +86,28 @@ class GpuRuntime : public chi::gpu::Container {
   chi::u32 bdev_type_;
   /// Allocation alignment in bytes
   chi::u32 alignment_;
-  /// Atomic bump-allocator cursor (advanced via atomicAdd)
+  /// Number of warps (set during Update from actual GPU launch config)
+  chi::u32 num_warps_;
+  /// Atomic bump-allocator cursor (fallback when free lists are empty)
   chi::u64 gpu_heap_;
+  /// Per-warp block caches (allocated during Update, one per warp)
+  chi::priv::shared_vector<GpuWarpBlockCache> warp_caches_;
 
   HSHM_GPU_FUN GpuRuntime()
       : hbm_ptr_(0), pinned_ptr_(0),
         hbm_size_(0), pinned_size_(0), total_size_(0),
-        bdev_type_(0), alignment_(4096), gpu_heap_(0) {}
+        bdev_type_(0), alignment_(4096), num_warps_(0),
+        gpu_heap_(0), warp_caches_(CHI_PRIV_SHARED_ALLOC) {}
 
   HSHM_GPU_FUN ~GpuRuntime() override = default;
+
+  /** Find the smallest size category that fits the requested size */
+  HSHM_GPU_FUN static int FindSizeCategory(chi::u64 size) {
+    for (int i = 0; i < static_cast<int>(GpuBlockSizeCategory::kNumCategories); ++i) {
+      if (kGpuBlockSizes[i] >= size) return i;
+    }
+    return -1;  // larger than any cached size
+  }
 
   HSHM_GPU_FUN chi::gpu::TaskResume Update(hipc::FullPtr<UpdateTask> task,
                             chi::gpu::RunContext &rctx);

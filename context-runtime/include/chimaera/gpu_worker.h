@@ -147,19 +147,19 @@ class Worker {
   HSHM_GPU_FUN void DbgPoll() {
 #ifndef NDEBUG
     if (dbg_ctrl_ && lane_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
-      dbg_ctrl_->dbg_poll_count[lane_id_]++;
+      dbg_ctrl_->dbg_poll_count[lane_id_] = dbg_ctrl_->dbg_poll_count[lane_id_] + 1;
     }
 #endif
   }
 
   HSHM_GPU_FUN void DbgTaskPopped() {
     if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
-      dbg_ctrl_->dbg_tasks_popped[worker_id_]++;
+      dbg_ctrl_->dbg_tasks_popped[worker_id_] = dbg_ctrl_->dbg_tasks_popped[worker_id_] + 1;
     }
   }
   HSHM_GPU_FUN void DbgTaskCompleted() {
     if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
-      dbg_ctrl_->dbg_tasks_completed[worker_id_]++;
+      dbg_ctrl_->dbg_tasks_completed[worker_id_] = dbg_ctrl_->dbg_tasks_completed[worker_id_] + 1;
 #ifdef HSHM_BUDDY_ALLOC_DEBUG
       u32 completed = dbg_ctrl_->dbg_tasks_completed[worker_id_];
       if (completed % 50 == 0) {
@@ -180,22 +180,22 @@ class Worker {
   }
   HSHM_GPU_FUN void DbgTaskResumed() {
     if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
-      dbg_ctrl_->dbg_tasks_resumed[worker_id_]++;
+      dbg_ctrl_->dbg_tasks_resumed[worker_id_] = dbg_ctrl_->dbg_tasks_resumed[worker_id_] + 1;
     }
   }
   HSHM_GPU_FUN void DbgAllocFailure() {
     if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
-      dbg_ctrl_->dbg_alloc_failures[worker_id_]++;
+      dbg_ctrl_->dbg_alloc_failures[worker_id_] = dbg_ctrl_->dbg_alloc_failures[worker_id_] + 1;
     }
   }
   HSHM_GPU_FUN void DbgQueuePop() {
     if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
-      dbg_ctrl_->dbg_queue_pops[worker_id_]++;
+      dbg_ctrl_->dbg_queue_pops[worker_id_] = dbg_ctrl_->dbg_queue_pops[worker_id_] + 1;
     }
   }
   HSHM_GPU_FUN void DbgNoContainer(unsigned int pool_major, unsigned int pool_minor) {
     if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
-      dbg_ctrl_->dbg_no_container[worker_id_]++;
+      dbg_ctrl_->dbg_no_container[worker_id_] = dbg_ctrl_->dbg_no_container[worker_id_] + 1;
       // Stash the last pool_id that failed
       dbg_ctrl_->dbg_last_method[worker_id_] =
           (pool_major << 16) | (pool_minor & 0xFFFF);
@@ -487,7 +487,7 @@ class Worker {
           // Not ready — re-enqueue
           if (dbg_ctrl_ && worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
             u32 raw_flags = awaited->flags_.bits_.load_device();
-            dbg_ctrl_->dbg_resume_checks[worker_id_]++;
+            dbg_ctrl_->dbg_resume_checks[worker_id_] = dbg_ctrl_->dbg_resume_checks[worker_id_] + 1;
             if ((dbg_ctrl_->dbg_resume_checks[worker_id_] % 100000) == 1) {
               printf("[W%u] awaiting fshm=%p flags=0x%x method=%u\n",
                      worker_id_, (void*)awaited, raw_flags, ctx->method_id_);
@@ -591,7 +591,7 @@ class Worker {
     DbgQueuePop();
     if (queue == internal_queue_ && dbg_ctrl_ &&
         worker_id_ < WorkOrchestratorControl::kMaxDebugWorkers) {
-      dbg_ctrl_->dbg_iq_pops[worker_id_]++;
+      dbg_ctrl_->dbg_iq_pops[worker_id_] = dbg_ctrl_->dbg_iq_pops[worker_id_] + 1;
     }
 
     // Resolve FutureShm

@@ -468,9 +468,9 @@ enum class AllocScope { kPrivate, kShared };
 #else
 #define CHI_TASK_ALLOC_T  hipc::BuddyAllocator
 // GPU: CHI_PRIV_ALLOC uses a cached PrivateBuddyAllocator* per warp.
-// The pointer is resolved once during GPU init (from ThreadAllocator) and
+// The pointer is resolved once during GPU init (from PartitionedAllocator) and
 // cached in IpcManager::warp_priv_alloc_[], eliminating the per-allocation
-// ThreadAllocator indirection (GetAutoTid + LazyInitThread + GetThreadBlock).
+// PartitionedAllocator indirection (GetAutoTid + LazyInitThread + GetThreadBlock).
 #define CHI_PRIV_ALLOC_T  hipc::PrivateBuddyAllocator
 /**
  * Get the GPU private allocator (cached PrivateBuddyAllocator for this warp).
@@ -480,12 +480,12 @@ enum class AllocScope { kPrivate, kShared };
  */
 HSHM_GPU_FUN hipc::PrivateBuddyAllocator *GetPrivAllocGpu();
 #define CHI_PRIV_ALLOC    (::chi::GetPrivAllocGpu())
-// GPU: CHI_PRIV_SHARED_ALLOC returns the ThreadAllocator (PartitionedAllocator)
+// GPU: CHI_PRIV_SHARED_ALLOC returns the PartitionedAllocator (PartitionedAllocator)
 // which dispatches allocations to the calling warp's partition via GetAutoTid().
 // Use for cross-warp data structures (shared maps, vectors) where multiple warps
 // may allocate/free concurrently.
-#define CHI_PRIV_SHARED_ALLOC_T hipc::ThreadAllocator
-HSHM_GPU_FUN hipc::ThreadAllocator *GetSharedAllocGpu();
+#define CHI_PRIV_SHARED_ALLOC_T hipc::PartitionedAllocator
+HSHM_GPU_FUN hipc::PartitionedAllocator *GetSharedAllocGpu();
 #define CHI_PRIV_SHARED_ALLOC   (::chi::GetSharedAllocGpu())
 #endif
 
@@ -600,7 +600,7 @@ using unordered_map = hshm::priv::unordered_map_ll<Key, T, CHI_PRIV_ALLOC_T>;
 
 // Shared-scope types for cross-warp GPU data structures.
 // On CPU these are identical to the private types above.
-// On GPU, AllocT = ThreadAllocator which dispatches to the correct
+// On GPU, AllocT = PartitionedAllocator which dispatches to the correct
 // warp partition, avoiding concurrent access to a single BuddyAllocator.
 typedef hshm::priv::string<CHI_PRIV_SHARED_ALLOC_T> shared_string;
 

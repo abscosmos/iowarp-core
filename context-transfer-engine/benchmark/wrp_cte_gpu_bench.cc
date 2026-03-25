@@ -331,7 +331,7 @@ __global__ void gpu_putget_kernel(
 /**
  * Kernel 2b: Multi-block allocator stress test.
  * Each warp initializes, allocates from scratch and heap, then frees.
- * Used to isolate multi-block ThreadAllocator bugs.
+ * Used to isolate multi-block PartitionedAllocator bugs.
  */
 __global__ void gpu_alloc_test_kernel(
     chi::IpcManagerGpu gpu_info,
@@ -704,7 +704,7 @@ static int run_cte_gpu_bench_putblob(
     return -1;
   }
 
-  // --- 3. GPU heap backend (for ThreadAllocator) ---
+  // --- 3. GPU heap backend (for PartitionedAllocator) ---
   // Holds blob_map entries, coroutine frames, and strings.
   constexpr size_t kPerWarpHeap = 1 * 1024 * 1024;  // 1MB per warp
   size_t heap_size = static_cast<size_t>(total_warps) * kPerWarpHeap;
@@ -757,10 +757,10 @@ static int run_cte_gpu_bench_putblob(
   // Zero client scratch/heap backends (device memory) so non-block-0
   // blocks don't see stale heap_ready_ flags from previous allocations.
   if (scratch_backend.data_ != nullptr) {
-    cudaMemset(scratch_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+    cudaMemset(scratch_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
   }
   if (heap_backend.data_ != nullptr) {
-    cudaMemset(heap_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+    cudaMemset(heap_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
   }
 
   // Record CUDA event on client stream just before kernel launch
@@ -997,10 +997,10 @@ static int run_cte_gpu_bench_putget(
   cudaGetLastError();
 
   if (scratch_backend.data_ != nullptr) {
-    cudaMemset(scratch_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+    cudaMemset(scratch_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
   }
   if (heap_backend.data_ != nullptr) {
-    cudaMemset(heap_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+    cudaMemset(heap_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
   }
 
   cudaEvent_t ev_start, ev_end;
@@ -1322,9 +1322,9 @@ static int run_bdev_alloc_free(
   memset((void*)d_progress, 0, sizeof(int) * total_warps);
 
   if (scratch_backend.data_ != nullptr)
-    cudaMemset(scratch_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+    cudaMemset(scratch_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
   if (heap_backend.data_ != nullptr)
-    cudaMemset(heap_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+    cudaMemset(heap_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
 
   void *stream = hshm::GpuApi::CreateStream();
   cudaGetLastError();
@@ -1481,9 +1481,9 @@ static int run_bdev_read_write(
   memset(d_read_clk, 0, sizeof(long long) * total_warps);
 
   if (scratch_backend.data_ != nullptr)
-    cudaMemset(scratch_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+    cudaMemset(scratch_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
   if (heap_backend.data_ != nullptr)
-    cudaMemset(heap_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+    cudaMemset(heap_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
 
   void *stream = hshm::GpuApi::CreateStream();
   cudaGetLastError();
@@ -1792,9 +1792,9 @@ int main(int argc, char **argv) {
     memset((void*)d_progress, 0, sizeof(int) * 64);
 
     if (scratch_backend.data_ != nullptr)
-      cudaMemset(scratch_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+      cudaMemset(scratch_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
     if (heap_backend.data_ != nullptr)
-      cudaMemset(heap_backend.data_, 0, sizeof(hipc::ThreadAllocator));
+      cudaMemset(heap_backend.data_, 0, sizeof(hipc::PartitionedAllocator));
     cudaDeviceSynchronize();
 
     void *stream = hshm::GpuApi::CreateStream();

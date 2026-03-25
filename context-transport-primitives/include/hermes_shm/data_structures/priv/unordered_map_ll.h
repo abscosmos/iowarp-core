@@ -58,7 +58,7 @@ struct InsertResult {
  *
  * @tparam Key      Key type (must support copy/move and operator==)
  * @tparam T        Mapped value type
- * @tparam AllocT   Allocator type (e.g., BuddyAllocator, ThreadAllocator)
+ * @tparam AllocT   Allocator type (e.g., BuddyAllocator, PartitionedAllocator)
  * @tparam Hash     Hash functor (defaults to hshm::hash<Key>)
  * @tparam KeyEqual Equality functor (defaults to hshm::equal_to<Key>)
  */

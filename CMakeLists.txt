@@ -668,15 +668,14 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   add_compile_options(-fcoroutines)
   message(STATUS "GCC detected - enabling coroutines with -fcoroutines")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-  # GCC's libstdc++ <coroutine> header guards itself with __cpp_impl_coroutine,
-  # which GCC sets via -fcoroutines. Clang does not pass that flag automatically.
-  # Clang 16+ accepts -fcoroutines as an alias; older clang needs a -D instead.
-  if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "16")
-    add_compile_options(-fcoroutines)
-    message(STATUS "Clang ${CMAKE_CXX_COMPILER_VERSION} detected - enabling coroutines with -fcoroutines")
+  # Clang 16+ enables C++20 coroutines natively (no flags needed for CXX).
+  # NVCC host compilation uses GCC which needs -fcoroutines for the builtins.
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-fcoroutines>)
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "16")
+    add_compile_definitions(__cpp_impl_coroutine=201902L)
+    message(STATUS "Clang ${CMAKE_CXX_COMPILER_VERSION} detected - enabling coroutines with -D__cpp_impl_coroutine (libstdc++ compat)")
   else()
-    add_compile_definitions(__cpp_impl_coroutine=1)
-    message(STATUS "Clang ${CMAKE_CXX_COMPILER_VERSION} detected - enabling coroutines with -D__cpp_impl_coroutine=1 (libstdc++ compat)")
+    message(STATUS "Clang ${CMAKE_CXX_COMPILER_VERSION} detected - C++20 coroutines enabled natively")
   endif()
 endif()
 
@@ -734,7 +733,10 @@ if(NOT MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-but-set-variable -Wno-unused-function -Wno-cast-function-type")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-self-move -Wno-format")
     # Suppress GCC false positives in template-heavy shared memory code (Release -O3)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-array-bounds -Wno-stringop-overflow")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-array-bounds")
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-stringop-overflow")
+    endif()
     # Suppress unused-result warnings (freopen/system in test code)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-result")
 
