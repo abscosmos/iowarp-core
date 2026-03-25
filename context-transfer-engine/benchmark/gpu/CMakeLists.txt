@@ -47,3 +47,7 @@ add_gpu_bench(bench_gpu_gnn_features gnn_features.cu)
 # 3. Gray-Scott reaction-diffusion — stencil simulation with periodic I/O
 #    Inspired by external/iowarp-gray-scott
 add_gpu_bench(bench_gpu_gray_scott gray_scott.cu)
+
+# 4. LLM KV cache offloading — attention decode with KV in DRAM
+#    Inspired by GeminiFS (FAST'25)
+add_gpu_bench(bench_gpu_llm_kvcache llm_kvcache.cu)
