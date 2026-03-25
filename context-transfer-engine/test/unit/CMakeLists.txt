@@ -70,6 +70,42 @@ if(WRP_CORE_ENABLE_CUDA)
       LINK_LIBS hshm::cuda_cxx chimaera_cxx_gpu
   )
   target_link_libraries(test_gpu_initiated_kernels hshm::cuda_cxx)
+
+  # GPU-tiered test: PutBlob 200MB + GetBlob 100MB with HBM+pinned tiers
+  # Single executable via add_cuda_executable (clang-cuda dual-pass)
+  set(_TIERED_EXTRA_INCLUDES "")
+  foreach(_dep yaml-cpp::yaml-cpp ZeroMQ::libzmq)
+    if(TARGET "${_dep}")
+      get_target_property(_dep_incs "${_dep}" INTERFACE_INCLUDE_DIRECTORIES)
+      if(_dep_incs)
+        list(APPEND _TIERED_EXTRA_INCLUDES ${_dep_incs})
+      endif()
+    endif()
+  endforeach()
+
+  add_cuda_executable(test_gpu_tiered TRUE
+      test_gpu_tiered.cc
+      test_gpu_tiered_gpu.cc
+      INCLUDE_DIRS
+          ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+          ${CMAKE_SOURCE_DIR}/context-runtime/include
+          ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+          ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+          ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
+          ${CMAKE_SOURCE_DIR}/context-runtime/compiler/include
+          ${_TIERED_EXTRA_INCLUDES}
+      LINK_LIBS
+          wrp_cte::core_client
+          chimaera::cxx
+          hshm::cuda_cxx
+  )
+  install(TARGETS test_gpu_tiered RUNTIME DESTINATION bin)
+
+  add_test(NAME cte_gpu_tiered_test COMMAND test_gpu_tiered)
+  set_tests_properties(cte_gpu_tiered_test PROPERTIES
+      TIMEOUT 180
+      LABELS "msan_skip"
+      ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
 endif()
 
 add_executable(test_cte_gpu_coroutine
