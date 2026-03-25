@@ -2365,6 +2365,12 @@ int main(int argc, char **argv) {
     // These are used by workloads that call AsyncPutBlob/AsyncGetBlob
     // For non-CTE modes, these are unused.
 
+    // Pause GPU orchestrator for non-CTE workload modes
+    // (otherwise the persistent GPU kernel conflicts with workload kernels)
+    if (cfg.workload_mode != "cte") {
+      CHI_IPC->PauseGpuOrchestrator();
+    }
+
     WorkloadResult wresult = {};
     const char *wmode = cfg.workload_mode.c_str();
 
