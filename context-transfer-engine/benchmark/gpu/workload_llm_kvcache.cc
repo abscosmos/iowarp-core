@@ -1,10 +1,15 @@
 /**
- * workload_llm_kvcache.cc — LLM KV cache offloading for CTE GPU bench
+ * workload_llm_kvcache.cc — LLM KV cache for CTE GPU bench
  *
- * CTE mode: Per-layer KV stored as CTE blobs. Each decode token:
- *   AsyncGetBlob to load layer KV → attention → AsyncPutBlob updated KV.
- * BaM mode: KV cache in DRAM, attention reads through BaM page cache.
- * HBM/Direct modes: standard.
+ * CTE mode: Combined kernel. Each warp owns a batch of attention heads.
+ *   For each layer: Lane 0 calls AsyncGetBlob to load KV for its heads.
+ *   All 32 lanes compute attention (Q·K^T, argmax, V lookup).
+ *   Lane 0 calls AsyncPutBlob to write updated KV after writeback.
+ *
+ * BaM mode: Uses bam::ArrayDevice<float>::read() for KV access.
+ *   Transparent page cache — no raw page_cache_acquire.
+ *
+ * HBM/Direct: Standard compute kernels.
  */
 
 #include <cstdint>
@@ -17,11 +22,10 @@
 #include <hermes_shm/util/gpu_api.h>
 
 #ifdef WRP_CORE_ENABLE_BAM
-#include <bam/page_cache.cuh>
-#include <bam/types.h>
+#include <bam/array.cuh>
 #endif
 
-// --- Compute kernels ---
+// --- HBM/Direct compute kernels ---
 
 __global__ void llm_attn_hbm(const float *kv, const float *q, float *out,
                               uint32_t nh, uint32_t sl, uint32_t hd) {
@@ -54,17 +58,11 @@ __global__ void llm_attn_direct(const float *h_kv, const float *q, float *out,
 }
 
 #ifdef WRP_CORE_ENABLE_BAM
-__device__ inline float llm_bam_read(bam::PageCacheDeviceState &cache,
-                                      const uint8_t *host, uint64_t idx) {
-  uint64_t boff=idx*sizeof(float); uint64_t poff=boff&~((uint64_t)cache.page_size-1);
-  uint32_t inp=(uint32_t)(boff&((uint64_t)cache.page_size-1));
-  bool nl; uint8_t *pg=bam::page_cache_acquire(cache,poff,&nl);
-  if(nl){bam::host_read_page(pg,host,poff,cache.page_size);bam::page_cache_finish_load(cache,poff);}
-  return *reinterpret_cast<const float*>(pg+inp);
-}
-
-__global__ void llm_attn_bam(bam::PageCacheDeviceState kv_cache,
-                              const uint8_t *kv_host, const float *q, float *out,
+/**
+ * BaM LLM attention: reads KV through bam::ArrayDevice<float>.
+ */
+__global__ void llm_attn_bam(bam::ArrayDevice<float> kv_cache,
+                              const float *q, float *out,
                               uint32_t nh, uint32_t sl, uint32_t hd) {
   uint32_t wid=(blockIdx.x*blockDim.x+threadIdx.x)/32, lid=threadIdx.x&31;
   uint64_t kvs=(uint64_t)sl*hd;
@@ -73,10 +71,10 @@ __global__ void llm_attn_bam(bam::PageCacheDeviceState kv_cache,
     const float*Q=q+(uint64_t)h*hd; float*O=out+(uint64_t)h*hd;
     float mx=-1e30f; uint32_t bp=0;
     for(uint32_t s=0;s<sl;s++){float d=0;
-      for(uint32_t i=lid;i<hd;i+=32)d+=Q[i]*llm_bam_read(kv_cache,kv_host,kb+s*hd+i);
+      for(uint32_t i=lid;i<hd;i+=32)d+=Q[i]*kv_cache.read(kb+s*hd+i);
       for(int o=16;o>0;o>>=1)d+=__shfl_down_sync(0xFFFFFFFF,d,o);
       d=__shfl_sync(0xFFFFFFFF,d,0);d/=sqrtf((float)hd);if(d>mx){mx=d;bp=s;}}
-    for(uint32_t i=lid;i<hd;i+=32)O[i]=llm_bam_read(kv_cache,kv_host,vb+bp*hd+i);
+    for(uint32_t i=lid;i<hd;i+=32)O[i]=kv_cache.read(vb+bp*hd+i);
     __syncwarp();
   }
 }
@@ -100,54 +98,162 @@ __global__ void llm_kv_wb_direct(float *h_kv, const float *nk, const float *nv,
     __syncwarp();}
 }
 
-// --- CTE orchestrator kernels ---
+/**
+ * Combined CTE LLM kernel: I/O + attention + writeback in one kernel.
+ *
+ * Each warp owns a batch of attention heads. For each layer:
+ *   1. Lane 0: AsyncGetBlob loads KV for this warp's heads
+ *   2. All 32 lanes: compute attention (the science)
+ *   3. Lane 0: AsyncPutBlob writes updated KV after writeback
+ *
+ * Data layout in data backend:
+ *   [layer_0 KV | layer_1 KV | ... | layer_N KV]
+ *   Each layer's KV = [K heads | V heads] contiguously
+ */
+__global__ void llm_cte_kernel(
+    chi::IpcManagerGpu gpu_info,
+    chi::PoolId cte_pool_id,
+    wrp_cte::core::TagId tag_id,
+    chi::u32 num_blocks,
+    // Data
+    hipc::FullPtr<char> data_ptr,
+    hipc::AllocatorId data_alloc_id,
+    const float *d_q,                  // Query (in HBM)
+    float *d_o,                        // Output (in HBM)
+    const float *d_nk, const float *d_nv, // New K, V (in HBM)
+    // Per-layer per-warp partition info (pinned host arrays)
+    const uint64_t *warp_kv_offsets,   // byte offset into data_ptr for each warp's KV per layer
+    const uint64_t *warp_kv_bytes,     // byte count for each warp's KV per layer
+    const uint32_t *warp_head_start,   // first head for each warp
+    const uint32_t *warp_head_end,     // last+1 head for each warp
+    chi::u32 total_warps,
+    chi::u32 num_layers, chi::u32 num_heads, chi::u32 seq_len, chi::u32 head_dim,
+    chi::u32 decode_token_pos,
+    int *d_done) {
+  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
 
+  chi::u32 warp_id = chi::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+
+  if (warp_id < total_warps) {
+    uint32_t head_start = warp_head_start[warp_id];
+    uint32_t head_end = warp_head_end[warp_id];
+    chi::u64 my_kv_offset = warp_kv_offsets[warp_id];
+    chi::u64 my_kv_bytes = warp_kv_bytes[warp_id];
+    char *my_data = data_ptr.ptr_ + my_kv_offset;
+
+    // Iterate over layers
+    for (uint32_t layer = 0; layer < num_layers; layer++) {
+      // Build blob name: "kv_l<layer>_w<warp_id>"
+      using StrT = hshm::priv::basic_string<char, CHI_PRIV_ALLOC_T>;
+      char name_buf[32];
+      int pos = 0;
+      const char *pfx = "kv_l";
+      while (*pfx) name_buf[pos++] = *pfx++;
+      pos += StrT::NumberToStr(name_buf + pos, 32 - pos, layer);
+      name_buf[pos++] = '_';
+      pfx = "w";
+      while (*pfx) name_buf[pos++] = *pfx++;
+      pos += StrT::NumberToStr(name_buf + pos, 32 - pos, warp_id);
+      name_buf[pos] = '\0';
+
+      bool alloc_failed = false;
+
+      // === I/O: GetBlob — load this warp's KV for this layer from CTE ===
+      if (chi::IpcManager::IsWarpScheduler() && my_kv_bytes > 0) {
+        wrp_cte::core::Client cte_client(cte_pool_id);
+        hipc::ShmPtr<> shm;
+        shm.alloc_id_ = data_alloc_id;
+        shm.off_.exchange(data_ptr.shm_.off_.load() + my_kv_offset);
+
+        auto get_future = cte_client.AsyncGetBlob(
+            tag_id, name_buf, (chi::u64)0, my_kv_bytes,
+            (chi::u32)0, shm, chi::PoolQuery::Local());
+        if (!get_future.GetFutureShmPtr().IsNull()) {
+          get_future.Wait();
+        } else {
+          alloc_failed = true;
+        }
+      }
+      __syncwarp();
+
+      // === COMPUTE: All 32 lanes compute attention (THE SCIENCE) ===
+      if (!alloc_failed) {
+        float *my_kv = reinterpret_cast<float *>(my_data);
+        uint64_t kvs = (uint64_t)seq_len * head_dim;
+
+        for (uint32_t head = head_start + lane_id; head < head_end; head += 32) {
+          const float *K = my_kv + (head - head_start) * kvs;
+          const float *V = my_kv + (head_end - head_start) * kvs + (head - head_start) * kvs;
+          const float *Q = d_q + head * head_dim;
+          float *O = d_o + head * head_dim;
+
+          float mx = -1e30f;
+          uint32_t bp = 0;
+          for (uint32_t s = 0; s < seq_len; s++) {
+            float d = 0.0f;
+            for (uint32_t i = 0; i < head_dim; i++) {
+              d += Q[i] * K[s * head_dim + i];
+            }
+            d /= sqrtf((float)head_dim);
+            if (d > mx) { mx = d; bp = s; }
+          }
+          for (uint32_t i = 0; i < head_dim; i++) {
+            O[i] = V[bp * head_dim + i];
+          }
+        }
+        __syncwarp();
+
+        // === Writeback: Update KV with new tokens ===
+        for (uint32_t head = head_start + lane_id; head < head_end; head += 32) {
+          float *K = my_kv + (head - head_start) * kvs;
+          float *V = my_kv + (head_end - head_start) * kvs + (head - head_start) * kvs;
+          const float *NK = d_nk + head * head_dim;
+          const float *NV = d_nv + head * head_dim;
+
+          for (uint32_t i = 0; i < head_dim; i++) {
+            K[decode_token_pos * head_dim + i] = NK[i];
+            V[decode_token_pos * head_dim + i] = NV[i];
+          }
+        }
+        __syncwarp();
+      }
+
+      // === I/O: PutBlob — write back updated KV ===
+      if (chi::IpcManager::IsWarpScheduler() && !alloc_failed && my_kv_bytes > 0) {
+        wrp_cte::core::Client cte_client(cte_pool_id);
+        hipc::ShmPtr<> shm;
+        shm.alloc_id_ = data_alloc_id;
+        shm.off_.exchange(data_ptr.shm_.off_.load() + my_kv_offset);
+
+        auto put_future = cte_client.AsyncPutBlob(
+            tag_id, name_buf, (chi::u64)0, my_kv_bytes,
+            shm, -1.0f, wrp_cte::core::Context(), (chi::u32)0,
+            chi::PoolQuery::Local());
+        if (!put_future.GetFutureShmPtr().IsNull()) {
+          put_future.Wait();
+        }
+      }
+      __syncwarp();
+    }
+  }
+
+  // Signal completion
+  if (chi::IpcManager::IsWarpScheduler()) {
+    atomicAdd_system(d_done, 1);
+    __threadfence_system();
+  }
+}
+
+// Alloc kernel
 __global__ void llm_cte_alloc_kernel(
     hipc::MemoryBackend data_backend, chi::u64 total_bytes,
     hipc::FullPtr<char> *d_out_ptr) {
-  if(threadIdx.x!=0||blockIdx.x!=0)return;
+  if (threadIdx.x!=0||blockIdx.x!=0) return;
   using AllocT=hipc::PrivateBuddyAllocator;
   auto *alloc=data_backend.MakeAlloc<AllocT>(data_backend.data_capacity_);
-  if(!alloc){d_out_ptr->SetNull();return;}
+  if (!alloc) { d_out_ptr->SetNull(); return; }
   *d_out_ptr=alloc->AllocateObjs<char>(total_bytes);
-}
-
-/**
- * GPU-initiated PutBlob/GetBlob for KV cache layers.
- * Blob name is passed via pinned memory (pre-built by host).
- */
-__global__ void llm_cte_putblob_kernel(
-    chi::IpcManagerGpu gpu_info, chi::PoolId pool_id,
-    wrp_cte::core::TagId tag_id, chi::u32 num_blocks,
-    hipc::FullPtr<char> data_ptr, hipc::AllocatorId alloc_id,
-    chi::u64 data_bytes, const char *blob_name, int *d_done) {
-  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
-  if(chi::IpcManager::GetWarpId()==0 && chi::IpcManager::IsWarpScheduler()){
-    wrp_cte::core::Client c(pool_id);
-    hipc::ShmPtr<> shm; shm.alloc_id_=alloc_id;
-    shm.off_.exchange(data_ptr.shm_.off_.load());
-    auto f=c.AsyncPutBlob(tag_id,blob_name,(chi::u64)0,data_bytes,shm,-1.0f,
-        wrp_cte::core::Context(),(chi::u32)0,chi::PoolQuery::Local());
-    if(!f.GetFutureShmPtr().IsNull())f.Wait();
-    atomicAdd_system(d_done,1); __threadfence_system();
-  }
-}
-
-__global__ void llm_cte_getblob_kernel(
-    chi::IpcManagerGpu gpu_info, chi::PoolId pool_id,
-    wrp_cte::core::TagId tag_id, chi::u32 num_blocks,
-    hipc::FullPtr<char> data_ptr, hipc::AllocatorId alloc_id,
-    chi::u64 data_bytes, const char *blob_name, int *d_done) {
-  CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
-  if(chi::IpcManager::GetWarpId()==0 && chi::IpcManager::IsWarpScheduler()){
-    wrp_cte::core::Client c(pool_id);
-    hipc::ShmPtr<> shm; shm.alloc_id_=alloc_id;
-    shm.off_.exchange(data_ptr.shm_.off_.load());
-    auto f=c.AsyncGetBlob(tag_id,blob_name,(chi::u64)0,data_bytes,
-        (chi::u32)0,shm,chi::PoolQuery::Local());
-    if(!f.GetFutureShmPtr().IsNull())f.Wait();
-    atomicAdd_system(d_done,1); __threadfence_system();
-  }
 }
 
 // ================================================================
@@ -162,25 +268,8 @@ __global__ void llm_cte_getblob_kernel(
 #include <vector>
 #include <cstring>
 
-static bool llm_poll(int *d,int e,int ts){
-  int64_t el=0,tu=(int64_t)ts*1000000;
-  while(__atomic_load_n(d,__ATOMIC_ACQUIRE)<e&&el<tu){
-    std::this_thread::sleep_for(std::chrono::microseconds(100));el+=100;}
-  return __atomic_load_n(d,__ATOMIC_ACQUIRE)>=e;
-}
-
-static bool llm_cte_cycle(int *d_done, int ts) {
-  CHI_IPC->ResumeGpuOrchestrator();
-  auto *o=static_cast<chi::gpu::WorkOrchestrator*>(CHI_IPC->gpu_orchestrator_);
-  auto *c=o?o->control_:nullptr;
-  if(c){int w=0;while(c->running_flag==0&&w<5000){std::this_thread::sleep_for(std::chrono::milliseconds(1));++w;}}
-  bool ok=llm_poll(d_done,1,ts);
-  CHI_IPC->PauseGpuOrchestrator();
-  return ok;
-}
-
 int run_workload_llm_kvcache(const WorkloadConfig &cfg, const char *mode, WorkloadResult *result) {
-  uint32_t nl=cfg.param_num_layers,nh=cfg.param_num_heads,hd=cfg.param_head_dim,sl=cfg.param_seq_len;
+  uint32_t nl=cfg.param_num_layers, nh=cfg.param_num_heads, hd=cfg.param_head_dim, sl=cfg.param_seq_len;
   uint32_t dt=cfg.param_decode_tokens; std::string m(mode);
   uint64_t kvpl=2ULL*nh*sl*hd;  // floats per layer
   uint64_t kvbl=kvpl*sizeof(float);  // bytes per layer
@@ -197,127 +286,175 @@ int run_workload_llm_kvcache(const WorkloadConfig &cfg, const char *mode, Worklo
   if(!blocks)blocks=1;
 
   if (m=="cte") {
-    // ======== CTE MODE: Per-layer GetBlob/PutBlob per token ========
+    // ======== CTE: Combined kernel with multi-warp I/O + compute ========
+    uint32_t total_warps = (cfg.client_blocks * cfg.client_threads) / 32;
+    if (total_warps == 0) total_warps = 1;
+
+    // Partition heads among warps
+    uint32_t heads_per_warp = (nh + total_warps - 1) / total_warps;
+    std::vector<uint32_t> h_head_start(total_warps), h_head_end(total_warps);
+    std::vector<uint64_t> h_kv_offsets(total_warps), h_kv_bytes(total_warps);
+
+    uint64_t total_kv_bytes = 0;
+    for (uint32_t w = 0; w < total_warps; w++) {
+      h_head_start[w] = w * heads_per_warp;
+      h_head_end[w] = std::min((w + 1) * heads_per_warp, nh);
+      uint32_t batch_heads = h_head_end[w] - h_head_start[w];
+      h_kv_offsets[w] = total_kv_bytes;
+      h_kv_bytes[w] = (uint64_t)batch_heads * 2 * sl * hd * sizeof(float);
+      total_kv_bytes += h_kv_bytes[w];
+    }
+
+    HIPRINT("  CTE: {} warps, {} heads/warp, {:.1f} MB KV/layer, {} layers",
+            total_warps, heads_per_warp, total_kv_bytes/(1024.0*1024.0), nl);
+
     CHI_IPC->SetGpuOrchestratorBlocks(cfg.rt_blocks, cfg.rt_threads);
     CHI_IPC->PauseGpuOrchestrator();
 
-    // Data backend: one layer's KV at a time in HBM
+    // Data backend
     hipc::MemoryBackendId data_id(200,0); hipc::GpuMalloc data_backend;
-    data_backend.shm_init(data_id, kvbl+4*1024*1024, "", 0);
+    data_backend.shm_init(data_id, total_kv_bytes + 4*1024*1024, "", 0);
     hipc::MemoryBackendId scratch_id(201,0); hipc::GpuMalloc scratch_backend;
-    scratch_backend.shm_init(scratch_id, 1*1024*1024, "", 0);
+    scratch_backend.shm_init(scratch_id, (size_t)total_warps*1024*1024, "", 0);
     hipc::MemoryBackendId heap_id(202,0); hipc::GpuMalloc heap_backend;
-    heap_backend.shm_init(heap_id, 1*1024*1024, "", 0);
+    heap_backend.shm_init(heap_id, (size_t)total_warps*1024*1024, "", 0);
 
-    hipc::FullPtr<char> *d_ptr; cudaMallocHost(&d_ptr,sizeof(hipc::FullPtr<char>));
+    hipc::FullPtr<char> *d_ptr; cudaMallocHost(&d_ptr, sizeof(hipc::FullPtr<char>));
     d_ptr->SetNull();
-    llm_cte_alloc_kernel<<<1,1>>>(static_cast<hipc::MemoryBackend&>(data_backend),kvbl,d_ptr);
+    llm_cte_alloc_kernel<<<1,1>>>(static_cast<hipc::MemoryBackend&>(data_backend),
+                                   total_kv_bytes, d_ptr);
     cudaDeviceSynchronize();
-    if(d_ptr->IsNull()){HLOG(kError,"LLM CTE alloc failed");cudaFreeHost(d_ptr);
-      CHI_IPC->ResumeGpuOrchestrator();goto cleanup;}
+    if (d_ptr->IsNull()) {
+      HLOG(kError,"LLM CTE alloc failed"); cudaFreeHost(d_ptr);
+      CHI_IPC->ResumeGpuOrchestrator();
+      cudaFree(d_q);cudaFree(d_o);cudaFree(d_nk);cudaFree(d_nv);
+      return -2;
+    }
+    hipc::FullPtr<char> array_ptr = *d_ptr; cudaFreeHost(d_ptr);
+    hipc::AllocatorId data_alloc_id(data_id.major_, data_id.minor_);
+    CHI_IPC->RegisterGpuAllocator(data_id, data_backend.data_, data_backend.data_capacity_);
+
+    chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+    gpu_info.backend = scratch_backend;
+    int *d_done; cudaMallocHost(&d_done, sizeof(int)); *d_done = 0;
+    if(scratch_backend.data_) cudaMemset(scratch_backend.data_,0,sizeof(hipc::PartitionedAllocator));
+    if(heap_backend.data_) cudaMemset(heap_backend.data_,0,sizeof(hipc::PartitionedAllocator));
+    cudaDeviceSynchronize();
+
+    // Copy partition info to pinned memory
+    uint64_t *h_ko, *h_kb; uint32_t *h_hs, *h_he;
+    cudaMallocHost(&h_ko, total_warps*sizeof(uint64_t));
+    cudaMallocHost(&h_kb, total_warps*sizeof(uint64_t));
+    cudaMallocHost(&h_hs, total_warps*sizeof(uint32_t));
+    cudaMallocHost(&h_he, total_warps*sizeof(uint32_t));
+    memcpy(h_ko, h_kv_offsets.data(), total_warps*sizeof(uint64_t));
+    memcpy(h_kb, h_kv_bytes.data(), total_warps*sizeof(uint64_t));
+    memcpy(h_hs, h_head_start.data(), total_warps*sizeof(uint32_t));
+    memcpy(h_he, h_head_end.data(), total_warps*sizeof(uint32_t));
+
+    // Seed per-warp KV blobs (zero-initialized for all layers)
+    char *h_all_kv = (char*)malloc(total_kv_bytes);
+    memset(h_all_kv, 0, total_kv_bytes);
+    cudaMemcpy(array_ptr.ptr_, h_all_kv, total_kv_bytes, cudaMemcpyHostToDevice);
+    free(h_all_kv);
+    cudaDeviceSynchronize();
+
+    // Seed each warp's blobs via CTE client
     {
-      hipc::FullPtr<char> array_ptr=*d_ptr; cudaFreeHost(d_ptr);
-      hipc::AllocatorId data_alloc_id(data_id.major_,data_id.minor_);
-      CHI_IPC->RegisterGpuAllocator(data_id,data_backend.data_,data_backend.data_capacity_);
+      wrp_cte::core::Client cte_client(cfg.cte_pool_id);
+      for (uint32_t layer = 0; layer < nl; layer++) {
+        for (uint32_t w = 0; w < total_warps; w++) {
+          char bname[32];
+          int pos = 0;
+          const char *pfx = "kv_l";
+          while (*pfx) bname[pos++] = *pfx++;
+          pos += std::to_string(layer).copy(bname + pos, 32 - pos);
+          bname[pos++] = '_';
+          pfx = "w";
+          while (*pfx) bname[pos++] = *pfx++;
+          pos += std::to_string(w).copy(bname + pos, 32 - pos);
+          bname[pos] = '\0';
 
-      chi::IpcManagerGpu gpu_info=CHI_IPC->GetClientGpuInfo(0);
-      gpu_info.backend=scratch_backend;
-      int *d_done; cudaMallocHost(&d_done,sizeof(int));
-
-      // Blob names for each layer (pinned memory, GPU-accessible)
-      char **h_names; cudaMallocHost(&h_names, nl*sizeof(char*));
-      for(uint32_t l=0;l<nl;l++){
-        cudaMallocHost(&h_names[l],32);
-        snprintf(h_names[l],32,"kv_l%u",l);
-      }
-
-      // Timing variables declared before any goto
-      std::chrono::high_resolution_clock::time_point t0, t1;
-
-      // Seed: PutBlob zero-initialized KV for each layer
-      HIPRINT("  CTE: Seeding {} layers of KV ({:.1f} MB each)...", nl, kvbl/(1024.0*1024.0));
-      cudaMemset(array_ptr.ptr_, 0, kvbl); cudaDeviceSynchronize();
-      for(uint32_t l=0;l<nl;l++){
-        if(scratch_backend.data_)cudaMemset(scratch_backend.data_,0,sizeof(hipc::PartitionedAllocator));
-        if(heap_backend.data_)cudaMemset(heap_backend.data_,0,sizeof(hipc::PartitionedAllocator));
-        cudaDeviceSynchronize();
-        *d_done=0;
-        llm_cte_putblob_kernel<<<cfg.rt_blocks,cfg.rt_threads>>>(
-            gpu_info,cfg.cte_pool_id,cfg.tag_id,cfg.rt_blocks,
-            array_ptr,data_alloc_id,kvbl,h_names[l],d_done);
-        if(!llm_cte_cycle(d_done,cfg.timeout_sec)){
-          HLOG(kError,"LLM CTE seed PutBlob layer {} timed out",l); goto llm_cleanup;}
-      }
-      HIPRINT("  CTE: All layers seeded.");
-
-      // Decode loop
-      t0=std::chrono::high_resolution_clock::now();
-      for(uint32_t t=0;t<dt;t++){
-        for(uint32_t l=0;l<nl;l++){
-          // GetBlob: load layer l's KV into HBM
-          if(scratch_backend.data_)cudaMemset(scratch_backend.data_,0,sizeof(hipc::PartitionedAllocator));
-          cudaDeviceSynchronize();
-          *d_done=0;
-          llm_cte_getblob_kernel<<<cfg.rt_blocks,cfg.rt_threads>>>(
-              gpu_info,cfg.cte_pool_id,cfg.tag_id,cfg.rt_blocks,
-              array_ptr,data_alloc_id,kvbl,h_names[l],d_done);
-          if(!llm_cte_cycle(d_done,cfg.timeout_sec)){
-            HLOG(kError,"LLM CTE GetBlob layer {} token {} timed out",l,t); goto llm_cleanup;}
-
-          // Compute attention on HBM KV
-          float *lkv=reinterpret_cast<float*>(array_ptr.ptr_);
-          llm_attn_hbm<<<blocks,threads>>>(lkv,d_q,d_o,nh,sl,hd);
-          llm_kv_wb_hbm<<<blocks,threads>>>(lkv,d_nk,d_nv,nh,sl,hd,t);
-          cudaDeviceSynchronize();
-
-          // PutBlob: write updated KV back to CTE
-          if(scratch_backend.data_)cudaMemset(scratch_backend.data_,0,sizeof(hipc::PartitionedAllocator));
-          cudaDeviceSynchronize();
-          *d_done=0;
-          llm_cte_putblob_kernel<<<cfg.rt_blocks,cfg.rt_threads>>>(
-              gpu_info,cfg.cte_pool_id,cfg.tag_id,cfg.rt_blocks,
-              array_ptr,data_alloc_id,kvbl,h_names[l],d_done);
-          if(!llm_cte_cycle(d_done,cfg.timeout_sec)){
-            HLOG(kError,"LLM CTE PutBlob layer {} token {} timed out",l,t); goto llm_cleanup;}
+          hipc::ShmPtr<> shm;
+          shm.alloc_id_ = data_alloc_id;
+          shm.off_.exchange(array_ptr.shm_.off_.load() + h_kv_offsets[w]);
+          auto f = cte_client.AsyncPutBlob(cfg.tag_id, bname,
+              (chi::u64)0, h_kv_bytes[w], shm, -1.0f,
+              wrp_cte::core::Context(), (chi::u32)0, chi::PoolQuery::Local());
+          f.Wait();
         }
       }
-      t1=std::chrono::high_resolution_clock::now();
-      result->elapsed_ms=std::chrono::duration<double,std::milli>(t1-t0).count();
-      result->primary_metric=dt/(result->elapsed_ms/1e3);
-      result->metric_name="tokens/sec";
-      result->bandwidth_gbps=((uint64_t)nl*(kvbl+2*nh*hd*4)*dt/1e9)/(result->elapsed_ms/1e3);
-
-llm_cleanup:
-      for(uint32_t l=0;l<nl;l++) cudaFreeHost(h_names[l]);
-      cudaFreeHost(h_names); cudaFreeHost(d_done);
+      HIPRINT("  CTE: Seeded {} layers x {} warps KV blobs", nl, total_warps);
     }
+
+    // Clear data backend before GetBlob
+    cudaMemset(array_ptr.ptr_, 0, total_kv_bytes);
+    if(scratch_backend.data_) cudaMemset(scratch_backend.data_,0,sizeof(hipc::PartitionedAllocator));
+    if(heap_backend.data_) cudaMemset(heap_backend.data_,0,sizeof(hipc::PartitionedAllocator));
+    cudaDeviceSynchronize();
+
+    // Run combined CTE kernel for each decode token
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (uint32_t token = 0; token < dt; token++) {
+      *d_done = 0;
+      if(scratch_backend.data_) cudaMemset(scratch_backend.data_,0,sizeof(hipc::PartitionedAllocator));
+      cudaDeviceSynchronize();
+
+      void *stream = hshm::GpuApi::CreateStream();
+      llm_cte_kernel<<<cfg.client_blocks, cfg.client_threads, 0,
+                       static_cast<cudaStream_t>(stream)>>>(
+          gpu_info, cfg.cte_pool_id, cfg.tag_id, cfg.client_blocks,
+          array_ptr, data_alloc_id,
+          d_q, d_o, d_nk, d_nv,
+          h_ko, h_kb, h_hs, h_he,
+          total_warps, nl, nh, sl, hd, token, d_done);
+
+      CHI_IPC->ResumeGpuOrchestrator();
+      auto *orch = static_cast<chi::gpu::WorkOrchestrator*>(CHI_IPC->gpu_orchestrator_);
+      auto *ctrl = orch ? orch->control_ : nullptr;
+      if(ctrl){int w=0;while(ctrl->running_flag==0&&w<5000){std::this_thread::sleep_for(std::chrono::milliseconds(1));++w;}}
+      int64_t tus=(int64_t)cfg.timeout_sec*1000000,el=0;
+      while(__atomic_load_n(d_done,__ATOMIC_ACQUIRE)<(int)total_warps&&el<tus){
+        std::this_thread::sleep_for(std::chrono::microseconds(100));el+=100;}
+      CHI_IPC->PauseGpuOrchestrator();
+      hshm::GpuApi::Synchronize(stream);
+      hshm::GpuApi::DestroyStream(stream);
+
+      if(__atomic_load_n(d_done,__ATOMIC_ACQUIRE)<(int)total_warps){
+        HLOG(kError,"LLM CTE token {} timed out",token); break;}
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    result->elapsed_ms = std::chrono::duration<double,std::milli>(t1-t0).count();
+    result->primary_metric = dt/(result->elapsed_ms/1e3);
+    result->metric_name = "tokens/sec";
+    result->bandwidth_gbps = ((uint64_t)nl*(kvbl+2*nh*hd*4)*dt/1e9)/(result->elapsed_ms/1e3);
+
+    cudaFreeHost(d_done); cudaFreeHost(h_ko); cudaFreeHost(h_kb);
+    cudaFreeHost(h_hs); cudaFreeHost(h_he);
   }
 
 #ifdef WRP_CORE_ENABLE_BAM
   else if (m=="bam") {
     uint64_t kvb_al=((kvbt+cfg.bam_page_size-1)/cfg.bam_page_size)*cfg.bam_page_size;
-    // Match BaM HBM to CTE: CTE holds one layer at a time (kvbl bytes)
-    uint64_t kvbl_al=((kvbl+cfg.bam_page_size-1)/cfg.bam_page_size)*cfg.bam_page_size;
-    uint32_t matched_pages=(uint32_t)(kvbl_al/cfg.bam_page_size);
+    uint32_t matched_pages=(uint32_t)(kvb_al/cfg.bam_page_size);
     bam::PageCacheConfig pcfg; pcfg.page_size=cfg.bam_page_size; pcfg.num_pages=matched_pages;
     pcfg.num_queues=0;pcfg.queue_depth=0;pcfg.backend=bam::BackendType::kHostMemory;pcfg.nvme_dev=nullptr;
-    bam::PageCache cache(pcfg); cache.alloc_host_backing(kvb_al);
-    memset(cache.host_buffer(),0,kvb_al);
-    HIPRINT("  BaM HBM cache: {} pages x {} B = {:.1f} MB/layer (matched to CTE, KV total {:.1f} MB)",
+    bam::PageCache cache(pcfg);
+    bam::Array<float> kv_array(nl*kvpl, cache);
+    std::vector<float> h_kv(nl*kvpl, 0.0f);
+    kv_array.load_from_host(h_kv.data(), nl*kvpl);
+    HIPRINT("  BaM HBM cache: {} pages x {} B = {:.1f} MB (matched to CTE)",
             matched_pages,cfg.bam_page_size,
-            (double)matched_pages*cfg.bam_page_size/(1024.0*1024.0),kvbt/(1024.0*1024.0));
+            (double)matched_pages*cfg.bam_page_size/(1024.0*1024.0));
     auto t0=std::chrono::high_resolution_clock::now();
     for(uint32_t t=0;t<dt;t++){
       for(uint32_t l=0;l<nl;l++){
-        llm_attn_bam<<<blocks,threads>>>(cache.device_state(),
-            cache.host_buffer()+l*kvbl, d_q,d_o,nh,sl,hd);
+        llm_attn_bam<<<blocks,threads>>>(kv_array.device(), d_q,d_o,nh,sl,hd);
         llm_kv_wb_direct<<<blocks,threads>>>(
-            reinterpret_cast<float*>(cache.host_buffer()+l*kvbl),
+            reinterpret_cast<float*>(cache.host_buffer())+l*kvpl,
             d_nk,d_nv,nh,sl,hd,t);
       }
-      cudaDeviceSynchronize();
-      cudaMemset(cache.device_state().page_tags,0xFF,matched_pages*sizeof(uint64_t));
-      cudaMemset(cache.device_state().page_states,0,matched_pages*sizeof(uint32_t));
       cudaDeviceSynchronize();
     }
     auto t1=std::chrono::high_resolution_clock::now();
@@ -353,11 +490,12 @@ llm_cleanup:
     result->primary_metric=dt/(result->elapsed_ms/1e3);result->metric_name="tokens/sec";
     result->bandwidth_gbps=((uint64_t)nl*(kvbl+2*nh*hd*4)*dt/1e9)/(result->elapsed_ms/1e3);
     cudaFreeHost(h_kv);
-  } else { HLOG(kError,"llm_kvcache: unknown mode '{}'",mode); goto cleanup; }
+  } else { HLOG(kError,"llm_kvcache: unknown mode '{}'",mode);
+    cudaFree(d_q);cudaFree(d_o);cudaFree(d_nk);cudaFree(d_nv);
+    return -1; }
 
-cleanup:
   cudaFree(d_q);cudaFree(d_o);cudaFree(d_nk);cudaFree(d_nv);
   return 0;
 }
 
-#endif
+#endif  // HSHM_IS_HOST
