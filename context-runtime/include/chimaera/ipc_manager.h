@@ -896,7 +896,7 @@ class IpcManager {
 
     // Distribute across queue lanes using warp ID
     u32 lane_id = 0;
-#if HSHM_IS_GPU_COMPILER
+#if HSHM_IS_GPU
     if (queue == internal_queue_) {
       if (internal_num_lanes_ > 1) {
         lane_id = GetWarpId() % internal_num_lanes_;

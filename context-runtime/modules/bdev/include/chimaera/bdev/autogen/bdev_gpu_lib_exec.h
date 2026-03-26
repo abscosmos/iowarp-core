@@ -4,6 +4,9 @@
 
 HSHM_GPU_FUN chi::gpu::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
                        chi::gpu::RunContext &rctx) override {
+  if (method >= Method::kWrite && threadIdx.x < 4) {
+    printf("[bdev::Run] tid=%u method=%u\n", threadIdx.x, method);
+  }
   switch (method) {
     case Method::kUpdate: {
       auto typed = task_ptr.template Cast<UpdateTask>();
