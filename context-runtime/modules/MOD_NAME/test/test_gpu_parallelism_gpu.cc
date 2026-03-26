@@ -37,17 +37,13 @@ extern "C" int run_gpu_parallelism_test(
     chi::u32 parallelism,
     chi::u32 *out_counter) {
 
-  // Allocate a device-side atomic counter, initialized to 0
+  // Allocate pinned counter (CPU+GPU accessible, no cudaMemcpy needed)
   unsigned int *d_counter;
-  cudaError_t err = cudaMalloc(&d_counter, sizeof(unsigned int));
+  cudaError_t err = cudaMallocHost(&d_counter, sizeof(unsigned int));
   if (err != cudaSuccess) {
-    return -100;  // cudaMalloc failed
+    return -100;
   }
-  err = cudaMemset(d_counter, 0, sizeof(unsigned int));
-  if (err != cudaSuccess) {
-    cudaFree(d_counter);
-    return -101;  // cudaMemset failed
-  }
+  *d_counter = 0;
 
   // Create client and submit task with parallelism via ToLocalGpu
   chimaera::MOD_NAME::Client client(pool_id);
@@ -72,27 +68,19 @@ extern "C" int run_gpu_parallelism_test(
               fshm->total_warps_,
               fshm->completion_counter_.load());
     }
-    cudaFree(d_counter);
+    cudaFreeHost(d_counter);
     return -3;  // Timeout
   }
 
-  // Read counter from device
-  unsigned int h_counter = 0;
-  err = cudaMemcpy(&h_counter, d_counter, sizeof(unsigned int),
-                   cudaMemcpyDeviceToHost);
-  if (err != cudaSuccess) {
-    cudaFree(d_counter);
-    return -102;  // cudaMemcpy failed
-  }
-
-  *out_counter = h_counter;
+  // Read counter directly (pinned memory is CPU-visible after Future completes)
+  *out_counter = *d_counter;
 
   // Verify result_value_ is correct (last warp's output)
   chi::u32 expected = (test_value * 3) + gpu_id;
   if (future->result_value_ != expected) {
     fprintf(stderr, "[PARALLELISM] result_value_=%u expected=%u\n",
             future->result_value_, expected);
-    cudaFree(d_counter);
+    cudaFreeHost(d_counter);
     return -4;  // Wrong result value
   }
 
