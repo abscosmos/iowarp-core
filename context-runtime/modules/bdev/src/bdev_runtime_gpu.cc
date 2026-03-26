@@ -134,23 +134,25 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::FreeBlocks(hipc::FullPtr<FreeBlock
 }
 
 // ---------------------------------------------------------------------------
-// Write — lane-0 vectorized copy (uint4)
+// Write — per-lane stripe copy
 // ---------------------------------------------------------------------------
 
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> task,
                                      chi::gpu::RunContext &rctx) {
-  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; co_return; }
+  chi::u32 lane = co_await chi::gpu::get_lane_id();
   static constexpr chi::u32 kHbm    = static_cast<chi::u32>(BdevType::kHbm);
   static constexpr chi::u32 kPinned = static_cast<chi::u32>(BdevType::kPinned);
   static constexpr chi::u32 kNoop   = static_cast<chi::u32>(BdevType::kNoop);
 
   if (bdev_type_ == kNoop) {
-    task->bytes_written_ = task->length_;
-    task->return_code_ = 0;
+    if (lane == 0) {
+      task->bytes_written_ = task->length_;
+      task->return_code_ = 0;
+    }
     co_return;
   }
   if (bdev_type_ != kHbm && bdev_type_ != kPinned) {
-    task->return_code_ = 1;
+    if (lane == 0) task->return_code_ = 1;
     co_return;
   }
 
@@ -159,6 +161,10 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
   auto *ipc_mgr = CHI_IPC;
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
   char *src = data_ptr.ptr_;
+
+  chi::u32 num_lanes = rctx.parallelism_;
+  if (num_lanes == 0) num_lanes = 1;
+  if (lane >= num_lanes) co_return;
 
   size_t num_blocks = task->blocks_.size();
   chi::u64 data_off = 0;
@@ -171,22 +177,30 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
     char *block_dst = dst_base + block.offset_;
     const char *block_src = src + data_off;
 
-    bool aligned16 = ((reinterpret_cast<uintptr_t>(block_dst) |
-                        reinterpret_cast<uintptr_t>(block_src)) & 15) == 0;
-    if (aligned16) {
-      chi::u64 vec_elems = copy_size / sizeof(uint4);
-      const uint4 *src4 = reinterpret_cast<const uint4 *>(block_src);
-      uint4 *dst4 = reinterpret_cast<uint4 *>(block_dst);
+    chi::u64 stripe = copy_size / num_lanes;
+    chi::u64 my_start = lane * stripe;
+    chi::u64 my_end = (lane == num_lanes - 1) ? copy_size : (lane + 1) * stripe;
+    chi::u64 my_len = my_end - my_start;
+
+    const char *my_src = block_src + my_start;
+    char *my_dst = block_dst + my_start;
+
+    bool aligned16 = ((reinterpret_cast<uintptr_t>(my_dst) |
+                        reinterpret_cast<uintptr_t>(my_src)) & 15) == 0;
+    if (aligned16 && my_len >= sizeof(uint4)) {
+      chi::u64 vec_elems = my_len / sizeof(uint4);
+      const uint4 *src4 = reinterpret_cast<const uint4 *>(my_src);
+      uint4 *dst4 = reinterpret_cast<uint4 *>(my_dst);
       for (chi::u64 idx = 0; idx < vec_elems; ++idx) {
         dst4[idx] = src4[idx];
       }
       chi::u64 tail_start = vec_elems * sizeof(uint4);
-      for (chi::u64 b = tail_start; b < copy_size; ++b) {
-        block_dst[b] = block_src[b];
+      for (chi::u64 b = tail_start; b < my_len; ++b) {
+        my_dst[b] = my_src[b];
       }
     } else {
-      for (chi::u64 b = 0; b < copy_size; ++b) {
-        block_dst[b] = block_src[b];
+      for (chi::u64 b = 0; b < my_len; ++b) {
+        my_dst[b] = my_src[b];
       }
     }
     __threadfence_system();
@@ -197,29 +211,33 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
     }
   }
 
-  task->bytes_written_ = data_off;
-  task->return_code_ = 0;
+  if (lane == 0) {
+    task->bytes_written_ = data_off;
+    task->return_code_ = 0;
+  }
   co_return;
 }
 
 // ---------------------------------------------------------------------------
-// Read — lane-0 vectorized copy (uint4)
+// Read — per-lane stripe copy
 // ---------------------------------------------------------------------------
 
 HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
                                     chi::gpu::RunContext &rctx) {
-  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; co_return; }
+  chi::u32 lane = co_await chi::gpu::get_lane_id();
   static constexpr chi::u32 kHbm    = static_cast<chi::u32>(BdevType::kHbm);
   static constexpr chi::u32 kPinned = static_cast<chi::u32>(BdevType::kPinned);
   static constexpr chi::u32 kNoop   = static_cast<chi::u32>(BdevType::kNoop);
 
   if (bdev_type_ == kNoop) {
-    task->bytes_read_ = task->length_;
-    task->return_code_ = 0;
+    if (lane == 0) {
+      task->bytes_read_ = task->length_;
+      task->return_code_ = 0;
+    }
     co_return;
   }
   if (bdev_type_ != kHbm && bdev_type_ != kPinned) {
-    task->return_code_ = 1;
+    if (lane == 0) task->return_code_ = 1;
     co_return;
   }
 
@@ -228,6 +246,10 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
   auto *ipc_mgr = CHI_IPC;
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
   char *dst = data_ptr.ptr_;
+
+  chi::u32 num_lanes = rctx.parallelism_;
+  if (num_lanes == 0) num_lanes = 1;
+  if (lane >= num_lanes) co_return;
 
   size_t num_blocks = task->blocks_.size();
   chi::u64 data_off = 0;
@@ -240,22 +262,30 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
     const char *block_src = src_base + block.offset_;
     char *block_dst = dst + data_off;
 
-    bool aligned16 = ((reinterpret_cast<uintptr_t>(block_dst) |
-                        reinterpret_cast<uintptr_t>(block_src)) & 15) == 0;
-    if (aligned16) {
-      chi::u64 vec_elems = copy_size / sizeof(uint4);
-      const uint4 *src4 = reinterpret_cast<const uint4 *>(block_src);
-      uint4 *dst4 = reinterpret_cast<uint4 *>(block_dst);
+    chi::u64 stripe = copy_size / num_lanes;
+    chi::u64 my_start = lane * stripe;
+    chi::u64 my_end = (lane == num_lanes - 1) ? copy_size : (lane + 1) * stripe;
+    chi::u64 my_len = my_end - my_start;
+
+    const char *my_src = block_src + my_start;
+    char *my_dst = block_dst + my_start;
+
+    bool aligned16 = ((reinterpret_cast<uintptr_t>(my_dst) |
+                        reinterpret_cast<uintptr_t>(my_src)) & 15) == 0;
+    if (aligned16 && my_len >= sizeof(uint4)) {
+      chi::u64 vec_elems = my_len / sizeof(uint4);
+      const uint4 *src4 = reinterpret_cast<const uint4 *>(my_src);
+      uint4 *dst4 = reinterpret_cast<uint4 *>(my_dst);
       for (chi::u64 idx = 0; idx < vec_elems; ++idx) {
         dst4[idx] = src4[idx];
       }
       chi::u64 tail_start = vec_elems * sizeof(uint4);
-      for (chi::u64 b = tail_start; b < copy_size; ++b) {
-        block_dst[b] = block_src[b];
+      for (chi::u64 b = tail_start; b < my_len; ++b) {
+        my_dst[b] = my_src[b];
       }
     } else {
-      for (chi::u64 b = 0; b < copy_size; ++b) {
-        block_dst[b] = block_src[b];
+      for (chi::u64 b = 0; b < my_len; ++b) {
+        my_dst[b] = my_src[b];
       }
     }
     __threadfence_system();
@@ -268,8 +298,10 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
 
   __threadfence_system();
 
-  task->bytes_read_ = data_off;
-  task->return_code_ = 0;
+  if (lane == 0) {
+    task->bytes_read_ = data_off;
+    task->return_code_ = 0;
+  }
   co_return;
 }
 

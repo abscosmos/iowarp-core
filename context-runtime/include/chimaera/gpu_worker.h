@@ -159,6 +159,7 @@ class Worker {
           }
         } else {
           tmp.get_handle().promise().set_run_context(ctx);
+          tmp.get_handle().promise().set_lane_id(lane_id);
           ctx->task_coros_[lane_id] = tmp.release();
         }
         if (ctx->parallelism_ > 1) __syncwarp();
@@ -209,8 +210,12 @@ class Worker {
                          ctx->method_id_);
       auto *fshm = ctx->task_fshm_;
       if (fshm->total_warps_ > 1) {
+#if !HSHM_IS_HOST
         u32 prev = fshm->completion_counter_.fetch_add(1);
         __threadfence();
+#else
+        u32 prev = 0;
+#endif
         if (prev + 1 < fshm->total_warps_) {
           FreeContext(ctx);
           return;

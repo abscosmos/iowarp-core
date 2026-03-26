@@ -104,7 +104,7 @@ HSHM_GPU_FUN void GpuCoroFreeRaw(void *ptr);
  */
 struct alignas(8) FrameHeader {
   u32 parallelism_;
-  u32 pad_;
+  u32 lane_id_;  /**< Hardware lane at frame allocation (set in device pass) */
 };
 
 // ============================================================================
@@ -272,19 +272,20 @@ class TaskResume {
   struct promise_type {
     RunContext *run_ctx_ = nullptr;
     std::coroutine_handle<> caller_handle_ = nullptr;
+    u32 lane_id_ = 0;  /**< Hardware lane set by Worker before resume */
 
     /** Capture RunContext from the coroutine's first parameter. */
     template <typename... Args>
     __device__ promise_type(RunContext &ctx, Args &&...)
-        : run_ctx_(&ctx), caller_handle_(nullptr) {}
+        : run_ctx_(&ctx), caller_handle_(nullptr), lane_id_(0) {}
 
     /** Capture RunContext from the second parameter (FullPtr<Task>, RunContext&). */
     template <typename TaskT, typename... Args>
     __device__ promise_type(hipc::FullPtr<TaskT>, RunContext &ctx, Args &&...)
-        : run_ctx_(&ctx), caller_handle_(nullptr) {}
+        : run_ctx_(&ctx), caller_handle_(nullptr), lane_id_(0) {}
 
     __device__ promise_type()
-        : run_ctx_(nullptr), caller_handle_(nullptr) {}
+        : run_ctx_(nullptr), caller_handle_(nullptr), lane_id_(0) {}
 
     /**
      * Warp-level bulk allocation helper shared by all operator new overloads.
@@ -307,6 +308,7 @@ class TaskResume {
         char *my_frame = reinterpret_cast<char *>(base_ull) + lane * total;
         auto *hdr = reinterpret_cast<FrameHeader *>(my_frame);
         hdr->parallelism_ = parallelism;
+        hdr->lane_id_ = lane;
         return my_frame + sizeof(FrameHeader);
       }
 #else
@@ -316,6 +318,7 @@ class TaskResume {
       if (fp.IsNull()) return nullptr;
       auto *hdr = reinterpret_cast<FrameHeader *>(fp.ptr_);
       hdr->parallelism_ = 1;
+      hdr->lane_id_ = 0;
       return fp.ptr_ + sizeof(FrameHeader);
     }
 
@@ -399,9 +402,11 @@ class TaskResume {
 
     __device__ void unhandled_exception() { __trap(); }
 
-    __device__ void set_run_context(RunContext *ctx) { run_ctx_ = ctx; }
-    __device__ RunContext *get_run_context() const { return run_ctx_; }
-    __device__ void set_caller(std::coroutine_handle<> caller) {
+    __host__ __device__ void set_run_context(RunContext *ctx) { run_ctx_ = ctx; }
+    __host__ __device__ RunContext *get_run_context() const { return run_ctx_; }
+    __host__ __device__ void set_lane_id(u32 id) { lane_id_ = id; }
+    __host__ __device__ u32 get_lane_id() const { return lane_id_; }
+    __host__ __device__ void set_caller(std::coroutine_handle<> caller) {
       caller_handle_ = caller;
     }
   };
@@ -484,11 +489,11 @@ class TaskResume {
     // Store caller handle for await_resume to use
     caller_handle_ = caller_handle;
 
-    // Propagate RunContext from caller to inner
-    if constexpr (requires { caller_handle.promise().get_run_context(); }) {
-      auto *ctx = caller_handle.promise().get_run_context();
-      if (ctx) handle_.promise().set_run_context(ctx);
-    }
+    // Propagate RunContext and lane_id from caller to inner
+    handle_.promise().set_run_context(
+        caller_handle.promise().get_run_context());
+    handle_.promise().set_lane_id(
+        caller_handle.promise().get_lane_id());
 
     // NOTE: Do NOT set caller on inner's promise yet. If inner completes
     // synchronously, FinalAwaiter would try to access a stale caller.
@@ -528,6 +533,9 @@ class TaskResume {
            caller_handle_ ? caller_handle_.address() : nullptr);
     if (handle_) {
       auto *ctx = handle_.promise().get_run_context();
+      char *frame = static_cast<char *>(handle_.address());
+      auto *hdr = reinterpret_cast<FrameHeader *>(frame - sizeof(FrameHeader));
+      u32 lane = hdr->lane_id_;
       GPU_CORO_DPRINTF("[TaskResume::await_resume] destroying inner %p\n", handle_.address());
       handle_.destroy();
       handle_ = nullptr;
@@ -535,11 +543,6 @@ class TaskResume {
       // Update per-lane coro_handle to this coroutine (the caller) so that
       // subsequent yields or co_awaits are tracked correctly.
       if (ctx && caller_handle_) {
-#if HSHM_IS_GPU_COMPILER
-        u32 lane = threadIdx.x % kWarpSize;
-#else
-        u32 lane = 0;
-#endif
         ctx->coro_handles_[lane] = caller_handle_;
         GPU_CORO_DPRINTF("[TaskResume::await_resume] updated coro_handles_[%u] to caller %p\n",
                lane, caller_handle_.address());
@@ -567,11 +570,9 @@ class YieldAwaiter {
         handle.address());
     auto *ctx = typed.promise().get_run_context();
     if (!ctx) return;
-#if HSHM_IS_GPU_COMPILER
-    u32 lane = threadIdx.x % kWarpSize;
-#else
-    u32 lane = 0;
-#endif
+    char *frame = static_cast<char *>(handle.address());
+    auto *hdr = reinterpret_cast<FrameHeader *>(frame - sizeof(FrameHeader));
+    u32 lane = hdr->lane_id_;
     ctx->coro_handles_[lane] = handle;
     if (lane == 0) {
       ctx->is_yielded_ = true;
@@ -589,6 +590,42 @@ class YieldAwaiter {
  */
 __device__ inline YieldAwaiter yield(u32 spins = 0) {
   return YieldAwaiter(spins);
+}
+
+// ============================================================================
+// GetLaneIdAwaiter -- retrieve lane ID from coroutine promise
+// ============================================================================
+
+/**
+ * Awaitable that retrieves the lane ID from the promise.
+ *
+ * threadIdx.x is unreliable inside clang-cuda coroutine bodies.
+ * The Worker sets the correct lane_id on each coroutine's promise
+ * before resume, and propagates it to nested coroutines via
+ * TaskResume::await_suspend.
+ *
+ * Usage: chi::u32 lane = co_await chi::gpu::get_lane_id();
+ */
+class GetLaneIdAwaiter {
+ private:
+  u32 lane_id_ = 0;
+
+ public:
+  __device__ bool await_ready() noexcept { return false; }
+
+  __device__ bool
+  await_suspend(std::coroutine_handle<> handle) noexcept {
+    auto typed = std::coroutine_handle<TaskResume::promise_type>::from_address(
+        handle.address());
+    lane_id_ = typed.promise().lane_id_;  // Direct field access
+    return false;
+  }
+
+  __device__ u32 await_resume() noexcept { return lane_id_; }
+};
+
+__device__ inline GetLaneIdAwaiter get_lane_id() {
+  return GetLaneIdAwaiter{};
 }
 
 // ============================================================================
