@@ -293,6 +293,9 @@ class Worker {
 #if HSHM_IS_GPU_COMPILER
           if (ctx->parallelism_ > 1) __syncwarp();
 #endif
+          // Set per-lane identity — each lane writes to its own slot,
+          // no race. Coroutine body reads rctx.lane_ids_[threadIdx.x % 32].
+          ctx->lane_ids_[lane_id] = lane_id;
           auto &coro_h = ctx->coro_handles_[lane_id];
           if (coro_h && !coro_h.done()) {
             coro_h.resume();

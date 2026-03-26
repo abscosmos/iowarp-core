@@ -146,7 +146,8 @@ struct RunContext {
   u32 block_id_;
   u32 thread_id_;
   u32 warp_id_;    /**< Warp index within the grid */
-  u32 lane_id_;    /**< Thread lane within the warp (0-31) */
+  u32 lane_id_;    /**< Thread lane within the warp (0-31) — shared, may be stale */
+  u32 lane_ids_[kWarpSize];  /**< Per-lane identity for parallel coroutines */
 
   // ==== Awaited sub-task (co_await tracking) ====
 
@@ -276,19 +277,23 @@ class TaskResume {
   struct promise_type {
     RunContext *run_ctx_ = nullptr;
     std::coroutine_handle<> caller_handle_ = nullptr;
+    u32 coroutine_lane_id_ = 0;  /**< Hardware lane at coroutine creation */
 
     /** Capture RunContext from the coroutine's first parameter. */
     template <typename... Args>
     __device__ promise_type(RunContext &ctx, Args &&...)
-        : run_ctx_(&ctx), caller_handle_(nullptr) {}
+        : run_ctx_(&ctx), caller_handle_(nullptr),
+          coroutine_lane_id_(threadIdx.x % kWarpSize) {}
 
     /** Capture RunContext from the second parameter (FullPtr<Task>, RunContext&). */
     template <typename TaskT, typename... Args>
     __device__ promise_type(hipc::FullPtr<TaskT>, RunContext &ctx, Args &&...)
-        : run_ctx_(&ctx), caller_handle_(nullptr) {}
+        : run_ctx_(&ctx), caller_handle_(nullptr),
+          coroutine_lane_id_(threadIdx.x % kWarpSize) {}
 
     __device__ promise_type()
-        : run_ctx_(nullptr), caller_handle_(nullptr) {}
+        : run_ctx_(nullptr), caller_handle_(nullptr),
+          coroutine_lane_id_(0) {}
 
     /**
      * Warp-level bulk allocation helper shared by all operator new overloads.
@@ -404,6 +409,7 @@ class TaskResume {
     __device__ void unhandled_exception() { __trap(); }
 
     __device__ void set_run_context(RunContext *ctx) { run_ctx_ = ctx; }
+    __device__ u32 get_lane_id() const { return coroutine_lane_id_; }
     __device__ RunContext *get_run_context() const { return run_ctx_; }
     __device__ void set_caller(std::coroutine_handle<> caller) {
       caller_handle_ = caller;
