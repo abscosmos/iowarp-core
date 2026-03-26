@@ -296,10 +296,6 @@ class TaskResume {
     __device__ static void *AllocFrame(size_t size, u32 parallelism) noexcept {
       size_t total = sizeof(FrameHeader) + size;
       u32 lane = threadIdx.x % kWarpSize;
-      if (lane == 0) {
-        printf("[AllocFrame] par=%u lane=%u size=%llu\n",
-               parallelism, lane, (unsigned long long)size);
-      }
       if (parallelism > 1) {
         unsigned long long base_ull = 0;
         if (lane == 0) {

@@ -78,6 +78,19 @@ if(BAM_ENABLE_NVME)
 endif()
 
 #------------------------------------------------------------------------------
+# Install
+#------------------------------------------------------------------------------
+install(TARGETS bam
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+install(DIRECTORY include/bam
+  DESTINATION include
+  FILES_MATCHING PATTERN "*.h" PATTERN "*.cuh"
+)
+
+#------------------------------------------------------------------------------
 # Tests
 #------------------------------------------------------------------------------
 if(BAM_ENABLE_TESTS AND BAM_HAS_CUDA)
