@@ -269,8 +269,20 @@ __global__ void llm_cte_alloc_kernel(
 #include <cstring>
 
 int run_workload_llm_kvcache(const WorkloadConfig &cfg, const char *mode, WorkloadResult *result) {
-  uint32_t nl=cfg.param_num_layers, nh=cfg.param_num_heads, hd=cfg.param_head_dim, sl=cfg.param_seq_len;
+  uint32_t nl=cfg.param_num_layers, nh=cfg.param_num_heads, hd=cfg.param_head_dim;
   uint32_t dt=cfg.param_decode_tokens; std::string m(mode);
+
+  // Scale seq_len so that per-head KV size ≈ warp_bytes
+  // KV per head per layer = 2 * seq_len * head_dim * sizeof(float)
+  uint32_t sl = cfg.param_seq_len;
+  if (cfg.warp_bytes > 0) {
+    uint32_t target_sl = (uint32_t)(cfg.warp_bytes / (2 * hd * sizeof(float)));
+    if (target_sl > 0) sl = target_sl;
+  }
+
+  HIPRINT("  LLM params: {} layers, {} heads, {} head_dim, {} seq_len, {} decode_tokens",
+          nl, nh, hd, sl, dt);
+
   uint64_t kvpl=2ULL*nh*sl*hd;  // floats per layer
   uint64_t kvbl=kvpl*sizeof(float);  // bytes per layer
   uint64_t kvbt=(uint64_t)nl*kvbl;   // total bytes
@@ -289,6 +301,13 @@ int run_workload_llm_kvcache(const WorkloadConfig &cfg, const char *mode, Worklo
     // ======== CTE: Combined kernel with multi-warp I/O + compute ========
     uint32_t total_warps = (cfg.client_blocks * cfg.client_threads) / 32;
     if (total_warps == 0) total_warps = 1;
+    // Cap active warps to number of heads (no point having idle warps)
+    // Also must cap client_blocks to match, since CHIMAERA_GPU_ORCHESTRATOR_INIT
+    // runs on all launched blocks.
+    uint32_t active_warps = std::min(total_warps, nh);
+    uint32_t active_client_blocks = (active_warps * 32 + cfg.client_threads - 1) / cfg.client_threads;
+    if (active_client_blocks == 0) active_client_blocks = 1;
+    total_warps = active_warps;
 
     // Partition heads among warps
     uint32_t heads_per_warp = (nh + total_warps - 1) / total_warps;
@@ -401,9 +420,9 @@ int run_workload_llm_kvcache(const WorkloadConfig &cfg, const char *mode, Worklo
       cudaDeviceSynchronize();
 
       void *stream = hshm::GpuApi::CreateStream();
-      llm_cte_kernel<<<cfg.client_blocks, cfg.client_threads, 0,
+      llm_cte_kernel<<<active_client_blocks, cfg.client_threads, 0,
                        static_cast<cudaStream_t>(stream)>>>(
-          gpu_info, cfg.cte_pool_id, cfg.tag_id, cfg.client_blocks,
+          gpu_info, cfg.cte_pool_id, cfg.tag_id, active_client_blocks,
           array_ptr, data_alloc_id,
           d_q, d_o, d_nk, d_nv,
           h_ko, h_kb, h_hs, h_he,
