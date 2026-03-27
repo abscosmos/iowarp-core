@@ -99,7 +99,11 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     set(HSHM_COMPILER_MSVC "ON")
     set(REAL_TIME_FLAGS "ws2_32")
 else()
-    message(FATAL_ERROR "Unsupported compiler ${CMAKE_CXX_COMPILER_ID}")
+    # Treat unrecognized compilers (e.g. NVHPC on first cmake run) as GNU-compatible
+    message(WARNING "Unrecognized compiler '${CMAKE_CXX_COMPILER_ID}', assuming GNU-compatible flags")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3")
+    set(HSHM_COMPILER_GNU "ON")
+    set(REAL_TIME_FLAGS "-lrt -ldl")
 endif()
 
 # ------------------------------------------------------------------------------
