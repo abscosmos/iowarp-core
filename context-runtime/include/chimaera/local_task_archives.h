@@ -333,10 +333,10 @@ class LocalSaveTaskArchive : public LocalLbmBase {
    * Constructor with allocator and external buffer.
    * Used by WarpIpcManager where buffer is pre-allocated.
    */
-  template <typename AllocPtrT>
+  template <typename AllocPtrT, typename BufferT>
   HSHM_CROSS_FUN LocalSaveTaskArchive(LocalMsgType msg_type,
                                        AllocPtrT *alloc,
-                                       chi::priv::vector<char> &ext_buffer)
+                                       BufferT &ext_buffer)
       : Base(alloc),
         task_infos_(alloc),
         msg_type_(msg_type),
@@ -643,14 +643,14 @@ class LocalLoadTaskArchive : public LocalLbmBase {
    * Constructor with explicit allocator and external buffer.
    * Used by WarpIpcManager where buffer is pre-allocated.
    */
-  template <typename AllocPtrT>
+  template <typename AllocPtrT, typename BufferT>
   HSHM_CROSS_FUN LocalLoadTaskArchive(AllocPtrT *alloc,
-                                       chi::priv::vector<char> &buffer)
+                                       BufferT &buffer)
       : Base(alloc),
         task_infos_(alloc),
         msg_type_(LocalMsgType::kSerializeIn),
         owned_data_(alloc),
-        data_(&buffer),
+        data_(nullptr),
         deserializer_(buffer),
         current_task_index_(0) {}
 

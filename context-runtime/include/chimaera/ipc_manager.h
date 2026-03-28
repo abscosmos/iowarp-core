@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "hermes_shm/data_structures/priv/array_vector.h"
 #include "chimaera/chimaera_manager.h"
 #include "chimaera/corwlock.h"
 #include "chimaera/scheduler/scheduler.h"
@@ -276,6 +277,8 @@ class IpcManager {
     chi::priv::vector<char> buffer_;
     LocalSaveTaskArchive save_ar_;
     LocalLoadTaskArchive load_ar_;
+    hipc::FullPtr<char> fshm_;  /**< Cached FutureShm + 4KB copy_space */
+    static constexpr size_t kCopySpaceSize = 4096;
 
     HSHM_CROSS_FUN WarpIpcManager(CHI_PRIV_ALLOC_T *alloc)
         : priv_alloc_(alloc),
@@ -486,6 +489,21 @@ class IpcManager {
     return mgr ? &mgr->load_ar_ : nullptr;
 #else
     return nullptr;
+#endif
+  }
+
+  /** Get cached FutureShm + copy_space (lazy-allocated once per warp) */
+  HSHM_CROSS_FUN hipc::FullPtr<char> &GetCachedFutureShm() {
+#if HSHM_IS_GPU
+    auto *mgr = GetWarpManager();
+    if (mgr->fshm_.IsNull() && gpu_alloc_) {
+      size_t alloc_size = sizeof(FutureShm) + WarpIpcManager::kCopySpaceSize;
+      mgr->fshm_ = gpu_alloc_->template AllocateObjs<char>(alloc_size);
+    }
+    return mgr->fshm_;
+#else
+    static hipc::FullPtr<char> null = hipc::FullPtr<char>::GetNull();
+    return null;
 #endif
   }
 
@@ -839,16 +857,14 @@ class IpcManager {
       queue = gpu2gpu_queue_;
     }
 
-    // Allocate FutureShm with inline copy_space
-    size_t copy_space_size = task_ptr->GetCopySpaceSize();
-    if (copy_space_size == 0) copy_space_size = 4096;
-    size_t alloc_size = sizeof(FutureShm) + copy_space_size;
-    hipc::FullPtr<char> buffer = alloc->AllocateObjs<char>(alloc_size);
+    // Reuse cached FutureShm + copy_space (preallocated per warp)
+    hipc::FullPtr<char> &buffer = GetCachedFutureShm();
     if (buffer.IsNull()) {
       return Future<TaskT>();
     }
+    size_t copy_space_size = WarpIpcManager::kCopySpaceSize;
 
-    // Construct FutureShm
+    // Re-init FutureShm in-place (reuse same memory)
     FutureShm *fshm = new (buffer.ptr_) FutureShm();
     fshm->pool_id_ = task_ptr->pool_id_;
     fshm->method_id_ = task_ptr->method_;
@@ -856,16 +872,13 @@ class IpcManager {
     fshm->client_task_vaddr_ = 0;
     fshm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
 
-    // Store absolute UVA pointer in off_ with null alloc_id_ so that
-    // ProcessNewTask (gpu_worker.h) can directly cast off_ to FutureShm*,
-    // and ToFullPtr on GPU handles null alloc_id_ as a raw pointer.
     hipc::ShmPtr<FutureShm> fshmptr;
     fshmptr.alloc_id_ = hipc::AllocatorId::GetNull();
     fshmptr.off_ =
         reinterpret_cast<size_t>(reinterpret_cast<FutureShm *>(buffer.ptr_));
     Future<TaskT> future(fshmptr, task_ptr);
 
-    // Ring-buffer context for serialization
+    // Ring-buffer context using inline copy_space
     hshm::lbm::LbmContext ctx;
     ctx.copy_space = fshm->copy_space;
     ctx.shm_info_ = &fshm->input_;
