@@ -246,10 +246,10 @@ chi::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
          "Hdf5FileAssimilator: Waiting for {} distributed tasks to complete...",
          futures.size());
     for (size_t i = 0; i < futures.size(); ++i) {
-      CHI_CO_AWAIT(futures[i];  // Yield coroutine, allow other tasks to run auto task = futures[i].get());
-      if (task->result_code_ != 0) {
+      CHI_CO_AWAIT(futures[i]);  // Yield coroutine, allow other tasks to run
+      if (futures[i]->result_code_ != 0) {
         HLOG(kError, "Hdf5FileAssimilator: Dataset {} failed (error: {})",
-             filtered_paths[i], task->result_code_);
+             filtered_paths[i], futures[i]->result_code_);
         total_errors++;
       } else {
         HLOG(kDebug, "Hdf5FileAssimilator: Dataset {} completed successfully",
