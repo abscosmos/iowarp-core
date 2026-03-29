@@ -125,6 +125,8 @@ namespace chi::detail {
     explicit operator bool() const { return state_ != nullptr; }
     bool operator!() const { return state_ == nullptr; }
     FiberHandle& operator=(std::nullptr_t) noexcept { state_ = nullptr; return *this; }
+    bool operator==(std::nullptr_t) const noexcept { return state_ == nullptr; }
+    bool operator!=(std::nullptr_t) const noexcept { return state_ != nullptr; }
   };
 } // namespace chi::detail
 #endif // __NVCOMPILER
