@@ -2236,12 +2236,6 @@ template chi::TaskResume Runtime::GetOrCreateTag<CreateParams>(
 // Blob management helper functions
 BlobInfo *Runtime::CheckBlobExists(const std::string &blob_name,
                                    const TagId &tag_id) {
-#ifdef __NVCOMPILER
-  chi::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
-  CHI_TASK_BODY_BEGIN
   // Validate that blob name is provided
   if (blob_name.empty()) {
     return nullptr;
@@ -2259,7 +2253,6 @@ BlobInfo *Runtime::CheckBlobExists(const std::string &blob_name,
 
   // Return result (lock released automatically at scope exit)
   return blob_info_ptr;
-  CHI_TASK_BODY_END
 }
 
 BlobInfo *Runtime::CreateNewBlob(const std::string &blob_name,
@@ -2309,6 +2302,11 @@ chi::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, chi::u64 offset,
                                     chi::u64 size, float blob_score,
                                     chi::u32 &error_code,
                                     int min_persistence_level) {
+#ifdef __NVCOMPILER
+  thread_local chi::RunContext _fb_rctx;
+  chi::RunContext* _fp = chi::GetCurrentRunContextFromWorker();
+  chi::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+#endif
   // Calculate required additional space
   chi::u64 current_blob_size = blob_info.GetTotalSize();
   chi::u64 required_size = offset + size;
@@ -2428,6 +2426,11 @@ chi::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, chi::u64 offset,
 chi::TaskResume Runtime::ModifyExistingData(
     const std::vector<BlobBlock> &blocks, hipc::ShmPtr<> data, size_t data_size,
     size_t data_offset_in_blob, chi::u32 &error_code) {
+#ifdef __NVCOMPILER
+  thread_local chi::RunContext _fb_rctx;
+  chi::RunContext* _fp = chi::GetCurrentRunContextFromWorker();
+  chi::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+#endif
   HLOG(kDebug,
        "ModifyExistingData: blocks={}, data_size={}, data_offset_in_blob={}",
        blocks.size(), data_size, data_offset_in_blob);
@@ -2543,6 +2546,11 @@ chi::TaskResume Runtime::ReadData(const std::vector<BlobBlock> &blocks,
                                   hipc::ShmPtr<> data, size_t data_size,
                                   size_t data_offset_in_blob,
                                   chi::u32 &error_code) {
+#ifdef __NVCOMPILER
+  thread_local chi::RunContext _fb_rctx;
+  chi::RunContext* _fp = chi::GetCurrentRunContextFromWorker();
+  chi::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+#endif
   HLOG(kDebug, "ReadData: blocks={}, data_size={}, data_offset_in_blob={}",
        blocks.size(), data_size, data_offset_in_blob);
 
@@ -2654,6 +2662,11 @@ chi::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
                                             chi::u64 size,
                                             chi::u64 &allocated_offset,
                                             bool &success) {
+#ifdef __NVCOMPILER
+  thread_local chi::RunContext _fb_rctx;
+  chi::RunContext* _fp = chi::GetCurrentRunContextFromWorker();
+  chi::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+#endif
   HLOG(kDebug,
        "AllocateFromTarget: ENTER - target_name={}, "
        "bdev_client_.pool_id_=({},{}), size={}, remaining_space={}",
@@ -2728,6 +2741,11 @@ chi::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
 chi::TaskResume Runtime::ClearBlob(BlobInfo &blob_info, float blob_score,
                                    chi::u64 offset, chi::u64 size,
                                    bool &cleared) {
+#ifdef __NVCOMPILER
+  thread_local chi::RunContext _fb_rctx;
+  chi::RunContext* _fp = chi::GetCurrentRunContextFromWorker();
+  chi::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+#endif
   cleared = false;
   // Score must be in [0, 1]
   if (blob_score < 0.0f || blob_score > 1.0f) {
@@ -2749,6 +2767,11 @@ chi::TaskResume Runtime::ClearBlob(BlobInfo &blob_info, float blob_score,
 
 chi::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
                                            chi::u32 &error_code) {
+#ifdef __NVCOMPILER
+  thread_local chi::RunContext _fb_rctx;
+  chi::RunContext* _fp = chi::GetCurrentRunContextFromWorker();
+  chi::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+#endif
   // Map: PoolId -> (target_query, vector<Block>)
   std::unordered_map<chi::PoolId, std::pair<chi::PoolQuery,
                                             std::vector<chimaera::bdev::Block>>>
