@@ -159,9 +159,10 @@ class Worker {
     if (TryPopFromQueue(lane_id, internal_queue_, lane_id_, true)) return true;
     if (TryPopCrossWarpTask(lane_id)) return true;
     if (TryPopFromQueue(lane_id, gpu2gpu_queue_, lane_id_, true)) return true;
-    if (lane_id_ == 0) {
-      if (TryPopFromQueue(lane_id, cpu2gpu_queue_, 0, false)) return true;
-    }
+    // cpu2gpu_queue only polled by warp 0 — pass null for other warps
+    // so all lanes still enter TryPopFromQueue for __shfl_sync convergence
+    if (TryPopFromQueue(lane_id, lane_id_ == 0 ? cpu2gpu_queue_ : nullptr,
+                        0, false)) return true;
     return false;
   }
 
@@ -229,9 +230,20 @@ class Worker {
 
     __syncwarp();
 
-    // --- Lane 0: completion or suspension ---
+    // --- Lane 0: detect completion or suspension ---
+    int needs_serde = 0;
     if (lane_id == 0) {
-      EndTask(ctx);
+      needs_serde = EndTask(ctx);
+    }
+
+    // Warp-parallel serialization if needed
+    needs_serde = __shfl_sync(0xFFFFFFFF, needs_serde, 0);
+    if (needs_serde) {
+      SerializeAndComplete(lane_id, ctx->task_fshm_, ctx->container_,
+                           ctx->method_id_, ctx->task_ptr_, ctx->is_gpu2gpu_);
+      if (lane_id == 0) {
+        FreeContext(ctx);
+      }
     }
 
     __syncwarp();
@@ -242,7 +254,7 @@ class Worker {
   // EndTask: handle completion or suspension (lane 0 only)
   // ================================================================
 
-  HSHM_GPU_FUN void EndTask(RunContext *ctx) {
+  HSHM_GPU_FUN int EndTask(RunContext *ctx) {
     bool task_done = true;
     u32 par = ctx->parallelism_ > kWarpSize ? kWarpSize : ctx->parallelism_;
     for (u32 i = 0; i < par; ++i) {
@@ -267,23 +279,24 @@ class Worker {
 #endif
         if (prev + 1 < fshm->total_warps_) {
           FreeContext(ctx);
-          return;
+          return 0;
         }
       }
       if (ctx->is_copy_path_) {
-        auto *container = ctx->container_;
-        SerializeAndComplete(fshm, container, ctx->method_id_, ctx->task_ptr_,
-                             ctx->is_gpu2gpu_);
+        // Caller does warp-parallel SerializeAndComplete + FreeContext
+        return 1;
       } else {
         CompleteAndResumeParent(fshm, ctx->is_gpu2gpu_);
+        FreeContext(ctx);
+        return 0;
       }
-      FreeContext(ctx);
     } else {
       DbgState(3);
       GPU_WORKER_DPRINTF("[W%u] Task SUSPEND: method %u (nsus=%u)\n",
                          worker_id_, ctx->method_id_, num_suspended_ + 1);
       suspended_->Push(ctx);
       ++num_suspended_;
+      return 0;
     }
   }
 
@@ -365,7 +378,10 @@ class Worker {
       }
     }
     ExecTask(lane_id, ctx);
-    return ctx != nullptr;
+    // Broadcast result to all lanes to avoid warp divergence
+    int found = (ctx != nullptr) ? 1 : 0;
+    found = __shfl_sync(0xFFFFFFFF, found, 0);
+    return found != 0;
   }
 
   // ================================================================
@@ -375,6 +391,12 @@ class Worker {
   HSHM_GPU_FUN bool TryPopFromQueue(u32 lane_id, TaskQueue *queue, u32 qlane,
                                     bool is_gpu2gpu) {
     RunContext *ctx = nullptr;
+
+    // Lane 0: pop queue, validate, look up container
+    unsigned long long fshm_ull = 0, container_ull = 0;
+    u32 method_id = 0;
+    int is_copy = 0, need_prepare = 0;
+
     if (lane_id == 0 && queue) {
       auto &lane = queue->GetLane(qlane, 0);
 
@@ -417,7 +439,7 @@ class Worker {
           if (fshm) {
             hipc::threadfence();
             PoolId pool_id = fshm->pool_id_;
-            u32 method_id = fshm->method_id_;
+            method_id = fshm->method_id_;
             Container *container = pool_mgr_->GetContainer(pool_id);
             if (!container) {
               DbgNoContainer(pool_id.major_, pool_id.minor_);
@@ -425,20 +447,39 @@ class Worker {
             } else {
               DbgTaskPopped();
               prof_queue_pop_ += clock64() - _qpop_tc;
-              bool is_copy =
-                  fshm->flags_.AnyDevice(FutureShm::FUTURE_COPY_FROM_CLIENT);
-              if (is_copy) {
-                ctx = PrepareTaskCopy(fshm, container, method_id, is_gpu2gpu);
-              } else {
-                ctx = PrepareTaskDirect(fshm, container, method_id, is_gpu2gpu);
-              }
+              fshm_ull = reinterpret_cast<unsigned long long>(fshm);
+              container_ull = reinterpret_cast<unsigned long long>(container);
+              is_copy = fshm->flags_.AnyDevice(
+                  FutureShm::FUTURE_COPY_FROM_CLIENT) ? 1 : 0;
+              need_prepare = 1;
             }
           }
         }
       }
     }
+
+    // Broadcast for warp-parallel PrepareTaskCopy
+    fshm_ull = hipc::shfl_sync_u64(0xFFFFFFFF, fshm_ull, 0);
+    container_ull = hipc::shfl_sync_u64(0xFFFFFFFF, container_ull, 0);
+    method_id = __shfl_sync(0xFFFFFFFF, method_id, 0);
+    is_copy = __shfl_sync(0xFFFFFFFF, is_copy, 0);
+    need_prepare = __shfl_sync(0xFFFFFFFF, need_prepare, 0);
+
+    if (need_prepare) {
+      auto *fshm = reinterpret_cast<FutureShm *>(fshm_ull);
+      auto *container = reinterpret_cast<Container *>(container_ull);
+      if (is_copy) {
+        ctx = PrepareTaskCopy(lane_id, fshm, container, method_id, is_gpu2gpu);
+      } else if (lane_id == 0) {
+        ctx = PrepareTaskDirect(fshm, container, method_id, is_gpu2gpu);
+      }
+    }
+
     ExecTask(lane_id, ctx);
-    return ctx != nullptr;
+    // Use need_prepare (broadcast to all lanes) instead of ctx != nullptr.
+    // ctx is only non-null on lane 0, so using it would cause warp divergence
+    // in PollOnce's early-return path, breaking __shfl_sync convergence.
+    return need_prepare != 0;
   }
 
   // ================================================================
@@ -449,8 +490,7 @@ class Worker {
                                              Container *container,
                                              u32 method_id, bool is_gpu2gpu) {
     auto *ipc = CHI_IPC;
-    container->gpu_alloc_ = reinterpret_cast<HSHM_DEFAULT_ALLOC_GPU_T *>(
-        static_cast<void *>(ipc->gpu_alloc_));
+    // gpu_alloc_ accessed via CHI_IPC->gpu_alloc_ directly
 
     hipc::FullPtr<Task> task_ptr;
     task_ptr.ptr_ = reinterpret_cast<Task *>(fshm->client_task_vaddr_);
@@ -462,57 +502,93 @@ class Worker {
                                false, parallelism);
   }
 
-  HSHM_GPU_FUN RunContext *PrepareTaskCopy(FutureShm *fshm,
+  HSHM_GPU_FUN RunContext *PrepareTaskCopy(u32 lane_id, FutureShm *fshm,
                                            Container *container, u32 method_id,
                                            bool is_gpu2gpu) {
     long long _tc;
     auto *ipc = CHI_IPC;
-    container->gpu_alloc_ = reinterpret_cast<HSHM_DEFAULT_ALLOC_GPU_T *>(
-        static_cast<void *>(ipc->gpu_alloc_));
 
-    auto *priv_alloc = CHI_PRIV_ALLOC;
-    if (!priv_alloc) {
-      MarkComplete(fshm, is_gpu2gpu);
-      return nullptr;
-    }
-    size_t tw = fshm->input_.total_written_.load_device();
-    size_t cs = fshm->input_.copy_space_size_.load_device();
-    if (tw == 0 || tw > cs) {
-      MarkComplete(fshm, is_gpu2gpu);
-      return nullptr;
+    // Phase 1 (lane 0): validate + set up LbmContext
+    int valid = 0;
+    unsigned long long ctx_cs = 0, ctx_si = 0, ctx_mb = 0;
+    unsigned long long load_ar_ull = 0;
+
+    if (lane_id == 0) {
+      auto *priv_alloc = CHI_PRIV_ALLOC;
+      if (!priv_alloc) {
+        MarkComplete(fshm, is_gpu2gpu);
+      } else {
+        size_t tw = fshm->input_.total_written_.load_device();
+        size_t cs = fshm->input_.copy_space_size_.load_device();
+        if (tw == 0 || tw > cs) {
+          MarkComplete(fshm, is_gpu2gpu);
+        } else {
+          char *mb = ipc->GetCachedMetaBuf();
+          if (!mb) {
+            MarkComplete(fshm, is_gpu2gpu);
+          } else {
+            ctx_cs = reinterpret_cast<unsigned long long>(fshm->copy_space);
+            ctx_si = reinterpret_cast<unsigned long long>(&fshm->input_);
+            ctx_mb = reinterpret_cast<unsigned long long>(mb);
+            load_ar_ull = reinterpret_cast<unsigned long long>(
+                ipc->GetLoadArchive());
+            valid = 1;
+          }
+        }
+      }
     }
 
-    _tc = clock64();
-    hshm::lbm::LbmContext in_ctx;
-    in_ctx.copy_space = fshm->copy_space;
-    in_ctx.shm_info_ = &fshm->input_;
-    in_ctx.meta_buf_ = ipc->GetCachedMetaBuf();
-    in_ctx.meta_buf_size_ = IpcManager::WarpIpcManager::kMetaBufSize;
-    // warp_parallel_ = false (default) — orchestrator is single-lane
-    auto *load_ar_ptr = CHI_IPC->GetLoadArchive();
-    auto &load_ar = *load_ar_ptr;
+    // Broadcast
+    valid = __shfl_sync(0xFFFFFFFF, valid, 0);
+    if (!valid) return nullptr;
+    ctx_cs = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_cs, 0);
+    ctx_si = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_si, 0);
+    ctx_mb = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_mb, 0);
+    load_ar_ull = hipc::shfl_sync_u64(0xFFFFFFFF, load_ar_ull, 0);
+
+    // Phase 2 (all lanes): warp-parallel RecvDevice
+    if (lane_id == 0) _tc = clock64();
+    auto *load_ar_ptr = reinterpret_cast<LocalLoadTaskArchive *>(load_ar_ull);
     if (is_gpu2gpu) {
-      hshm::lbm::ShmTransport::RecvDevice(load_ar, in_ctx);
-    } else {
-      hshm::lbm::ShmTransport::Recv(load_ar, in_ctx);
+      hshm::lbm::LbmContext in_ctx;
+      in_ctx.copy_space = reinterpret_cast<char *>(ctx_cs);
+      in_ctx.shm_info_ = reinterpret_cast<hshm::lbm::ShmTransferInfo *>(ctx_si);
+      in_ctx.meta_buf_ = reinterpret_cast<char *>(ctx_mb);
+      in_ctx.meta_buf_size_ = IpcManager::WarpIpcManager::kMetaBufSize;
+      in_ctx.warp_parallel_ = true;
+      hshm::lbm::ShmTransport::RecvDevice(*load_ar_ptr, in_ctx);
+    } else if (lane_id == 0) {
+      hshm::lbm::LbmContext in_ctx;
+      in_ctx.copy_space = reinterpret_cast<char *>(ctx_cs);
+      in_ctx.shm_info_ = reinterpret_cast<hshm::lbm::ShmTransferInfo *>(ctx_si);
+      in_ctx.meta_buf_ = reinterpret_cast<char *>(ctx_mb);
+      in_ctx.meta_buf_size_ = IpcManager::WarpIpcManager::kMetaBufSize;
+      hshm::lbm::ShmTransport::Recv(*load_ar_ptr, in_ctx);
     }
-    prof_recv_device_ += clock64() - _tc;
-
-    _tc = clock64();
-    load_ar.SetMsgType(LocalMsgType::kSerializeIn);
-    hipc::FullPtr<Task> task_ptr =
-        container->LocalAllocLoadTask(method_id, load_ar);
-    prof_alloc_task_ += clock64() - _tc;
-    if (task_ptr.IsNull()) {
-      MarkComplete(fshm, is_gpu2gpu);
-      return nullptr;
+    __syncwarp();
+    if (lane_id == 0) {
+      prof_recv_device_ += clock64() - _tc;
     }
 
-    _tc = clock64();
-    u32 parallelism = task_ptr.ptr_->pool_query_.GetParallelism();
-    auto *result = AllocForParallelism(fshm, container, method_id, task_ptr,
-                               is_gpu2gpu, true, parallelism);
-    prof_alloc_ctx_ += clock64() - _tc;
+    // Phase 3 (lane 0): allocate task + deserialize + alloc context
+    RunContext *result = nullptr;
+    if (lane_id == 0) {
+      _tc = clock64();
+      load_ar_ptr->SetMsgType(LocalMsgType::kSerializeIn);
+      hipc::FullPtr<Task> task_ptr =
+          container->LocalAllocLoadTask(method_id, *load_ar_ptr);
+      prof_alloc_task_ += clock64() - _tc;
+
+      if (task_ptr.IsNull()) {
+        MarkComplete(fshm, is_gpu2gpu);
+      } else {
+        _tc = clock64();
+        u32 parallelism = task_ptr.ptr_->pool_query_.GetParallelism();
+        result = AllocForParallelism(fshm, container, method_id, task_ptr,
+                                     is_gpu2gpu, true, parallelism);
+        prof_alloc_ctx_ += clock64() - _tc;
+      }
+    }
     return result;
   }
 
@@ -636,7 +712,10 @@ class Worker {
       }
     }
     ExecTask(lane_id, ctx);
-    return ctx != nullptr;
+    // Broadcast result to all lanes to avoid warp divergence
+    int found = (ctx != nullptr) ? 1 : 0;
+    found = __shfl_sync(0xFFFFFFFF, found, 0);
+    return found != 0;
   }
 
   // ================================================================
@@ -651,42 +730,73 @@ class Worker {
     }
   }
 
-  HSHM_GPU_FUN void SerializeAndComplete(FutureShm *fshm, Container *container,
-                                         u32 method_id,
+  HSHM_GPU_FUN void SerializeAndComplete(u32 lane_id, FutureShm *fshm,
+                                         Container *container, u32 method_id,
                                          hipc::FullPtr<Task> &task_ptr,
                                          bool is_gpu2gpu) {
     long long _tc;
     auto *ipc = CHI_IPC;
 
-    _tc = clock64();
-    auto *save_ar_ptr = ipc->GetSaveArchive();
-    auto &save_ar = *save_ar_ptr;
-    save_ar.Reset(LocalMsgType::kSerializeOut);
-    container->LocalSaveTask(method_id, save_ar, task_ptr);
-    prof_save_task_ += clock64() - _tc;
+    // Phase 1 (lane 0): serialize task output + set up LbmContext
+    unsigned long long save_ar_ull = 0;
+    unsigned long long ctx_cs = 0, ctx_si = 0, ctx_mb = 0;
 
-    _tc = clock64();
-    hshm::lbm::LbmContext out_ctx;
-    out_ctx.copy_space = fshm->copy_space;
-    out_ctx.shm_info_ = &fshm->output_;
-    out_ctx.meta_buf_ = ipc->GetCachedMetaBuf();
-    out_ctx.meta_buf_size_ = IpcManager::WarpIpcManager::kMetaBufSize;
-    // warp_parallel_ = false (default) — orchestrator is single-lane
-    if (is_gpu2gpu) {
-      hshm::lbm::ShmTransport::SendDevice(save_ar, out_ctx);
-    } else {
-      hshm::lbm::ShmTransport::Send(save_ar, out_ctx);
+    if (lane_id == 0) {
+      _tc = clock64();
+      auto *save_ar_ptr = ipc->GetSaveArchive();
+      save_ar_ptr->Reset(LocalMsgType::kSerializeOut);
+      container->LocalSaveTask(method_id, *save_ar_ptr, task_ptr);
+      prof_save_task_ += clock64() - _tc;
+
+      // SAC phase1 done
+      save_ar_ull = reinterpret_cast<unsigned long long>(save_ar_ptr);
+      ctx_cs = reinterpret_cast<unsigned long long>(fshm->copy_space);
+      ctx_si = reinterpret_cast<unsigned long long>(&fshm->output_);
+      ctx_mb = reinterpret_cast<unsigned long long>(ipc->GetCachedMetaBuf());
     }
-    prof_send_device_ += clock64() - _tc;
 
-    _tc = clock64();
-    container->LocalDestroyTask(method_id, task_ptr);
-    ipc->gpu_alloc_->Free(task_ptr.template Cast<char>());
-    hipc::threadfence();
-    MarkComplete(fshm, is_gpu2gpu);
-    ResumeParentIfPresent(fshm);
-    prof_complete_ += clock64() - _tc;
-    ++prof_task_count_;
+    // Broadcast for warp-parallel SendDevice
+    save_ar_ull = hipc::shfl_sync_u64(0xFFFFFFFF, save_ar_ull, 0);
+    ctx_cs = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_cs, 0);
+    ctx_si = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_si, 0);
+    ctx_mb = hipc::shfl_sync_u64(0xFFFFFFFF, ctx_mb, 0);
+
+    // Phase 2 (all lanes): warp-parallel SendDevice
+    if (lane_id == 0) _tc = clock64();
+    auto *save_ar_ptr = reinterpret_cast<LocalSaveTaskArchive *>(save_ar_ull);
+    // SAC entering SendDevice
+    if (is_gpu2gpu) {
+      hshm::lbm::LbmContext out_ctx;
+      out_ctx.copy_space = reinterpret_cast<char *>(ctx_cs);
+      out_ctx.shm_info_ = reinterpret_cast<hshm::lbm::ShmTransferInfo *>(ctx_si);
+      out_ctx.meta_buf_ = reinterpret_cast<char *>(ctx_mb);
+      out_ctx.meta_buf_size_ = IpcManager::WarpIpcManager::kMetaBufSize;
+      out_ctx.warp_parallel_ = true;
+      hshm::lbm::ShmTransport::SendDevice(*save_ar_ptr, out_ctx);
+    } else if (lane_id == 0) {
+      hshm::lbm::LbmContext out_ctx;
+      out_ctx.copy_space = reinterpret_cast<char *>(ctx_cs);
+      out_ctx.shm_info_ = reinterpret_cast<hshm::lbm::ShmTransferInfo *>(ctx_si);
+      out_ctx.meta_buf_ = reinterpret_cast<char *>(ctx_mb);
+      out_ctx.meta_buf_size_ = IpcManager::WarpIpcManager::kMetaBufSize;
+      hshm::lbm::ShmTransport::Send(*save_ar_ptr, out_ctx);
+    }
+    __syncwarp();
+    if (lane_id == 0) {
+      prof_send_device_ += clock64() - _tc;
+    }
+
+    // Phase 3 (lane 0): cleanup + mark complete
+    if (lane_id == 0) {
+      _tc = clock64();
+      container->LocalDestroyTask(method_id, task_ptr);
+      ipc->gpu_alloc_->Free(task_ptr.template Cast<char>());
+      hipc::threadfence();
+      MarkComplete(fshm, is_gpu2gpu);
+      ResumeParentIfPresent(fshm);
+      prof_complete_ += clock64() - _tc;
+      ++prof_task_count_;
+    }
   }
 
   HSHM_GPU_FUN void CompleteAndResumeParent(FutureShm *fshm, bool is_gpu2gpu) {

@@ -24,7 +24,7 @@ HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(
     chi::u32 method, chi::LocalLoadTaskArchive &archive) override {
   switch (method) {
     case Method::kGpuSubmit: {
-      auto *alloc = gpu_alloc_;
+      auto *alloc = CHI_IPC->gpu_alloc_;
       auto task = alloc->template AllocateObjs<GpuSubmitTask>(1);
       if (task.IsNull()) return hipc::FullPtr<chi::Task>::GetNull();
       new (task.ptr_) GpuSubmitTask();
@@ -33,7 +33,7 @@ HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(
       return task.template Cast<chi::Task>();
     }
     case Method::kSubtaskTest: {
-      auto *alloc = gpu_alloc_;
+      auto *alloc = CHI_IPC->gpu_alloc_;
       auto task = alloc->template AllocateObjs<SubtaskTestTask>(1);
       if (task.IsNull()) return hipc::FullPtr<chi::Task>::GetNull();
       new (task.ptr_) SubtaskTestTask();
@@ -49,14 +49,14 @@ HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocTask(
     chi::u32 method) override {
   switch (method) {
     case Method::kGpuSubmit: {
-      auto *alloc = gpu_alloc_;
+      auto *alloc = CHI_IPC->gpu_alloc_;
       auto task = alloc->template AllocateObjs<GpuSubmitTask>(1);
       if (task.IsNull()) return hipc::FullPtr<chi::Task>::GetNull();
       new (task.ptr_) GpuSubmitTask();
       return task.template Cast<chi::Task>();
     }
     case Method::kSubtaskTest: {
-      auto *alloc = gpu_alloc_;
+      auto *alloc = CHI_IPC->gpu_alloc_;
       auto task = alloc->template AllocateObjs<SubtaskTestTask>(1);
       if (task.IsNull()) return hipc::FullPtr<chi::Task>::GetNull();
       new (task.ptr_) SubtaskTestTask();

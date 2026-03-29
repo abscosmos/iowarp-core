@@ -93,6 +93,8 @@ __global__ void gpu_bench_client_kernel(
   // Partition backend per block; initialize block-local IpcManager
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
+  __syncwarp();
+
   // Allocate task once, reuse across iterations to avoid per-task alloc/free.
   // All lanes participate in NewTask (lane 0 allocates) and Send (warp-parallel).
   auto *ipc = CHI_IPC;
@@ -381,9 +383,9 @@ __global__ void gpu_bench_serde_kernel(
     task_ull = reinterpret_cast<unsigned long long>(task_fp.ptr_);
     fshm_ull = reinterpret_cast<unsigned long long>(fshm);
   }
-  mgr_ull = __shfl_sync(0xFFFFFFFF, mgr_ull, 0);
-  task_ull = __shfl_sync(0xFFFFFFFF, task_ull, 0);
-  fshm_ull = __shfl_sync(0xFFFFFFFF, fshm_ull, 0);
+  mgr_ull = hipc::shfl_sync_u64(0xFFFFFFFF, mgr_ull, 0);
+  task_ull = hipc::shfl_sync_u64(0xFFFFFFFF, task_ull, 0);
+  fshm_ull = hipc::shfl_sync_u64(0xFFFFFFFF, fshm_ull, 0);
 
   for (chi::u32 i = 0; i < total_tasks; ++i) {
     // ============================================================
@@ -408,9 +410,9 @@ __global__ void gpu_bench_serde_kernel(
     }
 
     // Step 3: Warp-parallel SerializeIn
-    mgr_ull = __shfl_sync(0xFFFFFFFF, mgr_ull, 0);
-    task_ull = __shfl_sync(0xFFFFFFFF, task_ull, 0);
-    fshm_ull = __shfl_sync(0xFFFFFFFF, fshm_ull, 0);
+    mgr_ull = hipc::shfl_sync_u64(0xFFFFFFFF, mgr_ull, 0);
+    task_ull = hipc::shfl_sync_u64(0xFFFFFFFF, task_ull, 0);
+    fshm_ull = hipc::shfl_sync_u64(0xFFFFFFFF, fshm_ull, 0);
 
     tc = clock64();
     if (mgr_ull && task_ull) {
@@ -467,6 +469,8 @@ __global__ void gpu_bench_serde_kernel(
       hshm::lbm::LbmContext out_ctx;
       out_ctx.copy_space = fshm->copy_space;
       out_ctx.shm_info_ = &fshm->output_;
+      out_ctx.meta_buf_ = ipc->GetCachedMetaBuf();
+      out_ctx.meta_buf_size_ = chi::IpcManager::WarpIpcManager::kMetaBufSize;
       hshm::lbm::ShmTransport::SendDevice(out_save, out_ctx);
       hipc::threadfence();
       fshm->flags_.SetBits(chi::FutureShm::FUTURE_COMPLETE);
@@ -485,9 +489,9 @@ __global__ void gpu_bench_serde_kernel(
       }
     }
     // All lanes participate in RecvDevice (warp-parallel copy)
-    mgr_ull2 = __shfl_sync(0xFFFFFFFF, mgr_ull2, 0);
+    mgr_ull2 = hipc::shfl_sync_u64(0xFFFFFFFF, mgr_ull2, 0);
     has_output = __shfl_sync(0xFFFFFFFF, has_output, 0);
-    fshm_ull = __shfl_sync(0xFFFFFFFF, fshm_ull, 0);
+    fshm_ull = hipc::shfl_sync_u64(0xFFFFFFFF, fshm_ull, 0);
     tc = clock64();
     if (has_output && mgr_ull2) {
       auto *mgr = reinterpret_cast<chi::IpcManager::WarpIpcManager *>(mgr_ull2);
@@ -511,8 +515,8 @@ __global__ void gpu_bench_serde_kernel(
     }
 
     // Step 8: Warp-parallel SerializeOut
-    mgr_ull2 = __shfl_sync(0xFFFFFFFF, mgr_ull2, 0);
-    task_ull = __shfl_sync(0xFFFFFFFF, task_ull, 0);
+    mgr_ull2 = hipc::shfl_sync_u64(0xFFFFFFFF, mgr_ull2, 0);
+    task_ull = hipc::shfl_sync_u64(0xFFFFFFFF, task_ull, 0);
     has_output = __shfl_sync(0xFFFFFFFF, has_output, 0);
 
     tc = clock64();
@@ -605,6 +609,8 @@ __global__ void gpu_bench_serde_kernel(
       hshm::lbm::LbmContext prep_ctx;
       prep_ctx.copy_space = fshm_sub->copy_space;
       prep_ctx.shm_info_ = &fshm_sub->input_;
+      prep_ctx.meta_buf_ = ipc->GetCachedMetaBuf();
+      prep_ctx.meta_buf_size_ = chi::IpcManager::WarpIpcManager::kMetaBufSize;
       hshm::lbm::ShmTransport::SendDevice(mgr->save_ar_, prep_ctx);
       size_t written = fshm_sub->input_.total_written_.load();
 
@@ -630,6 +636,8 @@ __global__ void gpu_bench_serde_kernel(
         hshm::lbm::LbmContext ctx;
         ctx.copy_space = fshm_sub->copy_space;
         ctx.shm_info_ = &fshm_sub->input_;
+        ctx.meta_buf_ = ipc->GetCachedMetaBuf();
+        ctx.meta_buf_size_ = chi::IpcManager::WarpIpcManager::kMetaBufSize;
 
         tc = clock64();
         hshm::lbm::ShmTransport::RecvDevice(mgr->load_ar_, ctx);

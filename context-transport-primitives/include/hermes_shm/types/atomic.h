@@ -1064,6 +1064,26 @@ HSHM_INLINE static void threadfence_system() {
 }
 #endif
 
+/**
+ * Safe 64-bit warp shuffle broadcast.
+ * Splits into two 32-bit shuffles to avoid potential issues with
+ * __shfl_sync for 64-bit types on some GPU architectures.
+ */
+#if HSHM_IS_GPU
+HSHM_GPU_FUN static unsigned long long shfl_sync_u64(
+    unsigned mask, unsigned long long val, int src_lane) {
+  unsigned int lo = __shfl_sync(mask, static_cast<unsigned int>(val), src_lane);
+  unsigned int hi = __shfl_sync(mask, static_cast<unsigned int>(val >> 32), src_lane);
+  return (static_cast<unsigned long long>(hi) << 32) | lo;
+}
+#else
+HSHM_INLINE static unsigned long long shfl_sync_u64(
+    unsigned mask, unsigned long long val, int src_lane) {
+  (void)mask; (void)src_lane;
+  return val;
+}
+#endif
+
 }  // namespace hshm::ipc
 
 #endif  // HSHM_INCLUDE_HSHM_TYPES_ATOMIC_H_

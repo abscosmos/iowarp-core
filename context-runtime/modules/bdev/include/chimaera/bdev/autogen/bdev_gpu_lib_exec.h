@@ -37,7 +37,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> 
 
 HSHM_GPU_FUN hipc::FullPtr<chi::Task> LocalAllocLoadTask(
     chi::u32 method, chi::LocalLoadTaskArchive &archive) override {
-  auto *alloc = gpu_alloc_;
+  auto *alloc = CHI_IPC->gpu_alloc_;
   switch (method) {
     case Method::kUpdate: {
       auto task = alloc->template AllocateObjs<UpdateTask>(1);

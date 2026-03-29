@@ -918,8 +918,8 @@ class IpcManager {
 send_bcast:
 
     // === Phase 2: Warp-parallel SerializeIn ===
-    mgr_ull = __shfl_sync(0xFFFFFFFF, mgr_ull, 0);
-    task_ull = __shfl_sync(0xFFFFFFFF, task_ull, 0);
+    mgr_ull = hipc::shfl_sync_u64(0xFFFFFFFF, mgr_ull, 0);
+    task_ull = hipc::shfl_sync_u64(0xFFFFFFFF, task_ull, 0);
 
     if (mgr_ull != 0 && task_ull != 0) {
       auto *mgr = reinterpret_cast<WarpIpcManager *>(mgr_ull);
@@ -955,9 +955,9 @@ send_bcast:
     }
 
     // Broadcast for warp-parallel SendDevice
-    cs_ull = __shfl_sync(0xFFFFFFFF, cs_ull, 0);
-    si_ull = __shfl_sync(0xFFFFFFFF, si_ull, 0);
-    mb_ull = __shfl_sync(0xFFFFFFFF, mb_ull, 0);
+    cs_ull = hipc::shfl_sync_u64(0xFFFFFFFF, cs_ull, 0);
+    si_ull = hipc::shfl_sync_u64(0xFFFFFFFF, si_ull, 0);
+    mb_ull = hipc::shfl_sync_u64(0xFFFFFFFF, mb_ull, 0);
     is_to_cpu = __shfl_sync(0xFFFFFFFF, is_to_cpu, 0);
 
     Future<TaskT> future;
@@ -1090,7 +1090,7 @@ send_bcast:
         fshm_ull = reinterpret_cast<unsigned long long>(fshm_full.ptr_);
       }
     }
-    fshm_ull = __shfl_sync(0xFFFFFFFF, fshm_ull, 0);
+    fshm_ull = hipc::shfl_sync_u64(0xFFFFFFFF, fshm_ull, 0);
     if (fshm_ull == 0) return;
     FutureShm *fshm = reinterpret_cast<FutureShm *>(fshm_ull);
 
@@ -1111,9 +1111,9 @@ send_bcast:
         ++spin_count;
         if (spin_count == 1000000 && lane == 0) {
           u32 raw_flags = fshm->flags_.bits_.load_device();
-          printf("[RECV] warp=%u STUCK: fshm=%p flags=0x%x (device) spin=%d\n",
-                 (blockIdx.x * blockDim.x + threadIdx.x) / 32, (void *)fshm,
-                 raw_flags, spin_count);
+          size_t out_tw = fshm->output_.total_written_.load_device();
+          printf("[RECV-STUCK] blk=%u flags=0x%x out_tw=%llu spin=%d\n",
+                 blockIdx.x, raw_flags, (unsigned long long)out_tw, spin_count);
           spin_count = 0;
         }
       }
@@ -1150,12 +1150,12 @@ send_bcast:
     }
 
     // Broadcast for warp-parallel RecvDevice
-    mgr_ull = __shfl_sync(0xFFFFFFFF, mgr_ull, 0);
-    task_ull = __shfl_sync(0xFFFFFFFF, task_ull, 0);
+    mgr_ull = hipc::shfl_sync_u64(0xFFFFFFFF, mgr_ull, 0);
+    task_ull = hipc::shfl_sync_u64(0xFFFFFFFF, task_ull, 0);
     has_output = __shfl_sync(0xFFFFFFFF, has_output, 0);
-    recv_cs_ull = __shfl_sync(0xFFFFFFFF, recv_cs_ull, 0);
-    recv_si_ull = __shfl_sync(0xFFFFFFFF, recv_si_ull, 0);
-    recv_mb_ull = __shfl_sync(0xFFFFFFFF, recv_mb_ull, 0);
+    recv_cs_ull = hipc::shfl_sync_u64(0xFFFFFFFF, recv_cs_ull, 0);
+    recv_si_ull = hipc::shfl_sync_u64(0xFFFFFFFF, recv_si_ull, 0);
+    recv_mb_ull = hipc::shfl_sync_u64(0xFFFFFFFF, recv_mb_ull, 0);
 
     if (has_output && device_scope) {
       auto *mgr = reinterpret_cast<WarpIpcManager *>(mgr_ull);

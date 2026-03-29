@@ -229,12 +229,9 @@ class ShmTransport
     for (size_t i = lane; i < chunks4; i += 32) {
       dst4[i] = src4[i];
     }
-    // Lane 0 handles tail bytes
     size_t tail_start = chunks4 * 4;
     if (lane == 0) {
-      for (size_t i = tail_start; i < n; ++i) {
-        dst[i] = src[i];
-      }
+      for (size_t i = tail_start; i < n; ++i) dst[i] = src[i];
     }
 #else
     std::memcpy(dst, src, n);
@@ -303,7 +300,7 @@ class ShmTransport
         ArrayVec& meta_buf = *reinterpret_cast<ArrayVec*>(ctx.meta_buf_);
         meta_size = static_cast<unsigned int>(meta_buf.size());
       }
-      src_ull = __shfl_sync(0xFFFFFFFF, src_ull, 0);
+      src_ull = hipc::shfl_sync_u64(0xFFFFFFFF, src_ull, 0);
       meta_size = __shfl_sync(0xFFFFFFFF, meta_size, 0);
       total_write = __shfl_sync(0xFFFFFFFF, total_write, 0);
       if (meta_size > 0) {
@@ -320,8 +317,10 @@ class ShmTransport
     // Phase 3: Lane 0 updates ring buffer atomics
     if (lane == 0) {
       hshm::ipc::threadfence();
+      // Use load_device() to bypass L1 cache — the counter may have been
+      // reset by a different kernel (client Reset) via atomicExch to L2.
       ctx.shm_info_->total_written_.store(
-          ctx.shm_info_->total_written_.load() + total_write);
+          ctx.shm_info_->total_written_.load_device() + total_write);
     }
     return 0;
   }
@@ -349,9 +348,14 @@ class ShmTransport
     unsigned long long dst_ull = 0;
     unsigned long long src_ull = 0;
     if (lane == 0) {
-      size_t total_read = ctx.shm_info_->total_read_.load();
-      size_t read_pos = total_read % ctx.shm_info_->copy_space_size_.load();
+      hipc::threadfence();
+      size_t total_read = ctx.shm_info_->total_read_.load_device();
+      size_t cs_size = ctx.shm_info_->copy_space_size_.load_device();
+      size_t read_pos = cs_size > 0 ? (total_read % cs_size) : 0;
       memcpy(&meta_len, ctx.copy_space + read_pos, sizeof(uint32_t));
+      if (meta_len > 256) {
+        meta_len = 0;
+      }
       meta_buf.resize(meta_len);
 
       dst_ull = reinterpret_cast<unsigned long long>(meta_buf.data());
@@ -363,8 +367,8 @@ class ShmTransport
 #if HSHM_IS_GPU
     if (ctx.warp_parallel_) {
       meta_len = __shfl_sync(0xFFFFFFFF, meta_len, 0);
-      dst_ull = __shfl_sync(0xFFFFFFFF, dst_ull, 0);
-      src_ull = __shfl_sync(0xFFFFFFFF, src_ull, 0);
+      dst_ull = hipc::shfl_sync_u64(0xFFFFFFFF, dst_ull, 0);
+      src_ull = hipc::shfl_sync_u64(0xFFFFFFFF, src_ull, 0);
       if (meta_len > 0) {
         WarpMemCpy(reinterpret_cast<char*>(dst_ull),
                    reinterpret_cast<const char*>(src_ull), meta_len);
@@ -379,8 +383,10 @@ class ShmTransport
     // Phase 3: Lane 0 deserializes and updates ring buffer atomics
     if (lane == 0) {
       size_t total_bytes = sizeof(uint32_t) + meta_len;
+      // Use load_device() to bypass L1 cache — the counter may have been
+      // reset by a different kernel (client Reset) via atomicExch to L2.
       ctx.shm_info_->total_read_.store(
-          ctx.shm_info_->total_read_.load() + total_bytes);
+          ctx.shm_info_->total_read_.load_device() + total_bytes);
 
       hshm::ipc::LocalDeserialize<ArrayVec> ar(meta_buf);
       ar(meta);

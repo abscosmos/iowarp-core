@@ -507,7 +507,8 @@ struct FutureShm {
   /** Number of warps sharing this FutureShm */
   u32 total_warps_;
 
-  /** Copy space for serialized task data (flexible array member) */
+  /** Copy space for serialized task data (flexible array member).
+   *  Must be 4-byte aligned for WarpMemCpy uint32_t strided access. */
   char copy_space[];
 
   /**

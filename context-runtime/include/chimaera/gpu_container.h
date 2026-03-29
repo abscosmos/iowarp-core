@@ -60,9 +60,8 @@ class Container {
  public:
   PoolId pool_id_;
   u32 container_id_;
-  HSHM_DEFAULT_ALLOC_GPU_T *gpu_alloc_ = nullptr;  /**< Set by worker before dispatch */
 
-  HSHM_GPU_FUN Container() : container_id_(0), gpu_alloc_(nullptr) {}
+  HSHM_GPU_FUN Container() : container_id_(0) {}
   HSHM_GPU_FUN virtual ~Container() = default;
 
   /**
