@@ -73,9 +73,18 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
                                            gpu::WorkOrchestratorControl *control,
                                            IpcManagerGpuInfo gpu_info,
                                            u32 num_blocks) {
+  if (threadIdx.x == 0) {
+    printf("[ORCH-PRE] blk=%u gpu2gpu=%p num_lanes=%u\n",
+           blockIdx.x, (void*)gpu_info.gpu2gpu_queue, gpu_info.gpu2gpu_num_lanes);
+  }
+
   // All threads: initialize per-block IpcManager (ArenaAllocators).
   // num_blocks is used to partition the backend memory among blocks.
   CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
+
+  if (threadIdx.x == 0) {
+    printf("[ORCH-POST] blk=%u init done\n", blockIdx.x);
+  }
 
   u32 warp_id = IpcManager::GetWarpId();
   u32 lane_id = IpcManager::GetLaneId();
