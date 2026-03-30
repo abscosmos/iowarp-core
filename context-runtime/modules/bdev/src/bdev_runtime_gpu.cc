@@ -152,8 +152,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Write(hipc::FullPtr<WriteTask> tas
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
   char *src = data_ptr.ptr_;
 
-  chi::u32 num_lanes = rctx.parallelism_;
-  if (num_lanes == 0) num_lanes = 1;
+  chi::u32 num_lanes = chi::gpu::kWarpSize;
 
   size_t num_blocks = task->blocks_.size();
   chi::u64 data_off = 0;
@@ -237,8 +236,7 @@ HSHM_GPU_FUN chi::gpu::TaskResume GpuRuntime::Read(hipc::FullPtr<ReadTask> task,
   hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).template Cast<char>();
   char *dst = data_ptr.ptr_;
 
-  chi::u32 num_lanes = rctx.parallelism_;
-  if (num_lanes == 0) num_lanes = 1;
+  chi::u32 num_lanes = chi::gpu::kWarpSize;
 
   size_t num_blocks = task->blocks_.size();
   chi::u64 data_off = 0;

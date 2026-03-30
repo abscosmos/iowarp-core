@@ -81,7 +81,7 @@ class PoolQuery {
       : routing_mode_(RoutingMode::Local), hash_value_(0),
         container_id_(kInvalidContainerId),
         range_offset_(0), range_count_(0), node_id_(0), ret_node_(0),
-        net_timeout_(-1.0f), parallelism_(1) {}
+        net_timeout_(-1.0f), parallelism_(32) {}
 
   /**
    * Copy constructor
@@ -126,7 +126,7 @@ class PoolQuery {
    * Create a local routing pool query
    * @return PoolQuery configured for local container routing
    */
-  static HSHM_CROSS_FUN PoolQuery Local(u32 parallelism = 1) {
+  static HSHM_CROSS_FUN PoolQuery Local(u32 parallelism = 32) {
     PoolQuery query;
     query.routing_mode_ = RoutingMode::Local;
     query.hash_value_ = 0;
@@ -198,7 +198,7 @@ class PoolQuery {
    * @param gpu_id GPU device ID on this node
    * @return PoolQuery configured for routing to a specific GPU
    */
-  static HSHM_CROSS_FUN PoolQuery ToLocalGpu(u32 gpu_id, u32 parallelism = 1) {
+  static HSHM_CROSS_FUN PoolQuery ToLocalGpu(u32 gpu_id, u32 parallelism = 32) {
     PoolQuery query;
     query.routing_mode_ = RoutingMode::ToLocalGpu;
     query.node_id_ = gpu_id;
@@ -210,7 +210,7 @@ class PoolQuery {
    * Create a pool query for GPU → CPU direction
    * @return PoolQuery configured for routing from GPU back to CPU
    */
-  static HSHM_CROSS_FUN PoolQuery ToLocalCpu(u32 parallelism = 1) {
+  static HSHM_CROSS_FUN PoolQuery ToLocalCpu(u32 parallelism = 32) {
     PoolQuery query;
     query.routing_mode_ = RoutingMode::ToLocalCpu;
     query.parallelism_ = parallelism;

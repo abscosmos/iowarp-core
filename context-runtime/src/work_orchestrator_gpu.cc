@@ -285,41 +285,20 @@ void gpu::WorkOrchestrator::Pause() {
   HLOG(kInfo, "GPU work orchestrator paused");
 }
 
-/** Resume a paused GPU work orchestrator. */
-void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
-  if (is_launched_) {
-    return;
-  }
-
-  cudaError_t pre_err = cudaGetLastError();
-  if (pre_err != cudaSuccess) {
-    HLOG(kError, "GPU work orchestrator Resume: clearing sticky CUDA error: {}",
-         cudaGetErrorString(pre_err));
-  }
-
-  control_->exit_flag = 0;
-  control_->running_flag = 0;
-  // Do NOT bump scratch_gen or reinit scratch — GPU container metadata
-  // (e.g. CTE GpuMetadata with targets, tags, blobs) must persist
-  // across pause/resume cycles.
-
-  IpcManagerGpuInfo resume_info = gpu_info;
-  resume_info.skip_scratch_init = true;  // preserve scratch allocator state
+/**
+ * Pre-allocate cross-warp resources for the next Resume.
+ * Must be called while NO persistent GPU kernels are running (e.g., after Pause),
+ * because cudaMalloc/cudaFree/cudaMemset/InitQueueOnDevice may synchronize
+ * with the default stream and deadlock if a persistent kernel is active.
+ */
+void gpu::WorkOrchestrator::PrepareResume() {
   u32 num_warps = (blocks_ * threads_per_block_) / 32;
   if (num_warps == 0) num_warps = 1;
-  resume_info.gpu2gpu_num_lanes = num_warps;
-  resume_info.internal_num_lanes = num_warps;
 
-  // Recompute warp group topology
-  resume_info.num_warps = num_warps;
-  u32 W2 = 1;
-  while (W2 * W2 < num_warps) ++W2;
-  resume_info.num_warp_groups = W2;
-  resume_info.warp_group_num_lanes = W2;
-
-  // Reallocate cross-warp resources if warp count changed
   if (num_warps != launched_num_warps_) {
-    HLOG(kInfo, "GPU orchestrator Resume: warp count changed {} -> {}, "
+    u32 W2 = num_warps;
+
+    HLOG(kInfo, "GPU orchestrator PrepareResume: warp count changed {} -> {}, "
          "reallocating cross-warp resources",
          launched_num_warps_, num_warps);
 
@@ -351,6 +330,38 @@ void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
 
     launched_num_warps_ = num_warps;
   }
+}
+
+/** Resume a paused GPU work orchestrator. */
+void gpu::WorkOrchestrator::Resume(const IpcManagerGpuInfo &gpu_info) {
+  if (is_launched_) {
+    return;
+  }
+
+  cudaError_t pre_err = cudaGetLastError();
+  if (pre_err != cudaSuccess) {
+    HLOG(kError, "GPU work orchestrator Resume: clearing sticky CUDA error: {}",
+         cudaGetErrorString(pre_err));
+  }
+
+  control_->exit_flag = 0;
+  control_->running_flag = 0;
+  // Do NOT bump scratch_gen or reinit scratch — GPU container metadata
+  // (e.g. CTE GpuMetadata with targets, tags, blobs) must persist
+  // across pause/resume cycles.
+
+  IpcManagerGpuInfo resume_info = gpu_info;
+  resume_info.skip_scratch_init = true;  // preserve scratch allocator state
+  u32 num_warps = (blocks_ * threads_per_block_) / 32;
+  if (num_warps == 0) num_warps = 1;
+  resume_info.gpu2gpu_num_lanes = num_warps;
+  resume_info.internal_num_lanes = num_warps;
+
+  // Recompute warp group topology
+  resume_info.num_warps = num_warps;
+  u32 W2 = num_warps;
+  resume_info.num_warp_groups = W2;
+  resume_info.warp_group_num_lanes = W2;
 
   resume_info.warp_group_load =
       static_cast<hipc::atomic<u32> *>(warp_group_load_);
@@ -453,18 +464,29 @@ hipc::FullPtr<TaskQueue> gpu::InitQueueOnDevice(char *device_data,
     return hipc::FullPtr<TaskQueue>::GetNull();
   }
 
-  gpu_init_queue_kernel<<<1, 1>>>(device_data, capacity, num_lanes,
-                                   queue_depth, d_out_off);
-  err = cudaDeviceSynchronize();
+  // Use a dedicated stream to avoid blocking on persistent kernels
+  // that may be running on other streams (e.g., client kernels).
+  // cudaDeviceSynchronize() and default-stream cudaMemcpy would deadlock
+  // if a persistent kernel is active on another stream.
+  cudaStream_t init_stream;
+  cudaStreamCreate(&init_stream);
+  gpu_init_queue_kernel<<<1, 1, 0, init_stream>>>(device_data, capacity,
+                                                    num_lanes, queue_depth,
+                                                    d_out_off);
+  err = cudaStreamSynchronize(init_stream);
   if (err != cudaSuccess) {
     HLOG(kError, "InitQueueOnDevice: kernel launch failed: {}",
          cudaGetErrorString(err));
+    cudaStreamDestroy(init_stream);
     cudaFree(d_out_off);
     return hipc::FullPtr<TaskQueue>::GetNull();
   }
 
   size_t off = static_cast<size_t>(-1);
-  cudaMemcpy(&off, d_out_off, sizeof(size_t), cudaMemcpyDeviceToHost);
+  cudaMemcpyAsync(&off, d_out_off, sizeof(size_t), cudaMemcpyDeviceToHost,
+                  init_stream);
+  cudaStreamSynchronize(init_stream);
+  cudaStreamDestroy(init_stream);
   cudaFree(d_out_off);
 
   hipc::FullPtr<TaskQueue> result;

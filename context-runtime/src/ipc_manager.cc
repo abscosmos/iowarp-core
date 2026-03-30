@@ -1021,6 +1021,14 @@ bool IpcManager::PauseGpuOrchestrator() {
       RebuildInternalQueue(0, new_lanes);
     }
   }
+
+  // Pre-allocate cross-warp resources (warp_group_queue, load arrays)
+  // while no persistent GPU kernels are running.  This must happen now
+  // because Resume() may be called while client kernels are active, and
+  // cudaMalloc/cudaFree/InitQueueOnDevice synchronize with the default
+  // stream, which would deadlock with a running persistent kernel.
+  orchestrator->PrepareResume();
+
   return true;
 #else
   return false;

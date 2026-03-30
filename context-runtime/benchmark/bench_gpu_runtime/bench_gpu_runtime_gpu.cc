@@ -857,6 +857,7 @@ __global__ void gpu_bench_serde_kernel(
 
 /**
  * Poll the pinned done flag until set or timeout.
+ * Every 500ms, dump orchestrator debug state for diagnosis.
  */
 static bool PollDone(volatile int *d_done, int total_threads, int timeout_us) {
   int elapsed_us = 0;

@@ -158,7 +158,15 @@ class WorkOrchestrator {
   void Pause();
 
   /**
+   * Pre-allocate cross-warp resources after Pause but before Resume.
+   * Must be called while NO persistent GPU kernels are running, as it
+   * uses cudaMalloc/cudaFree which synchronize with the default stream.
+   */
+  void PrepareResume();
+
+  /**
    * Resume a paused orchestrator with the same parameters.
+   * Safe to call while other GPU kernels are running (no implicit sync).
    * @param gpu_info IPC info with queue pointers
    */
   void Resume(const IpcManagerGpuInfo &gpu_info);

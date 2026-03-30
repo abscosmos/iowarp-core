@@ -189,50 +189,47 @@ class Worker {
 
     if (ctx == nullptr) return;
 
-    // --- Coroutine creation and resume ---
+    // --- Coroutine creation and resume (all 32 lanes always participate) ---
     GPU_WORKER_TIMER_DEF(_etc);
-    bool participate = (ctx->parallelism_ > 1) || (lane_id == 0);
-    if (participate) {
-      if (ctx->task_coros_[0] == nullptr) {
-        if (lane_id == 0) { GPU_WORKER_TIMER_START(_etc); }
-        auto *container = ctx->container_;
-        TaskResume tmp = container->Run(ctx->method_id_, ctx->task_ptr_, *ctx);
-        if (!tmp.get_handle()) {
-          if (lane_id == 0) {
-            GPU_WORKER_DPRINTF("[W%u] CORO ALLOC FAILED: method=%u\n",
-                               worker_id_, ctx->method_id_);
-          }
-        } else {
-          tmp.get_handle().promise().set_run_context(ctx);
-          tmp.get_handle().promise().set_lane_id(lane_id);
-          ctx->task_coros_[lane_id] = tmp.release();
-        }
-        if (ctx->parallelism_ > 1) __syncwarp();
-        if (lane_id == 0) { GPU_WORKER_TIMER_END(prof_coro_create_, _etc); }
-      }
-
-      if (ctx->task_coros_[lane_id] && !ctx->task_coros_[lane_id].done()) {
-        if (lane_id == 0) { ctx->is_yielded_ = false; GPU_WORKER_TIMER_START(_etc); }
-        if (ctx->parallelism_ > 1) __syncwarp();
-
-        auto &coro_h = ctx->coro_handles_[lane_id];
-        if (coro_h && !coro_h.done()) {
-          coro_h.resume();
-        } else {
-          ctx->task_coros_[lane_id].resume();
-        }
-        if (lane_id == 0) { GPU_WORKER_TIMER_END(prof_coro_resume_, _etc); }
-      }
-
-      // Destroy completed coroutine frames (all participating lanes together)
+    if (ctx->task_coros_[0] == nullptr) {
       if (lane_id == 0) { GPU_WORKER_TIMER_START(_etc); }
-      if (ctx->task_coros_[lane_id] && ctx->task_coros_[lane_id].done()) {
-        ctx->task_coros_[lane_id].destroy();
-        ctx->task_coros_[lane_id] = nullptr;
-        ctx->coro_handles_[lane_id] = nullptr;
+      auto *container = ctx->container_;
+      TaskResume tmp = container->Run(ctx->method_id_, ctx->task_ptr_, *ctx);
+      if (!tmp.get_handle()) {
+        if (lane_id == 0) {
+          GPU_WORKER_DPRINTF("[W%u] CORO ALLOC FAILED: method=%u\n",
+                             worker_id_, ctx->method_id_);
+        }
+      } else {
+        tmp.get_handle().promise().set_run_context(ctx);
+        tmp.get_handle().promise().set_lane_id(lane_id);
+        ctx->task_coros_[lane_id] = tmp.release();
       }
-      if (lane_id == 0) { GPU_WORKER_TIMER_END(prof_coro_destroy_, _etc); }
+      __syncwarp();
+      if (lane_id == 0) { GPU_WORKER_TIMER_END(prof_coro_create_, _etc); }
     }
+
+    if (ctx->task_coros_[lane_id] && !ctx->task_coros_[lane_id].done()) {
+      if (lane_id == 0) { ctx->is_yielded_ = false; GPU_WORKER_TIMER_START(_etc); }
+      __syncwarp();
+
+      auto &coro_h = ctx->coro_handles_[lane_id];
+      if (coro_h && !coro_h.done()) {
+        coro_h.resume();
+      } else {
+        ctx->task_coros_[lane_id].resume();
+      }
+      if (lane_id == 0) { GPU_WORKER_TIMER_END(prof_coro_resume_, _etc); }
+    }
+
+    // Destroy completed coroutine frames (all 32 lanes)
+    if (lane_id == 0) { GPU_WORKER_TIMER_START(_etc); }
+    if (ctx->task_coros_[lane_id] && ctx->task_coros_[lane_id].done()) {
+      ctx->task_coros_[lane_id].destroy();
+      ctx->task_coros_[lane_id] = nullptr;
+      ctx->coro_handles_[lane_id] = nullptr;
+    }
+    if (lane_id == 0) { GPU_WORKER_TIMER_END(prof_coro_destroy_, _etc); }
 
     __syncwarp();
 
@@ -262,8 +259,7 @@ class Worker {
 
   HSHM_GPU_FUN int EndTask(RunContext *ctx) {
     bool task_done = true;
-    u32 par = ctx->parallelism_ > kWarpSize ? kWarpSize : ctx->parallelism_;
-    for (u32 i = 0; i < par; ++i) {
+    for (u32 i = 0; i < kWarpSize; ++i) {
       if (ctx->task_coros_[i] != nullptr) {
         task_done = false;
         break;
