@@ -288,6 +288,11 @@ class LocalSaveTaskArchive : public LocalLbmBase {
     serializer_.cur_off_ = 0;
   }
 
+  /** Get the number of bytes actually serialized (not the buffer capacity) */
+  HSHM_INLINE_CROSS_FUN size_t GetSerializedSize() const {
+    return serializer_.cur_off_;
+  }
+
   /**
    * Serialize for ShmTransport compatibility.
    * Wire-compatible with SaveTaskArchive::serialize /
@@ -707,13 +712,180 @@ using WrapSaveArchive = LocalSaveTaskArchive<hshm::priv::wrap_vector>;
 using WrapLoadArchive = LocalLoadTaskArchive<hshm::priv::wrap_vector>;
 
 /**
- * Header for the preallocated copy_space transport (SendDevicePrealloc).
- * Stored at copy_space[0..sizeof(PreallocHeader)). Task data follows.
+ * Lightweight GPU save archive — no LbmMeta, no task_infos vectors.
+ * Serializes directly into a wrap_vector bound to copy_space.
+ * ShmPtr/FullPtr are copied as-is (same GPU, same address space).
  */
-struct PreallocHeader {
-  LocalMsgType msg_type;
-  u32 data_size;  /**< Bytes of serialized task data after this header */
+class GpuSaveTaskArchive {
+ public:
+  using is_saving = std::true_type;
+  using is_loading = std::false_type;
+  using supports_range_ops = std::true_type;
+
+  LocalMsgType msg_type_;
+  hshm::priv::wrap_vector &buffer_;
+  hshm::ipc::LocalSerialize<hshm::priv::wrap_vector> serializer_;
+
+  HSHM_CROSS_FUN GpuSaveTaskArchive(LocalMsgType msg_type,
+                                      hshm::priv::wrap_vector &buffer)
+      : msg_type_(msg_type), buffer_(buffer), serializer_(buffer) {}
+
+  HSHM_CROSS_FUN void Reset(LocalMsgType msg_type) {
+    msg_type_ = msg_type;
+    serializer_.cur_off_ = 0;
+  }
+
+  HSHM_INLINE_CROSS_FUN void SetWarpConverged(bool v) {
+    serializer_.warp_converged_ = v;
+  }
+
+  HSHM_INLINE_CROSS_FUN size_t GetSerializedSize() const {
+    return serializer_.cur_off_;
+  }
+
+  HSHM_CROSS_FUN LocalMsgType GetMsgType() const { return msg_type_; }
+
+  template <typename T>
+  HSHM_CROSS_FUN GpuSaveTaskArchive &operator<<(T &value) {
+    serializer_ << value;
+    return *this;
+  }
+
+  template <typename T>
+  HSHM_CROSS_FUN GpuSaveTaskArchive &operator&(T &value) {
+    return *this << value;
+  }
+
+  template <typename... Args>
+  HSHM_CROSS_FUN void operator()(Args &...args) {
+    (void)((serializer_ << args), ...);
+  }
+
+  HSHM_CROSS_FUN void write_binary(const char *data, size_t size) {
+    serializer_.write_binary(data, size);
+  }
+
+  HSHM_CROSS_FUN void save_string_fused(const char *str_data, size_t len) {
+    serializer_.save_string_fused(str_data, len);
+  }
+
+  template <typename FirstT, typename LastT>
+  HSHM_INLINE_CROSS_FUN void write_range(const FirstT *first,
+                                          const LastT *last) {
+    serializer_.write_range(first, last);
+  }
+
+  template <typename... Args>
+  HSHM_INLINE_CROSS_FUN void range(Args &...args) {
+    serializer_.range(args...);
+  }
+
+  /** GPU bulk: ShmPtr copied as-is (same address space) */
+  template <typename T>
+  HSHM_CROSS_FUN void bulk(hipc::ShmPtr<T> ptr, size_t size, uint32_t flags) {
+    (void)size; (void)flags;
+    serializer_.write_binary(reinterpret_cast<const char *>(&ptr), sizeof(ptr));
+  }
+
+  /** GPU bulk: FullPtr copied as-is */
+  template <typename T>
+  HSHM_CROSS_FUN void bulk(const hipc::FullPtr<T> &ptr, size_t size,
+                           uint32_t flags) {
+    (void)size; (void)flags;
+    serializer_.write_binary(reinterpret_cast<const char *>(&ptr), sizeof(ptr));
+  }
+
+  /** GPU bulk: raw pointer — copy data inline */
+  template <typename T>
+  HSHM_CROSS_FUN void bulk(T *ptr, size_t size, uint32_t flags) {
+    (void)flags;
+    serializer_.write_binary(reinterpret_cast<const char *>(ptr), size);
+  }
 };
+
+/**
+ * Lightweight GPU load archive — no LbmMeta, no task_infos vectors.
+ * Deserializes from a wrap_vector bound to copy_space.
+ * ShmPtr/FullPtr are copied as-is (same GPU, same address space).
+ */
+class GpuLoadTaskArchive {
+ public:
+  using is_saving = std::false_type;
+  using is_loading = std::true_type;
+  using supports_range_ops = std::true_type;
+
+  LocalMsgType msg_type_;
+  hshm::priv::wrap_vector &data_;
+  hshm::ipc::LocalDeserialize<hshm::priv::wrap_vector> deserializer_;
+
+  HSHM_CROSS_FUN GpuLoadTaskArchive(hshm::priv::wrap_vector &buffer)
+      : msg_type_(LocalMsgType::kSerializeIn), data_(buffer),
+        deserializer_(buffer) {}
+
+  HSHM_CROSS_FUN void SetMsgType(LocalMsgType msg_type) {
+    msg_type_ = msg_type;
+  }
+
+  HSHM_INLINE_CROSS_FUN void SetWarpConverged(bool v) {
+    deserializer_.warp_converged_ = v;
+  }
+
+  HSHM_CROSS_FUN LocalMsgType GetMsgType() const { return msg_type_; }
+
+  template <typename T>
+  HSHM_CROSS_FUN GpuLoadTaskArchive &operator>>(T &value) {
+    deserializer_ >> value;
+    return *this;
+  }
+
+  template <typename T>
+  HSHM_CROSS_FUN GpuLoadTaskArchive &operator&(T &value) {
+    return *this >> value;
+  }
+
+  template <typename... Args>
+  HSHM_CROSS_FUN void operator()(Args &...args) {
+    (void)((deserializer_ >> args), ...);
+  }
+
+  HSHM_CROSS_FUN void read_binary(char *data, size_t size) {
+    deserializer_.read_binary(data, size);
+  }
+
+  template <typename FirstT, typename LastT>
+  HSHM_INLINE_CROSS_FUN void read_range(FirstT *first, LastT *last) {
+    deserializer_.read_range(first, last);
+  }
+
+  template <typename... Args>
+  HSHM_INLINE_CROSS_FUN void range(Args &...args) {
+    deserializer_.range(args...);
+  }
+
+  /** GPU bulk: ShmPtr copied as-is (same address space) */
+  template <typename T>
+  HSHM_CROSS_FUN void bulk(hipc::ShmPtr<T> &ptr, size_t size,
+                           uint32_t flags) {
+    (void)size; (void)flags;
+    deserializer_.read_binary(reinterpret_cast<char *>(&ptr), sizeof(ptr));
+  }
+
+  /** GPU bulk: FullPtr copied as-is */
+  template <typename T>
+  HSHM_CROSS_FUN void bulk(hipc::FullPtr<T> &ptr, size_t size,
+                           uint32_t flags) {
+    (void)size; (void)flags;
+    deserializer_.read_binary(reinterpret_cast<char *>(&ptr), sizeof(ptr));
+  }
+
+  /** GPU bulk: raw pointer — read data inline */
+  template <typename T>
+  HSHM_CROSS_FUN void bulk(T *ptr, size_t size, uint32_t flags) {
+    (void)flags;
+    deserializer_.read_binary(reinterpret_cast<char *>(ptr), size);
+  }
+};
+
 
 }  // namespace chi
 

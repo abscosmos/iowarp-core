@@ -251,8 +251,10 @@ struct IpcManagerGpuInfo {
   /** Scratch allocator generation (from WorkOrchestratorControl) */
   u32 scratch_gen = 0;
 
-  /** Per-warp private BuddyAllocator region size (allocated from shared) */
-  size_t priv_region_size = 4096;
+  /** Per-warp private BuddyAllocator region size (allocated from shared).
+   *  Must fit the largest single allocation: Task + FutureShm + kDirectPathExtra
+   *  or Task + RunContext + kStackSize, whichever is larger. */
+  size_t priv_region_size = 16384;
 
   HSHM_CROSS_FUN IpcManagerGpuInfo() = default;
 
@@ -280,21 +282,27 @@ class IpcManager {
   struct WarpIpcManager {
     CHI_PRIV_ALLOC_T priv_alloc_;   /**< Per-warp private allocator (value) */
     hshm::priv::wrap_vector buffer_;  /**< Wraps copy_space task data region */
-    WrapSaveArchive save_ar_;
-    WrapLoadArchive load_ar_;
-    static constexpr size_t kCopySpaceSize = 256;
-    static constexpr size_t kHeaderSize = sizeof(PreallocHeader);
+    GpuSaveTaskArchive save_ar_;
+    GpuLoadTaskArchive load_ar_;
+    static constexpr size_t kCopySpaceSize = 1024;
+    static constexpr size_t kStackSize = 4096;
+    /** Offset in copy_space where serialized task data begins.
+     *  The first kDataOffset bytes are reserved for archive metadata. */
+    static constexpr size_t kDataOffset = sizeof(GpuSaveTaskArchive);
+    /** RunContext + coroutine stack for direct/exec-path tasks.
+     *  Must be >= sizeof(gpu::RunContext) + kStackSize. Verified by
+     *  static_assert in work_orchestrator_gpu.cc. */
+    static constexpr size_t kDirectPathExtra = 8192;
+    /** Compute RunContext + stack size for exec-path (no FutureShm). */
+    static HSHM_CROSS_FUN constexpr size_t kRunContextExtra(size_t stack_size) {
+      return kDirectPathExtra - kStackSize + stack_size;
+    }
 
-    /**
-     * Construct WarpIpcManager with a private BuddyAllocator.
-     * @param priv_region Pre-allocated region from the shared PartitionedAllocator
-     * @param priv_region_size Size of the private region in bytes
-     */
     HSHM_CROSS_FUN WarpIpcManager(char *priv_region, size_t priv_region_size)
         : priv_alloc_(),
           buffer_(),
-          save_ar_(LocalMsgType::kSerializeOut, &priv_alloc_, buffer_),
-          load_ar_(&priv_alloc_, buffer_) {
+          save_ar_(LocalMsgType::kSerializeOut, buffer_),
+          load_ar_(buffer_) {
 #if HSHM_IS_GPU
       hipc::MemoryBackend backend;
       backend.data_ = priv_region;
@@ -305,13 +313,13 @@ class IpcManager {
 #endif
     }
 
-    /** Set up buffer_ to point at copy_space task data region */
-    HSHM_CROSS_FUN void BindCopySpace(char *copy_space, size_t copy_space_size) {
+    /** Set up buffer_ to point at the task data region in copy_space */
+    HSHM_CROSS_FUN void BindCopySpace(char *copy_space) {
       hipc::FullPtr<char> fp;
-      fp.ptr_ = copy_space + kHeaderSize;
+      fp.ptr_ = copy_space + kDataOffset;
       fp.shm_.alloc_id_.SetNull();
       fp.shm_.off_ = reinterpret_cast<size_t>(fp.ptr_);
-      buffer_.set(fp, copy_space_size - kHeaderSize);
+      buffer_.set(fp, kCopySpaceSize - kDataOffset);
     }
   };
  public:
@@ -512,7 +520,7 @@ class IpcManager {
   }
 
   /** Get per-warp cached save archive */
-  HSHM_CROSS_FUN WrapSaveArchive *GetSaveArchive() {
+  HSHM_CROSS_FUN GpuSaveTaskArchive *GetSaveArchive() {
 #if HSHM_IS_GPU
     auto *mgr = GetWarpManager();
     return mgr ? &mgr->save_ar_ : nullptr;
@@ -522,7 +530,7 @@ class IpcManager {
   }
 
   /** Get per-warp cached load archive */
-  HSHM_CROSS_FUN WrapLoadArchive *GetLoadArchive() {
+  HSHM_CROSS_FUN GpuLoadTaskArchive *GetLoadArchive() {
 #if HSHM_IS_GPU
     auto *mgr = GetWarpManager();
     return mgr ? &mgr->load_ar_ : nullptr;
@@ -644,11 +652,33 @@ class IpcManager {
 #endif
 
   /**
-   * Create a new task in private memory
-   * Host: uses standard new
-   * GPU: uses AllocateBuffer from shared memory
-   * @param args Constructor arguments for the task
-   * @return FullPtr wrapping the task with null allocator
+   * Base task allocation: Task + append_size extra bytes.
+   * The caller is responsible for constructing any co-located objects
+   * (FutureShm, RunContext, etc.) in the appended region.
+   */
+  template <typename TaskT, typename... Args>
+  HSHM_CROSS_FUN hipc::FullPtr<TaskT> NewTaskBase(size_t append_size,
+                                                    Args &&...args) {
+#if HSHM_IS_HOST
+    (void)append_size;
+    TaskT *ptr = new TaskT(std::forward<Args>(args)...);
+    return hipc::FullPtr<TaskT>(ptr);
+#else
+    if (!IsWarpScheduler()) return hipc::FullPtr<TaskT>();
+    auto *priv = GetPrivAlloc();
+    if (!priv) return hipc::FullPtr<TaskT>();
+    size_t total = sizeof(TaskT) + append_size;
+    auto fp = priv->template AllocateObjs<char>(total);
+    if (fp.IsNull()) return hipc::FullPtr<TaskT>();
+    new (fp.ptr_) TaskT(std::forward<Args>(args)...);
+    return fp.template Cast<TaskT>();
+#endif
+  }
+
+  /**
+   * Create a task for client or orchestrator use.
+   * Client (SendGpu):       [Task | FutureShm | copy_space]
+   * Orchestrator (Direct):  [Task | FutureShm | RunContext+stack space]
    */
   template <typename TaskT, typename... Args>
   HSHM_CROSS_FUN hipc::FullPtr<TaskT> NewTask(Args &&...args) {
@@ -658,19 +688,35 @@ class IpcManager {
     return result;
 #else
     if (!IsWarpScheduler()) return hipc::FullPtr<TaskT>();
-    auto *priv = GetPrivAlloc();
-    if (!priv) return hipc::FullPtr<TaskT>();
-    // Bulk allocation: Task + FutureShm + copy_space in one call.
-    // Each task gets its own FutureShm so multiple in-flight tasks
-    // from the same warp don't corrupt each other's completion state.
-    size_t copy_space = sizeof(TaskT) + 256;
-    size_t total = sizeof(TaskT) + sizeof(FutureShm) + copy_space;
-    auto fp = priv->template AllocateObjs<char>(total);
-    if (fp.IsNull()) return hipc::FullPtr<TaskT>();
-    auto *task = new (fp.ptr_) TaskT(std::forward<Args>(args)...);
-    // Construct the co-located FutureShm (right after the task)
-    new (fp.ptr_ + sizeof(TaskT)) FutureShm();
-    return fp.template Cast<TaskT>();
+    // Client: Task + FutureShm + copy_space (for SendGpu serialization)
+    // Orchestrator: Task + FutureShm + RunContext + stack (for SendGpuDirect)
+    size_t append = is_gpu_runtime_
+        ? sizeof(FutureShm) + WarpIpcManager::kDirectPathExtra
+        : sizeof(FutureShm) + WarpIpcManager::kCopySpaceSize;
+    auto result = NewTaskBase<TaskT>(append, std::forward<Args>(args)...);
+    if (!result.IsNull()) {
+      new (reinterpret_cast<char *>(result.ptr_) + sizeof(TaskT)) FutureShm();
+    }
+    return result;
+#endif
+  }
+
+  /**
+   * Allocate a task for orchestrator-side execution (copy path).
+   * Layout: [Task | RunContext | stack]
+   * No FutureShm — uses the client's FutureShm from the queue entry.
+   * Called by autogenerated AllocTaskImpl in LocalAllocLoadDeser.
+   */
+  template <typename TaskT, typename... Args>
+  HSHM_CROSS_FUN hipc::FullPtr<TaskT> NewTaskExec(size_t stack_size,
+                                                    Args &&...args) {
+#if HSHM_IS_HOST
+    return NewTask<TaskT>(std::forward<Args>(args)...);
+#else
+    if (!IsWarpScheduler()) return hipc::FullPtr<TaskT>();
+    return NewTaskBase<TaskT>(
+        WarpIpcManager::kRunContextExtra(stack_size),
+        std::forward<Args>(args)...);
 #endif
   }
 
@@ -887,47 +933,42 @@ class IpcManager {
     hipc::ShmPtr<FutureShm> fshmptr;
     bool to_cpu = false;
     TaskQueue *queue = nullptr;
-    size_t copy_space_size = sizeof(TaskT) + 256;
+    size_t copy_space_size = WarpIpcManager::kCopySpaceSize;
 
     if (lane == 0) {
-      if (task_ptr.IsNull()) {
-        mgr_ull = 0;
-      } else {
+      if (!task_ptr.IsNull()) {
         RoutingMode mode = task_ptr->pool_query_.GetRoutingMode();
         to_cpu = (mode == RoutingMode::ToLocalCpu);
+        bool have_queue = to_cpu
+            ? (gpu2cpu_alloc_ && gpu2cpu_queue_)
+            : (gpu_alloc_ && gpu2gpu_queue_);
 
-        if (to_cpu) {
-          if (!gpu2cpu_alloc_ || !gpu2cpu_queue_) { mgr_ull = 0; goto send_bcast; }
-          queue = gpu2cpu_queue_;
-        } else {
-          if (!gpu_alloc_ || !gpu2gpu_queue_) { mgr_ull = 0; goto send_bcast; }
-          queue = gpu2gpu_queue_;
+        if (have_queue) {
+          queue = to_cpu ? gpu2cpu_queue_ : gpu2gpu_queue_;
+
+          // FutureShm is co-located right after the task (bulk-allocated by NewTask)
+          fshm = reinterpret_cast<FutureShm *>(
+              reinterpret_cast<char *>(task_ptr.ptr_) + sizeof(TaskT));
+          fshm->Reset(task_ptr->pool_id_, task_ptr->method_);
+          fshm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
+
+          fshmptr.alloc_id_ = hipc::AllocatorId::GetNull();
+          fshmptr.off_ = reinterpret_cast<size_t>(fshm);
+
+          // Prepare WarpIpcManager: bind buffer_ to this task's copy_space
+          auto *mgr = GetWarpManager();
+          mgr->BindCopySpace(fshm->copy_space);
+          mgr->buffer_.clear();
+          mgr->save_ar_.Reset(LocalMsgType::kSerializeIn);
+          mgr->save_ar_.SetWarpConverged(true);
+
+          mgr_ull = reinterpret_cast<unsigned long long>(mgr);
+          task_ull = reinterpret_cast<unsigned long long>(task_ptr.ptr_);
         }
-
-        // FutureShm is co-located right after the task (bulk-allocated by NewTask)
-        fshm = reinterpret_cast<FutureShm *>(
-            reinterpret_cast<char *>(task_ptr.ptr_) + sizeof(TaskT));
-        fshm->Reset(task_ptr->pool_id_, task_ptr->method_);
-        fshm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
-
-        fshmptr.alloc_id_ = hipc::AllocatorId::GetNull();
-        fshmptr.off_ = reinterpret_cast<size_t>(fshm);
-
-        // Prepare WarpIpcManager: bind buffer_ to this task's copy_space
-        auto *mgr = GetWarpManager();
-        mgr->BindCopySpace(fshm->copy_space, copy_space_size);
-        mgr->buffer_.clear();
-        mgr->save_ar_.Reset(LocalMsgType::kSerializeIn);
-        mgr->save_ar_.SetWarpConverged(true);
-
-        mgr_ull = reinterpret_cast<unsigned long long>(mgr);
-        task_ull = reinterpret_cast<unsigned long long>(task_ptr.ptr_);
       }
     }
-send_bcast:
 
     // === Phase 2: Warp-parallel SerializeIn directly into copy_space ===
-    // Task data is written via wrap_vector → copy_space + kHeaderSize
     mgr_ull = hipc::shfl_sync_u64(0xFFFFFFFF, mgr_ull, 0);
     task_ull = hipc::shfl_sync_u64(0xFFFFFFFF, task_ull, 0);
 
@@ -938,9 +979,7 @@ send_bcast:
     }
     __syncwarp();
 
-    // === Phase 3: Write header + queue push ===
-    unsigned long long cs_ull = 0;
-    unsigned long long si_ull = 0;
+    // === Phase 3: Set total_written and queue push ===
     int is_to_cpu = 0;
 
     if (lane == 0 && mgr_ull != 0) {
@@ -952,36 +991,27 @@ send_bcast:
         fshm->flags_.SetBits(FutureShm::FUTURE_DEVICE_SCOPE);
         fshm->input_.copy_space_size_.store(copy_space_size);
         fshm->output_.copy_space_size_.store(copy_space_size);
+        // Copy archive metadata to copy_space header area
+        memcpy(fshm->copy_space, &mgr->save_ar_,
+               WarpIpcManager::kDataOffset);
+        hshm::ipc::threadfence();
+        fshm->input_.total_written_.store(
+            WarpIpcManager::kDataOffset + mgr->save_ar_.GetSerializedSize());
       } else {
         fshm->input_.copy_space_size_.store_system(copy_space_size);
         fshm->output_.copy_space_size_.store_system(copy_space_size);
+        // GPU→CPU: same direct copy_space path
+        memcpy(fshm->copy_space, &mgr->save_ar_,
+               WarpIpcManager::kDataOffset);
+        hshm::ipc::threadfence();
+        fshm->input_.total_written_.store(
+            WarpIpcManager::kDataOffset + mgr->save_ar_.GetSerializedSize());
       }
-
-      cs_ull = reinterpret_cast<unsigned long long>(fshm->copy_space);
-      si_ull = reinterpret_cast<unsigned long long>(&fshm->input_);
     }
 
-    cs_ull = hipc::shfl_sync_u64(0xFFFFFFFF, cs_ull, 0);
-    si_ull = hipc::shfl_sync_u64(0xFFFFFFFF, si_ull, 0);
     is_to_cpu = __shfl_sync(0xFFFFFFFF, is_to_cpu, 0);
 
     Future<TaskT> future;
-    if (mgr_ull != 0 && cs_ull != 0 && !is_to_cpu) {
-      // GPU→GPU preallocated path: task data already in copy_space,
-      // just write the PreallocHeader and mark ready.
-      auto *mgr = reinterpret_cast<WarpIpcManager *>(mgr_ull);
-      PreallocHeader hdr;
-      hdr.msg_type = LocalMsgType::kSerializeIn;
-      hdr.data_size = static_cast<u32>(mgr->buffer_.size());
-
-      hshm::lbm::LbmContext ctx;
-      ctx.copy_space = reinterpret_cast<char*>(cs_ull);
-      ctx.shm_info_ = reinterpret_cast<hshm::lbm::ShmTransferInfo*>(si_ull);
-      hshm::lbm::ShmTransport::SendDevicePrealloc(
-          reinterpret_cast<const char*>(&hdr), sizeof(hdr),
-          hdr.data_size, ctx);
-    }
-
     // Lane 0: queue push + Future creation
     if (lane == 0 && mgr_ull != 0) {
       u32 queue_lane_id = 0;
@@ -993,12 +1023,6 @@ send_bcast:
       Future<Task> task_future(future.GetFutureShmPtr());
 
       if (to_cpu) {
-        // CPU path: use old SPSC Send path
-        auto *mgr = reinterpret_cast<WarpIpcManager *>(mgr_ull);
-        hshm::lbm::LbmContext cpu_ctx;
-        cpu_ctx.copy_space = fshm->copy_space;
-        cpu_ctx.shm_info_ = &fshm->input_;
-        hshm::lbm::ShmTransport::Send(mgr->save_ar_, cpu_ctx);
         qlane.PushSystem(task_future);
       } else {
         hipc::threadfence();
@@ -1131,7 +1155,6 @@ send_bcast:
     // === Phase 3: Read output via preallocated path ===
     unsigned long long task_ull = 0;
     int has_output = 0;
-    unsigned long long recv_cs_ull = 0, recv_si_ull = 0;
 
     if (lane == 0) {
       size_t output_written = device_scope
@@ -1140,51 +1163,49 @@ send_bcast:
 
       if (output_written > 0) {
         task_ull = reinterpret_cast<unsigned long long>(task_ptr);
-        recv_cs_ull = reinterpret_cast<unsigned long long>(fshm->copy_space);
-        recv_si_ull = reinterpret_cast<unsigned long long>(&fshm->output_);
         has_output = 1;
       }
     }
 
     task_ull = hipc::shfl_sync_u64(0xFFFFFFFF, task_ull, 0);
     has_output = __shfl_sync(0xFFFFFFFF, has_output, 0);
-    recv_cs_ull = hipc::shfl_sync_u64(0xFFFFFFFF, recv_cs_ull, 0);
-    recv_si_ull = hipc::shfl_sync_u64(0xFFFFFFFF, recv_si_ull, 0);
 
-    // Lane 0: read PreallocHeader, reconstruct wrap_vector, deserialize output
+    // Lane 0: read output, reconstruct wrap_vector, deserialize output
     if (lane == 0 && has_output && device_scope) {
-      // Read header from copy_space
-      PreallocHeader hdr;
-      hshm::lbm::LbmContext ctx;
-      ctx.copy_space = reinterpret_cast<char*>(recv_cs_ull);
-      ctx.shm_info_ = reinterpret_cast<hshm::lbm::ShmTransferInfo*>(recv_si_ull);
-      hshm::lbm::ShmTransport::RecvDevicePrealloc(
-          reinterpret_cast<char*>(&hdr), sizeof(hdr), ctx);
+      size_t total = fshm->output_.total_written_.load_device();
+      size_t data_size = total - WarpIpcManager::kDataOffset;
+      hipc::threadfence();
 
-      // Construct wrap_vector pointing at task data in copy_space
+      // Construct wrap_vector pointing at task data after archive header
       hipc::FullPtr<char> data_fp;
-      data_fp.ptr_ = ctx.copy_space + WarpIpcManager::kHeaderSize;
+      data_fp.ptr_ = fshm->copy_space + WarpIpcManager::kDataOffset;
       data_fp.shm_.alloc_id_.SetNull();
       data_fp.shm_.off_ = reinterpret_cast<size_t>(data_fp.ptr_);
-      hshm::priv::wrap_vector recv_buf(data_fp, hdr.data_size);
-      recv_buf.resize(hdr.data_size);
+      hshm::priv::wrap_vector recv_buf(data_fp, data_size);
+      recv_buf.resize(data_size);
 
-      WrapLoadArchive load_ar(recv_buf);
-      load_ar.SetMsgType(hdr.msg_type);
+      GpuLoadTaskArchive load_ar(recv_buf);
+      load_ar.SetMsgType(LocalMsgType::kSerializeOut);
       auto *task = reinterpret_cast<TaskT *>(task_ull);
       task->SerializeOut(load_ar);
     }
 
-    // Lane 0: non-device-scope path (CPU→GPU response via SPSC)
+    // Lane 0: non-device-scope path — same direct copy_space read
     if (lane == 0 && has_output && !device_scope) {
-      auto *mgr = GetWarpManager();
-      hshm::lbm::LbmContext cpu_ctx;
-      cpu_ctx.copy_space = fshm->copy_space;
-      cpu_ctx.shm_info_ = &fshm->output_;
-      hshm::lbm::ShmTransport::Recv(mgr->load_ar_, cpu_ctx);
-      mgr->load_ar_.SetMsgType(LocalMsgType::kSerializeOut);
+      size_t total = fshm->output_.total_written_.load_system();
+      size_t data_size = total - WarpIpcManager::kDataOffset;
+
+      hipc::FullPtr<char> data_fp;
+      data_fp.ptr_ = fshm->copy_space + WarpIpcManager::kDataOffset;
+      data_fp.shm_.alloc_id_.SetNull();
+      data_fp.shm_.off_ = reinterpret_cast<size_t>(data_fp.ptr_);
+      hshm::priv::wrap_vector recv_buf(data_fp, data_size);
+      recv_buf.resize(data_size);
+
+      GpuLoadTaskArchive load_ar(recv_buf);
+      load_ar.SetMsgType(LocalMsgType::kSerializeOut);
       auto *task = reinterpret_cast<TaskT *>(task_ull);
-      task->SerializeOut(mgr->load_ar_);
+      task->SerializeOut(load_ar);
     }
     __syncwarp();
 
@@ -2733,7 +2754,7 @@ send_bcast:
   hipc::PartitionedAllocator *gpu_alloc_ = nullptr;
   static constexpr u32 kMaxCachedWarps = 32;
   WarpIpcManager *warp_mgrs_[kMaxCachedWarps] = {};
-  size_t priv_region_size_ = 4096;  /**< Per-warp private BuddyAllocator region */
+  size_t priv_region_size_ = 16384;  /**< Per-warp private BuddyAllocator region */
 
   // --- GPU→CPU backend: pinned host for cross-direction FutureShm ---
   /** Pinned-host backend for GPU→CPU FutureShm allocation (ToLocalCpu path) */
@@ -3389,21 +3410,18 @@ HSHM_CROSS_FUN void Future<TaskT, AllocT>::WaitRecv(float max_sec,
   has_output = __shfl_sync(0xFFFFFFFF, has_output, 0);
 
   if (lane == 0 && has_output) {
-    PreallocHeader hdr;
-    hshm::lbm::LbmContext ctx;
-    ctx.copy_space = fshm->copy_space;
-    ctx.shm_info_ = &fshm->output_;
-    hshm::lbm::ShmTransport::RecvDevicePrealloc(
-        reinterpret_cast<char*>(&hdr), sizeof(hdr), ctx);
+    size_t total = fshm->output_.total_written_.load_device();
+    size_t data_size = total - IpcManager::WarpIpcManager::kDataOffset;
+    hipc::threadfence();
 
     hipc::FullPtr<char> data_fp;
-    data_fp.ptr_ = fshm->copy_space + IpcManager::WarpIpcManager::kHeaderSize;
+    data_fp.ptr_ = fshm->copy_space + IpcManager::WarpIpcManager::kDataOffset;
     data_fp.shm_.alloc_id_.SetNull();
     data_fp.shm_.off_ = reinterpret_cast<size_t>(data_fp.ptr_);
-    hshm::priv::wrap_vector recv_buf(data_fp, hdr.data_size);
-    recv_buf.resize(hdr.data_size);
-    WrapLoadArchive load_ar(recv_buf);
-    load_ar.SetMsgType(hdr.msg_type);
+    hshm::priv::wrap_vector recv_buf(data_fp, data_size);
+    recv_buf.resize(data_size);
+    GpuLoadTaskArchive load_ar(recv_buf);
+    load_ar.SetMsgType(LocalMsgType::kSerializeOut);
     task_ptr_.ptr_->SerializeOut(load_ar);
   }
 

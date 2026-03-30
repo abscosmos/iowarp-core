@@ -113,9 +113,27 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
 
   CHI_IPC->ResumeGpuOrchestrator();
 
-  // Poll for completion (10s timeout)
+  // Poll for completion (10s timeout), dump orchestrator state every 2s
+  auto *orch = static_cast<chi::gpu::WorkOrchestrator *>(CHI_IPC->gpu_orchestrator_);
+  int dump = 0;
   for (int i = 0; i < 100000 && *d_result == 0; ++i) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));
+    if (i % 20000 == 19999 && orch && orch->control_ && dump < 3) {
+      auto *ctrl = orch->control_;
+      printf("[CTE-DIAG] exit=%d running=%d d_result=%d\n",
+             ctrl->exit_flag, ctrl->running_flag, *d_result);
+      for (int w = 0; w < 4; ++w) {
+        printf("  W%d: polls=%llu popped=%u completed=%u qpops=%u nocont=%u "
+               "alloc_fail=%u tw=%llu cs=%llu\n",
+               w, (unsigned long long)ctrl->dbg_poll_count[w],
+               ctrl->dbg_tasks_popped[w], ctrl->dbg_tasks_completed[w],
+               ctrl->dbg_queue_pops[w], ctrl->dbg_no_container[w],
+               ctrl->dbg_alloc_failures[w],
+               (unsigned long long)ctrl->dbg_input_tw[w],
+               (unsigned long long)ctrl->dbg_input_cs[w]);
+      }
+      dump++;
+    }
   }
 
   int result = *d_result;

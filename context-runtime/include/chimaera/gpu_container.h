@@ -70,14 +70,14 @@ class Container {
   // ====================================================================
   using RunFn = TaskResume (*)(Container *, u32, hipc::FullPtr<Task>, RunContext &);
   using AllocTaskFn = TaskContextBlock (*)(Container *, u32, size_t);
-  /** Alloc Task+RunContext+stack, deserialize input from WrapLoadArchive, return both */
-  using AllocLoadDeserFn = TaskContextBlock (*)(Container *, u32, size_t, WrapLoadArchive &);
-  using WrapLoadTaskFn = void (*)(Container *, u32, WrapLoadArchive &, const hipc::FullPtr<Task> &);
-  using WrapSaveTaskFn = void (*)(Container *, u32, WrapSaveArchive &, const hipc::FullPtr<Task> &);
+  /** Alloc Task+RunContext+stack, deserialize input from GpuLoadTaskArchive, return both */
+  using AllocLoadDeserFn = TaskContextBlock (*)(Container *, u32, size_t, GpuLoadTaskArchive &);
+  using WrapLoadTaskFn = void (*)(Container *, u32, GpuLoadTaskArchive &, const hipc::FullPtr<Task> &);
+  using WrapSaveTaskFn = void (*)(Container *, u32, GpuSaveTaskArchive &, const hipc::FullPtr<Task> &);
   using DefaultLoadTaskFn = void (*)(Container *, u32, DefaultLoadArchive &, const hipc::FullPtr<Task> &);
   using DefaultSaveTaskFn = void (*)(Container *, u32, DefaultSaveArchive &, const hipc::FullPtr<Task> &);
   using AllocLoadTaskDefaultFn = hipc::FullPtr<Task> (*)(Container *, u32, DefaultLoadArchive &);
-  using AllocLoadTaskWrapFn = hipc::FullPtr<Task> (*)(Container *, u32, WrapLoadArchive &);
+  using AllocLoadTaskWrapFn = hipc::FullPtr<Task> (*)(Container *, u32, GpuLoadTaskArchive &);
   using LoadTaskOutputFn = void (*)(Container *, u32, DefaultLoadArchive &, const hipc::FullPtr<Task> &);
   using DestroyTaskFn = void (*)(Container *, u32, hipc::FullPtr<Task> &);
 
@@ -137,7 +137,7 @@ class Container {
 
   /** Alloc Task+RunContext+stack and deserialize input in one dispatch */
   HSHM_GPU_FUN TaskContextBlock LocalAllocLoadDeser(
-      u32 method, size_t stack_size, WrapLoadArchive &archive) {
+      u32 method, size_t stack_size, GpuLoadTaskArchive &archive) {
     return alloc_load_deser_(this, method, stack_size, archive);
   }
 
@@ -145,7 +145,7 @@ class Container {
     return alloc_load_task_default_(this, method, archive);
   }
 
-  HSHM_GPU_FUN hipc::FullPtr<Task> LocalAllocLoadTask(u32 method, WrapLoadArchive &archive) {
+  HSHM_GPU_FUN hipc::FullPtr<Task> LocalAllocLoadTask(u32 method, GpuLoadTaskArchive &archive) {
     return alloc_load_task_wrap_(this, method, archive);
   }
 
@@ -154,7 +154,7 @@ class Container {
     load_task_default_(this, method, archive, task);
   }
 
-  HSHM_GPU_FUN void LocalLoadTask(u32 method, WrapLoadArchive &archive,
+  HSHM_GPU_FUN void LocalLoadTask(u32 method, GpuLoadTaskArchive &archive,
                                     const hipc::FullPtr<Task> &task) {
     load_task_wrap_(this, method, archive, task);
   }
@@ -164,7 +164,7 @@ class Container {
     save_task_default_(this, method, archive, task);
   }
 
-  HSHM_GPU_FUN void LocalSaveTask(u32 method, WrapSaveArchive &archive,
+  HSHM_GPU_FUN void LocalSaveTask(u32 method, GpuSaveTaskArchive &archive,
                                     const hipc::FullPtr<Task> &task) {
     save_task_wrap_(this, method, archive, task);
   }

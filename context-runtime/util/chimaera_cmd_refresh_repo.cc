@@ -683,21 +683,19 @@ class ChiModGenerator {
     oss << "  co_return;\n";
     oss << "}\n\n";
 
-    // AllocTaskImpl
+    // AllocTaskImpl — uses NewTaskExec: [Task | RunContext | stack]
     oss << "static HSHM_GPU_FUN chi::gpu::TaskContextBlock AllocTaskImpl(\n";
     oss << "    chi::gpu::Container *self_, chi::u32 method, size_t stack_size) {\n";
     if (!gpu_methods.empty()) {
-      oss << "  auto *alloc = CHI_IPC->GetPrivAlloc();\n";
-      oss << "  if (!alloc) return {hipc::FullPtr<chi::Task>::GetNull(), nullptr};\n";
-      oss << "  size_t rctx_total = sizeof(chi::gpu::RunContext) + stack_size;\n";
+      oss << "  auto *ipc = CHI_IPC;\n";
       oss << "  switch (method) {\n";
       for (const auto& method : gpu_methods) {
         std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
         oss << "    case Method::" << method.constant_name << ": {\n";
-        oss << "      auto fp = alloc->template AllocateObjs<char>(sizeof(" << task_type << ") + rctx_total);\n";
+        oss << "      auto fp = ipc->template NewTaskExec<" << task_type << ">(stack_size);\n";
         oss << "      if (fp.IsNull()) return {hipc::FullPtr<chi::Task>::GetNull(), nullptr};\n";
-        oss << "      new (fp.ptr_) " << task_type << "();\n";
-        oss << "      auto *rctx = reinterpret_cast<chi::gpu::RunContext *>(fp.ptr_ + sizeof(" << task_type << "));\n";
+        oss << "      auto *rctx = reinterpret_cast<chi::gpu::RunContext *>(\n";
+        oss << "          reinterpret_cast<char *>(fp.ptr_) + sizeof(" << task_type << "));\n";
         oss << "      new (rctx) chi::gpu::RunContext();\n";
         oss << "      rctx->InitStack(reinterpret_cast<char *>(rctx) + sizeof(chi::gpu::RunContext), stack_size);\n";
         oss << "      return {fp.template Cast<chi::Task>(), rctx};\n";
@@ -724,7 +722,7 @@ class ChiModGenerator {
 
     // AllocLoadTaskWrapImpl
     oss << "static HSHM_GPU_FUN hipc::FullPtr<chi::Task> AllocLoadTaskWrapImpl(\n";
-    oss << "    chi::gpu::Container *self_, chi::u32 method, chi::WrapLoadArchive &ar) {\n";
+    oss << "    chi::gpu::Container *self_, chi::u32 method, chi::GpuLoadTaskArchive &ar) {\n";
     oss << "  auto *self = static_cast<GpuRuntime *>(self_);\n";
     oss << "  auto block = self->alloc_task_(self_, method, 0);\n";
     oss << "  if (block.task_ptr.IsNull()) return block.task_ptr;\n";
@@ -736,7 +734,7 @@ class ChiModGenerator {
     // AllocLoadDeserImpl — single dispatch: alloc + deserialize from WrapLoadArchive
     oss << "static HSHM_GPU_FUN chi::gpu::TaskContextBlock AllocLoadDeserImpl(\n";
     oss << "    chi::gpu::Container *self_, chi::u32 method,\n";
-    oss << "    size_t stack_size, chi::WrapLoadArchive &ar) {\n";
+    oss << "    size_t stack_size, chi::GpuLoadTaskArchive &ar) {\n";
     oss << "  auto *self = static_cast<GpuRuntime *>(self_);\n";
     oss << "  auto block = AllocTaskImpl(self_, method, stack_size);\n";
     oss << "  if (!block.task_ptr.IsNull()) {\n";
@@ -757,7 +755,7 @@ class ChiModGenerator {
     // LoadTaskWrapImpl
     oss << "static HSHM_GPU_FUN void LoadTaskWrapImpl(\n";
     oss << "    chi::gpu::Container *self_, chi::u32 method,\n";
-    oss << "    chi::WrapLoadArchive &ar, const hipc::FullPtr<chi::Task> &task) {\n";
+    oss << "    chi::GpuLoadTaskArchive &ar, const hipc::FullPtr<chi::Task> &task) {\n";
     oss << "  static_cast<GpuRuntime *>(self_)->LoadTaskTmpl(method, ar, task);\n";
     oss << "}\n\n";
 
@@ -771,7 +769,7 @@ class ChiModGenerator {
     // SaveTaskWrapImpl
     oss << "static HSHM_GPU_FUN void SaveTaskWrapImpl(\n";
     oss << "    chi::gpu::Container *self_, chi::u32 method,\n";
-    oss << "    chi::WrapSaveArchive &ar, const hipc::FullPtr<chi::Task> &task) {\n";
+    oss << "    chi::GpuSaveTaskArchive &ar, const hipc::FullPtr<chi::Task> &task) {\n";
     oss << "  static_cast<GpuRuntime *>(self_)->SaveTaskTmpl(method, ar, task);\n";
     oss << "}\n\n";
 

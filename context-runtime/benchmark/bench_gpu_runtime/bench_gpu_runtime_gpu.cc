@@ -96,16 +96,66 @@ __global__ void gpu_bench_client_kernel(
   __syncwarp();
 
   auto *ipc = CHI_IPC;
-
   // Allocate task once, reuse across iterations to avoid per-task alloc/free.
   // All lanes participate in NewTask (lane 0 allocates) and Send (warp-parallel).
+  // test_value=7, gpu_id=0 → expected result = 7*3+0 = 21
   auto task = ipc->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
       chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(),
-      (chi::u32)0, (chi::u32)0);
+      (chi::u32)0, (chi::u32)7);
 
+  if (chi::IpcManager::IsWarpScheduler() && task.IsNull()) {
+    printf("[BENCH FATAL] NewTask returned null — priv alloc too small\n");
+    atomicAdd(d_done, static_cast<int>(total_warps));
+    return;
+  }
+
+  // Verify warp convergence works before Send
+  {
+    chi::u32 test_val = chi::IpcManager::GetLaneId();
+    chi::u32 sum = __shfl_sync(0xFFFFFFFF, test_val, 0);
+    if (chi::IpcManager::IsWarpScheduler()) {
+      printf("[BENCH] kDataOffset=%llu kCopySpaceSize=%llu bufcap=%lld\n",
+             (unsigned long long)chi::IpcManager::WarpIpcManager::kDataOffset,
+             (unsigned long long)chi::IpcManager::WarpIpcManager::kCopySpaceSize,
+             (long long)(chi::IpcManager::WarpIpcManager::kCopySpaceSize -
+                         chi::IpcManager::WarpIpcManager::kDataOffset));
+      *d_done = (sum == 0) ? -1 : -99;
+      __threadfence_system();
+    }
+  }
+  __syncwarp();
+
+  chi::u32 errors = 0;
   for (chi::u32 i = 0; i < total_tasks; ++i) {
+    if (chi::IpcManager::IsWarpScheduler()) {
+      task->result_value_ = 0;  // Reset before each send
+    }
     auto future = ipc->Send(task);
+    if (chi::IpcManager::IsWarpScheduler() && i == 0) {
+      *d_done = -2;  // milestone: Send returned
+      __threadfence_system();
+    }
     future.Wait(0, /*reuse_task=*/true);
+    if (chi::IpcManager::IsWarpScheduler() && i == 0) {
+      *d_done = -3;  // milestone: Wait returned
+      __threadfence_system();
+    }
+    // Verify: GpuSubmit computes test_value*3 + gpu_id = 7*3+0 = 21
+    if (chi::IpcManager::IsWarpScheduler()) {
+      if (task->result_value_ != 21) {
+        if (errors == 0) {
+          printf("[BENCH ERROR] task %u: expected result=21, got %u (rc=%d)\n",
+                 i, (unsigned)task->result_value_,
+                 (int)task->return_code_);
+        }
+        ++errors;
+      }
+    }
+  }
+
+  if (chi::IpcManager::IsWarpScheduler() && errors > 0) {
+    printf("[BENCH FAIL] %u/%u tasks returned wrong result\n",
+           errors, total_tasks);
   }
 
   // Free the reused task after the loop
@@ -114,7 +164,8 @@ __global__ void gpu_bench_client_kernel(
   // All warps signal completion via lane 0
   __syncwarp();
   if (chi::IpcManager::IsWarpScheduler()) {
-    __threadfence();
+    *d_done = 0;  // Reset from milestone values before signaling
+    __threadfence_system();
     int prev = atomicAdd(d_done, 1);
     if (prev == static_cast<int>(total_warps) - 1) {
       __threadfence_system();
@@ -438,7 +489,11 @@ __global__ void gpu_bench_alloc_serde_kernel(
  *   7. ShmTransport::RecvDevice        — unframe from copy_space
  *   8. SerializeOut (warp-parallel)    — deserialize output fields
  *   9. DelTask + cleanup               — free task memory
+ *
+ * NOTE: This kernel is currently disabled — it uses the old SendDevice/RecvDevice
+ * transport which has been removed. Needs rewrite for the new direct copy_space path.
  */
+#if 0
 __global__ void gpu_bench_serde_kernel(
     chi::IpcManagerGpu gpu_info,
     chi::PoolId pool_id,
@@ -850,6 +905,7 @@ __global__ void gpu_bench_serde_kernel(
     __threadfence_system();
   }
 }
+#endif  // disabled gpu_bench_serde_kernel (uses removed SendDevice/RecvDevice)
 
 }  // namespace chi_bench
 
@@ -859,9 +915,26 @@ __global__ void gpu_bench_serde_kernel(
  */
 static bool PollDone(volatile int *d_done, int total_threads, int timeout_us) {
   int elapsed_us = 0;
+  int last_print = 0;
   while (*d_done < total_threads && elapsed_us < timeout_us) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));
     elapsed_us += 100;
+    if (elapsed_us - last_print >= 2000000) {  // every 2s
+      fprintf(stderr, "[PollDone] %ds: d_done=%d (need %d)",
+              elapsed_us / 1000000, *d_done, total_threads);
+    // Dump orchestrator worker 0 state if available
+    auto *orch = static_cast<chi::gpu::WorkOrchestrator *>(
+        CHI_IPC->gpu_orchestrator_);
+    if (orch && orch->control_) {
+      auto *c = orch->control_;
+      fprintf(stderr, " | W0: popped=%u completed=%u qpops=%u nocont=%u allocfail=%u",
+              c->dbg_tasks_popped[0], c->dbg_tasks_completed[0],
+              c->dbg_queue_pops[0], c->dbg_no_container[0],
+              c->dbg_alloc_failures[0]);
+    }
+    fprintf(stderr, "\n");
+      last_print = elapsed_us;
+    }
   }
   return *d_done >= total_threads;
 }
@@ -1154,6 +1227,7 @@ extern "C" int run_gpu_bench_alloc(
  * Allocates both a primary backend (for NewTask) and a heap backend
  * (for serialization scratch via CHI_PRIV_ALLOC / CHI_PRIV_ALLOC).
  */
+#if 0  // disabled (uses removed SendDevice/RecvDevice)
 extern "C" int run_gpu_bench_serde(
     chi::PoolId pool_id,
     chi::u32 client_blocks,
@@ -1227,6 +1301,13 @@ extern "C" int run_gpu_bench_serde(
   hshm::GpuApi::DestroyStream(stream);
 
   return completed ? 0 : -4;
+}
+#endif  // disabled run_gpu_bench_serde
+
+// Stub: serde benchmark disabled (uses removed SendDevice/RecvDevice)
+extern "C" int run_gpu_bench_serde(
+    chi::PoolId, chi::u32, chi::u32, chi::u32, float *) {
+  return -200;
 }
 
 /**

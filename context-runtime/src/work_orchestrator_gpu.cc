@@ -65,6 +65,12 @@
 
 namespace chi {
 
+// Verify kDirectPathExtra is large enough for RunContext + stack
+static_assert(
+    IpcManager::WarpIpcManager::kDirectPathExtra >=
+        sizeof(gpu::RunContext) + IpcManager::WarpIpcManager::kStackSize,
+    "kDirectPathExtra too small for RunContext + kStackSize");
+
 /**
  * GPU Work Orchestrator - persistent kernel for GPU task execution.
  * Uses warp-level dispatch: one Worker per warp, lane 0 schedules.
@@ -83,7 +89,8 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
   CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
 
   if (threadIdx.x == 0) {
-    printf("[ORCH-POST] blk=%u init done\n", blockIdx.x);
+    printf("[ORCH-POST] blk=%u kDataOffset=%llu\n", blockIdx.x,
+           (unsigned long long)IpcManager::WarpIpcManager::kDataOffset);
   }
 
   u32 warp_id = IpcManager::GetWarpId();
