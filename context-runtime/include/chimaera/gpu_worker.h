@@ -203,6 +203,7 @@ class Worker {
     }
 
     if (ctx == nullptr) return;
+    if (lane_id == 0) DbgStep(30);  // entered ExecTask
 
     // --- Coroutine creation and resume (all 32 lanes always participate) ---
     GPU_WORKER_TIMER_DEF(_etc);
@@ -260,6 +261,7 @@ class Worker {
     }
 
     __syncwarp();
+    if (lane_id == 0) DbgStep(40);  // after coro destroy + syncwarp
 
     // --- Lane 0: detect completion or suspension ---
     int needs_serde = 0;
@@ -548,15 +550,18 @@ class Worker {
     if (lane_id == 0) {
       auto *priv_alloc = CHI_PRIV_ALLOC;
       if (!priv_alloc) {
+        DbgStep(100);  // priv_alloc null
         MarkComplete(fshm, is_gpu2gpu);
       } else {
         size_t tw = fshm->input_.total_written_.load_device();
         size_t cs = fshm->input_.copy_space_size_.load_device();
         if (tw == 0 || tw > cs) {
+          DbgStep(200 + (tw == 0 ? 1 : 2));  // 201=tw zero, 202=tw>cs
           MarkComplete(fshm, is_gpu2gpu);
         } else {
           data_size = tw - IpcManager::WarpIpcManager::kDataOffset;
           valid = 1;
+          DbgStep(10);  // validation passed
         }
       }
     }
@@ -578,19 +583,17 @@ class Worker {
       GPU_WORKER_TIMER_END(prof_recv_device_, _tc);
 
       GPU_WORKER_TIMER_START(_tc2);
-      hipc::FullPtr<char> data_fp;
-      data_fp.ptr_ = fshm->copy_space + IpcManager::WarpIpcManager::kDataOffset;
-      data_fp.shm_.alloc_id_.SetNull();
-      data_fp.shm_.off_ = reinterpret_cast<size_t>(data_fp.ptr_);
-      hshm::priv::wrap_vector recv_buf(data_fp, data_size);
-      recv_buf.resize(data_size);
-      GpuLoadTaskArchive load_ar(recv_buf);
+      auto *mgr = ipc->GetWarpManager();
+      mgr->BindLoad(fshm->copy_space, data_size);
 
-      block = container->LocalAllocLoadDeser(method_id, kStackSize, load_ar);
+      block = container->LocalAllocLoadDeser(method_id, kStackSize, mgr->load_ar_);
       GPU_WORKER_TIMER_END(prof_alloc_task_, _tc2);
 
       if (block.task_ptr.IsNull()) {
+        DbgStep(300);  // AllocLoadDeser failed
         MarkComplete(fshm, is_gpu2gpu);
+      } else {
+        DbgStep(20);  // alloc+deser succeeded
       }
     }
 
@@ -773,33 +776,17 @@ class Worker {
     // Phase 1+2 (lane 0): serialize task output directly into copy_space + mark ready
     if (lane_id == 0) {
       GPU_WORKER_TIMER_START(_tc);
-      // Rebind buffer to CLIENT's copy_space and serialize output there
       auto *mgr = ipc->GetWarpManager();
-      mgr->BindCopySpace(fshm->copy_space);
-      auto *save_ar_ptr = &mgr->save_ar_;
-      save_ar_ptr->Reset(LocalMsgType::kSerializeOut);
-      container->LocalSaveTask(method_id, *save_ar_ptr, task_ptr);
+      mgr->BindSave(fshm->copy_space,
+                LocalMsgType::kSerializeOut);
+      container->LocalSaveTask(method_id, mgr->save_ar_, task_ptr);
       GPU_WORKER_TIMER_END(prof_save_task_, _tc);
 
       GPU_WORKER_TIMER_START(_tc2);
-      if (is_gpu2gpu) {
-        // Copy archive metadata to copy_space header area
-        memcpy(fshm->copy_space, &mgr->save_ar_,
-               IpcManager::WarpIpcManager::kDataOffset);
-        hshm::ipc::threadfence();
-        fshm->output_.total_written_.store(
-            IpcManager::WarpIpcManager::kDataOffset
-            + mgr->save_ar_.GetSerializedSize());
-      } else {
-        // TODO: GPU→CPU output path needs WrapSaveArchive for ShmTransport::Send
-        // For now, use same direct path as gpu2gpu
-        memcpy(fshm->copy_space, &mgr->save_ar_,
-               IpcManager::WarpIpcManager::kDataOffset);
-        hshm::ipc::threadfence();
-        fshm->output_.total_written_.store(
-            IpcManager::WarpIpcManager::kDataOffset
-            + mgr->save_ar_.GetSerializedSize());
-      }
+      hshm::ipc::threadfence();
+      fshm->output_.total_written_.store(
+          IpcManager::WarpIpcManager::kDataOffset
+          + mgr->save_ar_.GetSerializedSize());
       GPU_WORKER_TIMER_END(prof_send_device_, _tc2);
     }
     __syncwarp();

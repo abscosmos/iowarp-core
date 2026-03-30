@@ -927,10 +927,10 @@ static bool PollDone(volatile int *d_done, int total_threads, int timeout_us) {
         CHI_IPC->gpu_orchestrator_);
     if (orch && orch->control_) {
       auto *c = orch->control_;
-      fprintf(stderr, " | W0: popped=%u completed=%u qpops=%u nocont=%u allocfail=%u",
+      fprintf(stderr, " | W0: popped=%u completed=%u qpops=%u nocont=%u allocfail=%u step=%u",
               c->dbg_tasks_popped[0], c->dbg_tasks_completed[0],
               c->dbg_queue_pops[0], c->dbg_no_container[0],
-              c->dbg_alloc_failures[0]);
+              c->dbg_alloc_failures[0], c->dbg_dispatch_step[0]);
     }
     fprintf(stderr, "\n");
       last_print = elapsed_us;
@@ -1063,6 +1063,17 @@ extern "C" int run_gpu_bench_latency(
   // exit hangs waiting for the GPU kernel to terminate.
   hshm::GpuApi::Synchronize(stream);
 
+  // Print orchestrator debug state before pausing
+  {
+    auto *orch = static_cast<chi::gpu::WorkOrchestrator *>(CHI_IPC->gpu_orchestrator_);
+    if (orch && orch->control_) {
+      auto *c = orch->control_;
+      printf("[POST] W0: popped=%u completed=%u qpops=%u nocont=%u allocfail=%u step=%u\n",
+             c->dbg_tasks_popped[0], c->dbg_tasks_completed[0],
+             c->dbg_queue_pops[0], c->dbg_no_container[0],
+             c->dbg_alloc_failures[0], c->dbg_dispatch_step[0]);
+    }
+  }
   // All client blocks have now finished — safe to stop the orchestrator.
   CHI_IPC->PauseGpuOrchestrator();
 
