@@ -193,7 +193,7 @@ static HSHM_GPU_FUN void DestroyTaskImpl(
       task.template Cast<RegisterTargetTask>().ptr_->~RegisterTargetTask();
       break;
     case Method::kGetOrCreateTag:
-      task.template Cast<core::GetOrCreateTagTask<core::CreateParams>>().ptr_->~CreateParams>();
+      task.template Cast<core::GetOrCreateTagTask<core::CreateParams>>().ptr_->~GetOrCreateTagTask();
       break;
     case Method::kPutBlob:
       task.template Cast<PutBlobTask>().ptr_->~PutBlobTask();

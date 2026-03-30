@@ -3,6 +3,9 @@
  *
  * Tests the GPU→GPU dispatch path and coroutine suspend/resume machinery.
  * Compiled via add_cuda_library (clang-cuda dual-pass).
+ *
+ * All kernels launch with 32 threads (one warp) for warp-level execution.
+ * Lane 0 handles control flow; all lanes participate in Send/Wait.
  */
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
@@ -24,33 +27,63 @@ __global__ void gpu_leaf_task_kernel(
     chi::IpcManagerGpuInfo gpu_info,
     chi::PoolId pool_id,
     int *d_result) {
-  *d_result = 0;
-  CHIMAERA_GPU_INIT(gpu_info);
+  if (threadIdx.x == 0) *d_result = 0;
+  CHIMAERA_GPU_CLIENT_INIT(gpu_info, 1);
+  __syncwarp();
 
   auto *ipc = CHI_IPC;
-  printf("[GPU kernel] Calling AsyncGpuSubmit(gpu_id=0, test_value=7)\n");
+  if (threadIdx.x == 0) {
+    printf("[GPU kernel] ipc=%p gpu_alloc=%p gpu2gpu=%p priv_region=%llu\n",
+           (void*)ipc, (void*)ipc->gpu_alloc_, (void*)ipc->gpu2gpu_queue_,
+           (unsigned long long)ipc->priv_region_size_);
+    auto *priv = ipc->GetPrivAlloc();
+    printf("[GPU kernel] priv_alloc=%p sizeof(GpuSubmitTask)=%llu sizeof(FutureShm)=%llu kCopySpace=%llu total=%llu\n",
+           (void*)priv, (unsigned long long)sizeof(chimaera::MOD_NAME::GpuSubmitTask),
+           (unsigned long long)sizeof(chi::FutureShm),
+           (unsigned long long)chi::IpcManager::WarpIpcManager::kCopySpaceSize,
+           (unsigned long long)(sizeof(chimaera::MOD_NAME::GpuSubmitTask) + sizeof(chi::FutureShm)
+           + chi::IpcManager::WarpIpcManager::kCopySpaceSize));
+    printf("[GPU kernel] Calling AsyncGpuSubmit(gpu_id=0, test_value=7)\n");
+  }
+
+  // All 32 lanes participate in NewTask (lane 0 allocates) and Send (warp-parallel)
   auto sub = ipc->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
       chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(),
       chi::u32(0), chi::u32(7));
+  if (threadIdx.x == 0) {
+    printf("[GPU kernel] NewTask: sub.ptr=%p sub.IsNull=%d\n",
+           (void*)sub.ptr_, sub.IsNull() ? 1 : 0);
+  }
   auto future = ipc->Send(sub);
 
-  if (future.IsNull()) {
-    printf("[GPU kernel] future is null\n");
-    *d_result = -2;
+  // Broadcast null check to all lanes
+  int is_null = 0;
+  if (threadIdx.x == 0) is_null = future.IsNull() ? 1 : 0;
+  is_null = __shfl_sync(0xFFFFFFFF, is_null, 0);
+  if (is_null) {
+    if (threadIdx.x == 0) {
+      printf("[GPU kernel] future is null\n");
+      *d_result = -2;
+    }
     return;
   }
 
-  printf("[GPU kernel] Waiting for GpuSubmit\n");
-  future.Wait();
-  printf("[GPU kernel] GpuSubmit done, rc=%d result=%u\n",
-         (int)future->return_code_, (unsigned)future->result_value_);
+  if (threadIdx.x == 0) printf("[GPU kernel] Waiting for GpuSubmit\n");
+  future.Wait(0, true);
 
-  // GpuSubmit computes: test_value * 3 + gpu_id = 7*3+0 = 21
-  if (future->return_code_ == 0 && future->result_value_ == 21) {
-    *d_result = 1;  // Success
-  } else {
-    *d_result = -3;
+  if (threadIdx.x == 0) {
+    printf("[GPU kernel] GpuSubmit done, rc=%d result=%u\n",
+           (int)future->return_code_, (unsigned)future->result_value_);
+
+    // GpuSubmit computes: test_value * 3 + gpu_id = 7*3+0 = 21
+    if (future->return_code_ == 0 && future->result_value_ == 21) {
+      *d_result = 1;  // Success
+    } else {
+      *d_result = -3;
+    }
   }
+
+  ipc->DelTask(sub);
 }
 
 extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
@@ -70,19 +103,18 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
   CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
-  chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
-  gpu_info.backend = gpu_backend;
-
   // Pinned result
   int *d_result;
   cudaMallocHost(&d_result, sizeof(int));
   *d_result = 0;
 
-  // Pause orchestrator, launch kernel, resume
+  // Pause orchestrator then fetch gpu_info (queue pointers rebuilt by Pause)
   CHI_IPC->PauseGpuOrchestrator();
+  chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  gpu_info.backend = gpu_backend;
 
   void *stream = hshm::GpuApi::CreateStream();
-  gpu_leaf_task_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+  gpu_leaf_task_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
       gpu_info, pool_id, d_result);
 
   cudaError_t launch_err = cudaGetLastError();
@@ -116,30 +148,43 @@ __global__ void gpu_subtask_kernel(
     chi::u32 test_value,
     int *d_result,
     chi::u32 *d_result_value) {
-  *d_result = 0;
-  *d_result_value = 0;
-  CHIMAERA_GPU_INIT(gpu_info);
+  if (threadIdx.x == 0) { *d_result = 0; *d_result_value = 0; }
+  CHIMAERA_GPU_CLIENT_INIT(gpu_info, 1);
+  __syncwarp();
 
   auto *ipc = CHI_IPC;
-  printf("[GPU kernel] Calling AsyncSubtaskTest(%u)\n", (unsigned)test_value);
+  if (threadIdx.x == 0) {
+    printf("[GPU kernel] Calling AsyncSubtaskTest(%u)\n", (unsigned)test_value);
+  }
+
+  // All 32 lanes participate in NewTask and Send
   auto sub = ipc->NewTask<chimaera::MOD_NAME::SubtaskTestTask>(
       chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(), test_value);
   auto future = ipc->Send(sub);
 
-  if (future.IsNull()) {
-    printf("[GPU kernel] subtask future is null\n");
-    *d_result = -2;
+  int is_null = 0;
+  if (threadIdx.x == 0) is_null = future.IsNull() ? 1 : 0;
+  is_null = __shfl_sync(0xFFFFFFFF, is_null, 0);
+  if (is_null) {
+    if (threadIdx.x == 0) {
+      printf("[GPU kernel] subtask future is null\n");
+      *d_result = -2;
+    }
     return;
   }
 
-  printf("[GPU kernel] Waiting for SubtaskTest\n");
-  future.Wait();
-  printf("[GPU kernel] SubtaskTest done, rc=%d result=%u\n",
-         (int)future->return_code_, (unsigned)future->result_value_);
+  if (threadIdx.x == 0) printf("[GPU kernel] Waiting for SubtaskTest\n");
+  future.Wait(0, true);
 
-  *d_result_value = future->result_value_;
-  __threadfence_system();
-  *d_result = (future->return_code_ == 0) ? 1 : -3;
+  if (threadIdx.x == 0) {
+    printf("[GPU kernel] SubtaskTest done, rc=%d result=%u\n",
+           (int)future->return_code_, (unsigned)future->result_value_);
+    *d_result_value = future->result_value_;
+    __threadfence_system();
+    *d_result = (future->return_code_ == 0) ? 1 : -3;
+  }
+
+  ipc->DelTask(sub);
 }
 
 extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
@@ -161,9 +206,6 @@ extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
   CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
-  chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
-  gpu_info.backend = gpu_backend;
-
   // Pinned results
   int *d_result;
   chi::u32 *d_rv;
@@ -172,11 +214,13 @@ extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
   *d_result = 0;
   *d_rv = 0;
 
-  // Pause orchestrator, launch kernel, resume
+  // Pause orchestrator then fetch gpu_info (queue pointers rebuilt by Pause)
   CHI_IPC->PauseGpuOrchestrator();
+  chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  gpu_info.backend = gpu_backend;
 
   void *stream = hshm::GpuApi::CreateStream();
-  gpu_subtask_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+  gpu_subtask_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
       gpu_info, pool_id, test_value, d_result, d_rv);
 
   cudaError_t launch_err = cudaGetLastError();
