@@ -156,6 +156,7 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
   cudaDeviceSetLimit(cudaLimitStackSize, 32768);
   cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 8 * 1024 * 1024);
   cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, 8192);
+  cudaDeviceSetLimit(cudaLimitMallocHeapSize, 32 * 1024 * 1024);  // 32MB device heap
 
   // Create dedicated stream
   stream_ = hshm::GpuApi::CreateStream();

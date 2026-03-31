@@ -89,8 +89,15 @@ __global__ void RunTask(Container *container, u32 method,
   // Initialize IpcManager for this CDP child kernel block.
   // Reattaches to the orchestrator's existing RoundRobinAllocator and
   // claims a partition for this block.
+  if (threadIdx.x == 0) {
+    printf("[RunTask] START method=%u task=%p fshm=%p gpu2gpu=%d\n",
+           method, (void*)task_raw, (void*)fshm, (int)is_gpu2gpu);
+  }
   chi::IpcManagerGpuInfo gpu_info = *gpu_info_ptr;
   CHIMAERA_GPU_SUBTASK_INIT(gpu_info, gridDim.x);
+  if (threadIdx.x == 0) {
+    printf("[RunTask] INIT DONE partition=%d\n", s_partition_id);
+  }
 
   // Reconstruct FullPtr from raw pointer + offset (avoids passing
   // user-defined-copy-ctor type to kernel)
@@ -109,6 +116,9 @@ __global__ void RunTask(Container *container, u32 method,
 
   // Execute the task method
   container->Run(method, task_ptr, rctx);
+  if (threadIdx.x == 0) {
+    printf("[RunTask] RUN DONE method=%u\n", method);
+  }
 
   // Thread 0 marks task as complete
   if (threadIdx.x == 0 && blockIdx.x == 0) {

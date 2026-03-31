@@ -110,6 +110,10 @@ int run_workload_llm_kvcache(const WorkloadConfig &cfg, const char *mode,
 int run_workload_synthetic(const WorkloadConfig &cfg, const char *mode,
                             WorkloadResult *result);
 
+// CUDA device malloc/free microbenchmark
+int run_cuda_malloc_bench(uint32_t client_blocks, uint32_t client_threads,
+                          uint32_t iterations);
+
 // CTE client overhead benchmark — measures AsyncPutBlob submission cost
 int run_cte_client_overhead(chi::PoolId cte_pool_id, wrp_cte::core::TagId tag_id,
                             uint32_t rt_blocks, uint32_t rt_threads,

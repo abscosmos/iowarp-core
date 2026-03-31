@@ -77,7 +77,8 @@ using namespace std::chrono_literals;
 //==============================================================================
 
 enum class TestCase { kClientOverhead, kClientOverheadCpu,
-  kWorkloadPageRank, kWorkloadGNN, kWorkloadGrayScott, kWorkloadLLMKVCache, kWorkloadSynthetic };
+  kWorkloadPageRank, kWorkloadGNN, kWorkloadGrayScott, kWorkloadLLMKVCache, kWorkloadSynthetic,
+  kCudaMalloc };
 
 struct BenchConfig {
   TestCase test_case = TestCase::kClientOverhead;
@@ -137,7 +138,7 @@ chi::u64 ParseSize(const std::string &s) {
 void PrintUsage(const char *prog) {
   HIPRINT("Usage: {} [options]", prog);
   HIPRINT("Options:");
-  HIPRINT("  --test-case <case>     client_overhead, client_overhead_cpu,");
+  HIPRINT("  --test-case <case>     client_overhead, client_overhead_cpu, cuda_malloc,");
   HIPRINT("                         pagerank, gnn, gray_scott, llm_kvcache, synthetic");
   HIPRINT("  --workload-mode <m>    For workloads: hbm, direct, bam, or cte (default: hbm)");
   HIPRINT("  --rt-blocks <N>        GPU runtime orchestrator blocks (default: 1)");
@@ -191,6 +192,7 @@ bool ParseArgs(int argc, char **argv, BenchConfig &cfg) {
       else if (tc == "gray_scott") cfg.test_case = TestCase::kWorkloadGrayScott;
       else if (tc == "llm_kvcache") cfg.test_case = TestCase::kWorkloadLLMKVCache;
       else if (tc == "synthetic") cfg.test_case = TestCase::kWorkloadSynthetic;
+      else if (tc == "cuda_malloc") cfg.test_case = TestCase::kCudaMalloc;
       else {
         HLOG(kError, "Unknown test case '{}'", tc);
         return false;
@@ -283,6 +285,12 @@ int main(int argc, char **argv) {
     }
   }
 
+  // cuda_malloc benchmark: standalone, no Chimaera runtime needed
+  if (cfg.test_case == TestCase::kCudaMalloc) {
+    return run_cuda_malloc_bench(cfg.client_blocks, cfg.client_threads,
+                                 cfg.iterations);
+  }
+
   // Load GPU config if CHI_SERVER_CONF is not already set
   if (!std::getenv("CHI_SERVER_CONF")) {
     std::string config_dir = std::string(__FILE__);
@@ -312,6 +320,7 @@ int main(int argc, char **argv) {
                          (cfg.test_case == TestCase::kWorkloadGrayScott) ? "gray_scott" :
                          (cfg.test_case == TestCase::kWorkloadLLMKVCache) ? "llm_kvcache" :
                          (cfg.test_case == TestCase::kWorkloadSynthetic) ? "synthetic" :
+                         (cfg.test_case == TestCase::kCudaMalloc) ? "cuda_malloc" :
                          "unknown";
 
   HIPRINT("\n=== CTE GPU Benchmark ===");
