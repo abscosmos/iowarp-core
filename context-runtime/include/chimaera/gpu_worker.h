@@ -84,7 +84,14 @@ class Worker;
  */
 __global__ void RunTask(Container *container, u32 method,
                         Task *task_raw, size_t task_shm_off,
-                        FutureShm *fshm, bool is_gpu2gpu) {
+                        FutureShm *fshm, bool is_gpu2gpu,
+                        chi::IpcManagerGpuInfo *gpu_info_ptr) {
+  // Initialize IpcManager for this CDP child kernel block.
+  // Reattaches to the orchestrator's existing RoundRobinAllocator and
+  // claims a partition for this block.
+  chi::IpcManagerGpuInfo gpu_info = *gpu_info_ptr;
+  CHIMAERA_GPU_SUBTASK_INIT(gpu_info, gridDim.x);
+
   // Reconstruct FullPtr from raw pointer + offset (avoids passing
   // user-defined-copy-ctor type to kernel)
   hipc::FullPtr<Task> task_ptr;
@@ -135,6 +142,7 @@ class Worker {
   PoolManager *pool_mgr_;
   char *queue_backend_base_;
   WorkOrchestratorControl *dbg_ctrl_;
+  IpcManagerGpuInfo *gpu_info_ptr_; /**< Device ptr to gpu_info for CDP child init */
 
   // Profiling counters
   long long prof_queue_pop_, prof_task_count_;
@@ -150,6 +158,7 @@ class Worker {
     pool_mgr_ = pool_mgr;
     queue_backend_base_ = queue_backend_base;
     dbg_ctrl_ = dbg_ctrl;
+    gpu_info_ptr_ = nullptr;  // Set by orchestrator after init
     is_running_ = true;
     prof_queue_pop_ = 0;
     prof_task_count_ = 0;
@@ -280,7 +289,8 @@ class Worker {
 
     // Launch CDP child kernel with fire-and-forget semantics
     RunTask<<<grid_dim, 32>>>(container, method_id, task_ptr.ptr_,
-                               task_ptr.shm_.off_.load(), fshm, is_gpu2gpu);
+                               task_ptr.shm_.off_.load(), fshm, is_gpu2gpu,
+                               gpu_info_ptr_);
 
     return 1;
   }

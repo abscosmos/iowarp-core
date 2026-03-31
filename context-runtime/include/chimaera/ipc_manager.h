@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "hermes_shm/data_structures/priv/array_vector.h"
+#include "hermes_shm/memory/allocator/round_robin_allocator.h"
 #include "chimaera/chimaera_manager.h"
 #include "chimaera/corwlock.h"
 #include "chimaera/scheduler/scheduler.h"
@@ -388,7 +389,7 @@ class IpcManager {
     if (num_warps < kMaxCachedWarps) num_warps = kMaxCachedWarps;
     if (gpu_backend_.data_ != nullptr) {
       if (gpu_info.skip_scratch_init) {
-        gpu_alloc_ = reinterpret_cast<hipc::PartitionedAllocator *>(gpu_backend_.data_);
+        gpu_alloc_ = reinterpret_cast<hipc::RoundRobinAllocator *>(gpu_backend_.data_);
         gpu_alloc_->WaitReady();
       } else {
         InitHeapAllocator(gpu_backend_, num_warps, &gpu_alloc_);
@@ -400,7 +401,7 @@ class IpcManager {
       gpu2cpu_backend_ = gpu_info.gpu2cpu_backend;
       if (gpu_info.skip_scratch_init) {
         gpu2cpu_alloc_ =
-            reinterpret_cast<hipc::PartitionedAllocator *>(gpu2cpu_backend_.data_);
+            reinterpret_cast<hipc::RoundRobinAllocator *>(gpu2cpu_backend_.data_);
         gpu2cpu_alloc_->WaitReady();
       } else {
         InitHeapAllocator(gpu2cpu_backend_, num_warps, &gpu2cpu_alloc_);
@@ -437,12 +438,12 @@ class IpcManager {
    */
   HSHM_CROSS_FUN
   void InitHeapAllocator(const hipc::MemoryBackend &backend, int num_threads,
-                         hipc::PartitionedAllocator **alloc_out) {
+                         hipc::RoundRobinAllocator **alloc_out) {
     char *base = backend.data_;
     size_t data_capacity = backend.data_capacity_;
 
-    auto *alloc = reinterpret_cast<hipc::PartitionedAllocator *>(base);
-    new (alloc) hipc::PartitionedAllocator();
+    auto *alloc = reinterpret_cast<hipc::RoundRobinAllocator *>(base);
+    new (alloc) hipc::RoundRobinAllocator();
 
     hipc::MemoryBackend sub_backend;
     sub_backend.data_ = base;
@@ -450,7 +451,7 @@ class IpcManager {
     sub_backend.id_ = backend.id_;
 
     // Calculate per-thread partition size (leave room for allocator header)
-    size_t overhead = sizeof(hipc::PartitionedAllocator);
+    size_t overhead = sizeof(hipc::RoundRobinAllocator);
     size_t thread_unit = (data_capacity - overhead) / num_threads;
 
     alloc->shm_init(sub_backend, 0, num_threads, thread_unit);
@@ -486,26 +487,46 @@ class IpcManager {
       return warp_mgrs_[local_warp];
     }
     if (gpu_alloc_) {
-      auto *shared_alloc = gpu_alloc_->GetWarpAllocator();
-      if (shared_alloc) {
-        // Allocate WarpIpcManager from shared allocator
-        auto p = shared_alloc->template AllocateObjs<WarpIpcManager>(1);
-        if (p.IsNull()) return nullptr;
-        // Allocate private region from shared allocator
-        auto priv = shared_alloc->template AllocateObjs<char>(priv_region_size_);
-        if (priv.IsNull()) {
-          shared_alloc->Free(p);
-          return nullptr;
-        }
-        auto *mgr = new (p.ptr_) WarpIpcManager(priv.ptr_, priv_region_size_);
-        if (local_warp < kMaxCachedWarps) warp_mgrs_[local_warp] = mgr;
-        return mgr;
+      // Allocate from the RoundRobinAllocator (auto-partition)
+      auto p = gpu_alloc_->template AllocateObjs<WarpIpcManager>(1);
+      if (p.IsNull()) return nullptr;
+      auto priv = gpu_alloc_->template AllocateObjs<char>(priv_region_size_);
+      if (priv.IsNull()) {
+        gpu_alloc_->Free(p);
+        return nullptr;
       }
+      auto *mgr = new (p.ptr_) WarpIpcManager(priv.ptr_, priv_region_size_);
+      if (local_warp < kMaxCachedWarps) warp_mgrs_[local_warp] = mgr;
+      return mgr;
     }
     return nullptr;
 #else
     return nullptr;
 #endif
+  }
+
+  /**
+   * Claim a partition from the RoundRobinAllocator.
+   * Thread-safe via atomic increment.
+   * @return Partition index
+   */
+  HSHM_GPU_FUN int ClaimPartition() {
+    if (gpu_alloc_) {
+      return gpu_alloc_->ClaimPartition();
+    }
+    return 0;
+  }
+
+  /**
+   * Get the BuddyAllocator for a specific partition.
+   * @param partition_id From ClaimPartition() or __shared__ s_partition_id
+   * @return Pointer to the partition's locked BuddyAllocator
+   */
+  HSHM_GPU_FUN hipc::BuddyAllocator *GetPartitionAlloc(int partition_id) {
+    if (gpu_alloc_) {
+      return gpu_alloc_->GetAllocator(partition_id);
+    }
+    return nullptr;
   }
 
   HSHM_CROSS_FUN hipc::PrivateBuddyAllocator *GetPrivAlloc() {
@@ -772,7 +793,7 @@ class IpcManager {
    * @param size Arena size in bytes
    * @return Arena RAII handle
    */
-  HSHM_CROSS_FUN hipc::Arena<hipc::PartitionedAllocator> PushArena(size_t size);
+  HSHM_CROSS_FUN hipc::Arena<hipc::RoundRobinAllocator> PushArena(size_t size);
 
   /**
    * Allocate GPU device data from the client's GpuMalloc backend.
@@ -2605,7 +2626,7 @@ class IpcManager {
   /** Primary GPU backend (orchestrator scratch or client device memory) */
   hipc::MemoryBackend gpu_backend_;
   /** PartitionedAllocator for GPU→GPU FutureShm or orch scratch (device memory) */
-  hipc::PartitionedAllocator *gpu_alloc_ = nullptr;
+  hipc::RoundRobinAllocator *gpu_alloc_ = nullptr;
   static constexpr u32 kMaxCachedWarps = 32;
   WarpIpcManager *warp_mgrs_[kMaxCachedWarps] = {};
   size_t priv_region_size_ = 32768;  /**< Per-warp private BuddyAllocator region */
@@ -2614,7 +2635,7 @@ class IpcManager {
   /** Pinned-host backend for GPU→CPU FutureShm allocation (ToLocalCpu path) */
   hipc::MemoryBackend gpu2cpu_backend_;
   /** PartitionedAllocator for GPU→CPU FutureShm (pinned host) */
-  hipc::PartitionedAllocator *gpu2cpu_alloc_ = nullptr;
+  hipc::RoundRobinAllocator *gpu2cpu_alloc_ = nullptr;
 
   // --- GPU allocator table for GPU-side ShmPtr resolution ---
   IpcManagerGpuInfo::GpuAllocEntry
@@ -2846,7 +2867,7 @@ namespace chi {
 HSHM_GPU_FUN inline hipc::PrivateBuddyAllocator *GetPrivAllocGpu() {
   return CHI_IPC->GetPrivAlloc();
 }
-HSHM_GPU_FUN inline hipc::PartitionedAllocator *GetSharedAllocGpu() {
+HSHM_GPU_FUN inline hipc::RoundRobinAllocator *GetSharedAllocGpu() {
   return CHI_IPC->gpu_alloc_;
 }
 }  // namespace chi
@@ -2946,6 +2967,31 @@ HSHM_GPU_FUN inline hipc::PartitionedAllocator *GetSharedAllocGpu() {
   }                                                                            \
   __syncthreads();                                                             \
   chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr
+
+/**
+ * Initialize IpcManager in a CDP child kernel (subtask).
+ *
+ * Reattaches to the orchestrator's existing RoundRobinAllocator
+ * (skip_heap_init + skip_scratch_init). Claims a partition from the
+ * round-robin allocator and stores it in __shared__ memory so all
+ * threads in this block share the same partition.
+ */
+#define CHIMAERA_GPU_SUBTASK_INIT(gpu_info, num_blocks)                        \
+  chi::IpcManager *g_ipc_manager_ptr = chi::IpcManager::GetBlockIpcManager();  \
+  int thread_id = chi::IpcManager::GetGpuThreadId();                           \
+  int num_threads = chi::IpcManager::GetGpuNumThreads();                       \
+  __shared__ int s_partition_id;                                               \
+  if (thread_id == 0) {                                                        \
+    chi::IpcManagerGpuInfo block_info = gpu_info;                              \
+    block_info.skip_heap_init = true;                                          \
+    block_info.skip_scratch_init = true;                                       \
+    g_ipc_manager_ptr->ClientInitGpu(block_info, num_threads, num_blocks);     \
+    g_ipc_manager_ptr->is_gpu_runtime_ = true;                                 \
+    s_partition_id = g_ipc_manager_ptr->ClaimPartition();                       \
+  }                                                                            \
+  __syncthreads();                                                             \
+  chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr;                        \
+  (void)s_partition_id
 #endif
 
 // Define Future methods after IpcManager and CHI_IPC are fully defined
@@ -2974,13 +3020,13 @@ inline HSHM_CROSS_FUN hipc::Arena<hipc::PrivateBuddyAllocator> IpcManager::PushP
   return hipc::Arena<hipc::PrivateBuddyAllocator>();
 }
 
-inline HSHM_CROSS_FUN hipc::Arena<hipc::PartitionedAllocator> IpcManager::PushArena(
+inline HSHM_CROSS_FUN hipc::Arena<hipc::RoundRobinAllocator> IpcManager::PushArena(
     size_t size) {
   // PushArena is for bulk allocator (PartitionedAllocator-based)
   if (gpu_backend_initialized_ && gpu_alloc_ != nullptr) {
     return gpu_alloc_->PushArena(size);
   }
-  return hipc::Arena<hipc::PartitionedAllocator>();
+  return hipc::Arena<hipc::RoundRobinAllocator>();
 }
 
 // Unified FreeBuffer implementation for GPU (host version is in ipc_manager.cc)

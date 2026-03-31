@@ -76,9 +76,11 @@ if(WRP_CORE_ENABLE_CUDA)
       gpu/workload_gray_scott.cc
       gpu/workload_llm_kvcache.cc
       gpu/workload_synthetic.cc
+      gpu/workload_cuda_malloc.cc
       INCLUDE_DIRS
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark
+          ${CMAKE_SOURCE_DIR}/context-transfer-engine/benchmark/gpu
           ${CMAKE_SOURCE_DIR}/context-runtime/include
           ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
           ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
@@ -167,6 +169,13 @@ if(WRP_CORE_ENABLE_CUDA)
   set_tests_properties(cte_gpu_bench_alloc_test PROPERTIES
     TIMEOUT 60 LABELS "msan_skip")
 
+  add_test(NAME cte_gpu_bench_cuda_malloc
+    COMMAND wrp_cte_gpu_bench
+      --test-case cuda_malloc
+      --iterations 10)
+  set_tests_properties(cte_gpu_bench_cuda_malloc PROPERTIES
+    TIMEOUT 120 LABELS "msan_skip")
+
   # BaM regression tests (only when BaM is enabled)
   set(_BAM_TEST_NAMES "")
   if(WRP_CORE_ENABLE_BAM AND TARGET bam)
@@ -254,6 +263,7 @@ if(WRP_CORE_ENABLE_CUDA)
     cte_gpu_bench_putblob_gpu_64warp
     cte_gpu_bench_putblob_gpu_64warp_stress
     cte_gpu_bench_alloc_test
+    cte_gpu_bench_cuda_malloc
     cte_gpu_synthetic_hbm
     cte_gpu_synthetic_direct
     cte_gpu_synthetic_hbm_validate

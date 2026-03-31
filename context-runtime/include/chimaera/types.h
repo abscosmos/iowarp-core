@@ -45,6 +45,7 @@
 #include <hermes_shm/hermes_shm.h>
 #include <hermes_shm/memory/allocator/malloc_allocator.h>
 #include <hermes_shm/memory/allocator/thread_allocator.h>
+#include <hermes_shm/memory/allocator/round_robin_allocator.h>
 
 /**
  * Core type definitions for Chimaera distributed task execution framework
@@ -484,8 +485,8 @@ HSHM_GPU_FUN hipc::PrivateBuddyAllocator *GetPrivAllocGpu();
 // which dispatches allocations to the calling warp's partition via GetAutoTid().
 // Use for cross-warp data structures (shared maps, vectors) where multiple warps
 // may allocate/free concurrently.
-#define CHI_PRIV_SHARED_ALLOC_T hipc::PartitionedAllocator
-HSHM_GPU_FUN hipc::PartitionedAllocator *GetSharedAllocGpu();
+#define CHI_PRIV_SHARED_ALLOC_T hipc::RoundRobinAllocator
+HSHM_GPU_FUN hipc::RoundRobinAllocator *GetSharedAllocGpu();
 #define CHI_PRIV_SHARED_ALLOC   (::chi::GetSharedAllocGpu())
 #endif
 

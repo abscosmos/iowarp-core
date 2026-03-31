@@ -83,6 +83,14 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
 
   // Only thread 0 polls
   if (threadIdx.x == 0) {
+    // Store gpu_info in device heap so CDP child kernels can access it
+    // via pointer (IpcManagerGpuInfo can't be passed by value to kernels).
+    IpcManagerGpuInfo *d_gpu_info = static_cast<IpcManagerGpuInfo *>(
+        malloc(sizeof(IpcManagerGpuInfo)));
+    if (d_gpu_info) {
+      memcpy(d_gpu_info, &gpu_info, sizeof(IpcManagerGpuInfo));
+    }
+
     gpu::Worker worker;
     worker.Init(0,           // worker_id
                 gpu_info.cpu2gpu_queue,
@@ -91,6 +99,7 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
                 pool_mgr,
                 gpu_info.cpu2gpu_queue_base,
                 control);
+    worker.gpu_info_ptr_ = d_gpu_info;
 
     // Poll until exit signal
     while (worker.is_running_ && !control->exit_flag) {
@@ -100,6 +109,7 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
     // Flush orchestrator profile to pinned host memory before shutdown
     worker.FlushProfile();
     worker.Finalize();
+    if (d_gpu_info) free(d_gpu_info);
   }
 }
 

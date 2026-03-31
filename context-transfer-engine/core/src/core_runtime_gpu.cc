@@ -451,10 +451,7 @@ HSHM_GPU_FUN void GpuRuntime::PutBlob(
   // Allocate blocks via bdev (outside locks)
   auto alloc_task = target_info.bdev_client_.AsyncAllocateBlocks(
       target_info.target_query_, size);
-  // Spin-poll for allocation completion
-  while (alloc_task->return_code_ == -1) {
-    // Task not yet complete, continue spinning
-  }
+  alloc_task.Wait();
 
   if (alloc_task->blocks_.empty()) {
     task->return_code_ = 8;  // Allocation failed
@@ -466,10 +463,7 @@ HSHM_GPU_FUN void GpuRuntime::PutBlob(
   warp_query.SetParallelism(32);
   auto write_task = target_info.bdev_client_.AsyncWrite(
       warp_query, alloc_task->blocks_, task->blob_data_, size);
-  // Spin-poll for write completion
-  while (write_task->return_code_ == -1) {
-    // Task not yet complete, continue spinning
-  }
+  write_task.Wait();
 
   if (write_task->return_code_ != 0) {
     task->return_code_ = 9;  // Write failed
@@ -600,10 +594,7 @@ HSHM_GPU_FUN void GpuRuntime::GetBlob(
   warp_query.SetParallelism(32);
   auto read_task = blocks[0].bdev_client_.AsyncRead(
       warp_query, read_blocks, task->blob_data_, size);
-  // Spin-poll for read completion
-  while (read_task->return_code_ == -1) {
-    // Task not yet complete, continue spinning
-  }
+  read_task.Wait();
 
   if (read_task->return_code_ != 0) {
     task->return_code_ = 4;  // Read failed
