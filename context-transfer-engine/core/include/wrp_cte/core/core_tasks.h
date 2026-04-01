@@ -1077,6 +1077,11 @@ struct PutBlobTask : public chi::Task {
     ar.range(return_code_, context_);
   }
 
+  /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
+  HSHM_CROSS_FUN void FixupAfterCopy() {
+    blob_name_.FixupSsoPointer();
+  }
+
   /**
    * Copy from another PutBlobTask
    */
@@ -1186,6 +1191,11 @@ struct GetBlobTask : public chi::Task {
   HSHM_CROSS_FUN void SerializeOut(Archive &ar) {
     ar.range(return_code_, completer_);
     ar.bulk(blob_data_, size_, BULK_XFER);
+  }
+
+  /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
+  HSHM_CROSS_FUN void FixupAfterCopy() {
+    blob_name_.FixupSsoPointer();
   }
 
   /**

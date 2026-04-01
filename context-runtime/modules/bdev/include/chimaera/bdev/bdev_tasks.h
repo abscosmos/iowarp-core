@@ -476,6 +476,11 @@ struct WriteTask : public chi::Task {
     ar(bytes_written_);
   }
 
+  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
+  HSHM_CROSS_FUN void FixupAfterCopy() {
+    blocks_.FixupSvoPtr();
+  }
+
   /** Aggregate */
   void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
     Task::Aggregate(other_base);
@@ -551,6 +556,11 @@ struct ReadTask : public chi::Task {
     ar(length_, bytes_read_);
     // Use BULK_XFER to actually transfer the read data back
     ar.bulk(data_, length_, BULK_XFER);
+  }
+
+  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
+  HSHM_CROSS_FUN void FixupAfterCopy() {
+    blocks_.FixupSvoPtr();
   }
 
   /** Aggregate */

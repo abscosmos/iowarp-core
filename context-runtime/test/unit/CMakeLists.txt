@@ -496,6 +496,30 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   )
 endif()
 
+# GPU POD Transfer test — proves CPU↔GPU task transfer via cudaMemcpy
+if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
+  find_package(CUDAToolkit QUIET)
+  add_cuda_executable(test_gpu_pod_transfer FALSE test_gpu_pod_transfer.cu
+    INCLUDE_DIRS
+      ${CHIMAERA_ROOT}/include
+      ${CHIMAERA_ROOT}/modules/admin/include
+      ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+      ${CHIMAERA_ROOT}/modules/bdev/include
+      ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+    LINK_LIBS
+      chimaera::cxx
+      hshm::cuda_cxx
+      Catch2::Catch2WithMain
+    DEFS CUDA_FORCE_CDP1_IF_SUPPORTED __CDPRT_SUPPRESS_SYNC_DEPRECATION_WARNING
+  )
+  target_compile_options(test_gpu_pod_transfer PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-rdc=true>)
+  add_test(NAME test_gpu_pod_transfer COMMAND test_gpu_pod_transfer)
+  set_tests_properties(test_gpu_pod_transfer PROPERTIES
+    TIMEOUT 60 LABELS "gpu;transfer")
+endif()
+
 # GPU Coroutine test removed (coroutines removed from GPU path in CDP migration)
 if(FALSE AND (WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM))
   set(GPU_COROUTINE_TEST_TARGET test_gpu_coroutine)
