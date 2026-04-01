@@ -2170,7 +2170,10 @@ class IpcManager {
    * Helper: cudaMemcpy device→host for POD task output retrieval.
    */
   void CudaMemcpyToHost(void *host_dst, const void *device_src, size_t size);
+  void CudaMemcpyToHostAsync(void *host_dst, const void *device_src, size_t size);
   void CudaMemcpyToDevice(void *device_dst, const void *host_src, size_t size);
+  void *CudaMallocHostPinned(size_t size);
+  void CudaFreeHostPinned(void *ptr);
 
   /**
    * Helper: cudaFree for POD task device buffer.
@@ -2204,36 +2207,36 @@ class IpcManager {
       return Future<TaskT>();
     }
 
-    // 1. Allocate device buffer: [TaskT | FutureShm]
+    // 1. Allocate device buffer for task only
     size_t task_size = sizeof(TaskT);
-    size_t total_size = task_size + sizeof(FutureShm);
     void *device_buf = CudaMallocAndCopy(
-        static_cast<const void *>(task_ptr.ptr_), task_size, total_size);
+        static_cast<const void *>(task_ptr.ptr_), task_size, task_size);
     if (!device_buf) {
       return Future<TaskT>();
     }
 
-    // 2. Initialize FutureShm in device memory (after the task)
-    FutureShm fshm;
-    memset(&fshm, 0, sizeof(fshm));
-    fshm.pool_id_ = task_ptr->pool_id_;
-    fshm.method_id_ = task_ptr->method_;
-    fshm.origin_ = FutureShm::FUTURE_CLIENT_SHM;
-    fshm.client_task_vaddr_ = reinterpret_cast<uintptr_t>(device_buf);
-    fshm.task_device_ptr_ = reinterpret_cast<uintptr_t>(device_buf);
-    fshm.task_size_ = static_cast<u32>(task_size);
-    fshm.flags_.SetBits(FutureShm::FUTURE_POD_COPY);
-    CudaMemcpyToDevice(
-        static_cast<char *>(device_buf) + task_size,
-        &fshm, sizeof(FutureShm));
+    // 2. Allocate FutureShm in pinned host memory (GPU can write via UVA,
+    //    CPU can read directly without cudaMemcpy which blocks on persistent kernel)
+    FutureShm *fshm = static_cast<FutureShm *>(
+        CudaMallocHostPinned(sizeof(FutureShm)));
+    if (!fshm) {
+      CudaFreeDevice(device_buf);
+      return Future<TaskT>();
+    }
+    memset(fshm, 0, sizeof(FutureShm));
+    fshm->pool_id_ = task_ptr->pool_id_;
+    fshm->method_id_ = task_ptr->method_;
+    fshm->origin_ = FutureShm::FUTURE_CLIENT_SHM;
+    fshm->client_task_vaddr_ = reinterpret_cast<uintptr_t>(device_buf);
+    fshm->task_device_ptr_ = reinterpret_cast<uintptr_t>(device_buf);
+    fshm->task_size_ = static_cast<u32>(task_size);
+    fshm->flags_.SetBits(FutureShm::FUTURE_POD_COPY);
 
-    // 3. Create Future with sentinel alloc_id for GPU POD transfer.
-    //    The ShmPtr stores the device address of the FutureShm directly.
-    //    Sentinel (UINT32_MAX-1, 0) distinguishes from normal null alloc_id.
+    // 3. Create Future with sentinel alloc_id.
+    //    ShmPtr stores the pinned-host FutureShm address directly.
     hipc::ShmPtr<FutureShm> fshmptr;
     fshmptr.alloc_id_ = hipc::AllocatorId{UINT32_MAX - 1, 0};
-    fshmptr.off_ = reinterpret_cast<size_t>(
-        static_cast<char *>(device_buf) + task_size);
+    fshmptr.off_ = reinterpret_cast<size_t>(fshm);
     Future<TaskT> future(fshmptr, task_ptr);
 
     // 4. Push to CPU→GPU queue
@@ -2241,13 +2244,15 @@ class IpcManager {
     Future<Task> task_future(future.GetFutureShmPtr());
     lane.Push(task_future);
 
-    // 5. Flush queue to DRAM for GPU visibility
+    // 5. Flush queue + FutureShm to DRAM for GPU visibility
 #if defined(__x86_64__) || defined(__i386__)
     {
-      const char *q_base = reinterpret_cast<const char *>(&lane);
-      for (const char *cl = q_base; cl < q_base + sizeof(lane); cl += 64) {
+      const char *base = reinterpret_cast<const char *>(fshm);
+      for (const char *cl = base; cl < base + sizeof(FutureShm); cl += 64)
         _mm_clflush(cl);
-      }
+      const char *q_base = reinterpret_cast<const char *>(&lane);
+      for (const char *cl = q_base; cl < q_base + sizeof(lane); cl += 64)
+        _mm_clflush(cl);
       _mm_sfence();
     }
 #endif
@@ -3160,22 +3165,13 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
     // GPU device pointers, distinguishing from normal null-alloc SHM futures.
     static const hipc::AllocatorId kGpuPodAllocId{UINT32_MAX - 1, 0};
     if (is_runtime && future_shm_.alloc_id_ == kGpuPodAllocId) {
-        // CPU→GPU POD PATH: FutureShm is in device memory.
-        // Poll by cudaMemcpy D→H of just the flags field.
-        void *device_fshm = reinterpret_cast<void *>(future_shm_.off_.load());
-        void *device_task = reinterpret_cast<void *>(
-            future_shm_.off_.load() - sizeof(TaskT));
+        // CPU→GPU POD PATH: FutureShm is in pinned host memory (GPU writes
+        // via system-scope atomics). CPU reads directly — no cudaMemcpy needed.
+        FutureShm *fshm = reinterpret_cast<FutureShm *>(future_shm_.off_.load());
         auto start = std::chrono::steady_clock::now();
 
-        // Poll flags via D→H copy
-        u32 flags_val = 0;
-        size_t flags_offset = offsetof(FutureShm, flags_);
-        while (!(flags_val & FutureShm::FUTURE_COMPLETE)) {
-          CHI_IPC->CudaMemcpyToHost(
-              &flags_val,
-              static_cast<char *>(device_fshm) + flags_offset,
-              sizeof(u32));
-          if (flags_val & FutureShm::FUTURE_COMPLETE) break;
+        // Poll pinned-host FutureShm flags directly
+        while (!fshm->flags_.AnySystem(FutureShm::FUTURE_COMPLETE)) {
           HSHM_THREAD_MODEL->Yield();
           if (max_sec > 0) {
             float elapsed = std::chrono::duration<float>(
@@ -3185,15 +3181,20 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
           }
         }
 
-        // Copy full task back from device to host
-        if (task_ptr_.ptr_) {
-          CHI_IPC->CudaMemcpyToHost(
-              task_ptr_.ptr_, device_task, sizeof(TaskT));
+        // Copy task results from device to host (async to avoid blocking
+        // on persistent kernel — uses non-blocking stream internally)
+        if (task_ptr_.ptr_ && fshm->task_device_ptr_ != 0) {
+          CHI_IPC->CudaMemcpyToHostAsync(
+              task_ptr_.ptr_,
+              reinterpret_cast<void *>(fshm->task_device_ptr_),
+              fshm->task_size_);
           task_ptr_->FixupAfterCopy();
         }
 
-        // Free device buffer (task + FutureShm)
-        CHI_IPC->CudaFreeDevice(device_task);
+        // Free device task buffer and pinned FutureShm
+        CHI_IPC->CudaFreeDevice(
+            reinterpret_cast<void *>(fshm->task_device_ptr_));
+        CHI_IPC->CudaFreeHostPinned(fshm);
         return true;
       }
 #endif

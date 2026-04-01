@@ -43,12 +43,13 @@
  * All lanes participate (warp-cooperative APIs).
  */
 __global__ void gpu_cte_setup_kernel(
-    chi::IpcManagerGpu gpu_info,
+    chi::IpcManagerGpu *gpu_info_ptr,
     chi::PoolId cte_pool_id,
     chi::PoolId bdev_pool_id,
     chi::u64 target_size,
     int *d_result,
     wrp_cte::core::TagId *d_tag_id) {
+  chi::IpcManagerGpu gpu_info = *gpu_info_ptr;
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, 1);
 
   auto *ipc = CHI_IPC;
@@ -518,23 +519,40 @@ int run_gpu_cte_setup(chi::PoolId cte_pool_id, chi::PoolId bdev_pool_id,
   // Don't pause/resume — the setup kernel needs the orchestrator
   // to process RegisterTarget and GetOrCreateTag tasks.
 
-  void *stream = hshm::GpuApi::CreateStream();
-  gpu_cte_setup_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
-      setup_gpu_info, cte_pool_id, bdev_pool_id,
+  // Use pinned host memory for gpu_info (cudaMallocHost doesn't block like cudaMalloc
+  // which device-synchronizes and deadlocks with the persistent kernel)
+  chi::IpcManagerGpu *d_gpu_info;
+  cudaMallocHost(&d_gpu_info, sizeof(chi::IpcManagerGpu));
+  memcpy(d_gpu_info, &setup_gpu_info, sizeof(chi::IpcManagerGpu));
+
+  printf("[HOST-SETUP] About to create stream...\n");
+  fflush(stdout);
+  cudaStream_t setup_stream;
+  cudaStreamCreateWithFlags(&setup_stream, cudaStreamNonBlocking);
+  printf("[HOST-SETUP] Stream created. Launching kernel...\n");
+  fflush(stdout);
+  gpu_cte_setup_kernel<<<1, 32, 0, setup_stream>>>(
+      d_gpu_info, cte_pool_id, bdev_pool_id,
       target_size, d_result, d_tag_id);
+
+  cudaError_t lerr = cudaGetLastError();
+  printf("[HOST-SETUP] Launch result: %s\n", cudaGetErrorString(lerr));
+  fflush(stdout);
 
   // Poll for completion (result != 0 means done)
   int elapsed_us = 0;
-  while (*d_result == 0 && elapsed_us < 15000000) {
+  while (*d_result == 0 && elapsed_us < 10000000) {
     usleep(1000000);  // 1s
     elapsed_us += 1000000;
     printf("[HOST-SETUP] poll: elapsed=%ds result=%d\n",
            elapsed_us / 1000000, (int)*d_result);
+    fflush(stdout);
     printf("[HOST] gpu_cte_setup poll: elapsed=%dms result=%d\n",
            elapsed_us / 1000, (int)*d_result);
   }
-  hshm::GpuApi::Synchronize(stream);
-  hshm::GpuApi::DestroyStream(stream);
+  cudaStreamSynchronize(setup_stream);
+  cudaStreamDestroy(setup_stream);
+  cudaFreeHost(d_gpu_info);
 
   int rc = *d_result;
   if (rc == 1 && out_tag_id) {

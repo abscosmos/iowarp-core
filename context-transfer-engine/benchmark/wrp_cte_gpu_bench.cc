@@ -524,34 +524,52 @@ int main(int argc, char **argv) {
     }
     std::this_thread::sleep_for(200ms);
 
-    // Create HBM bdev pool from CPU (compose has empty storage to avoid hang)
-    chi::PoolId bdev_pool_id(800, 0);
+    // Use compose's ram bdev pool (301,0) as the GPU target backing store.
+    chi::PoolId bdev_pool_id(301, 0);  // ram::chi_default_bdev from compose
     chi::u64 target_size = 64ULL * 1024 * 1024;
     if (!cfg.targets.empty()) target_size = cfg.targets[0].size_bytes;
+
+    // Register target on GPU via SendCpuToGpu (POD copy path)
+    HIPRINT("Registering GPU target via SendCpuToGpu...");
     {
-      chimaera::bdev::Client bdev_client(bdev_pool_id);
-      auto bdev_create = bdev_client.AsyncCreate(
-          chi::PoolQuery::Dynamic(), "gpu_bench_hbm_bdev",
-          bdev_pool_id, chimaera::bdev::BdevType::kHbm, target_size);
-      bdev_create.Wait();
-      if (bdev_create->return_code_ != 0) {
-        HLOG(kError, "Failed to create HBM bdev: {}", bdev_create->return_code_);
+      auto *ipc = CHI_IPC;
+      auto reg_task = ipc->NewTask<wrp_cte::core::RegisterTargetTask>(
+          chi::CreateTaskId(), gpu_pool_id,
+          chi::PoolQuery::LocalGpuBcast(),
+          "gpu_bench_target",
+          chimaera::bdev::BdevType::kRam,
+          target_size,
+          chi::PoolQuery::Local(), bdev_pool_id);
+      auto reg_future = ipc->Send(reg_task);
+      bool ok = reg_future.Wait(10.0f);
+      if (!ok || reg_task->return_code_ != 0) {
+        HLOG(kError, "GPU RegisterTarget failed: ok={} rc={}",
+             ok, (int)reg_task->return_code_);
         return 1;
       }
-      HIPRINT("Created HBM bdev pool ({},{}) size={}", bdev_pool_id.major_,
-              bdev_pool_id.minor_, target_size);
-      std::this_thread::sleep_for(200ms);
+      HIPRINT("GPU RegisterTarget OK");
     }
 
+    // Create tag on GPU via SendCpuToGpu
     wrp_cte::core::TagId tag_id;
-    HIPRINT("Running GPU-side CTE setup (register target + create tag)...");
-    int setup_rc = run_gpu_cte_setup(gpu_pool_id, bdev_pool_id,
-                                      target_size, &tag_id);
-    if (setup_rc != 1) {
-      HLOG(kError, "GPU-side CTE setup failed: {}", setup_rc);
-      return 1;
+    HIPRINT("Creating GPU tag via SendCpuToGpu...");
+    {
+      auto *ipc = CHI_IPC;
+      auto tag_task = ipc->NewTask<wrp_cte::core::GetOrCreateTagTask<wrp_cte::core::CreateParams>>(
+          chi::CreateTaskId(), gpu_pool_id,
+          chi::PoolQuery::LocalGpuBcast(),
+          "gpu_bench_tag",
+          wrp_cte::core::TagId::GetNull());
+      auto tag_future = ipc->Send(tag_task);
+      bool ok = tag_future.Wait(10.0f);
+      if (!ok || tag_task->return_code_ != 0) {
+        HLOG(kError, "GPU GetOrCreateTag failed: ok={} rc={}",
+             ok, (int)tag_task->return_code_);
+        return 1;
+      }
+      tag_id = tag_task->tag_id_;
+      HIPRINT("GPU GetOrCreateTag OK, tag_id=({},{})", tag_id.major_, tag_id.minor_);
     }
-    HIPRINT("GPU-side CTE setup OK, tag_id=({},{})", tag_id.major_, tag_id.minor_);
     std::this_thread::sleep_for(200ms);
     std::this_thread::sleep_for(200ms);
 

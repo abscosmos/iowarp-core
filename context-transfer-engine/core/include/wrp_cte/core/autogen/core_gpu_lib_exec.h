@@ -174,13 +174,16 @@ static HSHM_GPU_FUN void FixupTaskImpl(
     hipc::FullPtr<chi::Task> task) {
   (void)self_;
   switch (method) {
+    case Method::kRegisterTarget:
+      task.template Cast<RegisterTargetTask>().ptr_->FixupAfterCopy();
+      break;
     case Method::kPutBlob:
       task.template Cast<PutBlobTask>().ptr_->FixupAfterCopy();
       break;
     case Method::kGetBlob:
       task.template Cast<GetBlobTask>().ptr_->FixupAfterCopy();
       break;
-    default: break;  // RegisterTarget, GetOrCreateTag, etc.
+    default: break;
   }
 }
 

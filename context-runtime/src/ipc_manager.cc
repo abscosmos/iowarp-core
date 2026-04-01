@@ -963,6 +963,19 @@ void IpcManager::CudaMemcpyToHost(void *host_dst, const void *device_src,
 #endif
 }
 
+void IpcManager::CudaMemcpyToHostAsync(void *host_dst, const void *device_src,
+                                        size_t size) {
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  cudaStream_t s;
+  cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+  cudaMemcpyAsync(host_dst, device_src, size, cudaMemcpyDeviceToHost, s);
+  cudaStreamSynchronize(s);
+  cudaStreamDestroy(s);
+#else
+  (void)host_dst; (void)device_src; (void)size;
+#endif
+}
+
 void IpcManager::CudaMemcpyToDevice(void *device_dst, const void *host_src,
                                       size_t size) {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
@@ -970,6 +983,25 @@ void IpcManager::CudaMemcpyToDevice(void *device_dst, const void *host_src,
                         static_cast<const char *>(host_src), size);
 #else
   (void)device_dst; (void)host_src; (void)size;
+#endif
+}
+
+void *IpcManager::CudaMallocHostPinned(size_t size) {
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  void *ptr = nullptr;
+  cudaMallocHost(&ptr, size);
+  return ptr;
+#else
+  (void)size;
+  return nullptr;
+#endif
+}
+
+void IpcManager::CudaFreeHostPinned(void *ptr) {
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  if (ptr) cudaFreeHost(ptr);
+#else
+  (void)ptr;
 #endif
 }
 

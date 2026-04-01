@@ -295,6 +295,11 @@ struct RegisterTargetTask : public chi::Task {
     Task::SerializeOut(ar);
   }
 
+  /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
+  HSHM_CROSS_FUN void FixupAfterCopy() {
+    target_name_.FixupSsoPointer();
+  }
+
   /**
    * Copy from another RegisterTargetTask
    * Used when creating replicas for remote execution
