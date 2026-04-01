@@ -127,21 +127,10 @@ __global__ void RunTask(Container *container, u32 method,
 
   // Thread 0 marks task as complete
   if (threadIdx.x == 0 && blockIdx.x == 0) {
-    printf("[RunTask] MARKING COMPLETE fshm=%p is_gpu2gpu=%d\n",
-           (void*)fshm, (int)is_gpu2gpu);
-    __threadfence_system();
-    if (is_gpu2gpu) {
-      fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
-    } else {
-      // For CPU→GPU tasks: FutureShm is in pinned host memory.
-      // Write FUTURE_COMPLETE directly to pinned host.
-      volatile unsigned int *flag_ptr = reinterpret_cast<volatile unsigned int *>(
-          &fshm->flags_.bits_.x);
-      unsigned int old_val = *flag_ptr;
-      *flag_ptr = old_val | FutureShm::FUTURE_COMPLETE;
-      __threadfence_system();
-      printf("[RunTask] MARKED COMPLETE old=%u new=%u\n", old_val, old_val | FutureShm::FUTURE_COMPLETE);
-    }
+    __threadfence();
+    // Both gpu2gpu and cpu2gpu: FutureShm is in device memory.
+    // Use device-scope atomic for both cases.
+    fshm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
   }
 }
 
