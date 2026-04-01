@@ -274,7 +274,9 @@ class Worker {
     FutureShm *fshm;
     // Sentinel alloc_id (UINT32_MAX-1, 0) = SendCpuToGpu device pointer
     // Null alloc_id (UINT32_MAX, UINT32_MAX) = GPU→GPU raw device pointer
-    static constexpr hipc::AllocatorId kGpuPodAllocId{UINT32_MAX - 1, 0};
+    hipc::AllocatorId kGpuPodAllocId;
+    kGpuPodAllocId.major_ = UINT32_MAX - 1;
+    kGpuPodAllocId.minor_ = 0;
     if (sptr.alloc_id_ == hipc::AllocatorId::GetNull() ||
         sptr.alloc_id_ == kGpuPodAllocId) {
       // Raw device pointer (SendCpuToGpu or GPU→GPU direct path)
