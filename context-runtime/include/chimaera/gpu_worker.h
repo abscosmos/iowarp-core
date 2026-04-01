@@ -114,6 +114,11 @@ __global__ void RunTask(Container *container, u32 method,
   rctx.task_fshm_ = fshm;
   rctx.parallelism_ = gridDim.x * blockDim.x;
 
+  // Fix up SSO/SVO pointers for CPU→GPU POD-copied tasks
+  if (!is_gpu2gpu) {
+    container->FixupTask(method, task_ptr);
+  }
+
   // Execute the task method
   container->Run(method, task_ptr, rctx);
   if (threadIdx.x == 0) {

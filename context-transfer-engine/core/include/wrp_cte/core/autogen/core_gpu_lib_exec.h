@@ -168,8 +168,25 @@ static HSHM_GPU_FUN void DestroyTaskImpl(
   }
 }
 
+/** Fix up SSO/SVO pointers after cudaMemcpy for CPU→GPU POD tasks */
+static HSHM_GPU_FUN void FixupTaskImpl(
+    chi::gpu::Container *self_, chi::u32 method,
+    hipc::FullPtr<chi::Task> task) {
+  (void)self_;
+  switch (method) {
+    case Method::kPutBlob:
+      task.template Cast<PutBlobTask>().ptr_->FixupAfterCopy();
+      break;
+    case Method::kGetBlob:
+      task.template Cast<GetBlobTask>().ptr_->FixupAfterCopy();
+      break;
+    default: break;  // RegisterTarget, GetOrCreateTag, etc.
+  }
+}
+
 HSHM_GPU_FUN GpuRuntime() {
   run_ = &RunImpl;
+  fixup_task_ = &FixupTaskImpl;
   alloc_task_ = &AllocTaskImpl;
   alloc_load_deser_ = &AllocLoadDeserImpl;
   alloc_load_task_ = &AllocLoadTaskDefaultImpl;

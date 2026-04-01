@@ -89,6 +89,10 @@ class Container {
   /** Run a task method. Called from CDP child kernel. */
   using RunFn = void (*)(Container *, u32, hipc::FullPtr<Task>, RunContext &);
 
+  /** Fix up task internal pointers after cudaMemcpy (SSO/SVO reseat).
+   *  Called by RunTask before Run() for cpu2gpu POD-copied tasks. */
+  using FixupTaskFn = void (*)(Container *, u32, hipc::FullPtr<Task>);
+
   /** Allocate a task struct for the given method */
   using AllocTaskFn = hipc::FullPtr<Task> (*)(Container *, u32);
 
@@ -119,6 +123,7 @@ class Container {
 
   // Inline function pointer table
   RunFn run_;
+  FixupTaskFn fixup_task_;
   AllocTaskFn alloc_task_;
   AllocLoadDeserFn alloc_load_deser_;
   AllocLoadTaskFn alloc_load_task_;
@@ -132,7 +137,8 @@ class Container {
   // ====================================================================
   HSHM_GPU_FUN Container()
       : container_id_(0),
-        run_(nullptr), alloc_task_(nullptr), alloc_load_deser_(nullptr),
+        run_(nullptr), fixup_task_(nullptr),
+        alloc_task_(nullptr), alloc_load_deser_(nullptr),
         alloc_load_task_(nullptr), load_task_(nullptr),
         save_task_(nullptr),
         load_task_output_(nullptr), destroy_task_(nullptr) {}
@@ -161,6 +167,15 @@ class Container {
   HSHM_GPU_FUN void Run(u32 method, hipc::FullPtr<Task> task_ptr,
                          RunContext &rctx) {
     run_(this, method, task_ptr, rctx);
+  }
+
+  /**
+   * Fix up task internal pointers after cudaMemcpy (SSO/SVO reseat).
+   * Called by RunTask before Run() for cpu2gpu POD-copied tasks.
+   * No-op if fixup_task_ is null (task has no non-POD fields).
+   */
+  HSHM_GPU_FUN void FixupTask(u32 method, hipc::FullPtr<Task> task_ptr) {
+    if (fixup_task_) fixup_task_(this, method, task_ptr);
   }
 
   /**

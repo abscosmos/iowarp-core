@@ -2227,10 +2227,11 @@ class IpcManager {
         static_cast<char *>(device_buf) + task_size,
         &fshm, sizeof(FutureShm));
 
-    // 3. Create Future with device pointer as raw offset (null alloc_id)
+    // 3. Create Future with sentinel alloc_id for GPU POD transfer.
     //    The ShmPtr stores the device address of the FutureShm directly.
+    //    Sentinel (UINT32_MAX-1, 0) distinguishes from normal null alloc_id.
     hipc::ShmPtr<FutureShm> fshmptr;
-    fshmptr.alloc_id_ = hipc::AllocatorId::GetNull();
+    fshmptr.alloc_id_ = hipc::AllocatorId{UINT32_MAX - 1, 0};
     fshmptr.off_ = reinterpret_cast<size_t>(
         static_cast<char *>(device_buf) + task_size);
     Future<TaskT> future(fshmptr, task_ptr);
@@ -3153,10 +3154,12 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
     // Determine path: client vs runtime
     bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
 
-    if (is_runtime) {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-      // Check if this is a CPU→GPU POD transfer (null alloc_id = device pointer)
-      if (future_shm_.alloc_id_ == hipc::AllocatorId::GetNull()) {
+    // Check if this is a CPU→GPU POD transfer.
+    // SendCpuToGpu uses a sentinel allocator ID (UINT32_MAX-1, 0) to mark
+    // GPU device pointers, distinguishing from normal null-alloc SHM futures.
+    static const hipc::AllocatorId kGpuPodAllocId{UINT32_MAX - 1, 0};
+    if (is_runtime && future_shm_.alloc_id_ == kGpuPodAllocId) {
         // CPU→GPU POD PATH: FutureShm is in device memory.
         // Poll by cudaMemcpy D→H of just the flags field.
         void *device_fshm = reinterpret_cast<void *>(future_shm_.off_.load());
@@ -3195,12 +3198,15 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
       }
 #endif
 
+    // Resolve FutureShm for non-GPU paths (runtime SHM or client)
+    hipc::FullPtr<FutureShm> future_full = CHI_IPC->ToFullPtr(future_shm_);
+    if (future_full.IsNull()) {
+      HLOG(kError, "Future::Wait: ToFullPtr returned null");
+      return false;
+    }
+
+    if (is_runtime) {
       // RUNTIME PATH (non-GPU): Wait for FUTURE_COMPLETE
-      hipc::FullPtr<FutureShm> future_full = CHI_IPC->ToFullPtr(future_shm_);
-      if (future_full.IsNull()) {
-        HLOG(kError, "Future::Wait: ToFullPtr returned null");
-        return false;
-      }
       hshm::abitfield32_t &flags = future_full->flags_;
       auto start = std::chrono::steady_clock::now();
       {

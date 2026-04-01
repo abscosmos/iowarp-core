@@ -80,6 +80,7 @@ static HSHM_GPU_FUN void DestroyTaskImpl(
 
 HSHM_GPU_FUN GpuRuntime() {
   run_ = &RunImpl;
+  fixup_task_ = nullptr;
   alloc_task_ = &AllocTaskImpl;
   alloc_load_deser_ = &AllocLoadDeserImpl;
   alloc_load_task_ = &AllocLoadTaskDefaultImpl;
