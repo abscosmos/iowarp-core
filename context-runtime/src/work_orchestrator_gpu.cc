@@ -101,21 +101,10 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
                 control);
     worker.gpu_info_ptr_ = d_gpu_info;
 
-    // Poll until exit signal
-    unsigned long long poll_count = 0;
+    // Poll until exit signal — both GPU→GPU and CPU→GPU from same thread
     while (worker.is_running_ && !control->exit_flag) {
-      int found = worker.PollOnce();
-      ++poll_count;
-      if (found > 0) {
-        printf("[ORCH] poll#%llu found %d tasks\n", poll_count, found);
-      }
-      if (poll_count == 1 || poll_count % 100000 == 0) {
-        printf("[ORCH] poll#%llu alive, queues: g2g=%p int=%p c2g=%p\n",
-               poll_count,
-               (void*)worker.gpu2gpu_queue_,
-               (void*)worker.internal_queue_,
-               (void*)worker.cpu2gpu_queue_);
-      }
+      worker.PollGpu2Gpu();
+      worker.PollCpu2Gpu();
     }
 
     // Flush orchestrator profile to pinned host memory before shutdown

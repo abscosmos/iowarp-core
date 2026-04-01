@@ -193,21 +193,28 @@ class Worker {
   // Main poll loop (thread 0 only)
   // ================================================================
 
-  HSHM_GPU_FUN int PollOnce() {
-    DbgPoll();
+  /** Poll GPU→GPU queues (high priority) */
+  HSHM_GPU_FUN int PollGpu2Gpu() {
     int count = 0;
-
-    // High-priority: gpu2gpu and internal queues, polled multiple times
     for (int i = 0; i < 16; ++i) {
       count += TryPopFromQueue(gpu2gpu_queue_, worker_id_, true);
       count += TryPopFromQueue(internal_queue_, worker_id_, true);
     }
+    return count;
+  }
 
-    // Lower-priority: cpu2gpu (worker 0 only)
+  /** Poll CPU→GPU queue */
+  HSHM_GPU_FUN int PollCpu2Gpu() {
+    return TryPopFromQueue(cpu2gpu_queue_, 0, false);
+  }
+
+  /** Poll all queues (backward-compatible) */
+  HSHM_GPU_FUN int PollOnce() {
+    DbgPoll();
+    int count = PollGpu2Gpu();
     if (worker_id_ == 0) {
-      count += TryPopFromQueue(cpu2gpu_queue_, 0, false);
+      count += PollCpu2Gpu();
     }
-
     return count;
   }
 
@@ -265,8 +272,12 @@ class Worker {
 
     size_t off = sptr.off_.load();
     FutureShm *fshm;
-    if (sptr.alloc_id_ == hipc::AllocatorId::GetNull()) {
-      // Null alloc_id = raw device pointer (SendCpuToGpu or GPU→GPU)
+    // Sentinel alloc_id (UINT32_MAX-1, 0) = SendCpuToGpu device pointer
+    // Null alloc_id (UINT32_MAX, UINT32_MAX) = GPU→GPU raw device pointer
+    static constexpr hipc::AllocatorId kGpuPodAllocId{UINT32_MAX - 1, 0};
+    if (sptr.alloc_id_ == hipc::AllocatorId::GetNull() ||
+        sptr.alloc_id_ == kGpuPodAllocId) {
+      // Raw device pointer (SendCpuToGpu or GPU→GPU direct path)
       fshm = reinterpret_cast<FutureShm *>(off);
     } else if (!is_gpu2gpu) {
       fshm = reinterpret_cast<FutureShm *>(queue_backend_base_ + off);
