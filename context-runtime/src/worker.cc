@@ -413,7 +413,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     // Task was re-enqueued from another worker (e.g., by RouteLocal).
     // Update worker-specific RunContext fields to match this worker,
     // so subtask completion events go to the correct event queue.
-    RunContext *run_ctx = task_full_ptr->run_ctx_.get();
+    RunContext *run_ctx = task_full_ptr->GetRunCtx();
     if (run_ctx) {
       run_ctx->worker_id_ = worker_id_;
       run_ctx->lane_ = lane;
@@ -427,7 +427,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   if (route_result == RouteResult::ExecHere) {
 #if HSHM_IS_HOST
     // Re-fetch task pointer from future in case RouteTask changed it
-    RunContext *run_ctx = task_full_ptr->run_ctx_.get();
+    RunContext *run_ctx = task_full_ptr->GetRunCtx();
     bool is_started = task_full_ptr->task_flags_.Any(TASK_STARTED);
     ExecTask(task_full_ptr, run_ctx, is_started);
 #endif

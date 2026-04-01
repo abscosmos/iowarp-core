@@ -3153,15 +3153,18 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
       // RUNTIME PATH: Wait for FUTURE_COMPLETE
       hshm::abitfield32_t &flags = future_full->flags_;
       auto start = std::chrono::steady_clock::now();
-      HLOG(kInfo, "Wait: runtime path flags={:x} POD={} COMPLETE={}",
-           (u32)flags.bits_.load(), flags.Any(FutureShm::FUTURE_POD_COPY) ? 1 : 0,
+      HLOG(kInfo, "Wait: fshm_ptr={:x} fshm_alloc=({},{}) fshm_off={} "
+           "resolved={:x} flags_raw={} POD={} COMPLETE={}",
+           reinterpret_cast<uintptr_t>(&future_shm_),
+           (u32)future_shm_.alloc_id_.major_, (u32)future_shm_.alloc_id_.minor_,
+           future_shm_.off_.load(),
+           reinterpret_cast<uintptr_t>(future_full.ptr_),
+           (u32)flags.bits_.load(),
+           flags.Any(FutureShm::FUTURE_POD_COPY) ? 1 : 0,
            flags.Any(FutureShm::FUTURE_COMPLETE) ? 1 : 0);
-
       if (flags.Any(FutureShm::FUTURE_POD_COPY)) {
         // POD COPY PATH: poll with system-scope (FutureShm in pinned host,
         // GPU sets FUTURE_COMPLETE with SetBitsSystem)
-        HLOG(kInfo, "Wait: entering POD poll loop, fshm={:x}",
-             reinterpret_cast<uintptr_t>(future_full.ptr_));
         while (!flags.AnySystem(FutureShm::FUTURE_COMPLETE)) {
           HSHM_THREAD_MODEL->Yield();
           if (max_sec > 0) {
@@ -3174,19 +3177,12 @@ HSHM_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
         // Copy output from device task back to host task
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
         if (future_full->task_device_ptr_ != 0 && task_ptr_.ptr_) {
-          HLOG(kInfo, "POD Wait: D→H copy {} bytes from {:x} to {:x} rc={}",
-               future_full->task_size_,
-               future_full->task_device_ptr_,
-               reinterpret_cast<uintptr_t>(task_ptr_.ptr_),
-               (int)task_ptr_->return_code_.load());
           CHI_IPC->CudaMemcpyToHost(
               task_ptr_.ptr_,
               reinterpret_cast<void *>(future_full->task_device_ptr_),
               future_full->task_size_);
           // Fix up internal pointers (e.g., priv::vector SVO) after memcpy
           task_ptr_->FixupAfterCopy();
-          HLOG(kInfo, "POD Wait: after D→H rc={}",
-               (int)task_ptr_->return_code_.load());
         }
         // Free device buffer
         CHI_IPC->CudaFreeDevice(

@@ -386,11 +386,11 @@ void Runtime::SendIn(hipc::FullPtr<chi::Task> origin_task,
   send_map_[send_map_key] = origin_task;
 
   // Get pool_queries from task's RunContext
-  if (!origin_task->run_ctx_) {
+  if (!origin_task->GetRunCtx()) {
     HLOG(kError, "SendIn: origin_task has no RunContext");
     return;
   }
-  chi::RunContext *origin_task_rctx = origin_task->run_ctx_.get();
+  chi::RunContext *origin_task_rctx = origin_task->GetRunCtx();
 
   const std::vector<chi::PoolQuery> &pool_queries =
       origin_task_rctx->pool_queries_;
@@ -830,12 +830,12 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
       return;
     }
     hipc::FullPtr<chi::Task> origin_task = *send_it;
-    if (!origin_task->run_ctx_) {
+    if (!origin_task->GetRunCtx()) {
       HLOG(kError, "Admin: origin_task has no RunContext");
       task->SetReturnCode(6);
       return;
     }
-    chi::RunContext *origin_rctx = origin_task->run_ctx_.get();
+    chi::RunContext *origin_rctx = origin_task->GetRunCtx();
 
     // Locate replica in origin's run_ctx using replica_id
     chi::u32 replica_id = task_info.task_id_.replica_id_;
@@ -877,11 +877,11 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
       continue;
     }
     hipc::FullPtr<chi::Task> origin_task = *send_it;
-    if (!origin_task->run_ctx_) {
+    if (!origin_task->GetRunCtx()) {
       HLOG(kError, "Admin: origin_task has no RunContext");
       continue;
     }
-    chi::RunContext *origin_rctx = origin_task->run_ctx_.get();
+    chi::RunContext *origin_rctx = origin_task->GetRunCtx();
 
     // Locate replica in origin's run_ctx using replica_id
     chi::u32 replica_id = task_info.task_id_.replica_id_;
@@ -2194,9 +2194,9 @@ void Runtime::ScanSendMapTimeouts() {
   std::vector<size_t> keys_to_remove;
   send_map_.for_each(
       [&](const size_t &key, hipc::FullPtr<chi::Task> &origin_task) {
-        if (origin_task.IsNull() || !origin_task->run_ctx_) return;
+        if (origin_task.IsNull() || !origin_task->GetRunCtx()) return;
 
-        chi::RunContext *rctx = origin_task->run_ctx_.get();
+        chi::RunContext *rctx = origin_task->GetRunCtx();
         // Use per-task timeout if set, otherwise kRetryTimeoutSec
         float task_timeout = kRetryTimeoutSec;
         float task_net_timeout = origin_task->pool_query_.GetNetTimeout();
@@ -2248,8 +2248,8 @@ void Runtime::FlushStaleStateForNode(chi::u64 node_id) {
       auto send_it = send_map_.find(net_key);
       if (send_it != nullptr) {
         auto &origin = *send_it;
-        if (origin->run_ctx_) {
-          origin->run_ctx_->completed_replicas_++;
+        if (origin->GetRunCtx()) {
+          origin->GetRunCtx()->completed_replicas_++;
         }
       }
       HLOG(kInfo,

@@ -116,55 +116,57 @@ __global__ void gpu_client_overhead_kernel(
       }
       __syncwarp();
 
-      // Only lane 0 submits PutBlob
-      if (chi::IpcManager::IsWarpScheduler()) {
-        if (!alloc_failed) {
-          if (warp_id < total_warps) {
-            d_progress[warp_id] = static_cast<int>(2 + (iter << 8));
-            __threadfence_system();
-          }
+      if (lane_id == 0 && warp_id < total_warps) {
+        d_progress[warp_id] = static_cast<int>(2 + (iter << 8));
+        __threadfence_system();
+      }
 
-          wrp_cte::core::Client cte_client(cte_pool_id);
+      // All lanes participate in NewTask/Send/Wait (warp-cooperative APIs)
+      wrp_cte::core::Client cte_client(cte_pool_id);
 
-          hipc::ShmPtr<> blob_shm;
-          blob_shm.alloc_id_ = data_alloc_id;
-          size_t base_off = array_ptr.shm_.off_.load();
-          blob_shm.off_.exchange(base_off + my_offset);
+      hipc::ShmPtr<> blob_shm;
+      blob_shm.alloc_id_ = data_alloc_id;
+      size_t base_off = array_ptr.shm_.off_.load();
+      blob_shm.off_.exchange(base_off + my_offset);
 
-          // Build blob name: "w_<warp_id>"
-          using StrT = hshm::priv::basic_string<char, CHI_PRIV_ALLOC_T>;
-          char name_buf[32];
-          int pos = 0;
-          name_buf[pos++] = 'w';
-          name_buf[pos++] = '_';
-          pos += StrT::NumberToStr(name_buf + pos, 32 - pos, warp_id);
-          name_buf[pos] = '\0';
+      // Build blob name: "w_<warp_id>" (lane 0 only, but data is uniform)
+      char name_buf[32];
+      if (lane_id == 0) {
+        using StrT = hshm::priv::basic_string<char, CHI_PRIV_ALLOC_T>;
+        int pos = 0;
+        name_buf[pos++] = 'w';
+        name_buf[pos++] = '_';
+        pos += StrT::NumberToStr(name_buf + pos, 32 - pos, warp_id);
+        name_buf[pos] = '\0';
+      }
 
-          auto pool_query = to_cpu ? chi::PoolQuery::ToLocalCpu()
-                                   : chi::PoolQuery::Local();
+      auto pool_query = to_cpu ? chi::PoolQuery::ToLocalCpu()
+                               : chi::PoolQuery::Local();
 
-          // === TIMED: AsyncPutBlob submission only ===
-          long long t0 = clock64();
-          auto future = cte_client.AsyncPutBlob(
-              tag_id, name_buf,
-              (chi::u64)0, warp_bytes,
-              blob_shm, -1.0f,
-              wrp_cte::core::Context(), (chi::u32)0, pool_query);
-          long long t1 = clock64();
-          submit_acc += (t1 - t0);
+      // === TIMED: AsyncPutBlob submission (all lanes enter) ===
+      long long t0 = clock64();
+      auto future = cte_client.AsyncPutBlob(
+          tag_id, name_buf,
+          (chi::u64)0, warp_bytes,
+          blob_shm, -1.0f,
+          wrp_cte::core::Context(), (chi::u32)0, pool_query);
+      long long t1 = clock64();
+      if (lane_id == 0) submit_acc += (t1 - t0);
 
-          // Check if allocation succeeded before waiting
-          if (future.GetFutureShmPtr().IsNull()) {
-            if (warp_id < total_warps) {
-              d_progress[warp_id] = -(1000 + static_cast<int>(iter));
-              __threadfence_system();
-            }
-            alloc_failed = true;
-          } else {
-            // Wait is NOT timed — we only care about submit cost
-            future.Wait();
-          }
+      // Check alloc failure (lane 0 checks, broadcast to all)
+      int is_null = 0;
+      if (lane_id == 0) is_null = future.GetFutureShmPtr().IsNull() ? 1 : 0;
+      is_null = __shfl_sync(0xFFFFFFFF, is_null, 0);
+
+      if (is_null) {
+        if (lane_id == 0 && warp_id < total_warps) {
+          d_progress[warp_id] = -(1000 + static_cast<int>(iter));
+          __threadfence_system();
         }
+        alloc_failed = true;
+      } else {
+        // All lanes enter Wait (RecvGpu uses __syncwarp)
+        future.Wait();
       }
       __syncwarp();
     }

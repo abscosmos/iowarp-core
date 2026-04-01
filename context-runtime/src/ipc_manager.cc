@@ -2661,8 +2661,8 @@ void IpcManager::BeginTask(Future<Task> &future, Container *container,
   Worker *worker = CHI_CUR_WORKER;
 
   // Initialize or reset the task's owned RunContext
-  task_ptr->run_ctx_ = std::make_unique<RunContext>();
-  RunContext *run_ctx = task_ptr->run_ctx_.get();
+  task_ptr->SetRunCtx(new RunContext());
+  RunContext *run_ctx = task_ptr->GetRunCtx();
 
   // Clear and initialize RunContext for new task execution
   run_ctx->worker_id_ = worker ? worker->GetId() : 0;
@@ -2755,8 +2755,8 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
       HLOG(kError, "RouteTask: RouteLocal returned {} for pool={} method={}, worker={}",
            (int)result, task_ptr->pool_id_, task_ptr->method_,
            worker ? (int)worker->GetId() : -1);
-      if (worker && task_ptr->run_ctx_) {
-        worker->AddToRetryQueue(task_ptr->run_ctx_.get());
+      if (worker && task_ptr->GetRunCtx()) {
+        worker->AddToRetryQueue(task_ptr->GetRunCtx());
       }
     }
     return result;
@@ -2863,8 +2863,8 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
   task_ptr->SetCompleter(exec_container->container_id_);
 
   // Update RunContext to use the resolved execution container
-  if (task_ptr->run_ctx_) {
-    task_ptr->run_ctx_->container_ = exec_container;
+  if (task_ptr->GetRunCtx()) {
+    task_ptr->GetRunCtx()->container_ = exec_container;
   }
 
   // Use scheduler to pick the destination worker
@@ -2904,8 +2904,8 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   }
 
   // Store pool_queries in task's RunContext for SendIn to access
-  if (task_ptr->run_ctx_) {
-    RunContext *run_ctx = task_ptr->run_ctx_.get();
+  if (task_ptr->GetRunCtx()) {
+    RunContext *run_ctx = task_ptr->GetRunCtx();
     run_ctx->pool_queries_ = pool_queries;
   }
 

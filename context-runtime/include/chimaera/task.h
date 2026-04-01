@@ -146,28 +146,31 @@ class Task {
   OUT hipc::atomic<ContainerId>
       completer_; /**< Container ID that completed this task */
   IN u32 pod_size_; /**< sizeof(TaskT) for POD copy transport */
-  /**
-   * Runtime context owned by task (RAII).
-   * Always reserve 8 bytes so derived task fields have the same offset
-   * on both CPU (where run_ctx_ is a unique_ptr) and GPU (where it's unused).
-   * This is critical for CPU→GPU POD copy transport.
-   */
+  /** Raw pointer to host RunContext (cast to RunContext* on CPU, always 0 on GPU).
+   *  Unconditional so sizeof(Task) is identical on CPU and GPU. */
+  TEMP uintptr_t host_run_ctx_ = 0;
+
 #if HSHM_IS_HOST
-  TEMP std::unique_ptr<RunContext> run_ctx_;
-#else
-  TEMP char run_ctx_pad_[sizeof(void *)];  /**< Padding to match host layout */
+  RunContext* GetRunCtx() { return reinterpret_cast<RunContext*>(host_run_ctx_); }
+  const RunContext* GetRunCtx() const { return reinterpret_cast<const RunContext*>(host_run_ctx_); }
+  void SetRunCtx(RunContext* ctx) { host_run_ctx_ = reinterpret_cast<uintptr_t>(ctx); }
+  /** Implemented out-of-line (task.cc) because RunContext is incomplete here */
+  void DestroyRunCtx();
 #endif
 
   /**
-   * Non-virtual destructor - tasks are deleted via Container::DelTask
-   * which dispatches through typed pointers, not vtable
+   * Destructor — must explicitly free RunContext since we no longer use unique_ptr.
    */
+#if HSHM_IS_HOST
+  ~Task();
+#else
   ~Task() = default;
+#endif
 
   /**
    * Default constructor
    */
-  HSHM_CROSS_FUN Task() { pod_size_ = 0; SetNull(); }
+  HSHM_CROSS_FUN Task() { pod_size_ = 0; host_run_ctx_ = 0; SetNull(); }
 
   /**
    * Emplace constructor with task initialization
@@ -183,9 +186,7 @@ class Task {
     pool_query_ = pool_query;
     period_ns_ = 0.0;
     pod_size_ = 0;
-#if HSHM_IS_HOST
-    // run_ctx_ is initialized by its default constructor
-#endif
+    host_run_ctx_ = 0;
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
   }
@@ -205,8 +206,7 @@ class Task {
     method_ = other->method_;
     task_flags_ = other->task_flags_;
     period_ns_ = other->period_ns_;
-    // Note: run_ctx_ is not copied - each task maintains its own RunContext
-    // The RunContext will be initialized when the task is executed
+    // host_run_ctx_ is not copied — each task owns its own RunContext
     return_code_.store(other->return_code_.load());
     completer_.store(other->completer_.load());
     task_group_ = other->task_group_;
@@ -223,8 +223,7 @@ class Task {
     task_flags_.Clear();
     period_ns_ = 0.0;
 #if HSHM_IS_HOST
-    run_ctx_
-        .reset();  // Reset the unique_ptr (destroys RunContext if allocated)
+    DestroyRunCtx();
 #endif
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
