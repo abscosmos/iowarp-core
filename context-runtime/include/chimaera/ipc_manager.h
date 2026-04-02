@@ -497,7 +497,7 @@ class IpcManager {
         u32 gpu_id = (mode == RoutingMode::ToLocalGpu)
                          ? task_ptr->pool_query_.GetNodeId()
                          : 0;
-        if (gpu_ipc_) return gpu_ipc_->SendCpuToGpu(task_ptr, gpu_id);
+        if (gpu_ipc_) return IpcCpu2Gpu::ClientSend(gpu_ipc_.get(), task_ptr, gpu_id);
         return Future<TaskT>();
       }
     }
