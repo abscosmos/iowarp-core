@@ -8,7 +8,7 @@
 #ifndef CHIMAERA_MOD_NAME_GPU_RUNTIME_H_
 #define CHIMAERA_MOD_NAME_GPU_RUNTIME_H_
 
-#include "chimaera/gpu_container.h"
+#include "chimaera/gpu/container.h"
 #include "chimaera/singletons.h"
 #include "chimaera/MOD_NAME/MOD_NAME_tasks.h"
 #include "chimaera/MOD_NAME/autogen/MOD_NAME_methods.h"

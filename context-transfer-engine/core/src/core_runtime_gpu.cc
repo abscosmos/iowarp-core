@@ -170,7 +170,7 @@ HSHM_GPU_FUN static chi::priv::string MakeCompoundKey(
 HSHM_GPU_FUN void GpuRuntime::RegisterTarget(
     hipc::FullPtr<RegisterTargetTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
-  if (!chi::IpcManager::IsWarpScheduler()) return;
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) return;
   printf("[GPU-RT] RegisterTarget: entering, bdev_id=(%u,%u) size=%llu\n",
          task->bdev_id_.major_, task->bdev_id_.minor_,
          (unsigned long long)task->total_size_);
@@ -228,12 +228,12 @@ HSHM_GPU_FUN void GpuRuntime::EnsureMetaInit() {
   m = *reinterpret_cast<GpuMetadata *volatile *>(&meta_);
   if (m != nullptr) return;
   hipc::FullPtr<GpuMetadata> ptr =
-      CHI_IPC->NewObj<GpuMetadata>(chi::AllocScope::kShared);
+      CHI_IPC->NewObj<GpuMetadata>();
   __threadfence();
   meta_ = ptr.ptr_;
   __threadfence();
   printf("[META] W%u init meta=%p\n",
-         chi::IpcManager::GetWarpId(), (void*)meta_);
+         chi::gpu::IpcManager::GetWarpId(), (void*)meta_);
 }
 
 //==============================================================================
@@ -283,7 +283,7 @@ HSHM_GPU_FUN void GpuRuntime::GetOrCreateTag(
     hipc::FullPtr<GetOrCreateTagTask<CreateParams>> task,
     chi::gpu::RunContext &rctx) {
   (void)rctx;
-  if (!chi::IpcManager::IsWarpScheduler()) return;
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) return;
   EnsureMetaInit();
 
   chi::priv::string name(CHI_PRIV_ALLOC, task->tag_name_.data());
@@ -329,7 +329,7 @@ HSHM_GPU_FUN void GpuRuntime::GetTagSize(
 HSHM_GPU_FUN void GpuRuntime::DelTag(
     hipc::FullPtr<DelTagTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
-  if (!chi::IpcManager::IsWarpScheduler()) return;
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) return;
   EnsureMetaInit();
 
   TagId tag_id = task->tag_id_;
@@ -397,7 +397,7 @@ HSHM_GPU_FUN void GpuRuntime::GetContainedBlobs(
 HSHM_GPU_FUN void GpuRuntime::PutBlob(
     hipc::FullPtr<PutBlobTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
-  if (!chi::IpcManager::IsWarpScheduler()) return;
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) return;
   EnsureMetaInit();
   TagId tag_id = task->tag_id_;
   const char *blob_name = task->blob_name_.data();
@@ -549,7 +549,7 @@ HSHM_GPU_FUN void GpuRuntime::PutBlob(
 HSHM_GPU_FUN void GpuRuntime::GetBlob(
     hipc::FullPtr<GetBlobTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
-  if (!chi::IpcManager::IsWarpScheduler()) return;
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) return;
   EnsureMetaInit();
   TagId tag_id = task->tag_id_;
   const char *blob_name = task->blob_name_.data();
@@ -626,7 +626,7 @@ HSHM_GPU_FUN void GpuRuntime::GetBlob(
 HSHM_GPU_FUN void GpuRuntime::ReorganizeBlob(
     hipc::FullPtr<ReorganizeBlobTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
-  if (!chi::IpcManager::IsWarpScheduler()) return;
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) return;
   EnsureMetaInit();
   TagId tag_id = task->tag_id_;
   const char *blob_name = task->blob_name_.data();
@@ -660,7 +660,7 @@ HSHM_GPU_FUN void GpuRuntime::ReorganizeBlob(
 HSHM_GPU_FUN void GpuRuntime::DelBlob(
     hipc::FullPtr<DelBlobTask> task, chi::gpu::RunContext &rctx) {
   (void)rctx;
-  if (!chi::IpcManager::IsWarpScheduler()) return;
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) return;
   EnsureMetaInit();
   TagId tag_id = task->tag_id_;
   const char *blob_name = task->blob_name_.data();

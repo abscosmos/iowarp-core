@@ -14,7 +14,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/bdev/bdev_client.h>
 #include <chimaera/singletons.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <chimaera/ipc_manager.h>
 #include <hermes_shm/util/gpu_api.h>
 #include "cte_helpers.h"
@@ -44,8 +44,8 @@ __global__ void gpu_bdev_alloc_free_kernel(
     volatile int *d_progress) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
 
   if (lane_id == 0 && warp_id < total_warps) {
     d_progress[warp_id] = 1;
@@ -53,7 +53,7 @@ __global__ void gpu_bdev_alloc_free_kernel(
   }
   __syncwarp();
 
-  if (warp_id < total_warps && chi::IpcManager::IsWarpScheduler()) {
+  if (warp_id < total_warps && chi::gpu::IpcManager::IsWarpScheduler()) {
     chimaera::bdev::Client bdev_client(bdev_pool_id);
     auto pool_query = chi::PoolQuery::Local();
 
@@ -80,7 +80,7 @@ __global__ void gpu_bdev_alloc_free_kernel(
   }
   __syncwarp();
 
-  if (chi::IpcManager::IsWarpScheduler() && warp_id < total_warps) {
+  if (chi::gpu::IpcManager::IsWarpScheduler() && warp_id < total_warps) {
     d_progress[warp_id] = 10;
     atomicAdd_system(d_done, 1);
     __threadfence_system();
@@ -107,8 +107,8 @@ __global__ void gpu_bdev_read_write_kernel(
     long long *d_read_clk) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
 
   if (lane_id == 0 && warp_id < total_warps) {
     d_progress[warp_id] = 1;
@@ -122,7 +122,7 @@ __global__ void gpu_bdev_read_write_kernel(
     chi::u64 my_offset = static_cast<chi::u64>(warp_id) * warp_bytes;
     char *my_data = data_ptr.ptr_ + my_offset;
 
-    if (chi::IpcManager::IsWarpScheduler()) {
+    if (chi::gpu::IpcManager::IsWarpScheduler()) {
       chimaera::bdev::Client bdev_client(bdev_pool_id);
       auto pool_query = chi::PoolQuery::Local();
       auto pool_query_parallel = chi::PoolQuery::Local(32);
@@ -206,7 +206,7 @@ __global__ void gpu_bdev_read_write_kernel(
   }
 
   __syncwarp();
-  if (chi::IpcManager::IsWarpScheduler() && warp_id < total_warps) {
+  if (chi::gpu::IpcManager::IsWarpScheduler() && warp_id < total_warps) {
     d_progress[warp_id] = 10;
     atomicAdd_system(d_done, 1);
     __threadfence_system();
@@ -246,8 +246,8 @@ int run_bdev_alloc_free(
     chi::u32 iterations,
     int timeout_sec,
     float *out_elapsed_ms) {
-  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+  CHI_CPU_IPC->PauseGpuOrchestrator();
 
   chi::u32 total_warps = (client_blocks * client_threads) / 32;
   if (total_warps == 0) total_warps = 1;
@@ -258,7 +258,7 @@ int run_bdev_alloc_free(
   hipc::MemoryBackendId scratch_id(201, 0);
   hipc::GpuMalloc scratch_backend;
   if (!scratch_backend.shm_init(scratch_id, scratch_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     return -1;
   }
 
@@ -268,11 +268,11 @@ int run_bdev_alloc_free(
   hipc::MemoryBackendId heap_id(202, 0);
   hipc::GpuMalloc heap_backend;
   if (!heap_backend.shm_init(heap_id, heap_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     return -1;
   }
 
-  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
 
 
@@ -304,14 +304,14 @@ int run_bdev_alloc_free(
   if (launch_err != cudaSuccess) {
     fprintf(stderr, "ERROR: bdev_alloc_free kernel launch failed: %s\n",
             cudaGetErrorString(launch_err));
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     cudaFreeHost(d_done);
     cudaFreeHost((void*)d_progress);
     hshm::GpuApi::DestroyStream(stream);
     return -3;
   }
 
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->ResumeGpuOrchestrator();
   auto *orchestrator = static_cast<chi::gpu::WorkOrchestrator *>(
       CHI_IPC->gpu_orchestrator_);
   auto *ctrl = orchestrator ? orchestrator->control_ : nullptr;
@@ -340,7 +340,7 @@ int run_bdev_alloc_free(
       fprintf(stderr, "  warp[%u]: %d\n", i, d_progress[i]);
     }
     fflush(stderr);
-    CHI_IPC->PauseGpuOrchestrator();
+    CHI_CPU_IPC->PauseGpuOrchestrator();
     *out_elapsed_ms = 0;
     cudaFreeHost(d_done);
     cudaFreeHost((void*)d_progress);
@@ -349,7 +349,7 @@ int run_bdev_alloc_free(
   }
 
   hshm::GpuApi::Synchronize(stream);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->PauseGpuOrchestrator();
   cudaFreeHost(d_done);
   cudaFreeHost((void*)d_progress);
   hshm::GpuApi::DestroyStream(stream);
@@ -375,8 +375,8 @@ int run_bdev_read_write(
     float *out_elapsed_ms,
     float *out_write_ms,
     float *out_read_ms) {
-  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+  CHI_CPU_IPC->PauseGpuOrchestrator();
 
   chi::u32 total_warps = (client_blocks * client_threads) / 32;
   if (total_warps == 0) total_warps = 1;
@@ -387,7 +387,7 @@ int run_bdev_read_write(
   hipc::GpuMalloc data_backend;
   size_t data_backend_size = total_data_bytes + 4 * 1024 * 1024;
   if (!data_backend.shm_init(data_backend_id, data_backend_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     return -1;
   }
 
@@ -397,7 +397,7 @@ int run_bdev_read_write(
   hipc::MemoryBackendId scratch_id(201, 0);
   hipc::GpuMalloc scratch_backend;
   if (!scratch_backend.shm_init(scratch_id, scratch_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     return -1;
   }
 
@@ -407,7 +407,7 @@ int run_bdev_read_write(
   hipc::MemoryBackendId heap_id(202, 0);
   hipc::GpuMalloc heap_backend;
   if (!heap_backend.shm_init(heap_id, heap_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     return -1;
   }
 
@@ -421,17 +421,17 @@ int run_bdev_read_write(
   cudaDeviceSynchronize();
   if (d_array_ptr->IsNull()) {
     cudaFreeHost(d_array_ptr);
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     return -2;
   }
   hipc::FullPtr<char> data_ptr = *d_array_ptr;
   cudaFreeHost(d_array_ptr);
 
   // Register data backend for ShmPtr resolution
-  CHI_IPC->RegisterGpuAllocator(data_backend_id, data_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(data_backend_id, data_backend.data_,
                                  data_backend.data_capacity_);
 
-  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
 
 
@@ -472,7 +472,7 @@ int run_bdev_read_write(
   if (launch_err != cudaSuccess) {
     fprintf(stderr, "ERROR: bdev_read_write kernel launch failed: %s\n",
             cudaGetErrorString(launch_err));
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     cudaFreeHost(d_done);
     cudaFreeHost((void*)d_progress);
     cudaFreeHost(d_write_clk);
@@ -481,7 +481,7 @@ int run_bdev_read_write(
     return -3;
   }
 
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->ResumeGpuOrchestrator();
   auto *orchestrator = static_cast<chi::gpu::WorkOrchestrator *>(
       CHI_IPC->gpu_orchestrator_);
   auto *ctrl = orchestrator ? orchestrator->control_ : nullptr;
@@ -510,7 +510,7 @@ int run_bdev_read_write(
       fprintf(stderr, "  warp[%u]: %d\n", i, d_progress[i]);
     }
     fflush(stderr);
-    CHI_IPC->PauseGpuOrchestrator();
+    CHI_CPU_IPC->PauseGpuOrchestrator();
     *out_elapsed_ms = 0;
     *out_write_ms = 0;
     *out_read_ms = 0;
@@ -539,7 +539,7 @@ int run_bdev_read_write(
   *out_read_ms = static_cast<float>(max_read_clk / clk_rate_khz);
 
   hshm::GpuApi::Synchronize(stream);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->PauseGpuOrchestrator();
   cudaFreeHost(d_done);
   cudaFreeHost((void*)d_progress);
   cudaFreeHost(d_write_clk);

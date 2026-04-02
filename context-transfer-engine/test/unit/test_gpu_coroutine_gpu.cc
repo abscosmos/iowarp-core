@@ -14,7 +14,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/singletons.h>
 #include <hermes_shm/util/gpu_api.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <thread>
 #include <chrono>
 
@@ -81,8 +81,8 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
   if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024, "", 0))
     return -100;
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                 gpu_backend.data_capacity_);
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+                                     gpu_backend.data_capacity_);
 
   // Pinned result
   int *d_result;
@@ -90,8 +90,8 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
   *d_result = 0;
 
   // Pause orchestrator then fetch gpu_info (queue pointers rebuilt by Pause)
-  CHI_IPC->PauseGpuOrchestrator();
-  chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
+  chi::IpcManagerGpuInfo gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   printf("[CTE-TEST] gpu2gpu=%p gpu2gpu_base=%p gpu2gpu_lanes=%u\n",
@@ -108,15 +108,15 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
     printf("[CTE-TEST] kernel launch failed: %s\n", cudaGetErrorString(launch_err));
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     hshm::GpuApi::DestroyStream(stream);
     return -201;
   }
 
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
 
   // Poll for completion (10s timeout), dump orchestrator state every 2s
-  auto *orch = static_cast<chi::gpu::WorkOrchestrator *>(CHI_IPC->gpu_orchestrator_);
+  auto *orch = static_cast<chi::gpu::WorkOrchestrator *>(CHI_CPU_IPC->gpu_orchestrator_);
   int dump = 0;
   for (int i = 0; i < 100000 && *d_result == 0; ++i) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -203,8 +203,8 @@ extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
   if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024, "", 0))
     return -100;
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                 gpu_backend.data_capacity_);
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+                                     gpu_backend.data_capacity_);
 
   // Pinned results
   int *d_result;
@@ -215,8 +215,8 @@ extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
   *d_rv = 0;
 
   // Pause orchestrator then fetch gpu_info (queue pointers rebuilt by Pause)
-  CHI_IPC->PauseGpuOrchestrator();
-  chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
+  chi::IpcManagerGpuInfo gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   void *stream = hshm::GpuApi::CreateStream();
@@ -225,12 +225,12 @@ extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     hshm::GpuApi::DestroyStream(stream);
     return -201;
   }
 
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
 
   // Poll for completion (10s timeout)
   for (int i = 0; i < 100000 && *d_result == 0; ++i) {

@@ -235,16 +235,16 @@ TEST_CASE("client_process_gpu_queue_attachment", "[gpu][client_process]") {
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   auto *ipc = CHI_IPC;
-  size_t num_to_gpu = ipc->GetToGpuQueueCount();
-  size_t num_g2g = ipc->GetGpuToGpuQueueCount();
+  size_t num_to_gpu = ipc->GetGpuIpcManager()->gpu_devices_.size();
+  size_t num_g2g = ipc->GetGpuIpcManager()->gpu_devices_.size();
 
   INFO("Client GPU queues: cpu2gpu=" + std::to_string(num_to_gpu) +
        ", gpu2gpu=" + std::to_string(num_g2g));
 
   // If server has GPUs, queues should be attached
   if (num_to_gpu > 0) {
-    REQUIRE(ipc->GetToGpuQueue(0) != nullptr);
-    REQUIRE(ipc->GetGpuToGpuQueue(0) != nullptr);
+    REQUIRE(ipc->GetGpuIpcManager()->gpu_devices_[0].cpu2gpu_queue.ptr_ != nullptr);
+    REQUIRE(ipc->GetGpuIpcManager()->gpu_devices_[0].gpu2gpu_queue.ptr_ != nullptr);
     INFO("Client GPU queue attachment verified");
   } else {
     INFO("No GPUs on server, skipping queue verification");
@@ -265,7 +265,7 @@ TEST_CASE("client_process_gpu_submit_to_gpu", "[gpu][client_process]") {
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   auto *ipc = CHI_IPC;
-  if (ipc->GetToGpuQueueCount() == 0) {
+  if (ipc->GetGpuIpcManager()->gpu_devices_.size() == 0) {
     INFO("No GPU queues available, skipping SendToGpu test");
     return;
   }

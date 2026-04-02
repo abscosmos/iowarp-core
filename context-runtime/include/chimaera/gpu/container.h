@@ -65,7 +65,7 @@ struct RunContext {
   /** Full pointer to the task being executed */
   hipc::FullPtr<chi::Task> task_ptr_;
   /** FutureShm associated with this task (for completion signaling) */
-  chi::FutureShm *task_fshm_;
+  gpu::FutureShm *task_fshm_;
   /** Total thread parallelism for this task (gridDim.x * blockDim.x) */
   u32 parallelism_;
 };

@@ -94,7 +94,7 @@ TEST_CASE("GpuCreate - AsyncCreate from GPU kernel", "[gpu][create]") {
 
   // Pause the GPU orchestrator so its persistent kernel does not block
   // the test kernel from being scheduled on the GPU.
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   // Use a unique pool ID for this test
   chi::PoolId target_pool_id(999, 0);
@@ -105,7 +105,7 @@ TEST_CASE("GpuCreate - AsyncCreate from GPU kernel", "[gpu][create]") {
                                    &return_code);
 
   // Resume the GPU orchestrator after the test kernel has completed.
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
 
   INFO("run_gpu_create_test returned: " << result
        << ", task return_code: " << return_code);

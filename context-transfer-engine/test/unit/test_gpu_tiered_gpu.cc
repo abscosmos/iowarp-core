@@ -13,7 +13,7 @@
 #include <wrp_cte/core/core_client.h>
 #include <chimaera/chimaera.h>
 #include <chimaera/singletons.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <chimaera/ipc_manager.h>
 #include <hermes_shm/util/gpu_api.h>
 
@@ -36,8 +36,8 @@ __global__ void gpu_tiered_test_kernel(
     volatile int *d_progress) {
   CHIMAERA_GPU_ORCHESTRATOR_INIT(gpu_info, num_blocks);
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
 
   if (warp_id != 0) return;
 
@@ -56,7 +56,7 @@ __global__ void gpu_tiered_test_kernel(
   if (lane_id == 0) { d_progress[0] = 2; __threadfence_system(); }
   __syncwarp();
 
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     wrp_cte::core::Client client(cte_pool_id);
     using StrT = hshm::priv::basic_string<char, CHI_PRIV_ALLOC_T>;
 
@@ -95,7 +95,7 @@ __global__ void gpu_tiered_test_kernel(
   if (lane_id == 0) { d_progress[0] = 4; __threadfence_system(); }
   __syncwarp();
 
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     wrp_cte::core::Client client(cte_pool_id);
     using StrT = hshm::priv::basic_string<char, CHI_PRIV_ALLOC_T>;
 
@@ -185,15 +185,15 @@ extern "C" int run_gpu_tiered_test(
           (unsigned long long)(blob_size/(1024*1024)), num_blobs,
           (unsigned long long)(total_data/(1024*1024)));
 
-  CHI_IPC->SetGpuOrchestratorBlocks(1, 32);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(1, 32);
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   // Data backend
   hipc::MemoryBackendId data_id(200, 0);
   hipc::GpuMalloc data_backend;
   if (!data_backend.shm_init(data_id, total_data + 16*1024*1024, "", 0)) {
     fprintf(stderr, "TEST: data backend init failed\n");
-    CHI_IPC->ResumeGpuOrchestrator(); return -1;
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator(); return -1;
   }
 
   hipc::MemoryBackendId scratch_id(201, 0);
@@ -217,7 +217,7 @@ extern "C" int run_gpu_tiered_test(
   cudaDeviceSynchronize();
   if (d_aptr->IsNull()) {
     fprintf(stderr, "TEST: alloc failed\n");
-    cudaFreeHost(d_aptr); CHI_IPC->ResumeGpuOrchestrator(); return -2;
+    cudaFreeHost(d_aptr); CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator(); return -2;
   }
   hipc::FullPtr<char> all_ptr = *d_aptr;
   cudaFreeHost(d_aptr);
@@ -234,10 +234,10 @@ extern "C" int run_gpu_tiered_test(
           read_ptr.ptr_, (unsigned long long)read_ptr.shm_.off_.load());
 
   hipc::AllocatorId data_alloc_id(data_id.major_, data_id.minor_);
-  CHI_IPC->RegisterGpuAllocator(data_id, data_backend.data_,
-                                 data_backend.data_capacity_);
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(data_id, data_backend.data_,
+                                     data_backend.data_capacity_);
 
-  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
 
   // Result: [0]=test result, [1]=done counter
@@ -264,12 +264,12 @@ extern "C" int run_gpu_tiered_test(
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     fprintf(stderr, "TEST: launch failed: %s\n", cudaGetErrorString(err));
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     hshm::GpuApi::DestroyStream(stream); return -4;
   }
 
-  CHI_IPC->ResumeGpuOrchestrator();
-  auto *orch = static_cast<chi::gpu::WorkOrchestrator*>(CHI_IPC->gpu_orchestrator_);
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
+  auto *orch = static_cast<chi::gpu::WorkOrchestrator*>(CHI_CPU_IPC->gpu_orchestrator_);
   auto *ctrl = orch ? orch->control_ : nullptr;
   if (ctrl) {
     int w = 0;
@@ -301,7 +301,7 @@ extern "C" int run_gpu_tiered_test(
   else fprintf(stderr, "TEST: FAILED\n");
   fflush(stderr);
 
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
   hshm::GpuApi::Synchronize(stream);
   hshm::GpuApi::DestroyStream(stream);
   cudaFreeHost(d_result);

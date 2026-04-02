@@ -272,7 +272,7 @@ TEST_CASE("bdev_gpu_hbm_gpu_write_read", "[gpu_bdev]") {
   EnsureServerInitialized();
 
   auto *ipc = CHI_IPC;
-  if (ipc->GetToGpuQueueCount() == 0) {
+  if (ipc->GetGpuIpcManager()->gpu_devices_.size() == 0) {
     INFO("No GPU queues available, skipping GPU-path bdev test");
     return;
   }

@@ -422,7 +422,7 @@ struct AddressHash {
 #define TASK_FIRE_AND_FORGET \
   BIT_OPT(chi::u32, 7)  ///< Task does not need a response. Wait/co_await return
                         ///< instantly; SendOut, ClientSend, and
-                        ///< EndTaskShmTransfer are skipped.
+                        ///< IpcManager::SendRuntime are skipped.
 
 // Bulk transfer flags are defined in hermes_shm/lightbeam/lightbeam.h:
 // - BULK_EXPOSE: Bulk is exposed (sender exposes for reading)
@@ -586,6 +586,13 @@ struct RecoveryAssignment {
     ar(pool_id_, chimod_name_, pool_name_, chimod_params_, container_id_,
        dest_node_id_, dead_node_id_);
   }
+};
+
+/** IPC transport mode for client-to-runtime communication */
+enum class IpcMode : u32 {
+  kTcp = 0,  ///< ZMQ tcp:// (default, always available)
+  kIpc = 1,  ///< ZMQ ipc:// (Unix Domain Socket)
+  kShm = 2,  ///< Shared memory (existing behavior)
 };
 
 }  // namespace chi

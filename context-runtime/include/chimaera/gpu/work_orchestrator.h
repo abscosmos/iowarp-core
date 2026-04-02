@@ -36,14 +36,12 @@
 
 #include "chimaera/types.h"
 #include "chimaera/task.h"
+#include "chimaera/gpu/gpu_info.h"
 #include <string>
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 
 namespace chi {
-
-// Forward declare IpcManagerGpuInfo (defined in ipc_manager.h)
-struct IpcManagerGpuInfo;
 
 namespace gpu {
 
@@ -88,6 +86,10 @@ struct WorkOrchestratorControl {
   volatile unsigned int dbg_iq_pops[kMaxDebugWorkers];
   /** Debug: internal queue push counters (from SendGpu) */
   volatile unsigned int dbg_iq_pushes[kMaxDebugWorkers];
+
+  /** Base of cpu2gpu copy-space backend for GPU-side ShmPtr->ptr conversion.
+   *  Set by host before orchestrator launch; used by gpu::Worker. */
+  char *cpu2gpu_queue_base = nullptr;
 
   /** Scratch allocator generation — incremented every time scratch is
    *  reinitialized (pause/resume).  GPU containers compare this against
@@ -137,7 +139,7 @@ class WorkOrchestrator {
   void *warp_group_load_ = nullptr;
   void *warp_load_ = nullptr;
   void *warp_group_queue_data_ = nullptr;
-  void *warp_group_queue_ptr_ = nullptr;  // TaskQueue* on device
+  void *warp_group_queue_ptr_ = nullptr;  // GpuTaskQueue* on device
   u32 launched_num_warps_ = 0;            // Warp count at last Launch/Resume
 
   /**
@@ -148,7 +150,8 @@ class WorkOrchestrator {
    * @return true if launch successful
    */
   bool Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks,
-              u32 threads_per_block);
+              u32 threads_per_block,
+              char *cpu2gpu_queue_base = nullptr);
 
   /**
    * Stop the orchestrator and free resources
@@ -202,16 +205,16 @@ class WorkOrchestrator {
 };
 
 /**
- * Initialize an ArenaAllocator + TaskQueue on device memory via a GPU kernel.
+ * Initialize an ArenaAllocator + GpuTaskQueue on device memory via a GPU kernel.
  * Called from CPU; launches a one-shot kernel to construct the allocator and
  * queue in-place on the device buffer, then returns the queue FullPtr.
  *
  * @param device_data  Pointer to device memory (from GpuMalloc)
  * @param capacity     Size of device_data in bytes
- * @param queue_depth  Depth of the TaskQueue ring buffer
- * @return FullPtr<TaskQueue> with shm_ offset valid for this allocator
+ * @param queue_depth  Depth of the GpuTaskQueue ring buffer
+ * @return FullPtr<GpuTaskQueue> with shm_ offset valid for this allocator
  */
-hipc::FullPtr<TaskQueue> InitQueueOnDevice(char *device_data, size_t capacity,
+hipc::FullPtr<GpuTaskQueue> InitQueueOnDevice(char *device_data, size_t capacity,
                                             u32 num_lanes, u32 queue_depth);
 
 }  // namespace gpu

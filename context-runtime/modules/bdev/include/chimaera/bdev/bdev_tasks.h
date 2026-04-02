@@ -451,7 +451,7 @@ struct WriteTask : public chi::Task {
   HSHM_CROSS_FUN ~WriteTask() {
 #if HSHM_IS_HOST
     if (task_flags_.Any(TASK_DATA_OWNER) && !data_.IsNull()) {
-      auto *ipc_manager = CHI_IPC;
+      auto *ipc_manager = CHI_CPU_IPC;
       if (ipc_manager) {
         ipc_manager->FreeBuffer(data_.Cast<char>());
       }
@@ -532,7 +532,7 @@ struct ReadTask : public chi::Task {
   HSHM_CROSS_FUN ~ReadTask() {
 #if HSHM_IS_HOST
     if (task_flags_.Any(TASK_DATA_OWNER) && !data_.IsNull()) {
-      auto *ipc_manager = CHI_IPC;
+      auto *ipc_manager = CHI_CPU_IPC;
       if (ipc_manager) {
         ipc_manager->FreeBuffer(data_.Cast<char>());
       }

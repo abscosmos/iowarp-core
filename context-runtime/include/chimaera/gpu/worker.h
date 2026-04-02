@@ -58,9 +58,9 @@
 #define GPU_WORKER_TIMER_END(counter, var) ((void)0)
 #endif
 
-#include "chimaera/gpu_container.h"
-#include "chimaera/gpu_pool_manager.h"
-#include "chimaera/gpu_work_orchestrator.h"
+#include "chimaera/gpu/container.h"
+#include "chimaera/gpu/pool_manager.h"
+#include "chimaera/gpu/work_orchestrator.h"
 #include "chimaera/local_task_archives.h"
 #include "chimaera/task.h"
 #include "hermes_shm/lightbeam/shm_transport.h"
@@ -149,19 +149,27 @@ class Worker {
  public:
   u32 worker_id_;
   volatile bool is_running_;
-  TaskQueue *cpu2gpu_queue_;
-  TaskQueue *gpu2gpu_queue_;
-  TaskQueue *internal_queue_;
+  GpuTaskQueue *cpu2gpu_queue_;
+  GpuTaskQueue *gpu2gpu_queue_;
+  GpuTaskQueue *internal_queue_;
   PoolManager *pool_mgr_;
   char *queue_backend_base_;
   WorkOrchestratorControl *dbg_ctrl_;
   IpcManagerGpuInfo *gpu_info_ptr_; /**< Device ptr to gpu_info for CDP child init */
 
+  /** Pending CPU→GPU tasks: device FutureShm pointers awaiting completion.
+   *  Parent kernel relays FUTURE_COMPLETE to pinned-host copy because
+   *  CDP child writes to device memory are only visible to the parent. */
+  static constexpr u32 kMaxPendingCpu2Gpu = 64;
+  FutureShm *pending_device_fshm_[kMaxPendingCpu2Gpu];
+  FutureShm *pending_host_fshm_[kMaxPendingCpu2Gpu];  /**< Pinned host mirrors */
+  u32 num_pending_;
+
   // Profiling counters
   long long prof_queue_pop_, prof_task_count_;
 
-  HSHM_GPU_FUN void Init(u32 worker_id, TaskQueue *cpu2gpu_queue,
-                         TaskQueue *gpu2gpu_queue, TaskQueue *internal_queue,
+  HSHM_GPU_FUN void Init(u32 worker_id, GpuTaskQueue *cpu2gpu_queue,
+                         GpuTaskQueue *gpu2gpu_queue, GpuTaskQueue *internal_queue,
                          PoolManager *pool_mgr, char *queue_backend_base,
                          WorkOrchestratorControl *dbg_ctrl) {
     worker_id_ = worker_id;
@@ -173,6 +181,11 @@ class Worker {
     dbg_ctrl_ = dbg_ctrl;
     gpu_info_ptr_ = nullptr;  // Set by orchestrator after init
     is_running_ = true;
+    num_pending_ = 0;
+    for (u32 i = 0; i < kMaxPendingCpu2Gpu; ++i) {
+      pending_device_fshm_[i] = nullptr;
+      pending_host_fshm_[i] = nullptr;
+    }
     prof_queue_pop_ = 0;
     prof_task_count_ = 0;
   }
@@ -201,9 +214,43 @@ class Worker {
     return count;
   }
 
-  /** Poll CPU→GPU queue */
+  /** Poll CPU→GPU queue AND check pending task completions */
   HSHM_GPU_FUN int PollCpu2Gpu() {
+    // Check pending CPU→GPU tasks for completion and relay to host
+    RelayPendingCompletions();
     return TryPopFromQueue(cpu2gpu_queue_, 0, false);
+  }
+
+  /**
+   * Check pending CPU→GPU tasks. If a CDP child completed (device FutureShm
+   * has FUTURE_COMPLETE), relay the flag to the pinned-host FutureShm mirror
+   * via system-scope write so the CPU can see it.
+   */
+  HSHM_GPU_FUN void RelayPendingCompletions() {
+    for (u32 i = 0; i < num_pending_; ) {
+      FutureShm *dev_fshm = pending_device_fshm_[i];
+      FutureShm *host_fshm = pending_host_fshm_[i];
+      // Parent kernel CAN see CDP child writes to device memory
+      if (dev_fshm->flags_.AnyDevice(FutureShm::FUTURE_COMPLETE)) {
+        // Relay to pinned host via system-scope write (parent kernel writes
+        // ARE visible to CPU, unlike CDP child kernel writes)
+        __threadfence_system();
+        volatile u32 *host_flags = reinterpret_cast<volatile u32 *>(
+            &host_fshm->flags_.bits_.x);
+        u32 old_val = *host_flags;
+        *host_flags = old_val | FutureShm::FUTURE_COMPLETE;
+        __threadfence_system();
+        printf("[RELAY] Completed task: dev_fshm=%p host_fshm=%p old=%u new=%u\n",
+               (void*)dev_fshm, (void*)host_fshm, old_val, old_val | FutureShm::FUTURE_COMPLETE);
+        // Remove from pending (swap with last)
+        --num_pending_;
+        pending_device_fshm_[i] = pending_device_fshm_[num_pending_];
+        pending_host_fshm_[i] = pending_host_fshm_[num_pending_];
+        // Don't increment i — check the swapped-in entry
+      } else {
+        ++i;
+      }
+    }
   }
 
   /** Poll all queues (backward-compatible) */
@@ -221,7 +268,7 @@ class Worker {
   // Queue polling and CDP launch
   // ================================================================
 
-  HSHM_GPU_FUN int TryPopFromQueue(TaskQueue *queue, u32 qlane, bool is_gpu2gpu) {
+  HSHM_GPU_FUN int TryPopFromQueue(GpuTaskQueue *queue, u32 qlane, bool is_gpu2gpu) {
     if (!queue) return 0;
 
     auto &lane = queue->GetLane(qlane, 0);
@@ -270,14 +317,20 @@ class Worker {
 
     size_t off = sptr.off_.load();
     FutureShm *fshm;
-    // Sentinel alloc_id (UINT32_MAX-1, 0) = SendCpuToGpu device pointer
+    // Sentinel alloc_id = SendCpuToGpu device pointer
     // Null alloc_id (UINT32_MAX, UINT32_MAX) = GPU→GPU raw device pointer
-    hipc::AllocatorId kGpuPodAllocId;
-    kGpuPodAllocId.major_ = UINT32_MAX - 1;
-    kGpuPodAllocId.minor_ = 0;
-    if (sptr.alloc_id_ == hipc::AllocatorId::GetNull() ||
-        sptr.alloc_id_ == kGpuPodAllocId) {
-      // Raw device pointer (SendCpuToGpu or GPU→GPU direct path)
+    FutureShm *host_fshm_for_relay = nullptr;  // Set for cpu2gpu tasks
+    if (sptr.alloc_id_ == FutureShm::GetCpu2GpuAllocId()) {
+      // SendCpuToGpu: off = pinned-host FutureShm address (UVA accessible).
+      // Read device task address and compute device FutureShm.
+      FutureShm *host_fshm = reinterpret_cast<FutureShm *>(off);
+      __threadfence_system();  // Ensure host writes are visible
+      uintptr_t device_task = host_fshm->client_task_vaddr_;
+      u32 task_size = host_fshm->task_size_;
+      fshm = reinterpret_cast<FutureShm *>(device_task + task_size);
+      host_fshm_for_relay = host_fshm;  // Track for completion relay
+    } else if (sptr.alloc_id_ == hipc::AllocatorId::GetNull()) {
+      // GPU→GPU direct path: raw device pointer
       fshm = reinterpret_cast<FutureShm *>(off);
     } else if (!is_gpu2gpu) {
       fshm = reinterpret_cast<FutureShm *>(queue_backend_base_ + off);
@@ -320,6 +373,13 @@ class Worker {
     RunTask<<<grid_dim, 32>>>(container, method_id, task_ptr.ptr_,
                                task_ptr.shm_.off_.load(), fshm, is_gpu2gpu,
                                gpu_info_ptr_);
+
+    // Track CPU→GPU tasks for completion relay
+    if (host_fshm_for_relay && num_pending_ < kMaxPendingCpu2Gpu) {
+      pending_device_fshm_[num_pending_] = fshm;
+      pending_host_fshm_[num_pending_] = host_fshm_for_relay;
+      ++num_pending_;
+    }
 
     return 1;
   }

@@ -1028,22 +1028,22 @@ chi::TaskResume Runtime::ClientConnect(hipc::FullPtr<ClientConnectTask> task,
 
   // Populate GPU queue info for client attachment
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-  auto *ipc = CHI_IPC;
-  chi::u32 num_gpus = static_cast<chi::u32>(ipc->GetToGpuQueueCount());
+  auto *gpu_ipc = CHI_IPC->GetGpuIpcManager();
+  chi::u32 num_gpus = gpu_ipc ? static_cast<chi::u32>(gpu_ipc->gpu_devices_.size()) : 0;
   if (num_gpus > kMaxGpuDevices) num_gpus = kMaxGpuDevices;
   task->num_gpus_ = num_gpus;
   task->gpu_queue_depth_ = CHI_CONFIG_MANAGER->GetQueueDepth();
 
   for (chi::u32 i = 0; i < num_gpus; ++i) {
     // Queue offsets within their respective backends
-    task->cpu2gpu_queue_off_[i] = ipc->GetCpu2GpuQueueOffset(i);
-    task->gpu2cpu_queue_off_[i] = ipc->GetGpu2CpuQueueOffset(i);
-    task->gpu2gpu_queue_off_[i] = ipc->GetGpu2GpuQueueOffset(i);
-    task->cpu2gpu_backend_size_[i] = ipc->GetCpu2GpuBackendSize(i);
-    task->gpu2cpu_backend_size_[i] = ipc->GetGpu2CpuBackendSize(i);
+    task->cpu2gpu_queue_off_[i] = gpu_ipc->GetCpu2GpuQueueOffset(i);
+    task->gpu2cpu_queue_off_[i] = gpu_ipc->GetGpu2CpuQueueOffset(i);
+    task->gpu2gpu_queue_off_[i] = gpu_ipc->GetGpu2GpuQueueOffset(i);
+    task->cpu2gpu_backend_size_[i] = gpu_ipc->GetCpu2GpuBackendSize(i);
+    task->gpu2cpu_backend_size_[i] = gpu_ipc->GetGpu2CpuBackendSize(i);
 
     // IPC handle for gpu2gpu GpuMalloc backend (device memory)
-    ipc->GetGpu2GpuIpcHandle(i, task->gpu2gpu_ipc_handle_bytes_[i]);
+    gpu_ipc->GetGpu2GpuIpcHandle(i, task->gpu2gpu_ipc_handle_bytes_[i]);
   }
 #else
   task->num_gpus_ = 0;
@@ -1798,7 +1798,7 @@ chi::TaskResume Runtime::RegisterMemory(hipc::FullPtr<RegisterMemoryTask> task,
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
       hshm::GpuIpcMemHandle ipc_handle;
       memcpy(&ipc_handle, task->ipc_handle_bytes_, sizeof(ipc_handle));
-      task->success_ = ipc_manager->RegisterGpuMemoryFromClient(
+      task->success_ = ipc_manager->GetGpuIpcManager()->RegisterGpuMemoryFromClient(
           backend_id, ipc_handle, task->data_capacity_);
 #else
       HLOG(kError, "Admin::RegisterMemory: GPU memory not supported (no CUDA/ROCm)");

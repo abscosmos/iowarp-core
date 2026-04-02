@@ -88,22 +88,14 @@ __global__ void gpu_submit_task_kernel(chi::IpcManagerGpu gpu_info,
  */
 extern "C" int run_gpu_kernel_task_submission_test(chi::PoolId pool_id,
                                                    chi::u32 test_value) {
-  // Create GPU memory backend using GPU-registered shared memory
-  hipc::MemoryBackendId backend_id(2, 0);
-  size_t gpu_memory_size = 10 * 1024 * 1024;  // 10MB
-  hipc::GpuShmMmap gpu_backend;
-  if (!gpu_backend.shm_init(backend_id, gpu_memory_size, "/gpu_kernel_submit",
-                            0)) {
-    return -100;  // Backend init failed
-  }
+  // Create GPU allocator backend and get populated IpcManagerGpuInfo
+  chi::IpcManagerGpuInfo gpu_info =
+      CHI_CPU_IPC->GetGpuIpcManager()->CreateGpuAllocator(10 * 1024 * 1024, 0);
 
   // Allocate result on GPU
   int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
   int h_result = 0;
   hshm::GpuApi::Memcpy(d_result, &h_result, sizeof(int));
-
-  // Create IpcManagerGpu for kernel
-  chi::IpcManagerGpu gpu_info(gpu_backend, nullptr);
 
   // Launch kernel on a dedicated stream (cudaDeviceSynchronize would block
   // on the persistent GPU orchestrator running on another stream)
@@ -166,25 +158,9 @@ extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
                                           chi::u32 test_value,
                                           chi::u32 *out_result_value) {
 
-  // Create GPU memory backend for kernel allocations
-  hipc::MemoryBackendId backend_id(3, 0);
-  hipc::GpuShmMmap gpu_backend;
-  if (!gpu_backend.shm_init(backend_id, 10 * 1024 * 1024, "/gpu_rt_test", 0))
-    return -100;
-
-  // Register GPU backend memory for host-side ShmPtr resolution.
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                 gpu_backend.data_capacity_);
-
-  // Set up IpcManagerGpuInfo for GPU→GPU path:
-  // - gpu2cu_queue = nullptr (not using GPU→CPU in this test)
-  // - cpu2gpu_queue = nullptr (not receiving CPU→GPU in this test)
-  // - gpu2gpu_queue = GPU orchestrator's GPU→GPU queue
-  chi::IpcManagerGpuInfo gpu_info;
-  gpu_info.backend = gpu_backend;
-  gpu_info.gpu2cpu_queue = nullptr;
-  gpu_info.cpu2gpu_queue = nullptr;
-  gpu_info.gpu2gpu_queue = CHI_IPC->GetGpuToGpuQueue(0);
+  // Create GPU allocator backend and get populated IpcManagerGpuInfo
+  chi::IpcManagerGpuInfo gpu_info =
+      CHI_CPU_IPC->GetGpuIpcManager()->CreateGpuAllocator(10 * 1024 * 1024, 0);
 
   // Use pinned host memory so CPU can poll result directly without
   // cudaStreamSynchronize (which can hang with persistent GPU orchestrator).
@@ -198,7 +174,7 @@ extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
 
   // Pause GPU orchestrator to free SMs for the test kernel launch,
   // then resume so the GPU orchestrator can process the GPU→GPU task.
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   void *stream = hshm::GpuApi::CreateStream();
   gpu_full_runtime_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -206,7 +182,7 @@ extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     cudaFreeHost(d_result);
     cudaFreeHost(d_rv);
     hshm::GpuApi::DestroyStream(stream);
@@ -214,7 +190,7 @@ extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
   }
 
   // Resume GPU orchestrator so it can process the GPU→GPU task
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
 
   // Poll pinned host memory for kernel completion instead of
   // cudaStreamSynchronize (persistent GPU orchestrator causes stream sync to hang)
@@ -249,7 +225,7 @@ extern "C" int run_gpu_full_runtime_test(chi::PoolId pool_id,
 extern "C" int run_cpu_to_gpu_test(chi::PoolId pool_id,
                                     chi::u32 test_value,
                                     chi::u32 *out_result_value) {
-  auto *ipc = CHI_IPC;
+  auto *ipc = CHI_CPU_IPC;
 
   // Create the task with LocalGpuBcast routing
   auto task = ipc->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
@@ -260,7 +236,7 @@ extern "C" int run_cpu_to_gpu_test(chi::PoolId pool_id,
   }
 
   // Send to GPU orchestrator via to_gpu_queue
-  auto future = ipc->SendGpuCpuCopy(task, 0);
+  auto future = ipc->Send(task);
   if (future.GetFutureShmPtr().IsNull()) {
     return -2;  // SendToGpu failed
   }
@@ -341,7 +317,7 @@ extern "C" int run_gpu_to_cpu_test(chi::PoolId pool_id,
                               "/gpu_to_cpu_g2c", 0))
     return -104;
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
   // Use the system's pre-existing GPU→CPU queue (backend 4000).
@@ -349,7 +325,7 @@ extern "C" int run_gpu_to_cpu_test(chi::PoolId pool_id,
   // called during runtime startup. No need to register a custom queue.
   chi::IpcManagerGpuInfo gpu_info;
   gpu_info.backend = static_cast<hipc::MemoryBackend &>(gpu_backend);
-  gpu_info.gpu2cpu_queue = CHI_IPC->GetGpuQueue(0);
+  gpu_info.gpu2cpu_queue = CHI_CPU_IPC->GetGpuQueue(0);
   gpu_info.gpu2cpu_backend = static_cast<hipc::MemoryBackend &>(g2c_backend);
 
   int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
@@ -412,7 +388,7 @@ extern "C" int run_async_gpu_submit_local_gpu_bcast_test(
   fprintf(stderr, "[ASYNC-BCAST-DIAG] fshm=%p future_shm_null=%d to_gpu_size=%zu\n",
           (void*)fshm,
           (int)future.GetFutureShmPtr().IsNull(),
-          (size_t)CHI_IPC->cpu2gpu_queues_.size());
+          (size_t)CHI_CPU_IPC->GetGpuQueueCount());
   if (fshm) {
     fprintf(stderr, "[ASYNC-BCAST-DIAG] flags=%u copy_from_client=%u in.size=%zu out.size=%zu\n",
             (unsigned)fshm->flags_.bits_.load(),
@@ -482,7 +458,7 @@ extern "C" int run_async_gpu_submit_to_local_cpu_test(
                               "/async_gpu_to_cpu_g2c", 0))
     return -104;
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
   // Use the system's pre-existing GPU→CPU queue (backend 4000).
@@ -490,7 +466,7 @@ extern "C" int run_async_gpu_submit_to_local_cpu_test(
   // called during runtime startup. No need to register a custom queue.
   chi::IpcManagerGpuInfo gpu_info;
   gpu_info.backend = static_cast<hipc::MemoryBackend &>(gpu_backend);
-  gpu_info.gpu2cpu_queue = CHI_IPC->GetGpuQueue(0);
+  gpu_info.gpu2cpu_queue = CHI_CPU_IPC->GetGpuQueue(0);
   gpu_info.gpu2cpu_backend = static_cast<hipc::MemoryBackend &>(g2c_backend);
 
   int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));

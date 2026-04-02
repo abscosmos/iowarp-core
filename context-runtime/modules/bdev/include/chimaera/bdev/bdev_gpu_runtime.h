@@ -8,7 +8,7 @@
 #ifndef CHIMAERA_BDEV_GPU_RUNTIME_H_
 #define CHIMAERA_BDEV_GPU_RUNTIME_H_
 
-#include "chimaera/gpu_container.h"
+#include "chimaera/gpu/container.h"
 #include "chimaera/bdev/bdev_tasks.h"
 #include "chimaera/bdev/autogen/bdev_methods.h"
 

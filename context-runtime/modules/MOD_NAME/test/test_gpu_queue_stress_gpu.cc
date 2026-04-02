@@ -68,10 +68,10 @@ __global__ void gpu_queue_stress_kernel(
   // Initialize IPC — multi-block aware, partitions allocators per warp
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
 
   // Only lane 0 does the work
-  if (!chi::IpcManager::IsWarpScheduler()) return;
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) return;
 
   d_progress[warp_id] = 1;  // running
 
@@ -111,7 +111,7 @@ extern "C" int run_gpu_queue_stress_test(
 
   // Pause GPU orchestrator — cudaMallocHost/cudaMalloc on the default stream
   // implicitly syncs with all streams, which blocks on the persistent kernel.
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   // Client scratch backend (pinned host memory, 10MB per block)
   size_t scratch_size = static_cast<size_t>(client_blocks) * 10 * 1024 * 1024;
@@ -120,7 +120,7 @@ extern "C" int run_gpu_queue_stress_test(
   if (!scratch_backend.shm_init(scratch_id, scratch_size,
                                  "/gpu_stress_scratch", 0))
     return -100;
-  CHI_IPC->RegisterGpuAllocator(scratch_id, scratch_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(scratch_id, scratch_backend.data_,
                                  scratch_backend.data_capacity_);
 
   // Client heap backend for serialization scratch (4MB per block)
@@ -133,7 +133,7 @@ extern "C" int run_gpu_queue_stress_test(
   // Build GPU info for client kernel
   chi::IpcManagerGpuInfo gpu_info;
   gpu_info.backend = scratch_backend;
-  gpu_info.gpu2gpu_queue = CHI_IPC->GetGpuToGpuQueue(0);
+  gpu_info.gpu2gpu_queue = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0).gpu2gpu_queue;
   gpu_info.gpu2gpu_num_lanes = 1;
 
   // Pinned host memory for completion tracking
@@ -173,7 +173,7 @@ extern "C" int run_gpu_queue_stress_test(
   if (launch_err != cudaSuccess) {
     fprintf(stderr, "ERROR: stress kernel launch failed: %s\n",
             cudaGetErrorString(launch_err));
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     cudaFreeHost(d_done);
     cudaFreeHost((void *)d_progress);
     hshm::GpuApi::DestroyStream(stream);
@@ -183,7 +183,7 @@ extern "C" int run_gpu_queue_stress_test(
   }
 
   // Resume GPU orchestrator so it can process the client's tasks
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
   fprintf(stderr, "[STRESS] %u warps × %u iters launched\n",
           total_warps, iterations);
 

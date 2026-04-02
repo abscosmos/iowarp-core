@@ -22,7 +22,7 @@
 #include <chimaera/singletons.h>
 #include <hermes_shm/util/logging.h>
 #include <hermes_shm/util/gpu_api.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <chimaera/ipc_manager.h>
 
 #include <hermes_shm/lightbeam/transport_factory_impl.h>
@@ -67,7 +67,7 @@ __global__ void gpu_cte_setup_kernel(
   auto reg_future = ipc->Send(reg_task);
   reg_future.Wait();
 
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     if (reg_future.IsNull() || reg_task->return_code_ != 0) {
       printf("[GPU-SETUP] RegisterTarget failed rc=%d\n",
              reg_future.IsNull() ? -999 : (int)reg_task->return_code_);
@@ -86,7 +86,7 @@ __global__ void gpu_cte_setup_kernel(
   auto tag_future = ipc->Send(tag_task);
   tag_future.Wait();
 
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     if (tag_future.IsNull() || tag_task->return_code_ != 0) {
       printf("[GPU-SETUP] GetOrCreateTag failed rc=%d\n",
              tag_future.IsNull() ? -999 : (int)tag_task->return_code_);
@@ -149,8 +149,8 @@ __global__ void gpu_client_overhead_kernel(
     long long *d_submit_clk) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
 
   if (lane_id == 0 && warp_id < total_warps) {
     d_progress[warp_id] = 1;  // init complete
@@ -235,14 +235,14 @@ __global__ void gpu_client_overhead_kernel(
     }
 
     // Store accumulated submit cycles
-    if (chi::IpcManager::IsWarpScheduler() && warp_id < total_warps) {
+    if (chi::gpu::IpcManager::IsWarpScheduler() && warp_id < total_warps) {
       d_submit_clk[warp_id] = submit_acc;
       __threadfence_system();
     }
   }
 
   __syncwarp();
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     atomicAdd_system(d_done, 1);
     __threadfence_system();
   }
@@ -282,8 +282,8 @@ int run_cte_client_overhead(
     int timeout_sec,
     float *out_elapsed_ms,
     float *out_avg_submit_us) {
-  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+  CHI_CPU_IPC->PauseGpuOrchestrator();
 
   chi::u32 total_warps = (client_blocks * client_threads) / 32;
   if (total_warps == 0) total_warps = 1;
@@ -294,7 +294,7 @@ int run_cte_client_overhead(
   hipc::GpuMalloc data_backend;
   size_t data_backend_size = total_data_bytes + 4 * 1024 * 1024;
   if (!data_backend.shm_init(data_backend_id, data_backend_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     return -1;
   }
 
@@ -304,7 +304,7 @@ int run_cte_client_overhead(
   hipc::MemoryBackendId scratch_id(201, 0);
   hipc::GpuMalloc scratch_backend;
   if (!scratch_backend.shm_init(scratch_id, scratch_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     return -1;
   }
 
@@ -314,7 +314,7 @@ int run_cte_client_overhead(
   hipc::MemoryBackendId heap_id(202, 0);
   hipc::GpuMalloc heap_backend;
   if (!heap_backend.shm_init(heap_id, heap_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     return -1;
   }
 
@@ -330,7 +330,7 @@ int run_cte_client_overhead(
 
   if (d_array_ptr->IsNull()) {
     cudaFreeHost(d_array_ptr);
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     return -2;
   }
 
@@ -338,11 +338,11 @@ int run_cte_client_overhead(
   cudaFreeHost(d_array_ptr);
 
   // --- 5. Register data backend ---
-  CHI_IPC->RegisterGpuAllocator(data_backend_id, data_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(data_backend_id, data_backend.data_,
                                  data_backend.data_capacity_);
 
   // --- 6. Build GPU info and launch kernel ---
-  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
 
   int *d_done;
@@ -381,7 +381,7 @@ int run_cte_client_overhead(
   if (launch_err != cudaSuccess) {
     fprintf(stderr, "ERROR: Client overhead kernel launch failed: %s\n",
             cudaGetErrorString(launch_err));
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->ResumeGpuOrchestrator();
     cudaFreeHost(d_done);
     cudaFreeHost((void*)d_progress);
     cudaFreeHost(d_submit_clk);
@@ -393,7 +393,7 @@ int run_cte_client_overhead(
       CHI_IPC->gpu_orchestrator_);
   auto *ctrl = orchestrator ? orchestrator->control_ : nullptr;
 
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->ResumeGpuOrchestrator();
   if (ctrl) {
     int wait_ms = 0;
     while (ctrl->running_flag == 0 && wait_ms < 5000) {
@@ -430,7 +430,7 @@ int run_cte_client_overhead(
       }
     }
     fflush(stderr);
-    CHI_IPC->PauseGpuOrchestrator();
+    CHI_CPU_IPC->PauseGpuOrchestrator();
     *out_elapsed_ms = 0;
     *out_avg_submit_us = 0;
     cudaFreeHost(d_done);
@@ -485,7 +485,7 @@ int run_cte_client_overhead(
   printf("---\n");
 
   hshm::GpuApi::Synchronize(stream);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->PauseGpuOrchestrator();
 
   cudaFreeHost(d_done);
   cudaFreeHost((void*)d_progress);
@@ -501,13 +501,13 @@ int run_cte_client_overhead(
  */
 int run_gpu_cte_setup(chi::PoolId cte_pool_id, chi::PoolId bdev_pool_id,
                        chi::u64 target_size, wrp_cte::core::TagId *out_tag_id) {
-  chi::IpcManagerGpu setup_gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu setup_gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   hipc::MemoryBackendId setup_bid(110, 0);
   hipc::GpuMalloc setup_backend;
   setup_backend.shm_init(setup_bid, 4 * 1024 * 1024, "", 0);
-  CHI_IPC->RegisterGpuAllocator(setup_bid, setup_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(setup_bid, setup_backend.data_,
                                  setup_backend.data_capacity_);
-  setup_gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  setup_gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   setup_gpu_info.backend = setup_backend;
 
   int *d_result;

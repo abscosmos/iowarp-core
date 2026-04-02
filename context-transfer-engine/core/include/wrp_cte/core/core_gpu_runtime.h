@@ -34,7 +34,7 @@
 #ifndef WRP_CTE_CORE_GPU_RUNTIME_H_
 #define WRP_CTE_CORE_GPU_RUNTIME_H_
 
-#include "chimaera/gpu_container.h"
+#include "chimaera/gpu/container.h"
 #include "autogen/core_methods.h"
 #include "core_tasks.h"
 #include <hermes_shm/data_structures/priv/vector.h>

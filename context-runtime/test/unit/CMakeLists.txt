@@ -496,6 +496,36 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   )
 endif()
 
+# GPU task trace tests — CPU->GPU, GPU->GPU, GPU->CPU end-to-end traces
+if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
+  add_cuda_executable(test_gpu_task_trace FALSE gpu/test_gpu_task_trace.cc
+    INCLUDE_DIRS
+      ${CHIMAERA_ROOT}/include
+      ${CHIMAERA_ROOT}/test
+      ${CHIMAERA_ROOT}/modules/admin/include
+      ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+      ${CMAKE_SOURCE_DIR}/context-transport-primitives/include
+    LINK_LIBS
+      chimaera_admin_runtime
+      chimaera_admin_client
+      chimaera_MOD_NAME_runtime
+      chimaera_MOD_NAME_client
+      hshm::cuda_cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(test_gpu_task_trace PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME cr_gpu_task_trace COMMAND test_gpu_task_trace
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_gpu_task_trace PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+    LABELS "gpu;msan_skip"
+  )
+endif()
+
 # GPU POD Transfer test — proves CPU↔GPU task transfer via cudaMemcpy
 if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   find_package(CUDAToolkit QUIET)

@@ -15,7 +15,7 @@
 #include <wrp_cte/core/core_client.h>
 #include <chimaera/chimaera.h>
 #include <chimaera/singletons.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <chimaera/ipc_manager.h>
 #include <hermes_shm/util/gpu_api.h>
 
@@ -310,8 +310,8 @@ __global__ void synthetic_cte_kernel(
 
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
 
   if (warp_id >= total_warps) return;
 
@@ -335,7 +335,7 @@ __global__ void synthetic_cte_kernel(
   for (uint32_t iter = 0; iter < iterations; iter++) {
     // Determine offset (sequential or random)
     uint64_t offset = 0;
-    if (chi::IpcManager::GetLaneId() == 0) {
+    if (chi::gpu::IpcManager::GetLaneId() == 0) {
       // For random pattern, use LCG to pick a random warp slice
       // All lanes in this warp use same offset for coherency
       offset = (lcg_next(lcg_seed) % total_warps) * warp_bytes;
@@ -344,7 +344,7 @@ __global__ void synthetic_cte_kernel(
     offset = __shfl_sync(0xffffffff, offset, 0);
 
     // === I/O: PutBlob — send data to CTE ===
-    if (chi::IpcManager::IsWarpScheduler()) {
+    if (chi::gpu::IpcManager::IsWarpScheduler()) {
       // Fill buffer with pattern
       uint64_t pattern = (((uint64_t)warp_id << 32) | iter);
       for (uint64_t i = 0; i < warp_bytes; i += 8) {
@@ -370,7 +370,7 @@ __global__ void synthetic_cte_kernel(
     __syncwarp();
 
     // === I/O: GetBlob — retrieve data from CTE ===
-    if (chi::IpcManager::IsWarpScheduler() && !alloc_failed) {
+    if (chi::gpu::IpcManager::IsWarpScheduler() && !alloc_failed) {
       wrp_cte::core::Client cte_client(cte_pool_id);
       hipc::ShmPtr<> shm;
       shm.alloc_id_ = data_alloc_id;
@@ -403,7 +403,7 @@ __global__ void synthetic_cte_kernel(
   }
 
   // Signal completion
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     atomicAdd_system(d_done, 1);
     __threadfence_system();
   }
@@ -461,7 +461,7 @@ int run_workload_synthetic(const WorkloadConfig &cfg, const char *mode,
   if (m == "cte") {
     // ======== CTE: AsyncPutBlob + AsyncGetBlob per iteration ========
 
-    CHI_IPC->SetGpuOrchestratorBlocks(cfg.rt_blocks, cfg.rt_threads);
+    CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(cfg.rt_blocks, cfg.rt_threads);
     CteGpuContext ctx;
     if (ctx.init(total_bytes * 2, total_warps) != 0) {
       HLOG(kError, "synthetic CTE init failed");
@@ -535,7 +535,7 @@ int run_workload_synthetic(const WorkloadConfig &cfg, const char *mode,
 
     if (!ctx.resume_and_poll(cfg.timeout_sec)) {
       HLOG(kError, "synthetic CTE timed out");
-      CHI_IPC->PauseGpuOrchestrator();
+      CHI_CPU_IPC->PauseGpuOrchestrator();
       hshm::GpuApi::Synchronize(stream);
       hshm::GpuApi::DestroyStream(stream);
       cudaFreeHost(d_errors);
@@ -544,7 +544,7 @@ int run_workload_synthetic(const WorkloadConfig &cfg, const char *mode,
     }
 
     // Pause orchestrator before synchronizing client stream
-    CHI_IPC->PauseGpuOrchestrator();
+    CHI_CPU_IPC->PauseGpuOrchestrator();
     hshm::GpuApi::Synchronize(stream);
     hshm::GpuApi::DestroyStream(stream);
 

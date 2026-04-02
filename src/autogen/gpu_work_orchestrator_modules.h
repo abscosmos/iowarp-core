@@ -7,7 +7,7 @@
 #include "wrp_cte/core/core_gpu_runtime.h"
 #include "wrp_cte/compressor/compressor_gpu_runtime.h"
 
-#include "chimaera/gpu_container.h"
+#include "chimaera/gpu/container.h"
 #include "chimaera/types.h"
 #include <cstring>
 

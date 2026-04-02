@@ -141,7 +141,7 @@ __global__ void test_gpu_alloc_no_ipc_kernel(const hipc::MemoryBackend backend,
  * Test just IpcManager construction in __shared__ memory
  */
 __global__ void test_gpu_ipc_construct_kernel(int *results) {
-  chi::IpcManager *ipc = chi::IpcManager::GetBlockIpcManager();
+  chi::IpcManager *ipc = chi::gpu::IpcManager::GetBlockIpcManager();
   int thread_id = threadIdx.x;
   __syncthreads();
 
@@ -178,7 +178,7 @@ __global__ void test_gpu_allocate_buffer_kernel(
   // Warp-level allocation: only lane 0 allocates, all lanes verify.
   // Each warp allocates (warp_size * per_lane_size) bytes, then each lane
   // writes/verifies its own slice.
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
   size_t per_lane_size = 64;
   size_t alloc_size = 32 * per_lane_size;  // One allocation per warp
 
@@ -232,7 +232,7 @@ __global__ void test_gpu_to_full_ptr_kernel(
 
   // Warp-level: only lane 0 allocates and tests ToFullPtr.
   // Other lanes just pass.
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
 
   if (lane_id == 0) {
     // Allocate a buffer
@@ -290,7 +290,7 @@ __global__ void test_gpu_multiple_allocs_kernel(
   CHIMAERA_GPU_INIT(gpu_info);
 
   // Warp-level: only lane 0 allocates and verifies multiple buffers.
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
 
   if (lane_id == 0) {
     const int num_allocs = 4;
@@ -524,7 +524,7 @@ __global__ void test_gpu_ipc_manager_gpu_alloc_kernel(
     chi::IpcManagerGpu gpu_info, int *results) {
   CHIMAERA_GPU_INIT(gpu_info);
 
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
   size_t per_lane_size = 64;
 
   // Lane 0 allocates for the entire warp

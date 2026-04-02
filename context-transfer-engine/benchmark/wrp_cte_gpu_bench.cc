@@ -459,7 +459,7 @@ int main(int argc, char **argv) {
               wcfg.tag_id.major_, wcfg.tag_id.minor_);
     } else {
       // Pause GPU orchestrator for non-CTE workload modes
-      CHI_IPC->PauseGpuOrchestrator();
+      CHI_CPU_IPC->PauseGpuOrchestrator();
     }
 
     WorkloadResult wresult = {};
@@ -511,7 +511,7 @@ int main(int argc, char **argv) {
     // Compose creates CTE before the GPU orchestrator launches, so the CTE
     // GPU container is never registered. Register it now manually.
     {
-      bool did_pause = CHI_IPC->PauseGpuOrchestrator();
+      bool did_pause = CHI_CPU_IPC->PauseGpuOrchestrator();
       if (did_pause) {
         void *gpu_cte = CHI_IPC->AllocGpuContainer(gpu_pool_id, 0, "wrp_cte_core");
         if (gpu_cte) {
@@ -519,7 +519,7 @@ int main(int argc, char **argv) {
           HIPRINT("Registered CTE GPU container for pool ({},{})",
                   gpu_pool_id.major_, gpu_pool_id.minor_);
         }
-        CHI_IPC->ResumeGpuOrchestrator();
+        CHI_CPU_IPC->ResumeGpuOrchestrator();
       }
     }
     std::this_thread::sleep_for(200ms);

@@ -54,7 +54,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/singletons.h>
 #include <hermes_shm/util/gpu_api.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <thread>
 #include <chrono>
 
@@ -164,8 +164,8 @@ extern "C" int run_gpu_initiated_putblob_getblob_test(
     return -100;
 
   // Register backend so host-side ShmPtr resolution works
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                 gpu_backend.data_capacity_);
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+                                     gpu_backend.data_capacity_);
 
   // Allocate GPU heap for CHI_PRIV_ALLOC (BuddyAllocator for serialization)
   hipc::MemoryBackendId heap_id(21, 0);
@@ -175,7 +175,7 @@ extern "C" int run_gpu_initiated_putblob_getblob_test(
 
   // Use GetClientGpuInfo for complete queue/backend setup, then override
   // the primary backend and heap backend with our custom ones
-  chi::IpcManagerGpuInfo gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpuInfo gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   // Allocate UVM buffers (accessible from both CPU and GPU)
@@ -198,7 +198,7 @@ extern "C" int run_gpu_initiated_putblob_getblob_test(
   *d_result = 0;
 
   // Pause GPU orchestrator to free SMs for kernel launch, then resume
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   void *stream = hshm::GpuApi::CreateStream();
   gpu_putblob_getblob_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -207,13 +207,13 @@ extern "C" int run_gpu_initiated_putblob_getblob_test(
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     hshm::GpuApi::DestroyStream(stream);
     return -201;
   }
 
   // Resume GPU orchestrator so it processes the GPU->GPU tasks
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
 
   // Poll pinned host memory for kernel completion
   int timeout_us = 10000000;  // 10 seconds

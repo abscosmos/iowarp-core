@@ -586,7 +586,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     // synchronizing call that would deadlock with the busy-waiting kernel.
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
     {
-      bool did_pause = ipc_manager2->PauseGpuOrchestrator();
+      bool did_pause = ipc_manager2->GetGpuIpcManager()->PauseGpuOrchestrator();
       if (did_pause) {
         void *gpu_container_ptr = ipc_manager2->AllocGpuContainer(
             target_pool_id, node_id, chimod_name);
@@ -595,10 +595,10 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
           if (it != pool_metadata_.end()) {
             it->second.gpu_container_ptr_ = gpu_container_ptr;
           }
-          ipc_manager2->RegisterGpuOrchestratorContainer(target_pool_id,
+          ipc_manager2->GetGpuIpcManager()->RegisterGpuOrchestratorContainer(target_pool_id,
                                                           gpu_container_ptr);
         }
-        ipc_manager2->ResumeGpuOrchestrator();
+        ipc_manager2->GetGpuIpcManager()->ResumeGpuOrchestrator();
         // Allow container to send GPU-init tasks now that the GPU container
         // is registered and the orchestrator is running.
         if (gpu_container_ptr) {

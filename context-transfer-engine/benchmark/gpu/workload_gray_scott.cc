@@ -17,7 +17,7 @@
 #include <wrp_cte/core/core_client.h>
 #include <chimaera/chimaera.h>
 #include <chimaera/singletons.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <chimaera/ipc_manager.h>
 #include <hermes_shm/util/gpu_api.h>
 
@@ -129,8 +129,8 @@ __global__ void gs_cte_kernel(
     int *d_done) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
 
   if (warp_id < total_warps) {
     uint32_t point_start = warp_point_start[warp_id];
@@ -156,7 +156,7 @@ __global__ void gs_cte_kernel(
     bool alloc_failed = false;
 
     // === I/O: GetBlob — load this warp's u,v fields from CTE ===
-    if (chi::IpcManager::IsWarpScheduler() && my_field_bytes > 0) {
+    if (chi::gpu::IpcManager::IsWarpScheduler() && my_field_bytes > 0) {
       wrp_cte::core::Client cte_client(cte_pool_id);
       uint64_t half_bytes = my_field_bytes / 2;
 
@@ -219,7 +219,7 @@ __global__ void gs_cte_kernel(
     }
 
     // === I/O: PutBlob — write back updated u2,v2 ===
-    if (chi::IpcManager::IsWarpScheduler() && !alloc_failed && my_field_bytes > 0) {
+    if (chi::gpu::IpcManager::IsWarpScheduler() && !alloc_failed && my_field_bytes > 0) {
       wrp_cte::core::Client cte_client(cte_pool_id);
       uint64_t half_bytes = my_field_bytes / 2;
 
@@ -251,7 +251,7 @@ __global__ void gs_cte_kernel(
   }
 
   // Signal completion
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     atomicAdd_system(d_done, 1);
     __threadfence_system();
   }
@@ -342,8 +342,8 @@ int run_workload_gray_scott(const WorkloadConfig &cfg, const char *mode,
     HIPRINT("  CTE: {} warps, {} points/warp, {:.1f} MB fields/step",
             total_warps, points_per_warp, total_field_bytes/(1024.0*1024.0));
 
-    CHI_IPC->SetGpuOrchestratorBlocks(cfg.rt_blocks, cfg.rt_threads);
-    CHI_IPC->PauseGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(cfg.rt_blocks, cfg.rt_threads);
+    CHI_CPU_IPC->PauseGpuOrchestrator();
 
     // Data backend
     hipc::MemoryBackendId data_id(200,0); hipc::GpuMalloc data_backend;
@@ -360,14 +360,14 @@ int run_workload_gray_scott(const WorkloadConfig &cfg, const char *mode,
     cudaDeviceSynchronize();
     if (d_ptr->IsNull()) {
       HLOG(kError,"GS CTE alloc failed"); cudaFreeHost(d_ptr);
-      CHI_IPC->ResumeGpuOrchestrator();
+      CHI_CPU_IPC->ResumeGpuOrchestrator();
       return -2;
     }
     hipc::FullPtr<char> array_ptr = *d_ptr; cudaFreeHost(d_ptr);
     hipc::AllocatorId data_alloc_id(data_id.major_, data_id.minor_);
-    CHI_IPC->RegisterGpuAllocator(data_id, data_backend.data_, data_backend.data_capacity_);
+    CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(data_id, data_backend.data_, data_backend.data_capacity_);
 
-    chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+    chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
     gpu_info.backend = scratch_backend;
     int *d_done; cudaMallocHost(&d_done, sizeof(int)); *d_done = 0;
     if(scratch_backend.data_) cudaMemset(scratch_backend.data_,0,sizeof(hipc::PartitionedAllocator));
@@ -473,14 +473,14 @@ int run_workload_gray_scott(const WorkloadConfig &cfg, const char *mode,
           h_fo, h_fb, h_ps, h_pe,
           total_warps, L, d_done);
 
-      CHI_IPC->ResumeGpuOrchestrator();
+      CHI_CPU_IPC->ResumeGpuOrchestrator();
       auto *orch = static_cast<chi::gpu::WorkOrchestrator*>(CHI_IPC->gpu_orchestrator_);
       auto *ctrl = orch ? orch->control_ : nullptr;
       if(ctrl){int w=0;while(ctrl->running_flag==0&&w<5000){std::this_thread::sleep_for(std::chrono::milliseconds(1));++w;}}
       int64_t tus=(int64_t)cfg.timeout_sec*1000000,el=0;
       while(__atomic_load_n(d_done,__ATOMIC_ACQUIRE)<(int)total_warps&&el<tus){
         std::this_thread::sleep_for(std::chrono::microseconds(100));el+=100;}
-      CHI_IPC->PauseGpuOrchestrator();
+      CHI_CPU_IPC->PauseGpuOrchestrator();
       hshm::GpuApi::Synchronize(stream);
       hshm::GpuApi::DestroyStream(stream);
 

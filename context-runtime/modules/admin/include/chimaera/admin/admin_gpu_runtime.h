@@ -8,7 +8,7 @@
 #ifndef CHIMAERA_ADMIN_GPU_RUNTIME_H_
 #define CHIMAERA_ADMIN_GPU_RUNTIME_H_
 
-#include "chimaera/gpu_container.h"
+#include "chimaera/gpu/container.h"
 
 namespace chimaera::admin {
 

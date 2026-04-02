@@ -48,7 +48,7 @@
 
 #include <chimaera/chimaera.h>
 #include <chimaera/ipc_manager.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <chimaera/pool_manager.h>
 #include <chimaera/config_manager.h>
 #include <chimaera/singletons.h>
@@ -167,12 +167,13 @@ TEST_CASE("GpuRuntime - ToGpu Queues Initialized", "[gpu]") {
   REQUIRE(g_initialized);
 
   auto *ipc = CHI_IPC;
-  size_t to_gpu_count = ipc->GetToGpuQueueCount();
+  auto *gpu_ipc = ipc->GetGpuIpcManager();
+  size_t to_gpu_count = gpu_ipc ? gpu_ipc->gpu_devices_.size() : 0;
   INFO("Number of to_gpu queues: " + std::to_string(to_gpu_count));
   REQUIRE(to_gpu_count > 0);
 
   // First queue should be non-null
-  chi::TaskQueue *q = ipc->GetToGpuQueue(0);
+  chi::GpuTaskQueue *q = gpu_ipc->gpu_devices_[0].cpu2gpu_queue.ptr_;
   REQUIRE(q != nullptr);
 }
 
@@ -184,12 +185,13 @@ TEST_CASE("GpuRuntime - GpuToGpu Queues Initialized", "[gpu]") {
   REQUIRE(g_initialized);
 
   auto *ipc = CHI_IPC;
-  size_t g2g_count = ipc->GetGpuToGpuQueueCount();
+  auto *gpu_ipc = ipc->GetGpuIpcManager();
+  size_t g2g_count = gpu_ipc ? gpu_ipc->gpu_devices_.size() : 0;
   INFO("Number of gpu_to_gpu queues: " + std::to_string(g2g_count));
   REQUIRE(g2g_count > 0);
 
   // First queue should be non-null
-  chi::TaskQueue *q = ipc->GetGpuToGpuQueue(0);
+  chi::GpuTaskQueue *q = gpu_ipc->gpu_devices_[0].gpu2gpu_queue.ptr_;
   REQUIRE(q != nullptr);
 }
 

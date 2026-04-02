@@ -35,7 +35,7 @@
 #define CHIMAERA_INCLUDE_CHIMAERA_GPU_POOL_MANAGER_H_
 
 #include "chimaera/types.h"
-#include "chimaera/gpu_container.h"
+#include "chimaera/gpu/container.h"
 
 namespace chi {
 namespace gpu {

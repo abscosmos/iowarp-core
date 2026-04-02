@@ -257,6 +257,57 @@ class GpuApi {
 #endif
   }
 
+  /** Allocate pinned host memory accessible by GPU. */
+  template <typename T>
+  static T *MallocHost(size_t size) {
+#if HSHM_ENABLE_ROCM
+    T *ptr;
+    HIP_ERROR_CHECK(hipHostMalloc(&ptr, size, hipHostMallocDefault));
+    return ptr;
+#endif
+#if HSHM_ENABLE_CUDA
+    void *vptr;
+    CUDA_ERROR_CHECK(cudaMallocHost(&vptr, size));
+    return static_cast<T *>(vptr);
+#endif
+    return nullptr;
+  }
+
+  /** Free pinned host memory. */
+  template <typename T>
+  static void FreeHost(T *ptr) {
+#if HSHM_ENABLE_ROCM
+    HIP_ERROR_CHECK(hipHostFree(ptr));
+#endif
+#if HSHM_ENABLE_CUDA
+    CUDA_ERROR_CHECK(cudaFreeHost(ptr));
+#endif
+  }
+
+  /** Async memcpy (uses cudaMemcpyDefault direction). */
+  template <typename T>
+  static void MemcpyAsync(T *dst, const T *src, size_t size,
+                           void *stream = nullptr) {
+#if HSHM_ENABLE_ROCM
+    HIP_ERROR_CHECK(hipMemcpyAsync(dst, src, size, hipMemcpyDefault,
+                                    static_cast<hipStream_t>(stream)));
+#endif
+#if HSHM_ENABLE_CUDA
+    CUDA_ERROR_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault,
+                                      static_cast<cudaStream_t>(stream)));
+#endif
+  }
+
+  /** Allocate device memory and copy host data into it. */
+  template <typename T>
+  static T *MallocAndCopy(const T *host_src, size_t copy_size,
+                           size_t alloc_size) {
+    T *device_ptr = Malloc<T>(alloc_size);
+    if (!device_ptr) return nullptr;
+    Memcpy(device_ptr, host_src, copy_size);
+    return device_ptr;
+  }
+
 #if HSHM_IS_GPU_COMPILER
   HSHM_GPU_FUN static size_t GetGlobalThreadId() {
     return threadIdx.x + blockIdx.x * blockDim.x +

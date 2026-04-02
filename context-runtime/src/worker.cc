@@ -239,10 +239,8 @@ void Worker::Run() {
       u32 count = ProcessNewTasks(assigned_lane_);
       if (count > 0) did_work_ = true;
     }
-    for (auto *gpu_lane : gpu_lanes_) {
-      u32 count = ProcessNewTasks(gpu_lane);
-      if (count > 0) did_work_ = true;
-    }
+    u32 gpu_count = ProcessNewTasksGpu();
+    if (gpu_count > 0) did_work_ = true;
 
     // Check blocked queue for completed tasks at end of each iteration
     ContinueBlockedTasks(false);
@@ -279,63 +277,156 @@ void Worker::SetLane(TaskLane *lane) {
 
 TaskLane *Worker::GetLane() const { return assigned_lane_; }
 
-void Worker::SetGpuLanes(const std::vector<TaskLane *> &lanes) {
+void Worker::SetGpuLanes(const std::vector<GpuTaskLane *> &lanes) {
   gpu_lanes_ = lanes;
 }
 
-const std::vector<TaskLane *> &Worker::GetGpuLanes() const {
+const std::vector<GpuTaskLane *> &Worker::GetGpuLanes() const {
   return gpu_lanes_;
+}
+
+u32 Worker::ProcessNewTasksGpu() {
+  u32 total = 0;
+  for (auto *gpu_lane : gpu_lanes_) {
+    if (ProcessNewTaskGpu(gpu_lane)) {
+      ++total;
+    }
+  }
+  return total;
+}
+
+bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
+  // GPU→CPU queue stores gpu::Future<Task> entries.
+  // gpu::Future<Task> has a different layout from chi::Future<Task>:
+  //   - chi::Future<Task>: task_ptr_(24B) + future_shm_(16B) +
+  //                        parent_task_(8B) + consumed_(1B) + range_(8B) = ~72B
+  //   - gpu::Future<Task>: task_ptr_(24B) + future_shm_(16B) + consumed_(1B) = ~48B
+  //
+  // When a GPU thread calls SendGpu() it:
+  //   1. Places the gpu::FutureShm* as a raw address in future_shm_.off_
+  //   2. Pushes Future<Task>(fshmptr) — task_ptr_ is NULL in the queued entry
+  //   3. client_task_vaddr_ in gpu::FutureShm holds the raw task pointer
+  //
+  // We must NOT reinterpret_cast to TaskLane* — that would read 72B chi::Future
+  // fields from a 48B gpu::Future slot, causing out-of-bounds reads and
+  // interpreting gpu::FutureShm fields as chi::FutureShm fields.
+
+  // Step 1: Pop the gpu::Future<Task> entry from the lane.
+  gpu::Future<Task> gpu_future;
+  if (!gpu_lane->Pop(gpu_future)) {
+    return false;
+  }
+
+  SetCurrentRunContext(nullptr);
+
+  // Step 2: Resolve the gpu::FutureShm pointer.
+  // The ShmPtr::off_ field stores the raw virtual address of the
+  // gpu::FutureShm struct (embedded immediately after the task in device/
+  // pinned memory). The alloc_id_ may be null or a GPU sentinel ID.
+  hipc::ShmPtr<gpu::FutureShm> gpu_fshm_shmptr = gpu_future.GetFutureShmPtr();
+  if (gpu_fshm_shmptr.IsNull()) {
+    HLOG(kError, "Worker {}: ProcessNewTaskGpu: gpu FutureShm ShmPtr is null",
+         worker_id_);
+    return true;
+  }
+
+  // The off_ is a raw pointer address — resolve directly.
+  auto *gpu_fshm = reinterpret_cast<gpu::FutureShm *>(gpu_fshm_shmptr.off_.load());
+  if (!gpu_fshm) {
+    HLOG(kError, "Worker {}: ProcessNewTaskGpu: gpu_fshm is null",
+         worker_id_);
+    return true;
+  }
+
+  // Step 3: Extract routing info and the task pointer from gpu::FutureShm.
+  PoolId pool_id = gpu_fshm->pool_id_;
+  u32 method_id = gpu_fshm->method_id_;
+
+  // client_task_vaddr_ holds the raw device/pinned-host pointer to the task.
+  Task *task_raw = reinterpret_cast<Task *>(gpu_fshm->client_task_vaddr_);
+  if (!task_raw) {
+    HLOG(kError,
+         "Worker {}: ProcessNewTaskGpu: client_task_vaddr_ is 0 "
+         "(pool={}, method={})",
+         worker_id_, pool_id, method_id);
+    // Mark the GPU future complete so the GPU side doesn't hang.
+    gpu_fshm->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
+    return true;
+  }
+
+  // Build a FullPtr<Task>. The task lives in pinned host or device memory;
+  // the ShmPtr fields are best-effort (alloc_id from task_ptr_ in the entry,
+  // or null if not set). We use a null alloc_id so chi::IpcManager does not
+  // try to free through a CPU allocator.
+  hipc::FullPtr<Task> task_full_ptr(task_raw);
+
+  // Step 4: Wrap in a chi::Future<Task> via MakePointerFuture.
+  // This allocates a chi::FutureShm on the runtime SHM heap and sets up
+  // the future for BeginTask / RouteTask.
+  Future<Task> future = CHI_IPC->MakePointerFuture(task_full_ptr);
+  if (future.GetFutureShmPtr().IsNull()) {
+    HLOG(kError,
+         "Worker {}: ProcessNewTaskGpu: MakePointerFuture failed "
+         "(pool={}, method={})",
+         worker_id_, pool_id, method_id);
+    gpu_fshm->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
+    return true;
+  }
+
+  // Step 5: Patch the chi::FutureShm with GPU-origin metadata so that
+  // SendRuntime uses the correct completion path (FUTURE_CLIENT_GPU2CPU:
+  // set FUTURE_COMPLETE and free device memory; no network send needed).
+  auto chi_fshm = future.GetFutureShm();
+  chi_fshm->pool_id_ = pool_id;
+  chi_fshm->method_id_ = method_id;
+  chi_fshm->origin_ = FutureShm::FUTURE_CLIENT_GPU2CPU;
+  // Store the gpu::FutureShm pointer so SendRuntime can set FUTURE_COMPLETE
+  // on the device-side struct and wake the GPU waiter.
+  chi_fshm->task_device_ptr_ =
+      reinterpret_cast<uintptr_t>(gpu_fshm);
+
+  // Step 6: Find the container for routing.
+  auto *pool_manager = CHI_POOL_MANAGER;
+  Container *container = pool_manager->GetStaticContainer(pool_id);
+  if (!container) {
+    HLOG(kError,
+         "Worker {}: ProcessNewTaskGpu: Container not found "
+         "(pool={}, method={})",
+         worker_id_, pool_id, method_id);
+    chi_fshm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
+    gpu_fshm->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
+    return true;
+  }
+
+  // Step 7: Allocate RunContext and route the task.
+  if (!task_full_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
+    CHI_IPC->BeginTask(future, container, assigned_lane_);
+  } else {
+    RunContext *run_ctx = task_full_ptr->GetRunCtx();
+    if (run_ctx) {
+      run_ctx->worker_id_ = worker_id_;
+      run_ctx->lane_ = assigned_lane_;
+      run_ctx->event_queue_ = event_queue_;
+    }
+  }
+
+  RouteResult route_result = CHI_IPC->RouteTask(future);
+  if (route_result == RouteResult::ExecHere) {
+#if HSHM_IS_HOST
+    RunContext *run_ctx = task_full_ptr->GetRunCtx();
+    bool is_started = task_full_ptr->task_flags_.Any(TASK_STARTED);
+    ExecTask(task_full_ptr, run_ctx, is_started);
+#endif
+  }
+
+  return true;
 }
 
 hipc::FullPtr<Task> Worker::GetOrCopyTaskFromFuture(Future<Task> &future,
                                                     Container *container,
                                                     u32 method_id) {
-  auto future_shm = future.GetFutureShm();
-  FullPtr<Task> task_full_ptr = future.GetTaskPtr();
-
-  // Check FUTURE_COPY_FROM_CLIENT flag to determine if task needs to be loaded
-  if (future_shm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT) &&
-      !future_shm->flags_.Any(FutureShm::FUTURE_WAS_COPIED)) {
-    // CLIENT PATH: Load task from serialized data in FutureShm copy_space
-    // Only copy if not already copied (FUTURE_WAS_COPIED not set)
-
-    // Build SHM context for transfer
-    hshm::lbm::LbmContext ctx;
-    ctx.copy_space = future_shm->copy_space;
-    ctx.shm_info_ = &future_shm->input_;
-
-    // Detect GPU→CPU tasks: SendGpu sets client_task_vaddr_=0 and uses
-    // DefaultSaveArchive (LocalSerialize format). SendShm (CPU→CPU) sets
-    // client_task_vaddr_ to the task pointer and uses SaveTaskArchive (cereal).
-    bool is_gpu_task = (future_shm->client_task_vaddr_ == 0);
-
-    if (is_gpu_task) {
-      // GPU→CPU path: task was serialized with DefaultSaveArchive.
-      // Use DefaultLoadArchive (LocalDeserialize) to match the wire format.
-      chi::priv::vector<char> recv_buf;
-      recv_buf.reserve(256);
-      DefaultLoadArchive local_archive(recv_buf);
-      auto info = shm_recv_transport_->Recv(local_archive, ctx);
-      (void)info;
-      task_full_ptr = container->LocalAllocLoadTask(method_id, local_archive);
-    } else {
-      // CPU→CPU SHM path: task was serialized with SaveTaskArchive (cereal).
-      // Use LoadTaskArchive (cereal BinaryInputArchive) to match.
-      LoadTaskArchive archive;
-      auto info = shm_recv_transport_->Recv(archive, ctx);
-      (void)info;
-      task_full_ptr = container->AllocLoadTask(method_id, archive);
-    }
-
-    // Update the Future's task pointer
-    future.GetTaskPtr() = task_full_ptr;
-
-    // Mark as copied to prevent re-copying if task migrates between workers
-    future_shm->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
-  }
-  // RUNTIME PATH or ALREADY COPIED: Task pointer is already set in future
-
-  return task_full_ptr;
+  return CHI_IPC->RecvRuntime(future, container, method_id,
+                              shm_recv_transport_.get());
 }
 
 u32 Worker::ProcessNewTasks(TaskLane *lane) {
@@ -761,33 +852,6 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   EndTask(task_ptr, run_ctx, true);
 }
 
-void Worker::EndTaskShmTransfer(const FullPtr<Task> &task_ptr,
-                                RunContext *run_ctx, Container *container) {
-  auto future_shm = run_ctx->future_.GetFutureShm();
-
-  // Build SHM context for transfer (output reuses same copy_space)
-  future_shm->output_.copy_space_size_ = future_shm->input_.copy_space_size_;
-  hshm::lbm::LbmContext ctx;
-  ctx.copy_space = future_shm->copy_space;
-  ctx.shm_info_ = &future_shm->output_;
-
-  // Serialize outputs
-  SaveTaskArchive archive(MsgType::kSerializeOut, shm_send_transport_.get());
-  container->SaveTask(task_ptr->method_, archive, task_ptr);
-
-  // Send via SHM transport (blocking)
-  shm_send_transport_->Send(archive, ctx);
-
-  // Set FUTURE_COMPLETE and clean up task.
-  // Use SetBitsSystem for CPU→GPU visibility: on discrete GPUs the GPU's
-  // system-scope atomic read may not observe a plain CPU store without
-  // a system-scope fence/atomic on the CPU side.
-  future_shm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
-  // Clear TASK_DATA_OWNER before deletion so the destructor
-  // doesn't try to FreeBuffer on transport-allocated data
-  task_ptr->ClearFlags(TASK_DATA_OWNER);
-  container->DelTask(task_ptr->method_, task_ptr);
-}
 
 void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
                      bool can_resched) {
@@ -857,46 +921,9 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // transfer)
   RunContext *parent_task = run_ctx->future_.GetParentTask();
 
-  // Handle client transfer based on origin transport mode
-  if (was_copied) {
-    u32 origin = future_shm->origin_;
-    switch (origin) {
-      case FutureShm::FUTURE_CLIENT_SHM:
-        EndTaskShmTransfer(task_ptr, run_ctx, container);
-        break;
-      case FutureShm::FUTURE_CLIENT_TCP:
-        CHI_IPC->EnqueueNetTask(run_ctx->future_,
-                                NetQueuePriority::kClientSendTcp);
-        break;
-      case FutureShm::FUTURE_CLIENT_IPC:
-        CHI_IPC->EnqueueNetTask(run_ctx->future_,
-                                NetQueuePriority::kClientSendIpc);
-        break;
-      default:
-        EndTaskShmTransfer(task_ptr, run_ctx, container);
-        break;
-    }
-  } else if (parent_task && parent_task->event_queue_) {
-    // Runtime subtask with parent: enqueue Future to parent worker's event
-    // queue. FUTURE_COMPLETE is NOT set here — it will be set by
-    // ProcessEventQueue on the parent's worker thread. This prevents the race
-    // where the parent sees FUTURE_COMPLETE early, completes, frees memory, and
-    // a stale event resumes a different task that reused the same address.
-    auto *parent_event_queue =
-        reinterpret_cast<hipc::mpsc_ring_buffer<Future<Task, CHI_QUEUE_ALLOC_T>,
-                                                hshm::ipc::MallocAllocator> *>(
-            parent_task->event_queue_);
-    bool was_empty = parent_event_queue->Empty();
-    parent_event_queue->Emplace(run_ctx->future_);
-    if (was_empty && parent_task->lane_) {
-      CHI_IPC->AwakenWorker(parent_task->lane_);
-    }
-  } else {
-    // Runtime task without parent (top-level client task) - set FUTURE_COMPLETE
-    // directly so the client's Wait() can see it.
-    // Use SetBitsSystem for CPU→GPU visibility in UVM.
-    future_shm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
-  }
+  // Dispatch response via transport class
+  IpcCpu2Self::RuntimeSend(task_ptr, run_ctx, container,
+                           shm_send_transport_.get());
 }
 
 void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,

@@ -16,7 +16,7 @@ namespace chimaera::bdev {
 
 HSHM_GPU_FUN void GpuRuntime::Update(hipc::FullPtr<UpdateTask> task,
                                       chi::gpu::RunContext &rctx) {
-  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; return; }
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) { (void)rctx; return; }
   hbm_ptr_    = task->hbm_ptr_;
   pinned_ptr_ = task->pinned_ptr_;
   hbm_size_   = task->hbm_size_;
@@ -28,7 +28,7 @@ HSHM_GPU_FUN void GpuRuntime::Update(hipc::FullPtr<UpdateTask> task,
   printf("[BDEV-GPU Update] total_size=%llu bdev_type=%u hbm=%p pinned=%p this=%p\n",
          (unsigned long long)total_size_, (unsigned)bdev_type_,
          (void*)hbm_ptr_, (void*)pinned_ptr_, (void*)this);
-  num_warps_ = chi::IpcManager::GetNumWarps();
+  num_warps_ = chi::gpu::IpcManager::GetNumWarps();
   if (num_warps_ == 0) num_warps_ = 1;
   warp_caches_.clear();
   warp_caches_.resize(num_warps_);
@@ -48,7 +48,7 @@ HSHM_GPU_FUN void GpuRuntime::Update(hipc::FullPtr<UpdateTask> task,
 HSHM_GPU_FUN void GpuRuntime::AllocateBlocks(
     hipc::FullPtr<AllocateBlocksTask> task,
     chi::gpu::RunContext &rctx) {
-  if (!chi::IpcManager::IsWarpScheduler()) { (void)rctx; return; }
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) { (void)rctx; return; }
   chi::u64 req = task->size_;
   if (req == 0 || total_size_ == 0) {
     task->return_code_ = 0;
@@ -68,7 +68,7 @@ HSHM_GPU_FUN void GpuRuntime::AllocateBlocks(
     block_type = static_cast<chi::u32>(GpuBlockSizeCategory::kNumCategories);
   }
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
   if (warp_id >= num_warps_) warp_id = 0;
 
   Block blk;
@@ -106,9 +106,9 @@ HSHM_GPU_FUN void GpuRuntime::AllocateBlocks(
 
 HSHM_GPU_FUN void GpuRuntime::FreeBlocks(hipc::FullPtr<FreeBlocksTask> task,
                                            chi::gpu::RunContext &rctx) {
-  if (!chi::IpcManager::IsWarpScheduler()) { (void)task; (void)rctx; return; }
+  if (!chi::gpu::IpcManager::IsWarpScheduler()) { (void)task; (void)rctx; return; }
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
   if (warp_id >= num_warps_) warp_id = 0;
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {

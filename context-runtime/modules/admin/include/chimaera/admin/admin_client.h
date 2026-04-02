@@ -348,7 +348,7 @@ class Client : public chi::ContainerClient {
     auto task = ipc_manager->NewTask<RegisterMemoryTask>(
         chi::CreateTaskId(), pool_id_, pool_query, alloc_id);
 
-    return ipc_manager->SendZmq(task, chi::IpcMode::kTcp);
+    return chi::IpcCpu2CpuZmq::ClientSend(ipc_manager, task, chi::IpcMode::kTcp);
   }
   /**
    * RestartContainers - Re-create pools from saved restart configs

@@ -56,7 +56,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/bdev/bdev_client.h>
 #include <chimaera/bdev/bdev_tasks.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/core/core_tasks.h>
 
@@ -218,7 +218,7 @@ class GpuCoreGpuFixture {
       INFO("CHI_IPC is null; GPU-path CTE tests will be skipped");
       return;
     }
-    if (ipc->GetToGpuQueueCount() == 0) {
+    if (ipc->GetGpuIpcManager()->gpu_devices_.size() == 0) {
       INFO("No GPU queues available; GPU-path CTE tests will be skipped");
       return;
     }

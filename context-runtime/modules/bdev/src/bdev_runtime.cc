@@ -1393,7 +1393,7 @@ void Runtime::PostGpuContainerCreate() {
       HLOG(kInfo, "PostGpuContainerCreate: sending UpdateTask pool={} type={} ipc={:x} cpu2gpu_backends={}",
            pool_id_, (int)bdev_type_,
            reinterpret_cast<uintptr_t>(ipc),
-           ipc->cpu2gpu_copy_backends_.size());
+           ipc->gpu_ipc_ ? ipc->gpu_ipc_->gpu_devices_.size() : 0);
       // fire-and-forget: worker frees the task after executing it
       (void)ipc->Send(update_task);
     }

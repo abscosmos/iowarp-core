@@ -820,7 +820,7 @@ class ChiModGenerator {
       oss << "#include \"" << repo_namespace_ << "/" << module_name << "/" << chimod_name << "_gpu_runtime.h\"\n";
     }
     oss << "\n";
-    oss << "#include \"chimaera/gpu_container.h\"\n";
+    oss << "#include \"chimaera/gpu/container.h\"\n";
     oss << "#include \"chimaera/types.h\"\n";
     oss << "#include <cstring>\n";
     oss << "\n";

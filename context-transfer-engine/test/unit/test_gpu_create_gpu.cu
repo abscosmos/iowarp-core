@@ -132,8 +132,8 @@ __global__ void gpu_create_kernel(chi::IpcManagerGpu gpu_info,
   // This replaces future.Wait() to avoid an unbreakable infinite loop.
   {
     auto fshm_full = future.GetFutureShm();
-    chi::FutureShm *fshm = fshm_full.ptr_;
-    while (fshm && !fshm->flags_.AnySystem(chi::FutureShm::FUTURE_COMPLETE)) {
+    chi::gpu::FutureShm *fshm = fshm_full.ptr_;
+    while (fshm && !fshm->flags_.AnySystem(chi::gpu::FutureShm::FUTURE_COMPLETE)) {
       // Use atomicAdd_system(0) to bypass GPU L2 cache so we see the
       // CPU-written stop flag without a stale L2-cached value.
       int stop = atomicAdd_system(const_cast<int *>(d_stop), 0);
@@ -187,13 +187,13 @@ extern "C" int run_gpu_create_test(const char *pool_name,
 
   fprintf(stderr, "[GPU_CREATE_DEBUG] backends initialized\n"); fflush(stderr);
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                 gpu_backend.data_capacity_);
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+                                     gpu_backend.data_capacity_);
 
   // Set up IpcManagerGpuInfo for GPU→CPU path
   chi::IpcManagerGpuInfo gpu_info;
   gpu_info.backend = static_cast<hipc::MemoryBackend &>(gpu_backend);
-  gpu_info.gpu2cpu_queue = CHI_IPC->GetGpuQueue(0);
+  gpu_info.gpu2cpu_queue = CHI_CPU_IPC->GetGpuQueue(0);
   gpu_info.gpu2cpu_backend = static_cast<hipc::MemoryBackend &>(g2c_backend);
 
   fprintf(stderr, "[GPU_CREATE_DEBUG] gpu_info set up, launching kernel\n"); fflush(stderr);

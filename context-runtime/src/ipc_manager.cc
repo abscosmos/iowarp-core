@@ -66,11 +66,14 @@
 #include "chimaera/admin/admin_client.h"
 #include "chimaera/chimaera_manager.h"
 #include "chimaera/config_manager.h"
+#include "chimaera/container.h"
+#include "chimaera/local_task_archives.h"
 #include "chimaera/pool_manager.h"
 #include "chimaera/scheduler/scheduler_factory.h"
+#include "chimaera/task_archives.h"
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-#include "chimaera/gpu_work_orchestrator.h"
+#include "chimaera/gpu/work_orchestrator.h"
 #include <hermes_shm/util/gpu_api.h>
 #endif
 
@@ -610,12 +613,12 @@ void IpcManager::AssignGpuLanesToWorker() {
   if (num_gpus == 0 || !scheduler_) return;
   Worker *gpu_worker = scheduler_->GetGpuWorker();
   if (!gpu_worker) return;
-  std::vector<TaskLane *> gpu_lanes;
+  std::vector<GpuTaskLane *> gpu_lanes;
   gpu_lanes.reserve(num_gpus);
   for (size_t gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
-    TaskQueue *gpu_queue = GetGpuQueue(gpu_id);
+    GpuTaskQueue *gpu_queue = GetGpuQueue(gpu_id);
     if (gpu_queue) {
-      TaskLane *gpu_lane = &gpu_queue->GetLane(0, 0);
+      GpuTaskLane *gpu_lane = &gpu_queue->GetLane(0, 0);
       gpu_lanes.push_back(gpu_lane);
       gpu_lane->SetAssignedWorkerId(gpu_worker->GetId());
     }
@@ -648,18 +651,15 @@ bool IpcManager::ServerInitGpuQueues() {
     ConfigManager *config = CHI_CONFIG_MANAGER;
     u32 queue_depth = config->GetQueueDepth();
 
-    // Reserve per-GPU vectors
-    gpu2gpu_queue_backends_.reserve(num_gpus);
-    internal_queue_backends_.reserve(num_gpus);
-    gpu2cpu_queue_backends_.reserve(num_gpus);
-    cpu2gpu_queue_backends_.reserve(num_gpus);
-    gpu2cpu_copy_backends_.reserve(num_gpus);
-    cpu2gpu_copy_backends_.reserve(num_gpus);
-    gpu_orchestrator_backends_.reserve(num_gpus);
-    gpu2gpu_queues_.reserve(num_gpus);
-    internal_queues_.reserve(num_gpus);
-    gpu2cpu_queues_.reserve(num_gpus);
-    cpu2gpu_queues_.reserve(num_gpus);
+    // Initialize the GPU IPC manager if not already done.
+    // gpu_ipc_ is a std::unique_ptr default-constructed to nullptr;
+    // it must be created here before any gpu_ipc_->... access.
+    if (!gpu_ipc_) {
+      gpu_ipc_ = std::make_unique<gpu::IpcManager>();
+    }
+
+    // Resize gpu_devices_ to hold all GPUs
+    gpu_ipc_->gpu_devices_.resize(num_gpus);
 
     for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
       if (!InitGpuBackendsForDevice(gpu_id, queue_depth)) {
@@ -720,16 +720,16 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
       return false;
     }
     // Initialize allocator + queue entirely on the GPU
-    hipc::FullPtr<TaskQueue> q = gpu::InitQueueOnDevice(
+    hipc::FullPtr<GpuTaskQueue> q = gpu::InitQueueOnDevice(
         backend->data_, backend->data_capacity_, num_lanes, queue_depth);
     if (q.IsNull()) {
       HLOG(kError, "Failed to init gpu2gpu TaskQueue on device for GPU {}", gpu_id);
       return false;
     }
-    RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
-    gpu2gpu_queues_.push_back(q);
-    gpu2gpu_queue_backends_.push_back(std::move(backend));
-    gpu2gpu_num_lanes_ = num_lanes;
+    gpu_ipc_->RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
+    gpu_ipc_->gpu_devices_[gpu_id].gpu2gpu_queue = q;
+    gpu_ipc_->gpu_devices_[gpu_id].gpu2gpu_queue_backend = std::move(backend);
+    gpu_ipc_->gpu_orchestrator_info_.gpu2gpu_num_lanes = num_lanes;
   }
 
   // --- 2. GPU→CPU queue backend (pinned host, GpuShmMmap) ---
@@ -745,12 +745,12 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
     auto *alloc = backend->template MakeAlloc<CHI_QUEUE_ALLOC_T>(
         backend->data_capacity_);
     if (!alloc) return false;
-    hipc::FullPtr<TaskQueue> q = alloc->template NewObj<TaskQueue>(
+    hipc::FullPtr<GpuTaskQueue> q = alloc->template NewObj<GpuTaskQueue>(
         alloc, 1, 2, queue_depth);
     if (q.IsNull()) return false;
-    RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
-    gpu2cpu_queues_.push_back(q);
-    gpu2cpu_queue_backends_.push_back(std::move(backend));
+    gpu_ipc_->RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
+    gpu_ipc_->gpu_devices_[gpu_id].gpu2cpu_queue = q;
+    gpu_ipc_->gpu_devices_[gpu_id].gpu2cpu_queue_backend = std::move(backend);
   }
 
   // --- 3. CPU→GPU queue backend (pinned host, GpuShmMmap) ---
@@ -766,12 +766,12 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
     auto *alloc = backend->template MakeAlloc<CHI_QUEUE_ALLOC_T>(
         backend->data_capacity_);
     if (!alloc) return false;
-    hipc::FullPtr<TaskQueue> q = alloc->template NewObj<TaskQueue>(
+    hipc::FullPtr<GpuTaskQueue> q = alloc->template NewObj<GpuTaskQueue>(
         alloc, 1, 2, queue_depth);
     if (q.IsNull()) return false;
-    RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
-    cpu2gpu_queues_.push_back(q);
-    cpu2gpu_queue_backends_.push_back(std::move(backend));
+    gpu_ipc_->RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
+    gpu_ipc_->gpu_devices_[gpu_id].cpu2gpu_queue = q;
+    gpu_ipc_->gpu_devices_[gpu_id].cpu2gpu_queue_backend = std::move(backend);
   }
 
   // --- 4. GPU→CPU copy-space backend (pinned host, GpuShmMmap) ---
@@ -784,8 +784,8 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
       HLOG(kError, "Failed to init gpu2cpu copy backend for GPU {}", gpu_id);
       return false;
     }
-    RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
-    gpu2cpu_copy_backends_.push_back(std::move(backend));
+    gpu_ipc_->RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
+    gpu_ipc_->gpu_devices_[gpu_id].gpu2cpu_copy_backend = std::move(backend);
   }
 
   // --- 5. CPU→GPU copy-space backend (pinned host, GpuShmMmap) ---
@@ -808,8 +808,8 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
       HLOG(kError, "Failed to init allocator for cpu2gpu copy backend GPU {}", gpu_id);
       return false;
     }
-    RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
-    cpu2gpu_copy_backends_.push_back(std::move(backend));
+    gpu_ipc_->RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
+    gpu_ipc_->gpu_devices_[gpu_id].cpu2gpu_copy_backend = std::move(backend);
   }
 
   // --- 6. Orchestrator scratch backend (pinned host, GpuShmMmap) ---
@@ -829,7 +829,7 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
       HLOG(kError, "Failed to init orchestrator backend for GPU {}", gpu_id);
       return false;
     }
-    gpu_orchestrator_backends_.push_back(std::move(backend));
+    gpu_ipc_->gpu_devices_[gpu_id].gpu_orchestrator_backend = std::move(backend);
   }
 
   // --- 7. Internal subtask queue backend (device memory, GpuMalloc) ---
@@ -847,15 +847,15 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
       HLOG(kError, "Failed to init internal queue backend for GPU {}", gpu_id);
       return false;
     }
-    hipc::FullPtr<TaskQueue> q = gpu::InitQueueOnDevice(
+    hipc::FullPtr<GpuTaskQueue> q = gpu::InitQueueOnDevice(
         backend->data_, backend->data_capacity_, num_lanes, queue_depth);
     if (q.IsNull()) {
       HLOG(kError, "Failed to init internal TaskQueue on device for GPU {}", gpu_id);
       return false;
     }
-    RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
-    internal_queues_.push_back(q);
-    internal_queue_backends_.push_back(std::move(backend));
+    gpu_ipc_->RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
+    gpu_ipc_->gpu_devices_[gpu_id].internal_queue = q;
+    gpu_ipc_->gpu_devices_[gpu_id].internal_queue_backend = std::move(backend);
   }
 
   HLOG(kInfo, "GPU {} backends initialized (queue_depth={})", gpu_id,
@@ -870,21 +870,15 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
  * @param queue_depth Queue depth (stored in info struct)
  */
 void IpcManager::BuildOrchestratorInfo(u32 gpu_id, u32 queue_depth) {
-  gpu_orchestrator_info_.backend =
-      static_cast<hipc::MemoryBackend &>(*gpu_orchestrator_backends_[gpu_id]);
-  gpu_orchestrator_info_.gpu2gpu_queue = gpu2gpu_queues_[gpu_id].ptr_;
-  gpu_orchestrator_info_.gpu2gpu_queue_base =
-      gpu2gpu_queue_backends_[gpu_id]->data_;
-  gpu_orchestrator_info_.internal_queue = internal_queues_[gpu_id].ptr_;
-  gpu_orchestrator_info_.internal_queue_base =
-      internal_queue_backends_[gpu_id]->data_;
-  gpu_orchestrator_info_.cpu2gpu_queue = cpu2gpu_queues_[gpu_id].ptr_;
-  gpu_orchestrator_info_.cpu2gpu_queue_base =
-      cpu2gpu_copy_backends_[gpu_id]->data_;
-  gpu_orchestrator_info_.gpu2cpu_queue = gpu2cpu_queues_[gpu_id].ptr_;
-  gpu_orchestrator_info_.gpu2cpu_backend =
-      static_cast<hipc::MemoryBackend &>(*gpu2cpu_copy_backends_[gpu_id]);
-  gpu_orchestrator_info_.gpu_queue_depth = queue_depth;
+  gpu_ipc_->gpu_orchestrator_info_.backend =
+      static_cast<hipc::MemoryBackend &>(*gpu_ipc_->gpu_devices_[gpu_id].gpu_orchestrator_backend);
+  gpu_ipc_->gpu_orchestrator_info_.gpu2gpu_queue = gpu_ipc_->gpu_devices_[gpu_id].gpu2gpu_queue.ptr_;
+  gpu_ipc_->gpu_orchestrator_info_.internal_queue = gpu_ipc_->gpu_devices_[gpu_id].internal_queue.ptr_;
+  gpu_ipc_->gpu_orchestrator_info_.cpu2gpu_queue = gpu_ipc_->gpu_devices_[gpu_id].cpu2gpu_queue.ptr_;
+  gpu_ipc_->gpu_orchestrator_info_.gpu2cpu_queue = gpu_ipc_->gpu_devices_[gpu_id].gpu2cpu_queue.ptr_;
+  gpu_ipc_->gpu_orchestrator_info_.gpu2cpu_backend =
+      static_cast<hipc::MemoryBackend &>(*gpu_ipc_->gpu_devices_[gpu_id].gpu2cpu_copy_backend);
+  gpu_ipc_->gpu_orchestrator_info_.gpu_queue_depth = queue_depth;
 }
 
 bool IpcManager::LaunchGpuOrchestrator() {
@@ -898,39 +892,43 @@ bool IpcManager::LaunchGpuOrchestrator() {
   u32 threads_per_block = config->GetGpuThreadsPerBlock();
 
   auto *orchestrator = new gpu::WorkOrchestrator();
-  if (!orchestrator->Launch(gpu_orchestrator_info_, blocks, threads_per_block)) {
+  char *cpu2gpu_base = gpu_ipc_->gpu_devices_[0].cpu2gpu_copy_backend
+                           ? gpu_ipc_->gpu_devices_[0].cpu2gpu_copy_backend->data_
+                           : nullptr;
+  if (!orchestrator->Launch(gpu_ipc_->gpu_orchestrator_info_, blocks,
+                            threads_per_block, cpu2gpu_base)) {
     HLOG(kError, "Failed to launch GPU work orchestrator");
     delete orchestrator;
     return false;
   }
 
-  gpu_orchestrator_ = orchestrator;
+  gpu_ipc_->gpu_orchestrator_= orchestrator;
   return true;
 }
 
 void IpcManager::FinalizeGpuOrchestrator() {
-  if (gpu_orchestrator_) {
-    auto *orchestrator = static_cast<gpu::WorkOrchestrator *>(gpu_orchestrator_);
+  if (gpu_ipc_->gpu_orchestrator_) {
+    auto *orchestrator = static_cast<gpu::WorkOrchestrator *>(gpu_ipc_->gpu_orchestrator_);
     orchestrator->Finalize();
     delete orchestrator;
-    gpu_orchestrator_ = nullptr;
+    gpu_ipc_->gpu_orchestrator_= nullptr;
   }
 }
 
 hipc::FullPtr<char> IpcManager::AllocateGpuBuffer(size_t size, u32 gpu_id) {
   // Server path: use cpu2gpu COPY backend (7000+gpu_id, GpuShmMmap, 32MB).
   // The GPU orchestrator resolves FutureShm offsets relative to this backend's
-  // base (cpu2gpu_queue_base_ = cpu2gpu_copy_backends_[gpu_id]->data_), so
+  // base (cpu2gpu_queue_base_ = cpu2gpu_copy_backend->data_), so
   // FutureShm must be allocated here — not in the queue backend (5000).
-  if (gpu_id < cpu2gpu_copy_backends_.size()) {
-    auto *alloc = cpu2gpu_copy_backends_[gpu_id]->template AttachAlloc<CHI_QUEUE_ALLOC_T>();
+  if (gpu_id < gpu_ipc_->gpu_devices_.size()) {
+    auto *alloc = gpu_ipc_->gpu_devices_[gpu_id].cpu2gpu_copy_backend->template AttachAlloc<CHI_QUEUE_ALLOC_T>();
     if (alloc) {
       return alloc->AllocateObjs<char>(size);
     }
   }
   // Client path: use client_cpu2gpu backends (attached to server's GpuShmMmap)
-  if (gpu_id < client_cpu2gpu_backends_.size()) {
-    auto *alloc = client_cpu2gpu_backends_[gpu_id]->template AttachAlloc<CHI_QUEUE_ALLOC_T>();
+  if (gpu_id < gpu_ipc_->gpu_devices_.size()) {
+    auto *alloc = gpu_ipc_->gpu_devices_[gpu_id].client_cpu2gpu_backend->template AttachAlloc<CHI_QUEUE_ALLOC_T>();
     if (alloc) {
       return alloc->AllocateObjs<char>(size);
     }
@@ -938,84 +936,9 @@ hipc::FullPtr<char> IpcManager::AllocateGpuBuffer(size_t size, u32 gpu_id) {
   return hipc::FullPtr<char>::GetNull();
 }
 
-void *IpcManager::CudaMallocAndCopy(const void *host_src, size_t copy_size,
-                                     size_t alloc_size) {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-  void *device_ptr = hshm::GpuApi::Malloc<char>(alloc_size);
-  if (device_ptr) {
-    hshm::GpuApi::Memcpy(static_cast<char *>(device_ptr),
-                          static_cast<const char *>(host_src), copy_size);
-  }
-  return device_ptr;
-#else
-  (void)host_src; (void)copy_size; (void)alloc_size;
-  return nullptr;
-#endif
-}
+// CUDA helpers removed — use hshm::GpuApi directly.
 
-void IpcManager::CudaMemcpyToHost(void *host_dst, const void *device_src,
-                                    size_t size) {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-  hshm::GpuApi::Memcpy(static_cast<char *>(host_dst),
-                        static_cast<const char *>(device_src), size);
-#else
-  (void)host_dst; (void)device_src; (void)size;
-#endif
-}
-
-void IpcManager::CudaMemcpyToHostAsync(void *host_dst, const void *device_src,
-                                        size_t size) {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-  cudaStream_t s;
-  cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
-  cudaMemcpyAsync(host_dst, device_src, size, cudaMemcpyDeviceToHost, s);
-  cudaStreamSynchronize(s);
-  cudaStreamDestroy(s);
-#else
-  (void)host_dst; (void)device_src; (void)size;
-#endif
-}
-
-void IpcManager::CudaMemcpyToDevice(void *device_dst, const void *host_src,
-                                      size_t size) {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-  hshm::GpuApi::Memcpy(static_cast<char *>(device_dst),
-                        static_cast<const char *>(host_src), size);
-#else
-  (void)device_dst; (void)host_src; (void)size;
-#endif
-}
-
-void *IpcManager::CudaMallocHostPinned(size_t size) {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-  void *ptr = nullptr;
-  cudaMallocHost(&ptr, size);
-  return ptr;
-#else
-  (void)size;
-  return nullptr;
-#endif
-}
-
-void IpcManager::CudaFreeHostPinned(void *ptr) {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-  if (ptr) cudaFreeHost(ptr);
-#else
-  (void)ptr;
-#endif
-}
-
-void IpcManager::CudaFreeDevice(void *device_ptr) {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-  if (device_ptr) {
-    hshm::GpuApi::Free(static_cast<char *>(device_ptr));
-  }
-#else
-  (void)device_ptr;
-#endif
-}
-
-void IpcManager::RegisterGpuOrchestratorContainer(const PoolId &pool_id,
+void gpu::IpcManager::RegisterGpuOrchestratorContainer(const PoolId &pool_id,
                                                     void *gpu_container_ptr) {
   if (!gpu_orchestrator_) {
     return;
@@ -1026,16 +949,16 @@ void IpcManager::RegisterGpuOrchestratorContainer(const PoolId &pool_id,
 
 void *IpcManager::AllocGpuContainer(const PoolId &pool_id, u32 container_id,
                                       const std::string &chimod_name) {
-  if (!gpu_orchestrator_) {
+  if (!gpu_ipc_->gpu_orchestrator_) {
     return nullptr;
   }
-  auto *orchestrator = static_cast<gpu::WorkOrchestrator *>(gpu_orchestrator_);
+  auto *orchestrator = static_cast<gpu::WorkOrchestrator *>(gpu_ipc_->gpu_orchestrator_);
   return orchestrator->AllocGpuContainer(pool_id, container_id, chimod_name);
 }
 
 #endif
 
-void IpcManager::PrintGpuOrchestratorProfile() {
+void gpu::IpcManager::PrintGpuOrchestratorProfile() {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   if (!gpu_orchestrator_) return;
   auto *orch = static_cast<gpu::WorkOrchestrator *>(gpu_orchestrator_);
@@ -1085,7 +1008,7 @@ void IpcManager::PrintGpuOrchestratorProfile() {
 #endif
 }
 
-bool IpcManager::PauseGpuOrchestrator() {
+bool gpu::IpcManager::PauseGpuOrchestrator() {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   if (!gpu_orchestrator_) {
     return false;
@@ -1101,9 +1024,9 @@ bool IpcManager::PauseGpuOrchestrator() {
   // correct pointers before the next kernel launch.
   u32 new_lanes = (orchestrator->blocks_ * orchestrator->threads_per_block_) / 32;
   if (new_lanes < 1) new_lanes = 1;
-  if (new_lanes != gpu2gpu_num_lanes_ && !gpu2gpu_queue_backends_.empty()) {
+  if (new_lanes != gpu_orchestrator_info_.gpu2gpu_num_lanes && !gpu_devices_.empty()) {
     RebuildGpu2GpuQueue(0, new_lanes);
-    if (!internal_queue_backends_.empty()) {
+    if (!gpu_devices_.empty()) {
       RebuildInternalQueue(0, new_lanes);
     }
   }
@@ -1121,7 +1044,7 @@ bool IpcManager::PauseGpuOrchestrator() {
 #endif
 }
 
-void IpcManager::ResumeGpuOrchestrator() {
+void gpu::IpcManager::ResumeGpuOrchestrator() {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   if (!gpu_orchestrator_) {
     return;
@@ -1131,7 +1054,7 @@ void IpcManager::ResumeGpuOrchestrator() {
 #endif
 }
 
-void IpcManager::SetGpuOrchestratorBlocks(u32 blocks, u32 threads_per_block) {
+void gpu::IpcManager::SetGpuOrchestratorBlocks(u32 blocks, u32 threads_per_block) {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   if (!gpu_orchestrator_) {
     return;
@@ -1143,12 +1066,12 @@ void IpcManager::SetGpuOrchestratorBlocks(u32 blocks, u32 threads_per_block) {
 }
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-void IpcManager::RebuildGpu2GpuQueue(u32 gpu_id, u32 new_lanes) {
+void gpu::IpcManager::RebuildGpu2GpuQueue(u32 gpu_id, u32 new_lanes) {
   u32 queue_depth = gpu_orchestrator_info_.gpu_queue_depth;
 
   // Destroy old gpu2gpu queue backend (frees device memory)
-  gpu2gpu_queue_backends_[gpu_id].reset();
-  gpu2gpu_queues_[gpu_id] = hipc::FullPtr<TaskQueue>::GetNull();
+  gpu_devices_[gpu_id].gpu2gpu_queue_backend.reset();
+  gpu_devices_[gpu_id].gpu2gpu_queue = hipc::FullPtr<GpuTaskQueue>::GetNull();
 
   // Create new backend with enough space for the new lane count
   hipc::MemoryBackendId bid(3000 + gpu_id, 0);
@@ -1163,7 +1086,7 @@ void IpcManager::RebuildGpu2GpuQueue(u32 gpu_id, u32 new_lanes) {
     return;
   }
 
-  hipc::FullPtr<TaskQueue> q = gpu::InitQueueOnDevice(
+  hipc::FullPtr<GpuTaskQueue> q = gpu::InitQueueOnDevice(
       backend->data_, backend->data_capacity_, new_lanes, queue_depth);
   if (q.IsNull()) {
     HLOG(kError, "RebuildGpu2GpuQueue: Failed to init queue with {} lanes",
@@ -1172,25 +1095,23 @@ void IpcManager::RebuildGpu2GpuQueue(u32 gpu_id, u32 new_lanes) {
   }
 
   RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
-  gpu2gpu_queues_[gpu_id] = q;
-  gpu2gpu_queue_backends_[gpu_id] = std::move(backend);
-  gpu2gpu_num_lanes_ = new_lanes;
+  gpu_devices_[gpu_id].gpu2gpu_queue = q;
+  gpu_devices_[gpu_id].gpu2gpu_queue_backend = std::move(backend);
+  gpu_orchestrator_info_.gpu2gpu_num_lanes = new_lanes;
 
   // Update orchestrator info with new queue pointers
-  gpu_orchestrator_info_.gpu2gpu_queue = gpu2gpu_queues_[gpu_id].ptr_;
-  gpu_orchestrator_info_.gpu2gpu_queue_base =
-      gpu2gpu_queue_backends_[gpu_id]->data_;
+  gpu_orchestrator_info_.gpu2gpu_queue = gpu_devices_[gpu_id].gpu2gpu_queue.ptr_;
 
   HLOG(kInfo, "RebuildGpu2GpuQueue: Recreated gpu2gpu queue with {} lanes "
        "(depth {})", new_lanes, queue_depth);
 }
 
-void IpcManager::RebuildInternalQueue(u32 gpu_id, u32 new_lanes) {
+void gpu::IpcManager::RebuildInternalQueue(u32 gpu_id, u32 new_lanes) {
   u32 queue_depth = gpu_orchestrator_info_.gpu_queue_depth;
 
   // Destroy old internal queue backend
-  internal_queue_backends_[gpu_id].reset();
-  internal_queues_[gpu_id] = hipc::FullPtr<TaskQueue>::GetNull();
+  gpu_devices_[gpu_id].internal_queue_backend.reset();
+  gpu_devices_[gpu_id].internal_queue = hipc::FullPtr<GpuTaskQueue>::GetNull();
 
   // Create new backend
   hipc::MemoryBackendId bid(10000 + gpu_id, 0);
@@ -1205,7 +1126,7 @@ void IpcManager::RebuildInternalQueue(u32 gpu_id, u32 new_lanes) {
     return;
   }
 
-  hipc::FullPtr<TaskQueue> q = gpu::InitQueueOnDevice(
+  hipc::FullPtr<GpuTaskQueue> q = gpu::InitQueueOnDevice(
       backend->data_, backend->data_capacity_, new_lanes, queue_depth);
   if (q.IsNull()) {
     HLOG(kError, "RebuildInternalQueue: Failed to init queue with {} lanes",
@@ -1214,49 +1135,54 @@ void IpcManager::RebuildInternalQueue(u32 gpu_id, u32 new_lanes) {
   }
 
   RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
-  internal_queues_[gpu_id] = q;
-  internal_queue_backends_[gpu_id] = std::move(backend);
+  gpu_devices_[gpu_id].internal_queue = q;
+  gpu_devices_[gpu_id].internal_queue_backend = std::move(backend);
 
   // Update orchestrator info with new queue pointers
-  gpu_orchestrator_info_.internal_queue = internal_queues_[gpu_id].ptr_;
-  gpu_orchestrator_info_.internal_queue_base =
-      internal_queue_backends_[gpu_id]->data_;
+  gpu_orchestrator_info_.internal_queue = gpu_devices_[gpu_id].internal_queue.ptr_;
 
   HLOG(kInfo, "RebuildInternalQueue: Recreated internal queue with {} lanes "
        "(depth {})", new_lanes, queue_depth);
 }
 #endif
 
-TaskQueue *IpcManager::GetToGpuQueue(size_t gpu_id) {
-  if (gpu_id < cpu2gpu_queues_.size()) {
-    return cpu2gpu_queues_[gpu_id].ptr_;
-  }
-  return nullptr;
-}
 
-TaskQueue *IpcManager::GetGpuToGpuQueue(size_t gpu_id) {
-  if (gpu_id < gpu2gpu_queues_.size()) {
-    return gpu2gpu_queues_[gpu_id].ptr_;
-  }
-  return nullptr;
-}
-
-void IpcManager::RegisterGpuAllocator(const hipc::MemoryBackendId &id,
+void gpu::IpcManager::RegisterGpuAllocator(const hipc::MemoryBackendId &id,
                                        char *data, size_t capacity) {
   // Host-side map for ToFullPtr resolution on CPU
   u64 key = (static_cast<u64>(id.major_) << 32) |
             static_cast<u64>(id.minor_);
-  allocator_map_lock_.WriteLock();
-  gpu_alloc_map_[key] = GpuAllocInfo{data, capacity};
-  allocator_map_lock_.WriteUnlock();
+  gpu_alloc_map_[key] = GpuAllocInfo{
+      hipc::AllocatorId{id.major_, id.minor_}, data, capacity};
+}
 
-  // GPU-side table in orchestrator info for ToFullPtr resolution on GPU
-  auto &info = gpu_orchestrator_info_;
-  if (info.num_gpu_allocs < IpcManagerGpuInfo::kMaxGpuAllocs) {
-    info.gpu_allocs[info.num_gpu_allocs].alloc_id = id;
-    info.gpu_allocs[info.num_gpu_allocs].base = data;
-    ++info.num_gpu_allocs;
+IpcManagerGpuInfo gpu::IpcManager::CreateGpuAllocator(size_t gpu_memory_size,
+                                                       u32 gpu_id) {
+  // Create a GpuMalloc backend on the device
+  auto backend = std::make_unique<hipc::GpuMalloc>();
+  hipc::MemoryBackendId backend_id(
+      static_cast<u32>(100 + client_alloc_backends_.size()), 0);
+  if (!backend->shm_init(backend_id, gpu_memory_size, "", 0)) {
+    HLOG(kError, "CreateGpuAllocator: Failed to allocate {} bytes of GPU memory",
+         gpu_memory_size);
+    return IpcManagerGpuInfo();
   }
+
+  // Register for host-side ShmPtr resolution
+  u64 key = (static_cast<u64>(backend_id.major_) << 32) |
+            static_cast<u64>(backend_id.minor_);
+  gpu_alloc_map_[key] = GpuAllocInfo{
+      hipc::AllocatorId{backend_id.major_, backend_id.minor_},
+      backend->data_, backend->data_capacity_};
+
+  // Build IpcManagerGpuInfo with queue pointers
+  IpcManagerGpuInfo info = GetGpuInfo(gpu_id);
+  info.backend = static_cast<hipc::MemoryBackend &>(*backend);
+
+  // Keep backend alive
+  client_alloc_backends_.push_back(std::move(backend));
+
+  return info;
 }
 
 bool IpcManager::ClientInitQueues() {
@@ -1331,7 +1257,7 @@ bool IpcManager::WaitForLocalServer() {
   // Send a ClientConnectTask via the lightbeam transport
   auto task = NewTask<chimaera::admin::ClientConnectTask>(
       CreateTaskId(), kAdminPoolId, PoolQuery::Local());
-  auto future = SendZmq(task, ipc_mode_);
+  auto future = IpcCpu2CpuZmq::ClientSend(this,task, ipc_mode_);
 
   // Wait for response with timeout (-1 → pass 0 to Wait which means no limit)
   float effective_timeout = wait_server_timeout_ > 0 ? wait_server_timeout_ : 0;
@@ -1358,7 +1284,10 @@ bool IpcManager::WaitForLocalServer() {
     // Initialize client GPU queues from server response
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
     if (task->num_gpus_ > 0) {
-      if (!ClientInitGpuQueues(
+      if (!gpu_ipc_) {
+        gpu_ipc_ = std::make_unique<gpu::IpcManager>();
+      }
+      if (!gpu_ipc_->ClientInitGpuQueues(
               task->num_gpus_,
               task->cpu2gpu_queue_off_,
               task->gpu2cpu_queue_off_,
@@ -1399,7 +1328,7 @@ bool IpcManager::WaitForLocalRuntimeStop(u32 timeout_sec) {
     // Send a ClientConnectTask with a 1-second timeout
     auto task = NewTask<chimaera::admin::ClientConnectTask>(
         CreateTaskId(), kAdminPoolId, PoolQuery::Local());
-    auto future = SendZmq(task, ipc_mode_);
+    auto future = IpcCpu2CpuZmq::ClientSend(this,task, ipc_mode_);
 
     if (!future.Wait(1.0f)) {
       // Timeout or server dead: runtime is no longer responding
@@ -1854,8 +1783,8 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
   // These are raw memory regions without a proper allocator — the GPU-side
   // allocator manages them. On the host we silently skip the free since the
   // memory is owned by the GPU backend and freed when it's destroyed.
-  auto git = gpu_alloc_map_.find(alloc_key);
-  if (git != gpu_alloc_map_.end()) {
+  auto git = gpu_ipc_->gpu_alloc_map_.find(alloc_key);
+  if (git != gpu_ipc_->gpu_alloc_map_.end()) {
     return;
   }
 
@@ -2026,7 +1955,7 @@ bool IpcManager::IncreaseClientShm(size_t size) {
     auto reg_task = NewTask<chimaera::admin::RegisterMemoryTask>(
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(),
         alloc_id);
-    SendZmq(reg_task, IpcMode::kTcp).Wait();
+    IpcCpu2CpuZmq::ClientSend(this,reg_task, IpcMode::kTcp).Wait();
 
     return true;
 
@@ -2429,7 +2358,7 @@ bool IpcManager::ReconnectToOriginalHost() {
       auto reg_task = NewTask<chimaera::admin::RegisterMemoryTask>(
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(),
           alloc_id);
-      SendZmq(reg_task, IpcMode::kTcp).Wait();
+      IpcCpu2CpuZmq::ClientSend(this,reg_task, IpcMode::kTcp).Wait();
     }
   }
 
@@ -2680,8 +2609,7 @@ bool IpcManager::RegisterAcceleratorMemory(const hipc::MemoryBackend &backend) {
   // This is called from GPU kernels where we have limited capability
   // The actual allocation happens in CHIMAERA_GPU_INIT macro where
   // each thread gets its own ArenaAllocator instance
-  gpu_backend_ = backend;
-  gpu_backend_initialized_ = true;
+  gpu_ipc_->gpu_orchestrator_info_.backend = backend;
 
   // Note: In GPU kernels, each thread maintains its own ArenaAllocator
   // The macro CHIMAERA_GPU_INIT handles per-thread allocator setup
@@ -2967,8 +2895,11 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 void IpcManager::RouteToGpu(const FullPtr<Task> &task_ptr,
                              Container *container, u32 gpu_id) {
-  (void)container;  // No longer needed — POD copy, no serialization
-  if (task_ptr.IsNull() || gpu_id >= cpu2gpu_queues_.size()) return;
+  (void)container;
+  if (task_ptr.IsNull() || !gpu_ipc_ ||
+      gpu_id >= gpu_ipc_->gpu_devices_.size()) {
+    return;
+  }
 
   u32 task_size = task_ptr->pod_size_;
   if (task_size == 0) {
@@ -2977,43 +2908,45 @@ void IpcManager::RouteToGpu(const FullPtr<Task> &task_ptr,
     return;
   }
 
-  // 1. cudaMalloc device buffer: [TaskT | FutureShm]
-  size_t device_buf_size = task_size + sizeof(FutureShm);
-  void *device_buf = CudaMallocAndCopy(
-      static_cast<const void *>(task_ptr.ptr_), task_size, device_buf_size);
+  // 1. Alloc device buffer [Task | gpu::FutureShm] and copy task H2D
+  size_t device_buf_size = task_size + sizeof(gpu::FutureShm);
+  void *device_buf = hshm::GpuApi::MallocAndCopy(
+      static_cast<const char *>(
+          static_cast<const void *>(task_ptr.ptr_)),
+      task_size, device_buf_size);
   if (!device_buf) return;
 
-  // 2. Allocate pinned host FutureShm
-  FullPtr<char> fshm_buf = AllocateGpuBuffer(sizeof(FutureShm), gpu_id);
+  // 2. Allocate pinned host gpu::FutureShm
+  FullPtr<char> fshm_buf = AllocateGpuBuffer(sizeof(gpu::FutureShm), gpu_id);
   if (fshm_buf.IsNull()) {
-    CudaFreeDevice(device_buf);
+    hshm::GpuApi::Free(static_cast<char *>(device_buf));
     return;
   }
 
-  // 3. Construct FutureShm in pinned host
-  FutureShm *fshm = new (fshm_buf.ptr_) FutureShm();
+  // 3. Construct gpu::FutureShm in pinned host
+  gpu::FutureShm *fshm = new (fshm_buf.ptr_) gpu::FutureShm();
   fshm->pool_id_ = task_ptr->pool_id_;
   fshm->method_id_ = task_ptr->method_;
-  fshm->origin_ = FutureShm::FUTURE_CLIENT_SHM;
+  fshm->origin_ = gpu::FutureShm::FUTURE_CLIENT_SHM;
   fshm->client_task_vaddr_ = reinterpret_cast<uintptr_t>(device_buf);
   fshm->task_device_ptr_ = reinterpret_cast<uintptr_t>(device_buf);
   fshm->task_size_ = task_size;
-  fshm->flags_.SetBits(FutureShm::FUTURE_POD_COPY);
+  fshm->flags_.SetBits(gpu::FutureShm::FUTURE_POD_COPY);
 
   // 4. Flush and push to CPU→GPU queue
 #if defined(__x86_64__) || defined(__i386__)
   {
     const char *base = reinterpret_cast<const char *>(fshm);
-    for (const char *cl = base; cl < base + sizeof(FutureShm); cl += 64) {
+    for (const char *cl = base; cl < base + sizeof(gpu::FutureShm); cl += 64) {
       _mm_clflush(cl);
     }
     _mm_sfence();
   }
 #endif
 
-  auto &lane = cpu2gpu_queues_[gpu_id].ptr_->GetLane(0, 0);
-  hipc::ShmPtr<FutureShm> fshmptr = fshm_buf.shm_.template Cast<FutureShm>();
-  Future<Task> future(fshmptr);
+  auto &lane = gpu_ipc_->gpu_devices_[gpu_id].cpu2gpu_queue.ptr_->GetLane(0, 0);
+  hipc::ShmPtr<gpu::FutureShm> fshmptr = fshm_buf.shm_.template Cast<gpu::FutureShm>();
+  gpu::Future<Task> future(fshmptr);
   lane.Push(future);
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -3242,55 +3175,56 @@ std::vector<PoolQuery> IpcManager::ResolvePhysicalQuery(
   return {query};
 }
 
-Future<Task> IpcManager::SendRuntimeClient(
-    const hipc::FullPtr<Task> &task_ptr) {
-  // Worker thread path: sets parent RunContext and allocates RunContext
-  // via BeginTask, then uses ClientMapTask to enqueue.
-  Worker *worker = CHI_CUR_WORKER;
-  Future<Task> future = MakePointerFuture(task_ptr);
+hipc::FullPtr<Task> IpcManager::RecvRuntime(
+    Future<Task> &future, Container *container, u32 method_id,
+    hshm::lbm::Transport *recv_transport) {
+  auto future_shm = future.GetFutureShm();
 
-  // Set parent task RunContext so EndTask can resume the parent coroutine.
-  if (worker != nullptr) {
-    RunContext *run_ctx = worker->GetCurrentRunContext();
-    if (run_ctx != nullptr) {
-      future.SetParentTask(run_ctx);
-    }
+  // Self-send path: no deserialization needed
+  if (!future_shm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT) ||
+      future_shm->flags_.Any(FutureShm::FUTURE_WAS_COPIED)) {
+    return IpcCpu2Self::RuntimeRecv(future);
   }
 
-  // Allocate RunContext before enqueueing (skip if already created)
-  if (!task_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-    BeginTask(future, nullptr, nullptr);
+  u32 origin = future_shm->origin_;
+  switch (origin) {
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+    case FutureShm::FUTURE_CLIENT_GPU2CPU:
+      return IpcGpu2Cpu::RuntimeRecv(this, future, container,
+                                      method_id, recv_transport);
+#endif
+    case FutureShm::FUTURE_CLIENT_SHM:
+    default:
+      return IpcCpu2Cpu::RuntimeRecv(this, future, container,
+                                      method_id, recv_transport);
   }
-
-  // Use ClientMapTask to pick a lane and enqueue
-  if (scheduler_ != nullptr) {
-    u32 lane_id = scheduler_->ClientMapTask(this, future);
-    if (!worker_queues_.IsNull()) {
-      auto &dest_lane = worker_queues_->GetLane(lane_id, 0);
-      bool was_empty = dest_lane.Empty();
-      dest_lane.Push(future);
-      if (was_empty) {
-        AwakenWorker(&dest_lane);
-      }
-    }
-  }
-
-  return future;
 }
 
-Future<Task> IpcManager::SendRuntime(const hipc::FullPtr<Task> &task_ptr) {
-  // Non-worker thread path: creates pointer future, then uses RouteTask
-  // with force_enqueue=true so RouteLocal always enqueues to the destination
-  // worker's lane (SendRuntime cannot execute tasks directly).
-  Future<Task> future = MakePointerFuture(task_ptr);
+void IpcManager::SendRuntime(
+    const FullPtr<Task> &task_ptr, RunContext *run_ctx,
+    Container *container, hshm::lbm::Transport *send_transport) {
+  auto future_shm = run_ctx->future_.GetFutureShm();
+  u32 origin = future_shm->origin_;
 
-  // Allocate RunContext before routing
-  if (!task_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-    BeginTask(future, nullptr, nullptr);
+  switch (origin) {
+    case FutureShm::FUTURE_CLIENT_SHM:
+    default:
+      IpcCpu2Cpu::RuntimeSend(this, task_ptr, run_ctx, container,
+                               send_transport);
+      break;
+    case FutureShm::FUTURE_CLIENT_TCP:
+    case FutureShm::FUTURE_CLIENT_IPC:
+      IpcCpu2CpuZmq::RuntimeSend(this, run_ctx, origin);
+      break;
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+    case FutureShm::FUTURE_CLIENT_GPU2CPU:
+      IpcGpu2Cpu::RuntimeSend(this, task_ptr, run_ctx, container);
+      break;
+    case FutureShm::FUTURE_CLIENT_CPU2GPU:
+      IpcCpu2Gpu::RuntimeSend(this, task_ptr, run_ctx, container);
+      break;
+#endif
   }
-
-  RouteTask(future, /*force_enqueue=*/true);
-  return future;
 }
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
@@ -3299,36 +3233,36 @@ Future<Task> IpcManager::SendRuntime(const hipc::FullPtr<Task> &task_ptr) {
 // GPU Queue Offset Helpers (for ClientConnect response)
 //==============================================================================
 
-u64 IpcManager::GetCpu2GpuQueueOffset(u32 gpu_id) const {
-  if (gpu_id >= cpu2gpu_queues_.size()) return 0;
-  return cpu2gpu_queues_[gpu_id].shm_.off_.load();
+u64 gpu::IpcManager::GetCpu2GpuQueueOffset(u32 gpu_id) const {
+  if (gpu_id >= gpu_devices_.size()) return 0;
+  return gpu_devices_[gpu_id].cpu2gpu_queue.shm_.off_.load();
 }
 
-u64 IpcManager::GetGpu2CpuQueueOffset(u32 gpu_id) const {
-  if (gpu_id >= gpu2cpu_queues_.size()) return 0;
-  return gpu2cpu_queues_[gpu_id].shm_.off_.load();
+u64 gpu::IpcManager::GetGpu2CpuQueueOffset(u32 gpu_id) const {
+  if (gpu_id >= gpu_devices_.size()) return 0;
+  return gpu_devices_[gpu_id].gpu2cpu_queue.shm_.off_.load();
 }
 
-u64 IpcManager::GetGpu2GpuQueueOffset(u32 gpu_id) const {
+u64 gpu::IpcManager::GetGpu2GpuQueueOffset(u32 gpu_id) const {
   // GPU→GPU queue is in device memory; offset within device backend.
-  if (gpu_id >= gpu2gpu_queues_.size()) return 0;
-  return gpu2gpu_queues_[gpu_id].shm_.off_.load();
+  if (gpu_id >= gpu_devices_.size()) return 0;
+  return gpu_devices_[gpu_id].gpu2gpu_queue.shm_.off_.load();
 }
 
-u64 IpcManager::GetCpu2GpuBackendSize(u32 gpu_id) const {
-  if (gpu_id >= cpu2gpu_queue_backends_.size()) return 0;
-  return cpu2gpu_queue_backends_[gpu_id]->data_capacity_;
+u64 gpu::IpcManager::GetCpu2GpuBackendSize(u32 gpu_id) const {
+  if (gpu_id >= gpu_devices_.size()) return 0;
+  return gpu_devices_[gpu_id].cpu2gpu_queue_backend->data_capacity_;
 }
 
-u64 IpcManager::GetGpu2CpuBackendSize(u32 gpu_id) const {
-  if (gpu_id >= gpu2cpu_queue_backends_.size()) return 0;
-  return gpu2cpu_queue_backends_[gpu_id]->data_capacity_;
+u64 gpu::IpcManager::GetGpu2CpuBackendSize(u32 gpu_id) const {
+  if (gpu_id >= gpu_devices_.size()) return 0;
+  return gpu_devices_[gpu_id].gpu2cpu_queue_backend->data_capacity_;
 }
 
-void IpcManager::GetGpu2GpuIpcHandle(u32 gpu_id, char *out_bytes) const {
+void gpu::IpcManager::GetGpu2GpuIpcHandle(u32 gpu_id, char *out_bytes) const {
   memset(out_bytes, 0, 64);
-  if (gpu_id >= gpu2gpu_queue_backends_.size()) return;
-  auto *backend = gpu2gpu_queue_backends_[gpu_id].get();
+  if (gpu_id >= gpu_devices_.size()) return;
+  auto *backend = gpu_devices_[gpu_id].gpu2gpu_queue_backend.get();
   if (!backend || !backend->region_) return;
   // Get IPC handle on-demand from the GPU allocation
   hshm::GpuIpcMemHandle ipc_handle;
@@ -3341,7 +3275,7 @@ void IpcManager::GetGpu2GpuIpcHandle(u32 gpu_id, char *out_bytes) const {
 // RegisterGpuMemoryFromClient
 //==============================================================================
 
-bool IpcManager::RegisterGpuMemoryFromClient(
+bool gpu::IpcManager::RegisterGpuMemoryFromClient(
     const hipc::MemoryBackendId &backend_id,
     const hshm::GpuIpcMemHandle &ipc_handle,
     size_t data_capacity) {
@@ -3368,7 +3302,7 @@ bool IpcManager::RegisterGpuMemoryFromClient(
 // ClientInitGpuQueues
 //==============================================================================
 
-bool IpcManager::ClientInitGpuQueues(
+bool gpu::IpcManager::ClientInitGpuQueues(
     u32 num_gpus,
     const u64 *cpu2gpu_offsets,
     const u64 *gpu2cpu_offsets,
@@ -3384,10 +3318,7 @@ bool IpcManager::ClientInitGpuQueues(
 
   HLOG(kInfo, "ClientInitGpuQueues: Attaching to {} GPU queue(s)", num_gpus);
 
-  client_cpu2gpu_backends_.reserve(num_gpus);
-  client_gpu2cpu_backends_.reserve(num_gpus);
-  cpu2gpu_queues_.reserve(num_gpus);
-  gpu2cpu_queues_.reserve(num_gpus);
+  gpu_devices_.resize(num_gpus);
 
   for (u32 gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
     const std::string sid = std::to_string(gpu_id);
@@ -3403,12 +3334,12 @@ bool IpcManager::ClientInitGpuQueues(
       }
       RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
 
-      hipc::FullPtr<TaskQueue> q;
+      hipc::FullPtr<GpuTaskQueue> q;
       q.shm_.off_ = cpu2gpu_offsets[gpu_id];
       q.shm_.alloc_id_ = hipc::AllocatorId(bid.major_, bid.minor_);
-      q.ptr_ = reinterpret_cast<TaskQueue *>(backend->data_ + cpu2gpu_offsets[gpu_id]);
-      cpu2gpu_queues_.push_back(q);
-      client_cpu2gpu_backends_.push_back(std::move(backend));
+      q.ptr_ = reinterpret_cast<GpuTaskQueue *>(backend->data_ + cpu2gpu_offsets[gpu_id]);
+      gpu_devices_[gpu_id].cpu2gpu_queue = q;
+      gpu_devices_[gpu_id].client_cpu2gpu_backend = std::move(backend);
     }
 
     // --- Attach to GPU→CPU queue backend (GpuShmMmap, pinned host) ---
@@ -3422,12 +3353,12 @@ bool IpcManager::ClientInitGpuQueues(
       }
       RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
 
-      hipc::FullPtr<TaskQueue> q;
+      hipc::FullPtr<GpuTaskQueue> q;
       q.shm_.off_ = gpu2cpu_offsets[gpu_id];
       q.shm_.alloc_id_ = hipc::AllocatorId(bid.major_, bid.minor_);
-      q.ptr_ = reinterpret_cast<TaskQueue *>(backend->data_ + gpu2cpu_offsets[gpu_id]);
-      gpu2cpu_queues_.push_back(q);
-      client_gpu2cpu_backends_.push_back(std::move(backend));
+      q.ptr_ = reinterpret_cast<GpuTaskQueue *>(backend->data_ + gpu2cpu_offsets[gpu_id]);
+      gpu_devices_[gpu_id].gpu2cpu_queue = q;
+      gpu_devices_[gpu_id].client_gpu2cpu_backend = std::move(backend);
     }
 
     // --- Attach to GPU→GPU queue backend via IPC handle (GpuMalloc, device) ---
@@ -3439,17 +3370,17 @@ bool IpcManager::ClientInitGpuQueues(
       if (!backend->shm_attach_ipc(handle)) {
         HLOG(kWarning, "ClientInitGpuQueues: Failed to attach GPU→GPU device "
              "backend for GPU {} (GPU→GPU dispatch unavailable)", gpu_id);
-        // Push null queue so gpu_id indexing stays consistent
-        gpu2gpu_queues_.push_back(hipc::FullPtr<TaskQueue>());
-        gpu2gpu_queue_backends_.push_back(nullptr);
+        // Set null queue so gpu_id indexing stays consistent
+        gpu_devices_[gpu_id].gpu2gpu_queue = hipc::FullPtr<GpuTaskQueue>();
+        gpu_devices_[gpu_id].gpu2gpu_queue_backend = nullptr;
       } else {
         RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
-        hipc::FullPtr<TaskQueue> q;
+        hipc::FullPtr<GpuTaskQueue> q;
         q.shm_.off_ = gpu2gpu_offsets[gpu_id];
         q.shm_.alloc_id_ = hipc::AllocatorId(bid.major_, bid.minor_);
-        q.ptr_ = reinterpret_cast<TaskQueue *>(backend->data_ + gpu2gpu_offsets[gpu_id]);
-        gpu2gpu_queues_.push_back(q);
-        gpu2gpu_queue_backends_.push_back(std::move(backend));
+        q.ptr_ = reinterpret_cast<GpuTaskQueue *>(backend->data_ + gpu2gpu_offsets[gpu_id]);
+        gpu_devices_[gpu_id].gpu2gpu_queue = q;
+        gpu_devices_[gpu_id].gpu2gpu_queue_backend = std::move(backend);
       }
     }
 
@@ -3460,58 +3391,45 @@ bool IpcManager::ClientInitGpuQueues(
 }
 
 //==============================================================================
-// GetClientGpuInfo
+// GetGpuInfo
 //==============================================================================
 
-IpcManagerGpuInfo IpcManager::GetClientGpuInfo(u32 gpu_id) {
+IpcManagerGpuInfo gpu::IpcManager::GetGpuInfo(u32 gpu_id) const {
   IpcManagerGpuInfo info;
 
-  if (gpu_id >= cpu2gpu_queues_.size()) {
-    HLOG(kError, "GetClientGpuInfo: Invalid gpu_id {}", gpu_id);
+  if (gpu_id >= gpu_devices_.size()) {
     return info;
   }
 
+  auto &dev = gpu_devices_[gpu_id];
+
   // Primary backend: orchestrator scratch (pinned host, accessible from GPU)
-  // For same-process use; cross-process clients should register their own GpuMalloc.
-  if (gpu_id < gpu_orchestrator_backends_.size()) {
+  if (dev.gpu_orchestrator_backend) {
     info.backend =
-        static_cast<hipc::MemoryBackend &>(*gpu_orchestrator_backends_[gpu_id]);
+        static_cast<hipc::MemoryBackend &>(*dev.gpu_orchestrator_backend);
   }
 
-  // GPU→GPU queue (device memory)
-  if (gpu_id < gpu2gpu_queues_.size()) {
-    info.gpu2gpu_queue = gpu2gpu_queues_[gpu_id].ptr_;
-  }
-  if (gpu_id < gpu2gpu_queue_backends_.size() &&
-      gpu2gpu_queue_backends_[gpu_id]) {
-    info.gpu2gpu_queue_base = gpu2gpu_queue_backends_[gpu_id]->data_;
-  }
-  info.gpu2gpu_num_lanes = gpu2gpu_num_lanes_;
+  // GPU->GPU queue (device memory)
+  info.gpu2gpu_queue = dev.gpu2gpu_queue.ptr_;
+  info.gpu2gpu_num_lanes = gpu_orchestrator_info_.gpu2gpu_num_lanes;
 
-  // CPU→GPU queue (pinned host, orchestrator polls)
-  info.cpu2gpu_queue = cpu2gpu_queues_[gpu_id].ptr_;
-  if (gpu_id < client_cpu2gpu_backends_.size()) {
-    info.cpu2gpu_queue_base = client_cpu2gpu_backends_[gpu_id]->data_;
-  } else if (gpu_id < cpu2gpu_queue_backends_.size()) {
-    info.cpu2gpu_queue_base = cpu2gpu_queue_backends_[gpu_id]->data_;
-  }
+  // Internal subtask queue (device memory)
+  info.internal_queue = dev.internal_queue.ptr_;
+  info.internal_num_lanes = gpu_orchestrator_info_.internal_num_lanes;
 
-  // GPU→CPU queue (pinned host, CPU worker polls)
-  if (gpu_id < gpu2cpu_queues_.size()) {
-    info.gpu2cpu_queue = gpu2cpu_queues_[gpu_id].ptr_;
-  }
+  // CPU->GPU queue (pinned host, orchestrator polls)
+  info.cpu2gpu_queue = dev.cpu2gpu_queue.ptr_;
 
-  // GPU→CPU copy-space backend (pinned host, GPU kernel allocates FutureShm here)
-  if (gpu_id < gpu2cpu_copy_backends_.size()) {
+  // GPU->CPU queue (pinned host, CPU worker polls)
+  info.gpu2cpu_queue = dev.gpu2cpu_queue.ptr_;
+
+  // GPU->CPU copy-space backend (pinned host)
+  if (dev.gpu2cpu_copy_backend) {
     info.gpu2cpu_backend =
-        static_cast<hipc::MemoryBackend &>(*gpu2cpu_copy_backends_[gpu_id]);
+        static_cast<hipc::MemoryBackend &>(*dev.gpu2cpu_copy_backend);
   }
 
-  // Copy registered GPU allocators for GPU-side ShmPtr resolution
-  info.num_gpu_allocs = gpu_orchestrator_info_.num_gpu_allocs;
-  for (u32 i = 0; i < info.num_gpu_allocs; ++i) {
-    info.gpu_allocs[i] = gpu_orchestrator_info_.gpu_allocs[i];
-  }
+  info.gpu_queue_depth = gpu_orchestrator_info_.gpu_queue_depth;
 
   return info;
 }

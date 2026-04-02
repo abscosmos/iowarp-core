@@ -40,7 +40,7 @@
 
 #include "chimaera/MOD_NAME/MOD_NAME_gpu_runtime.h"
 #include "chimaera/singletons.h"
-#include "chimaera/gpu_container.h"
+#include "chimaera/gpu/container.h"
 
 namespace chimaera::MOD_NAME {
 
@@ -59,12 +59,12 @@ HSHM_GPU_FUN void GpuRuntime::SubtaskTest(
     auto future = ipc->SendGpuDirect(sub);
     // All lanes must enter Wait (RecvGpu uses __syncwarp)
     future.Wait();
-    if (chi::IpcManager::IsWarpScheduler()) {
+    if (chi::gpu::IpcManager::IsWarpScheduler()) {
       last_result = future.get()->result_value_;
     }
   }
 
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     task->result_value_ = last_result + 1;
     task->return_code_ = 0;
   }

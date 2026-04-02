@@ -34,7 +34,7 @@
 #ifndef WRP_CTE_COMPRESSOR_GPU_RUNTIME_H_
 #define WRP_CTE_COMPRESSOR_GPU_RUNTIME_H_
 
-#include "chimaera/gpu_container.h"
+#include "chimaera/gpu/container.h"
 
 namespace wrp_cte::compressor {
 

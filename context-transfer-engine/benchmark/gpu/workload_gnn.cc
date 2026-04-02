@@ -17,7 +17,7 @@
 #include <wrp_cte/core/core_client.h>
 #include <chimaera/chimaera.h>
 #include <chimaera/singletons.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <chimaera/ipc_manager.h>
 #include <hermes_shm/util/gpu_api.h>
 
@@ -143,8 +143,8 @@ __global__ void gnn_cte_kernel(
     int *d_done) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
 
   if (warp_id < total_warps) {
     uint32_t my_node_start = warp_node_start[warp_id];
@@ -154,7 +154,7 @@ __global__ void gnn_cte_kernel(
     bool alloc_failed = false;
 
     // === PHASE 1: I/O — load only this warp's chunks from CTE ===
-    if (chi::IpcManager::IsWarpScheduler()) {
+    if (chi::gpu::IpcManager::IsWarpScheduler()) {
       wrp_cte::core::Client cte_client(cte_pool_id);
 
       for (uint32_t c = my_first_chunk; c < my_last_chunk; c++) {
@@ -189,13 +189,13 @@ __global__ void gnn_cte_kernel(
     __syncwarp();
 
     // Signal that this warp's load is done
-    if (chi::IpcManager::IsWarpScheduler()) {
+    if (chi::gpu::IpcManager::IsWarpScheduler()) {
       atomicAdd_system(d_load_done, 1);
       __threadfence_system();
     }
 
     // === BARRIER: spin until all warps have finished loading ===
-    if (chi::IpcManager::IsWarpScheduler()) {
+    if (chi::gpu::IpcManager::IsWarpScheduler()) {
       while (atomicAdd(d_load_done, 0) < (int)total_warps) {
         __threadfence_system();
       }
@@ -224,7 +224,7 @@ __global__ void gnn_cte_kernel(
   }
 
   // Signal completion
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     atomicAdd_system(d_done, 1);
     __threadfence_system();
   }
@@ -375,8 +375,8 @@ int run_workload_gnn(const WorkloadConfig &cfg, const char *mode,
             feat_bytes / (1024.0 * 1024.0),
             total_warp_io / (1024.0 * 1024.0));
 
-    CHI_IPC->SetGpuOrchestratorBlocks(cfg.rt_blocks, cfg.rt_threads);
-    CHI_IPC->PauseGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(cfg.rt_blocks, cfg.rt_threads);
+    CHI_CPU_IPC->PauseGpuOrchestrator();
 
     hipc::MemoryBackendId data_id(200,0); hipc::GpuMalloc data_backend;
     data_backend.shm_init(data_id, feat_bytes + 4*1024*1024, "", 0);
@@ -392,15 +392,15 @@ int run_workload_gnn(const WorkloadConfig &cfg, const char *mode,
     cudaDeviceSynchronize();
     if (d_ptr->IsNull()) {
       HLOG(kError,"GNN CTE alloc failed"); cudaFreeHost(d_ptr);
-      CHI_IPC->ResumeGpuOrchestrator();
+      CHI_CPU_IPC->ResumeGpuOrchestrator();
       cudaFree(d_offsets);cudaFree(d_adj);cudaFree(d_output);
       return -2;
     }
     hipc::FullPtr<char> array_ptr = *d_ptr; cudaFreeHost(d_ptr);
     hipc::AllocatorId data_alloc_id(data_id.major_, data_id.minor_);
-    CHI_IPC->RegisterGpuAllocator(data_id, data_backend.data_, data_backend.data_capacity_);
+    CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(data_id, data_backend.data_, data_backend.data_capacity_);
 
-    chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+    chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
     gpu_info.backend = scratch_backend;
     int *d_done; cudaMallocHost(&d_done, sizeof(int)); *d_done = 0;
     int *d_load_done; cudaMallocHost(&d_load_done, sizeof(int)); *d_load_done = 0;
@@ -474,14 +474,14 @@ int run_workload_gnn(const WorkloadConfig &cfg, const char *mode,
           h_wns, h_wne, h_wfc, h_wlc,
           total_warps, emb_dim, d_load_done, d_done);
 
-      CHI_IPC->ResumeGpuOrchestrator();
+      CHI_CPU_IPC->ResumeGpuOrchestrator();
       auto *orch = static_cast<chi::gpu::WorkOrchestrator*>(CHI_IPC->gpu_orchestrator_);
       auto *ctrl = orch ? orch->control_ : nullptr;
       if(ctrl){int w=0;while(ctrl->running_flag==0&&w<5000){std::this_thread::sleep_for(std::chrono::milliseconds(1));++w;}}
       int64_t tus=(int64_t)cfg.timeout_sec*1000000,el=0;
       while(__atomic_load_n(d_done,__ATOMIC_ACQUIRE)<(int)total_warps&&el<tus){
         std::this_thread::sleep_for(std::chrono::microseconds(100));el+=100;}
-      CHI_IPC->PauseGpuOrchestrator();
+      CHI_CPU_IPC->PauseGpuOrchestrator();
       hshm::GpuApi::Synchronize(stream);
       hshm::GpuApi::DestroyStream(stream);
 

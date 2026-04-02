@@ -17,7 +17,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/bdev/bdev_client.h>
 #include <chimaera/singletons.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <chimaera/ipc_manager.h>
 #include <hermes_shm/util/logging.h>
 #include <hermes_shm/util/gpu_api.h>

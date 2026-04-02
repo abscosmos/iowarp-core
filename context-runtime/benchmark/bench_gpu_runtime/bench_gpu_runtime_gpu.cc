@@ -47,7 +47,7 @@
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 
 #include <chimaera/ipc_manager.h>
-#include <chimaera/gpu_work_orchestrator.h>
+#include <chimaera/gpu/work_orchestrator.h>
 #include <chimaera/task.h>
 #include <chimaera/MOD_NAME/MOD_NAME_client.h>
 #include <chimaera/MOD_NAME/MOD_NAME_tasks.h>
@@ -194,7 +194,7 @@ __global__ void gpu_bench_client_kernel(
       chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(),
       (chi::u32)0, (chi::u32)7);
 
-  if (chi::IpcManager::IsWarpScheduler() && task.IsNull()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler() && task.IsNull()) {
     printf("[BENCH FATAL] blk=%u NewTask returned null — priv alloc too small\n",
            blockIdx.x);
     atomicAdd(d_done, static_cast<int>(total_warps));
@@ -203,13 +203,13 @@ __global__ void gpu_bench_client_kernel(
 
   chi::u32 errors = 0;
   for (chi::u32 i = 0; i < total_tasks; ++i) {
-    if (chi::IpcManager::IsWarpScheduler()) {
+    if (chi::gpu::IpcManager::IsWarpScheduler()) {
       task->result_value_ = 0;  // Reset before each send
     }
     auto future = ipc->Send(task);
     future.Wait(0, /*reuse_task=*/true);
     // Verify: GpuSubmit computes test_value*3 + gpu_id = 7*3+0 = 21
-    if (chi::IpcManager::IsWarpScheduler()) {
+    if (chi::gpu::IpcManager::IsWarpScheduler()) {
       if (task->result_value_ != 21) {
         if (errors == 0) {
           printf("[BENCH ERROR] blk=%u task %u: expected result=21, got %u (rc=%d)\n",
@@ -221,7 +221,7 @@ __global__ void gpu_bench_client_kernel(
     }
   }
 
-  if (chi::IpcManager::IsWarpScheduler() && errors > 0) {
+  if (chi::gpu::IpcManager::IsWarpScheduler() && errors > 0) {
     printf("[BENCH FAIL] blk=%u %u/%u tasks returned wrong result\n",
            blockIdx.x, errors, total_tasks);
   }
@@ -231,7 +231,7 @@ __global__ void gpu_bench_client_kernel(
 
   // All warps signal completion via atomicAdd — no reset race
   __syncwarp();
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     __threadfence_system();
     atomicAdd(d_done, 1);
   }
@@ -263,7 +263,7 @@ __global__ void gpu_bench_coroutine_kernel(
   }
 
   __syncwarp();
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     __threadfence();
     int prev = atomicAdd(d_done, 1);
     if (prev == static_cast<int>(total_warps) - 1) {
@@ -290,13 +290,13 @@ __global__ void gpu_bench_alloc_kernel(
   using GpuSubmitTask = chimaera::MOD_NAME::GpuSubmitTask;
 
   auto *ipc = CHI_IPC;
-  auto *priv_alloc = ipc->GetPrivAlloc();
-  if (!priv_alloc) return;
+  auto *alloc = ipc->gpu_alloc_;
+  if (!alloc) return;
 
   // Warm up
   {
-    auto w = priv_alloc->template AllocateObjs<GpuSubmitTask>(1);
-    if (!w.IsNull()) priv_alloc->Free(w);
+    auto w = alloc->template AllocateObjs<GpuSubmitTask>(1);
+    if (!w.IsNull()) alloc->Free(w);
   }
 
   long long t_raw_alloc = 0, t_raw_free = 0;
@@ -308,7 +308,7 @@ __global__ void gpu_bench_alloc_kernel(
   for (chi::u32 i = 0; i < total_tasks; ++i) {
     // 1. Raw alloc
     tc = clock64();
-    auto fp = priv_alloc->template AllocateObjs<GpuSubmitTask>(1);
+    auto fp = alloc->template AllocateObjs<GpuSubmitTask>(1);
     t_raw_alloc += clock64() - tc;
     if (fp.IsNull()) continue;
 
@@ -344,7 +344,7 @@ __global__ void gpu_bench_alloc_kernel(
 
     // 7. Free
     tc = clock64();
-    priv_alloc->Free(fp);
+    alloc->Free(fp);
     t_raw_free += clock64() - tc;
   }
 
@@ -352,11 +352,11 @@ __global__ void gpu_bench_alloc_kernel(
   // A coroutine frame is ~promise_type + locals, typically 64-128 bytes
   for (chi::u32 i = 0; i < total_tasks; ++i) {
     tc = clock64();
-    auto frame = priv_alloc->template AllocateObjs<char>(128);
+    auto frame = alloc->template AllocateObjs<char>(128);
     t_coro_alloc += clock64() - tc;
 
     tc = clock64();
-    if (!frame.IsNull()) priv_alloc->Free(frame);
+    if (!frame.IsNull()) alloc->Free(frame);
     t_coro_free += clock64() - tc;
   }
 
@@ -418,7 +418,7 @@ __global__ void gpu_bench_alloc_serde_kernel(
   auto *ipc = CHI_IPC;
 
   // Only warp scheduler runs — BuddyAllocator is not thread-safe
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     long long t_push_arena = 0, t_pop_arena = 0;
     long long t_alloc_task = 0, t_ctor_save = 0, t_ctor_load = 0, t_alloc_task2 = 0;
     long long t_free_task2 = 0, t_dtor_load = 0, t_dtor_save = 0, t_free_task = 0;
@@ -427,7 +427,6 @@ __global__ void gpu_bench_alloc_serde_kernel(
     long long tc = clock64();
     const size_t arena_bytes = static_cast<size_t>(4096) *
                                static_cast<size_t>(total_tasks + 8);
-    auto heap_arena = ipc->PushPrivArena(arena_bytes);
     auto arena = ipc->PushArena(arena_bytes);
     t_push_arena += clock64() - tc;
 
@@ -475,7 +474,6 @@ __global__ void gpu_bench_alloc_serde_kernel(
     // --- Arena pop (once) ---
     tc = clock64();
     arena.Release();
-    heap_arena.Release();
     t_pop_arena += clock64() - tc;
 
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -566,10 +564,9 @@ __global__ void gpu_bench_serde_kernel(
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
   using GpuSubmitTask = chimaera::MOD_NAME::GpuSubmitTask;
-  using WarpMgr = chi::IpcManager::WarpIpcManager;
   auto *ipc = CHI_IPC;
-  chi::u32 lane = chi::IpcManager::GetLaneId();
-  constexpr size_t kCopySpaceSize = WarpMgr::kCopySpaceSize;
+  chi::u32 lane = chi::gpu::IpcManager::GetLaneId();
+  constexpr size_t kCopySpaceSize = 1024;
 
   // Construct the GpuRuntime container (sets function pointer table)
   chimaera::MOD_NAME::GpuRuntime container;
@@ -578,22 +575,41 @@ __global__ void gpu_bench_serde_kernel(
   // Allocate client task (with co-located FutureShm + copy_space)
   hipc::FullPtr<GpuSubmitTask> client_task;
   chi::FutureShm *fshm = nullptr;
-  WarpMgr *mgr = nullptr;
   if (lane == 0) {
     client_task = ipc->NewTask<GpuSubmitTask>(
         chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(),
         (chi::u32)0, (chi::u32)7);
-    fshm = chi::IpcManager::GetTaskFutureShm(client_task.ptr_);
-    mgr = ipc->GetWarpManager();
+    fshm = reinterpret_cast<chi::FutureShm *>(
+        chi::gpu::IpcManager::GetTaskFutureShm(client_task.ptr_));
   }
-  unsigned long long mgr_ull = reinterpret_cast<unsigned long long>(mgr);
   unsigned long long task_ull = reinterpret_cast<unsigned long long>(client_task.ptr_);
-  mgr_ull = hipc::shfl_sync_u64(0xFFFFFFFF, mgr_ull, 0);
   task_ull = hipc::shfl_sync_u64(0xFFFFFFFF, task_ull, 0);
+
+  // Inline buffer + archive helpers (replacing WarpIpcManager)
+  hshm::priv::wrap_vector buffer;
+  chi::GpuSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn, buffer);
+  chi::GpuLoadTaskArchive load_ar(buffer);
+
+  auto BindSave = [&](char *copy_space, chi::LocalMsgType msg_type) {
+    hipc::FullPtr<char> fp;
+    fp.ptr_ = copy_space;
+    fp.shm_.alloc_id_.SetNull();
+    fp.shm_.off_ = reinterpret_cast<size_t>(fp.ptr_);
+    buffer.set(fp, kCopySpaceSize);
+    save_ar.Reset(msg_type);
+  };
+  auto BindLoad = [&](char *copy_space, size_t data_size) {
+    hipc::FullPtr<char> fp;
+    fp.ptr_ = copy_space;
+    fp.shm_.alloc_id_.SetNull();
+    fp.shm_.off_ = reinterpret_cast<size_t>(fp.ptr_);
+    buffer.set(fp, data_size);
+    buffer.resize(data_size);
+    load_ar.Reset(chi::LocalMsgType::kSerializeIn);
+  };
 
   int errors = 0;
   for (chi::u32 i = 0; i < total_tasks; ++i) {
-    auto *m = reinterpret_cast<WarpMgr *>(mgr_ull);
     auto *t = reinterpret_cast<GpuSubmitTask *>(task_ull);
 
     // === CLIENT: Serialize input into copy_space (mirrors SendGpu) ===
@@ -606,19 +622,19 @@ __global__ void gpu_bench_serde_kernel(
       client_task->test_value_ = 7;
       client_task->gpu_id_ = 0;
       client_task->result_value_ = 0;
-      m->BindSave(fshm->copy_space, chi::LocalMsgType::kSerializeIn);
+      BindSave(fshm->copy_space, chi::LocalMsgType::kSerializeIn);
     }
     __syncwarp();
-    if (m && t) {
-      m->save_ar_.SetWarpConverged(true);
-      t->SerializeIn(m->save_ar_);
+    if (t) {
+      save_ar.SetWarpConverged(true);
+      t->SerializeIn(save_ar);
       __syncwarp();
-      if (lane == 0) m->save_ar_.SetWarpConverged(false);
+      if (lane == 0) save_ar.SetWarpConverged(false);
     }
     __syncwarp();
     if (lane == 0) {
       hipc::threadfence();
-      fshm->input_.total_written_.store(m->save_ar_.GetSerializedSize());
+      fshm->input_.total_written_.store(save_ar.GetSerializedSize());
     }
     __syncwarp();
 
@@ -635,9 +651,9 @@ __global__ void gpu_bench_serde_kernel(
 
     hipc::FullPtr<chi::Task> task_ptr = hipc::FullPtr<chi::Task>::GetNull();
     if (lane == 0 && valid) {
-      m->BindLoad(fshm->copy_space, data_size);
+      BindLoad(fshm->copy_space, data_size);
       task_ptr = container.LocalAllocLoadDeser(
-          fshm->method_id_, m->load_ar_);
+          fshm->method_id_, load_ar);
     }
     __syncwarp();
 
@@ -651,10 +667,10 @@ __global__ void gpu_bench_serde_kernel(
     // SaveTask + set total_written
     if (lane == 0 && !task_ptr.IsNull()) {
       chi::u32 method = fshm->method_id_;
-      m->BindSave(fshm->copy_space, chi::LocalMsgType::kSerializeOut);
-      container.LocalSaveTask(method, m->save_ar_, task_ptr);
+      BindSave(fshm->copy_space, chi::LocalMsgType::kSerializeOut);
+      container.LocalSaveTask(method, save_ar, task_ptr);
       hipc::threadfence();
-      fshm->output_.total_written_.store(m->save_ar_.GetSerializedSize());
+      fshm->output_.total_written_.store(save_ar.GetSerializedSize());
       container.LocalDestroyTask(method, task_ptr);
       ipc->DelTask(task_ptr);
     }
@@ -664,9 +680,9 @@ __global__ void gpu_bench_serde_kernel(
     if (lane == 0) {
       size_t output_tw = fshm->output_.total_written_.load_device();
       hipc::threadfence();
-      m->BindLoad(fshm->copy_space, output_tw);
-      m->load_ar_.SetMsgType(chi::LocalMsgType::kSerializeOut);
-      client_task->SerializeOut(m->load_ar_);
+      BindLoad(fshm->copy_space, output_tw);
+      load_ar.SetMsgType(chi::LocalMsgType::kSerializeOut);
+      client_task->SerializeOut(load_ar);
       chi::u32 expected = 7 * 3 + 0;
       if (client_task->result_value_ != expected) {
         printf("[SERDE FAIL] task %u: expected=%u got=%u rc=%d\n",
@@ -1116,7 +1132,6 @@ __global__ void gpu_bench_buddy_kernel(
     chi::u32 total_threads) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
   using GpuSubmitTask = chimaera::MOD_NAME::GpuSubmitTask;
-  using WarpMgr = chi::IpcManager::WarpIpcManager;
 
   if (threadIdx.x != 0 || blockIdx.x != 0) {
     __threadfence();
@@ -1124,9 +1139,9 @@ __global__ void gpu_bench_buddy_kernel(
     return;
   }
 
-  auto *priv = CHI_IPC->GetPrivAlloc();
-  if (!priv) {
-    printf("[BUDDY] priv alloc null\n");
+  auto *alloc = CHI_IPC->gpu_alloc_;
+  if (!alloc) {
+    printf("[BUDDY] alloc null\n");
     atomicAdd(d_done, 1);
     return;
   }
@@ -1138,8 +1153,8 @@ __global__ void gpu_bench_buddy_kernel(
 
   // Warm up
   {
-    auto w = priv->template AllocateObjs<char>(kTaskExecSize);
-    if (!w.IsNull()) priv->Free(w);
+    auto w = alloc->template AllocateObjs<char>(kTaskExecSize);
+    if (!w.IsNull()) alloc->Free(w);
   }
 
   long long t_alloc_large = 0, t_free_large = 0;
@@ -1147,25 +1162,25 @@ __global__ void gpu_bench_buddy_kernel(
   long long t_alloc_arena = 0;
   long long tc;
 
-  // --- Test 1: alloc+free kTaskExecSize (16.5KB, hits AllocateLarge) ---
+  // --- Test 1: alloc+free kTaskExecSize ---
   for (chi::u32 i = 0; i < total_tasks; ++i) {
     tc = clock64();
-    auto fp = priv->template AllocateObjs<char>(kTaskExecSize);
+    auto fp = alloc->template AllocateObjs<char>(kTaskExecSize);
     t_alloc_large += clock64() - tc;
 
     tc = clock64();
-    if (!fp.IsNull()) priv->Free(fp);
+    if (!fp.IsNull()) alloc->Free(fp);
     t_free_large += clock64() - tc;
   }
 
-  // --- Test 2: alloc+free kSmallSize (64B, hits AllocateSmall) ---
+  // --- Test 2: alloc+free kSmallSize (64B) ---
   for (chi::u32 i = 0; i < total_tasks; ++i) {
     tc = clock64();
-    auto fp = priv->template AllocateObjs<char>(kSmallSize);
+    auto fp = alloc->template AllocateObjs<char>(kSmallSize);
     t_alloc_small += clock64() - tc;
 
     tc = clock64();
-    if (!fp.IsNull()) priv->Free(fp);
+    if (!fp.IsNull()) alloc->Free(fp);
     t_free_small += clock64() - tc;
   }
 
@@ -1173,10 +1188,10 @@ __global__ void gpu_bench_buddy_kernel(
   {
     const size_t arena_bytes = static_cast<size_t>(kTaskExecSize + 256) *
                                static_cast<size_t>(total_tasks + 4);
-    auto arena = CHI_IPC->PushPrivArena(arena_bytes);
+    auto arena = CHI_IPC->PushArena(arena_bytes);
     for (chi::u32 i = 0; i < total_tasks; ++i) {
       tc = clock64();
-      auto fp = priv->template AllocateObjs<char>(kTaskExecSize);
+      auto fp = alloc->template AllocateObjs<char>(kTaskExecSize);
       t_alloc_arena += clock64() - tc;
       // No free — pure bump
     }
@@ -1264,7 +1279,7 @@ extern "C" int run_gpu_bench_latency(
     chi::u32 total_tasks,
     float *out_elapsed_ms) {
   // Use non-inline SetGpuOrchestratorBlocks to avoid ODR layout mismatch
-  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+  CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
 
   // Allocate primary GPU backend (GpuMalloc, device memory): 10 MB per block.
   // Used by PartitionedAllocator for FutureShm allocation on GPU→GPU path.
@@ -1278,12 +1293,12 @@ extern "C" int run_gpu_bench_latency(
     return -1;
   }
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
-                                 gpu_backend.data_capacity_);
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+                                     gpu_backend.data_capacity_);
 
   // Allocate GPU heap backend (GpuMalloc, device memory): 4 MB per block.
   // Build IpcManagerGpuInfo from runtime's full GPU info, then override backends
-  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   int *d_done;
@@ -1296,11 +1311,11 @@ extern "C" int run_gpu_bench_latency(
   void *stream = hshm::GpuApi::CreateStream();
 
   // Pause orchestrator (triggers queue rebuild if block count changed)
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
   cudaGetLastError();  // Clear any sticky CUDA errors
 
   // Fetch gpu_info AFTER pause — queue was rebuilt by PauseGpuOrchestrator
-  gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   PrintKernelInfo("gpu_bench_client_kernel",
@@ -1313,14 +1328,14 @@ extern "C" int run_gpu_bench_latency(
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     cudaFreeHost(d_done);
     hshm::GpuApi::DestroyStream(stream);
     return -3;
   }
 
   // Resume orchestrator AFTER client launch — both run concurrently
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
   auto t_start = std::chrono::high_resolution_clock::now();
 
   // Poll for all warps to complete (60 s timeout)
@@ -1342,7 +1357,7 @@ extern "C" int run_gpu_bench_latency(
   hshm::GpuApi::Synchronize(stream);
 
   // All client blocks have now finished — safe to stop the orchestrator.
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   cudaFreeHost(d_done);
   hshm::GpuApi::DestroyStream(stream);
@@ -1365,7 +1380,7 @@ extern "C" int run_gpu_bench_coroutine(
     chi::u32 total_tasks,
     chi::u32 subtasks,
     float *out_elapsed_ms) {
-  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+  CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
 
   constexpr size_t kPerBlockBytes = 10 * 1024 * 1024;
   size_t backend_size = static_cast<size_t>(client_blocks) * kPerBlockBytes;
@@ -1376,10 +1391,10 @@ extern "C" int run_gpu_bench_coroutine(
     return -1;
   }
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
-  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   int *d_done;
@@ -1391,7 +1406,7 @@ extern "C" int run_gpu_bench_coroutine(
 
   void *stream = hshm::GpuApi::CreateStream();
 
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
   cudaGetLastError();
 
   PrintKernelInfo("gpu_bench_coroutine_kernel",
@@ -1404,13 +1419,13 @@ extern "C" int run_gpu_bench_coroutine(
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     cudaFreeHost(d_done);
     hshm::GpuApi::DestroyStream(stream);
     return -3;
   }
 
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
   auto t_start = std::chrono::high_resolution_clock::now();
 
   constexpr int kTimeoutUs = 60000000;
@@ -1423,7 +1438,7 @@ extern "C" int run_gpu_bench_coroutine(
   *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
 
   hshm::GpuApi::Synchronize(stream);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   cudaFreeHost(d_done);
   hshm::GpuApi::DestroyStream(stream);
@@ -1459,7 +1474,7 @@ __global__ void gpu_bench_parallel_kernel(
         chi::PoolQuery::Local(parallelism), (chi::u32)0, (chi::u32)7);
     future.Wait();
 
-    if (chi::IpcManager::IsWarpScheduler()) {
+    if (chi::gpu::IpcManager::IsWarpScheduler()) {
       if (!future.IsNull() && future->result_value_ != 21) {
         if (errors == 0) {
           printf("[PARALLEL ERROR] blk=%u task %u: expected=21, got=%u\n",
@@ -1470,13 +1485,13 @@ __global__ void gpu_bench_parallel_kernel(
     }
   }
 
-  if (chi::IpcManager::IsWarpScheduler() && errors > 0) {
+  if (chi::gpu::IpcManager::IsWarpScheduler() && errors > 0) {
     printf("[PARALLEL FAIL] blk=%u %u/%u wrong results\n",
            blockIdx.x, errors, total_tasks);
   }
 
   __syncwarp();
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     __threadfence_system();
     atomicAdd(d_done, 1);
   }
@@ -1499,7 +1514,7 @@ extern "C" int run_gpu_bench_parallel(
     chi::u32 total_tasks,
     chi::u32 parallelism,
     float *out_elapsed_ms) {
-  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+  CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
 
   constexpr size_t kPerBlockBytes = 10 * 1024 * 1024;
   size_t backend_size = static_cast<size_t>(client_blocks) * kPerBlockBytes;
@@ -1510,10 +1525,10 @@ extern "C" int run_gpu_bench_parallel(
     return -1;
   }
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
-  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   int *d_done;
@@ -1525,10 +1540,10 @@ extern "C" int run_gpu_bench_parallel(
 
   void *stream = hshm::GpuApi::CreateStream();
 
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
   cudaGetLastError();
 
-  gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   PrintKernelInfo("gpu_bench_parallel_kernel",
@@ -1542,13 +1557,13 @@ extern "C" int run_gpu_bench_parallel(
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     cudaFreeHost(d_done);
     hshm::GpuApi::DestroyStream(stream);
     return -3;
   }
 
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
   auto t_start = std::chrono::high_resolution_clock::now();
 
   constexpr int kTimeoutUs = 60000000;
@@ -1560,7 +1575,7 @@ extern "C" int run_gpu_bench_parallel(
   *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
 
   hshm::GpuApi::Synchronize(stream);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   cudaFreeHost(d_done);
   hshm::GpuApi::DestroyStream(stream);
@@ -1596,7 +1611,7 @@ __global__ void gpu_bench_bdev_kernel(
         chi::PoolQuery::Local(), alloc_size);
     future.Wait();
 
-    if (chi::IpcManager::IsWarpScheduler()) {
+    if (chi::gpu::IpcManager::IsWarpScheduler()) {
       if (future.IsNull() || future->return_code_ != 0) {
         if (errors == 0) {
           printf("[BDEV ERROR] blk=%u task %u: alloc failed (rc=%d)\n",
@@ -1608,13 +1623,13 @@ __global__ void gpu_bench_bdev_kernel(
     }
   }
 
-  if (chi::IpcManager::IsWarpScheduler() && errors > 0) {
+  if (chi::gpu::IpcManager::IsWarpScheduler() && errors > 0) {
     printf("[BDEV FAIL] blk=%u %u/%u allocations failed\n",
            blockIdx.x, errors, total_tasks);
   }
 
   __syncwarp();
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     __threadfence_system();
     atomicAdd(d_done, 1);
   }
@@ -1631,7 +1646,7 @@ extern "C" int run_gpu_bench_bdev(
     chi::u32 total_tasks,
     chi::u64 alloc_size,
     float *out_elapsed_ms) {
-  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+  CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
 
   constexpr size_t kPerBlockBytes = 10 * 1024 * 1024;
   size_t backend_size = static_cast<size_t>(client_blocks) * kPerBlockBytes;
@@ -1642,10 +1657,10 @@ extern "C" int run_gpu_bench_bdev(
     return -1;
   }
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
-  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   int *d_done;
@@ -1657,10 +1672,10 @@ extern "C" int run_gpu_bench_bdev(
 
   void *stream = hshm::GpuApi::CreateStream();
 
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
   cudaGetLastError();
 
-  gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   PrintKernelInfo("gpu_bench_bdev_kernel",
@@ -1674,13 +1689,13 @@ extern "C" int run_gpu_bench_bdev(
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     cudaFreeHost(d_done);
     hshm::GpuApi::DestroyStream(stream);
     return -3;
   }
 
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
   auto t_start = std::chrono::high_resolution_clock::now();
 
   constexpr int kTimeoutUs = 60000000;
@@ -1692,7 +1707,7 @@ extern "C" int run_gpu_bench_bdev(
   *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
 
   hshm::GpuApi::Synchronize(stream);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   cudaFreeHost(d_done);
   hshm::GpuApi::DestroyStream(stream);
@@ -1730,7 +1745,7 @@ __global__ void gpu_bench_bdev_full_kernel(
       chi::PoolQuery::Local(), io_size);
   alloc_future.Wait();
 
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     if (alloc_future.IsNull() || alloc_future->return_code_ != 0) {
       printf("[BDEV-FULL] FAIL: AllocateBlocks rc=%d null=%d\n",
              alloc_future.IsNull() ? -999 : (int)alloc_future->return_code_,
@@ -1754,7 +1769,7 @@ __global__ void gpu_bench_bdev_full_kernel(
   // Get the allocated blocks (lane 0 only has the valid future)
   // We need to copy blocks to a local variable accessible by all lanes
   chi::priv::vector<chimaera::bdev::Block> blocks;
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     blocks = alloc_future->blocks_;
   }
 
@@ -1775,7 +1790,7 @@ __global__ void gpu_bench_bdev_full_kernel(
   }
 
   // Fill with pattern: byte[i] = (i & 0xFF)
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     char *wbuf = write_buf.ptr_;
     for (chi::u64 i = 0; i < io_size; ++i) {
       wbuf[i] = static_cast<char>(i & 0xFF);
@@ -1790,7 +1805,7 @@ __global__ void gpu_bench_bdev_full_kernel(
       chi::PoolQuery::Local(), blocks, write_data_shm, io_size);
   write_future.Wait();
 
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     if (write_future.IsNull() || write_future->return_code_ != 0) {
       printf("[BDEV-FULL] FAIL: Write rc=%d\n",
              write_future.IsNull() ? -999 : (int)write_future->return_code_);
@@ -1818,7 +1833,7 @@ __global__ void gpu_bench_bdev_full_kernel(
   }
 
   // Zero the read buffer
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     memset(read_buf.ptr_, 0, io_size);
   }
   __syncwarp();
@@ -1830,7 +1845,7 @@ __global__ void gpu_bench_bdev_full_kernel(
       chi::PoolQuery::Local(), blocks, read_data_shm, io_size);
   read_future.Wait();
 
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     if (read_future.IsNull() || read_future->return_code_ != 0) {
       printf("[BDEV-FULL] FAIL: Read rc=%d\n",
              read_future.IsNull() ? -999 : (int)read_future->return_code_);
@@ -1843,7 +1858,7 @@ __global__ void gpu_bench_bdev_full_kernel(
   if (rc != 0) { if (threadIdx.x == 0) *d_result = rc; return; }
 
   // Step 4: Verify data
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     char *rbuf = read_buf.ptr_;
     char *wbuf = write_buf.ptr_;
     chi::u32 mismatches = 0;
@@ -1873,7 +1888,7 @@ __global__ void gpu_bench_bdev_full_kernel(
   CHI_IPC->FreeBuffer(read_buf.shm_);
 
   __syncwarp();
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     __threadfence_system();
     *d_result = rc;
   }
@@ -1887,7 +1902,7 @@ extern "C" int run_gpu_bench_bdev_full(
     chi::u32 rt_threads,
     chi::u64 io_size,
     float *out_elapsed_ms) {
-  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+  CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
 
   constexpr size_t kPerBlockBytes = 10 * 1024 * 1024;
   size_t backend_size = kPerBlockBytes;
@@ -1898,10 +1913,10 @@ extern "C" int run_gpu_bench_bdev_full(
     return -1;
   }
 
-  CHI_IPC->RegisterGpuAllocator(backend_id, gpu_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(backend_id, gpu_backend.data_,
                                  gpu_backend.data_capacity_);
 
-  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   int *d_result;
@@ -1910,10 +1925,10 @@ extern "C" int run_gpu_bench_bdev_full(
 
   void *stream = hshm::GpuApi::CreateStream();
 
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
   cudaGetLastError();
 
-  gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
   chi_bench::gpu_bench_bdev_full_kernel<<<1, 32, 0,
@@ -1924,13 +1939,13 @@ extern "C" int run_gpu_bench_bdev_full(
   if (launch_err != cudaSuccess) {
     printf("bdev_full kernel launch failed: %s\n",
            cudaGetErrorString(launch_err));
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     cudaFreeHost(d_result);
     hshm::GpuApi::DestroyStream(stream);
     return -3;
   }
 
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
   auto t_start = std::chrono::high_resolution_clock::now();
 
   // Poll for completion (result != 0 means done)
@@ -1949,7 +1964,7 @@ extern "C" int run_gpu_bench_bdev_full(
   int result = *d_result;
 
   hshm::GpuApi::Synchronize(stream);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   cudaFreeHost(d_result);
   hshm::GpuApi::DestroyStream(stream);
@@ -2528,8 +2543,8 @@ __global__ void gpu_putblob_kernel(
     int *d_done) {
   CHIMAERA_GPU_CLIENT_INIT(gpu_info, num_blocks);
 
-  chi::u32 warp_id = chi::IpcManager::GetWarpId();
-  chi::u32 lane_id = chi::IpcManager::GetLaneId();
+  chi::u32 warp_id = chi::gpu::IpcManager::GetWarpId();
+  chi::u32 lane_id = chi::gpu::IpcManager::GetLaneId();
 
   if (warp_id < total_warps) {
     // Compute this warp's slice of the array
@@ -2578,7 +2593,7 @@ __global__ void gpu_putblob_kernel(
   }
 
   __syncwarp();
-  if (chi::IpcManager::IsWarpScheduler()) {
+  if (chi::gpu::IpcManager::IsWarpScheduler()) {
     __threadfence();
     int prev = atomicAdd(d_done, 1);
     if (prev == static_cast<int>(total_warps) - 1) {
@@ -2606,12 +2621,12 @@ extern "C" int run_gpu_bench_putblob(
     chi::u64 total_bytes,
     bool to_cpu,
     float *out_elapsed_ms) {
-  CHI_IPC->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
+  CHI_CPU_IPC->GetGpuIpcManager()->SetGpuOrchestratorBlocks(rt_blocks, rt_threads);
 
   // Pause GPU orchestrator before any cudaDeviceSynchronize / GPU init.
   // The orchestrator is a persistent kernel; cudaDeviceSynchronize would block
   // forever waiting for it.
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   // --- 1. Data backend: device memory for array A ---
   hipc::MemoryBackendId data_backend_id(200, 0);
@@ -2619,7 +2634,7 @@ extern "C" int run_gpu_bench_putblob(
   // Extra space for BuddyAllocator header
   size_t data_backend_size = total_bytes + 4 * 1024 * 1024;
   if (!data_backend.shm_init(data_backend_id, data_backend_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     return -1;
   }
 
@@ -2629,7 +2644,7 @@ extern "C" int run_gpu_bench_putblob(
   hipc::MemoryBackendId scratch_id(201, 0);
   hipc::GpuMalloc scratch_backend;
   if (!scratch_backend.shm_init(scratch_id, scratch_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     return -1;
   }
 
@@ -2639,7 +2654,7 @@ extern "C" int run_gpu_bench_putblob(
   hipc::MemoryBackendId heap_id(202, 0);
   hipc::GpuMalloc heap_backend;
   if (!heap_backend.shm_init(heap_id, heap_size, "", 0)) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     return -1;
   }
 
@@ -2662,11 +2677,11 @@ extern "C" int run_gpu_bench_putblob(
   cudaFreeHost(d_array_ptr);
 
   // --- 5. Register data backend with runtime for ShmPtr resolution ---
-  CHI_IPC->RegisterGpuAllocator(data_backend_id, data_backend.data_,
+  CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuAllocator(data_backend_id, data_backend.data_,
                                  data_backend.data_capacity_);
 
   // --- 6. Build GPU info and launch data placement kernel ---
-  chi::IpcManagerGpu gpu_info = CHI_IPC->GetClientGpuInfo(0);
+  chi::IpcManagerGpu gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = scratch_backend;
 
   chi::u32 total_warps = (client_blocks * client_threads) / 32;
@@ -2694,13 +2709,13 @@ extern "C" int run_gpu_bench_putblob(
 
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
-    CHI_IPC->ResumeGpuOrchestrator();
+    CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
     cudaFreeHost(d_done);
     hshm::GpuApi::DestroyStream(stream);
     return -3;
   }
 
-  CHI_IPC->ResumeGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
   auto t_start = std::chrono::high_resolution_clock::now();
 
   constexpr int kTimeoutUs = 60000000;  // 60s
@@ -2712,7 +2727,7 @@ extern "C" int run_gpu_bench_putblob(
   *out_elapsed_ms = static_cast<float>(elapsed_ns / 1e6);
 
   hshm::GpuApi::Synchronize(stream);
-  CHI_IPC->PauseGpuOrchestrator();
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
   cudaFreeHost(d_done);
   hshm::GpuApi::DestroyStream(stream);
