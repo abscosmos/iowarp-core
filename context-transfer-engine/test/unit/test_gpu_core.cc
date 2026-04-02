@@ -263,8 +263,7 @@ class GpuCoreGpuFixture {
         auto elapsed = std::chrono::steady_clock::now() - start;
         auto secs = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
 
-        auto *orch = reinterpret_cast<chi::gpu::WorkOrchestrator*>(
-            CHI_IPC->gpu_orchestrator_);
+        chi::gpu::WorkOrchestrator *orch = nullptr;
         auto *ctrl = (orch && orch->control_) ? orch->control_ : nullptr;
 
         // Print debug every second
@@ -389,8 +388,7 @@ TEST_CASE("GpuCore - GPU PutBlob via LocalGpuBcast", "[gpu][cte][core]") {
       auto elapsed = std::chrono::steady_clock::now() - start;
       if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() >= 10) {
         // Dump GPU worker debug state
-        auto *orch = reinterpret_cast<chi::gpu::WorkOrchestrator*>(
-            CHI_IPC->gpu_orchestrator_);
+        chi::gpu::WorkOrchestrator *orch = nullptr;
         if (orch && orch->control_) {
           auto *ctrl = orch->control_;
           for (int w = 0; w < 2; ++w) {
@@ -418,8 +416,7 @@ TEST_CASE("GpuCore - GPU PutBlob via LocalGpuBcast", "[gpu][cte][core]") {
   }
   // Always dump debug info on completion
   {
-    auto *orch = reinterpret_cast<chi::gpu::WorkOrchestrator*>(
-        CHI_IPC->gpu_orchestrator_);
+    chi::gpu::WorkOrchestrator *orch = nullptr;
     if (orch && orch->control_) {
       auto *ctrl = orch->control_;
       for (int w = 0; w < 2; ++w) {

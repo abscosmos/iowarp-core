@@ -156,7 +156,7 @@ TEST_CASE("GpuRuntime - GPU Orchestrator Active", "[gpu]") {
 
   auto *ipc = CHI_IPC;
   // Check that the GPU orchestrator was created
-  REQUIRE(ipc->gpu_orchestrator_ != nullptr);
+  REQUIRE(ipc->GetGpuIpcManager()->gpu_orchestrator_ != nullptr);
 }
 
 /**
@@ -203,11 +203,11 @@ TEST_CASE("GpuRuntime - GPU Orchestrator Running Flag", "[gpu]") {
   REQUIRE(g_initialized);
 
   auto *ipc = CHI_IPC;
-  REQUIRE(ipc->gpu_orchestrator_ != nullptr);
+  REQUIRE(ipc->GetGpuIpcManager()->gpu_orchestrator_ != nullptr);
 
   // Cast to gpu::WorkOrchestrator and check running_flag
   auto *launcher =
-      static_cast<chi::gpu::WorkOrchestrator *>(ipc->gpu_orchestrator_);
+      static_cast<chi::gpu::WorkOrchestrator *>(ipc->GetGpuIpcManager()->gpu_orchestrator_);
   REQUIRE(launcher->control_ != nullptr);
 
   // Give the kernel time to set running_flag (it's async)

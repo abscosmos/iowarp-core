@@ -159,7 +159,8 @@ TEST_CASE("BuddyBenchmark - single block (control)",
   REQUIRE(backend.shm_init(backend_id, kBackendSize,
                            "/test_buddy_bench_single", 0));
 
-  chi::IpcManagerGpu gpu_info(backend, nullptr);
+  chi::IpcManagerGpu gpu_info;
+  gpu_info.backend = backend;
 
   constexpr int kTotal = kNumBlocks * kThreadsPerBlock;
   int *d_results = nullptr;
@@ -208,7 +209,8 @@ TEST_CASE("BuddyBenchmark - multi block (benchmark workload)",
   REQUIRE(backend.shm_init(backend_id, kBackendSize,
                            "/test_buddy_bench_multi", 0));
 
-  chi::IpcManagerGpu gpu_info(backend, nullptr);
+  chi::IpcManagerGpu gpu_info;
+  gpu_info.backend = backend;
 
   constexpr int kTotal = kNumBlocks * kThreadsPerBlock;
   int *d_results = nullptr;
@@ -251,7 +253,8 @@ TEST_CASE("BuddyBenchmark - stress (8 blocks, 500 allocs)",
   REQUIRE(backend.shm_init(backend_id, kBackendSize,
                            "/test_buddy_bench_stress", 0));
 
-  chi::IpcManagerGpu gpu_info(backend, nullptr);
+  chi::IpcManagerGpu gpu_info;
+  gpu_info.backend = backend;
 
   constexpr int kTotal = kNumBlocks * kThreadsPerBlock;
   int *d_results = nullptr;

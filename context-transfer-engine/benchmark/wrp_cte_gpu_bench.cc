@@ -511,15 +511,15 @@ int main(int argc, char **argv) {
     // Compose creates CTE before the GPU orchestrator launches, so the CTE
     // GPU container is never registered. Register it now manually.
     {
-      bool did_pause = CHI_CPU_IPC->PauseGpuOrchestrator();
+      bool did_pause = CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
       if (did_pause) {
-        void *gpu_cte = CHI_IPC->AllocGpuContainer(gpu_pool_id, 0, "wrp_cte_core");
+        void *gpu_cte = CHI_CPU_IPC->AllocGpuContainer(gpu_pool_id, 0, "wrp_cte_core");
         if (gpu_cte) {
-          CHI_IPC->RegisterGpuOrchestratorContainer(gpu_pool_id, gpu_cte);
+          CHI_CPU_IPC->GetGpuIpcManager()->RegisterGpuOrchestratorContainer(gpu_pool_id, gpu_cte);
           HIPRINT("Registered CTE GPU container for pool ({},{})",
                   gpu_pool_id.major_, gpu_pool_id.minor_);
         }
-        CHI_CPU_IPC->ResumeGpuOrchestrator();
+        CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
       }
     }
     std::this_thread::sleep_for(200ms);

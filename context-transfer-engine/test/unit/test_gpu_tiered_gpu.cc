@@ -269,7 +269,7 @@ extern "C" int run_gpu_tiered_test(
   }
 
   CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
-  auto *orch = static_cast<chi::gpu::WorkOrchestrator*>(CHI_CPU_IPC->gpu_orchestrator_);
+  chi::gpu::WorkOrchestrator *orch = nullptr;
   auto *ctrl = orch ? orch->control_ : nullptr;
   if (ctrl) {
     int w = 0;

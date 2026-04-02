@@ -94,8 +94,8 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
   chi::IpcManagerGpuInfo gpu_info = CHI_CPU_IPC->GetGpuIpcManager()->GetClientGpuInfo(0);
   gpu_info.backend = gpu_backend;
 
-  printf("[CTE-TEST] gpu2gpu=%p gpu2gpu_base=%p gpu2gpu_lanes=%u\n",
-         (void*)gpu_info.gpu2gpu_queue, (void*)gpu_info.gpu2gpu_queue_base,
+  printf("[CTE-TEST] gpu2gpu=%p gpu2gpu_lanes=%u\n",
+         (void*)gpu_info.gpu2gpu_queue,
          gpu_info.gpu2gpu_num_lanes);
   printf("[CTE-TEST] cpu2gpu=%p internal=%p backend.data=%p\n",
          (void*)gpu_info.cpu2gpu_queue, (void*)gpu_info.internal_queue,
@@ -116,7 +116,7 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
   CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
 
   // Poll for completion (10s timeout), dump orchestrator state every 2s
-  auto *orch = static_cast<chi::gpu::WorkOrchestrator *>(CHI_CPU_IPC->gpu_orchestrator_);
+  chi::gpu::WorkOrchestrator *orch = nullptr;
   int dump = 0;
   for (int i = 0; i < 100000 && *d_result == 0; ++i) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));

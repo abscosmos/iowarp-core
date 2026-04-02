@@ -19,6 +19,7 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
     ${CHIMAERA_ROOT}/modules/MOD_NAME/src/MOD_NAME_runtime_gpu.cc
     ${CHIMAERA_ROOT}/modules/bdev/src/bdev_runtime_gpu.cc
     ${CHIMAERA_ROOT}/src/gpu/work_orchestrator_gpu.cc
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/src/core_runtime_gpu.cc
   )
   add_cuda_executable(${BENCH_TARGET} FALSE
     ${BENCH_GPU_SOURCE}
