@@ -13,3 +13,4 @@ ignore:
   - "**/test/**"
   - "**/tests/**"
   - "**/benchmark/**"
+  - "**/globus_file_assimilator.cc"
