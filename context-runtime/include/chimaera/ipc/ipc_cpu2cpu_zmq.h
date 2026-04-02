@@ -25,6 +25,11 @@ struct IpcCpu2CpuZmq {
                                    const hipc::FullPtr<TaskT> &task_ptr,
                                    IpcMode mode);
 
+  /** RuntimeRecv: handled by the net worker receive thread (not called directly). */
+  static hipc::FullPtr<Task> RuntimeRecv(
+      IpcManager *ipc, Future<Task> &future, Container *container,
+      u32 method_id, hshm::lbm::Transport *recv_transport);
+
   /** Enqueue to net queue for TCP/IPC response. */
   static void RuntimeSend(IpcManager *ipc, RunContext *run_ctx, u32 origin);
 

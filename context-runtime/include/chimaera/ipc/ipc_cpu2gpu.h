@@ -28,10 +28,16 @@ struct IpcCpu2Gpu {
       gpu::IpcManager *ipc, const hipc::FullPtr<TaskT> &task_ptr,
       u32 gpu_id = 0);
 
+  /** RuntimeRecv: handled by gpu::Worker::TryPopFromQueue (not called directly). */
+
   /** Set FUTURE_COMPLETE on CPU side. */
   static void RuntimeSend(
       IpcManager *ipc, const FullPtr<Task> &task_ptr,
       RunContext *run_ctx, Container *container);
+
+  /** Client-side wait: poll pinned-host gpu::FutureShm, copy result D2H. */
+  template <typename TaskT, typename AllocT>
+  static bool ClientRecv(Future<TaskT, AllocT> &future, float max_sec);
 };
 
 }  // namespace chi

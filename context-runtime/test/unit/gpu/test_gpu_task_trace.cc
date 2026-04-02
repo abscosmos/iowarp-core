@@ -210,12 +210,30 @@ __global__ void gpu2gpu_kernel(chi::IpcManagerGpu gpu_info,
   *d_result = 0;
   CHIMAERA_GPU_INIT(gpu_info);
 
-  chimaera::MOD_NAME::Client client(pool_id);
-  auto future = client.AsyncGpuSubmit(
-      chi::PoolQuery::Local(), chi::u32(0), test_value);
-  future.Wait();
+  printf("[GPU2GPU-K] gpu_alloc=%p queue=%p\n",
+         (void*)g_ipc_manager.gpu_alloc_,
+         (void*)g_ipc_manager.gpu_info_.gpu2gpu_queue);
 
-  *d_result_value = future->result_value_;
+  auto task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+      chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(),
+      chi::u32(0), test_value);
+  printf("[GPU2GPU-K] NewTask ptr=%p null=%d\n",
+         (void*)task.ptr_, (int)task.IsNull());
+
+  if (!task.IsNull()) {
+    auto future = CHI_IPC->Send(task);
+    printf("[GPU2GPU-K] Send done fshm_null=%d\n",
+           (int)future.GetFutureShmPtr().IsNull());
+
+    // Check queue state after push
+    auto &qlane = g_ipc_manager.gpu_info_.gpu2gpu_queue->GetLane(0, 0);
+    printf("[GPU2GPU-K] After push: head=%llu tail=%llu\n",
+           (unsigned long long)qlane.GetHeadDevice(),
+           (unsigned long long)qlane.GetTailDevice());
+
+    future.Wait();
+    *d_result_value = future->result_value_;
+  }
   __threadfence_system();
   *d_result = 1;
 }
@@ -312,6 +330,15 @@ TEST_CASE("gpu2gpu_trace", "[gpu][gpu2gpu][trace]") {
   *d_result = 0;
   *d_rv = 0;
 
+  // Resume orchestrator FIRST so it's running when the client kernel pushes.
+  // If the client kernel starts first on a GPU with limited SMs, the
+  // orchestrator may never get scheduled (SM starvation deadlock).
+  ipc->GetGpuIpcManager()->ResumeGpuOrchestrator();
+  fprintf(stderr, "[TRACE] Orchestrator resumed\n");
+
+  // Small delay to let orchestrator kernel actually start polling
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
   cudaGetLastError();  // Clear sticky errors
   void *stream = hshm::GpuApi::CreateStream();
   fprintf(stderr, "[TRACE] Launching gpu2gpu_kernel(val=%u)\n", test_value);
@@ -321,14 +348,8 @@ TEST_CASE("gpu2gpu_trace", "[gpu][gpu2gpu][trace]") {
   if (err != cudaSuccess) {
     fprintf(stderr, "[TRACE] FAIL: kernel launch error %d: %s\n",
             (int)err, cudaGetErrorString(err));
-    ipc->GetGpuIpcManager()->ResumeGpuOrchestrator();
   }
   REQUIRE(err == cudaSuccess);
-
-  // Resume orchestrator so it processes the GPU→GPU task.
-  // The test kernel is now running on its stream, waiting in future.Wait().
-  ipc->GetGpuIpcManager()->ResumeGpuOrchestrator();
-  fprintf(stderr, "[TRACE] Orchestrator resumed\n");
 
   // Poll pinned-host for kernel completion
   fprintf(stderr, "[TRACE] Polling kernel result (10s timeout)...\n");

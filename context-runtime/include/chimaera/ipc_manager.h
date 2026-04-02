@@ -1756,51 +1756,10 @@ template <typename TaskT, typename AllocT>
 HSHM_HOST_FUN bool Future<TaskT, AllocT>::WaitCpu2Gpu(float max_sec,
                                                        bool reuse_task) {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-  // ShmPtr offset points to pinned-host gpu::FutureShm.
-  // GPU worker relays FUTURE_COMPLETE from device to host via system-scope
-  // write, so we poll the host mirror.
-  void *host_fshm = reinterpret_cast<void *>(future_shm_.off_.load());
-  auto start = std::chrono::steady_clock::now();
-
-  // Poll flags on pinned-host gpu::FutureShm
-  u32 flags_val = 0;
-  size_t flags_offset = offsetof(gpu::FutureShm, flags_);
-  while (!(flags_val & gpu::FutureShm::FUTURE_COMPLETE)) {
-    hshm::GpuApi::Memcpy(
-        &flags_val,
-        reinterpret_cast<u32 *>(
-            static_cast<char *>(host_fshm) + flags_offset),
-        sizeof(u32));
-    if (flags_val & gpu::FutureShm::FUTURE_COMPLETE) break;
-    HSHM_THREAD_MODEL->Yield();
-    if (max_sec > 0) {
-      float elapsed = std::chrono::duration<float>(
-                          std::chrono::steady_clock::now() - start)
-                          .count();
-      if (elapsed >= max_sec) return false;
-    }
-  }
-
-  // Read device task address from host gpu::FutureShm
-  auto *gpu_fshm = reinterpret_cast<gpu::FutureShm *>(host_fshm);
-  void *device_task = reinterpret_cast<void *>(gpu_fshm->task_device_ptr_);
-
-  // Copy full task back from device to host
-  if (task_ptr_.ptr_ && device_task) {
-    hshm::GpuApi::Memcpy(
-        task_ptr_.ptr_,
-        static_cast<TaskT *>(device_task),
-        sizeof(TaskT));
-    task_ptr_->FixupAfterCopy();
-  }
-
-  // Free device buffer (task + gpu::FutureShm)
-  if (device_task) {
-    hshm::GpuApi::Free(device_task);
-  }
-  // Free pinned-host gpu::FutureShm
-  hshm::GpuApi::FreeHost(gpu_fshm);
-  return true;
+  bool ok = IpcCpu2Gpu::ClientRecv(*this, max_sec);
+  if (reuse_task) task_ptr_.SetNull();
+  Destroy(true);
+  return ok;
 #else
   (void)max_sec; (void)reuse_task;
   return true;
@@ -1810,29 +1769,22 @@ HSHM_HOST_FUN bool Future<TaskT, AllocT>::WaitCpu2Gpu(float max_sec,
 template <typename TaskT, typename AllocT>
 HSHM_HOST_FUN bool Future<TaskT, AllocT>::WaitCpu2Cpu(float max_sec,
                                                        bool reuse_task) {
-  hipc::FullPtr<FutureShm> future_full = CHI_CPU_IPC->ToFullPtr(future_shm_);
-  if (future_full.IsNull()) {
-    HLOG(kError, "Future::WaitCpu2Cpu: ToFullPtr returned null");
-    return false;
-  }
-
   bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
   if (is_runtime) {
-    return IpcCpu2Self::ClientRecv(*this, max_sec, future_full);
+    // Runtime self-send: poll FUTURE_COMPLETE in SHM
+    hipc::FullPtr<FutureShm> future_full =
+        CHI_CPU_IPC->ToFullPtr(future_shm_);
+    if (future_full.IsNull()) return false;
+    bool ok = IpcCpu2Self::ClientRecv(*this, max_sec, future_full);
+    if (!ok) return false;
   } else {
-    // CLIENT PATH: SHM lightbeam or ZMQ streaming.
-    // Don't wait for FUTURE_COMPLETE first — that causes deadlock for
-    // streaming.
+    // Client: SHM or ZMQ recv path
     if (!CHI_CPU_IPC->Recv(*this, max_sec)) {
       task_ptr_->SetReturnCode(static_cast<u32>(-1));
       return false;
     }
   }
-
-  // PostWait + mark consumed; task freed by ~Future()
-  if (reuse_task) {
-    task_ptr_.SetNull();
-  }
+  if (reuse_task) task_ptr_.SetNull();
   Destroy(true);
   return true;
 }
@@ -1840,47 +1792,15 @@ HSHM_HOST_FUN bool Future<TaskT, AllocT>::WaitCpu2Cpu(float max_sec,
 template <typename TaskT, typename AllocT>
 HSHM_HOST_FUN bool Future<TaskT, AllocT>::WaitGpu2Cpu(float max_sec,
                                                        bool reuse_task) {
-  hipc::FullPtr<FutureShm> future_full = CHI_CPU_IPC->ToFullPtr(future_shm_);
-  if (future_full.IsNull()) {
-    HLOG(kError, "Future::WaitGpu2Cpu: ToFullPtr returned null");
-    return false;
-  }
-
-  // Poll FUTURE_COMPLETE (set by GPU with system-scope atomics)
-  hshm::abitfield32_t &flags = future_full->flags_;
-  auto start = std::chrono::steady_clock::now();
-  while (!flags.AnySystem(FutureShm::FUTURE_COMPLETE)) {
-    HSHM_THREAD_MODEL->Yield();
-    if (max_sec > 0) {
-      float elapsed = std::chrono::duration<float>(
-                          std::chrono::steady_clock::now() - start)
-                          .count();
-      if (elapsed >= max_sec) {
-        task_ptr_->SetReturnCode(static_cast<u32>(-3));
-        return false;
-      }
-    }
-  }
-
-  // Deserialize output from GPU FutureShm ring buffer if present
-  if (future_full->output_.total_written_.load() > 0) {
-    hshm::lbm::LbmContext ctx;
-    ctx.copy_space = future_full->copy_space;
-    ctx.shm_info_ = &future_full->output_;
-    chi::priv::vector<char> load_buf;
-    load_buf.reserve(256);
-    DefaultLoadArchive load_ar(load_buf);
-    load_ar.SetMsgType(LocalMsgType::kSerializeOut);
-    hshm::lbm::ShmTransport::Recv(load_ar, ctx);
-    task_ptr_->SerializeOut(load_ar);
-  }
-
-  // PostWait + mark consumed; task freed by ~Future()
-  if (reuse_task) {
-    task_ptr_.SetNull();
-  }
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  bool ok = IpcGpu2Cpu::ClientRecv(*this, max_sec);
+  if (reuse_task) task_ptr_.SetNull();
   Destroy(true);
+  return ok;
+#else
+  (void)max_sec; (void)reuse_task;
   return true;
+#endif
 }
 
 // ----------------------------------------------------------------
@@ -2137,5 +2057,7 @@ HSHM_CROSS_FUN void Future<TaskT, AllocT>::DelTask() {
 // Template implementations for transport classes (need full IpcManager definition)
 #include "chimaera/ipc/ipc_cpu2cpu_impl.h"
 #include "chimaera/ipc/ipc_cpu2cpu_zmq_impl.h"
+#include "chimaera/ipc/ipc_gpu2cpu_impl.h"
+#include "chimaera/ipc/ipc_cpu2gpu_impl.h"
 
 #endif  // CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_IPC_MANAGER_H_

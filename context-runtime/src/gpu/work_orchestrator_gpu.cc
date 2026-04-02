@@ -102,6 +102,7 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
     worker.gpu_info_ptr_ = d_gpu_info;
 
     // Poll until exit signal — both GPU→GPU and CPU→GPU from same thread
+    // Poll until exit signal — both GPU→GPU and CPU→GPU from same thread
     while (worker.is_running_ && !control->exit_flag) {
       worker.PollGpu2Gpu();
       worker.PollCpu2Gpu();

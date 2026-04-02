@@ -56,6 +56,48 @@ chi::Future<TaskT> IpcCpu2Gpu::ClientSend(
   return chi::Future<TaskT>(chi_fshmptr, task_ptr);
 }
 
+template <typename TaskT, typename AllocT>
+bool IpcCpu2Gpu::ClientRecv(Future<TaskT, AllocT> &future, float max_sec) {
+  // ShmPtr offset points to pinned-host gpu::FutureShm
+  void *host_fshm = reinterpret_cast<void *>(future.future_shm_.off_.load());
+  auto start = std::chrono::steady_clock::now();
+
+  // Poll flags on pinned-host gpu::FutureShm
+  u32 flags_val = 0;
+  size_t flags_offset = offsetof(gpu::FutureShm, flags_);
+  while (!(flags_val & gpu::FutureShm::FUTURE_COMPLETE)) {
+    hshm::GpuApi::Memcpy(
+        &flags_val,
+        reinterpret_cast<u32 *>(
+            static_cast<char *>(host_fshm) + flags_offset),
+        sizeof(u32));
+    if (flags_val & gpu::FutureShm::FUTURE_COMPLETE) break;
+    HSHM_THREAD_MODEL->Yield();
+    if (max_sec > 0) {
+      float elapsed = std::chrono::duration<float>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+      if (elapsed >= max_sec) return false;
+    }
+  }
+
+  // Read device task address and copy result D2H
+  auto *gpu_fshm = reinterpret_cast<gpu::FutureShm *>(host_fshm);
+  void *device_task = reinterpret_cast<void *>(gpu_fshm->task_device_ptr_);
+  if (future.task_ptr_.ptr_ && device_task) {
+    hshm::GpuApi::Memcpy(
+        future.task_ptr_.ptr_,
+        static_cast<TaskT *>(device_task),
+        sizeof(TaskT));
+    future.task_ptr_->FixupAfterCopy();
+  }
+
+  // Free device buffer and pinned-host gpu::FutureShm
+  if (device_task) hshm::GpuApi::Free(device_task);
+  hshm::GpuApi::FreeHost(gpu_fshm);
+  return true;
+}
+
 #endif  // HSHM_IS_HOST
 
 }  // namespace chi

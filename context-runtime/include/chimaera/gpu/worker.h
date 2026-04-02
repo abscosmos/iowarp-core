@@ -294,7 +294,7 @@ class Worker {
     GPU_WORKER_TIMER_DEF(_qpop_tc);
     GPU_WORKER_TIMER_START(_qpop_tc);
     Future<Task> future;
-    bool popped = is_gpu2gpu ? lane.PopDevice(future) : lane.Pop(future);
+    bool popped = lane.Pop(future);
     if (!popped) {
       return 0;
     }

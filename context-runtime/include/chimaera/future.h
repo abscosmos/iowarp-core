@@ -223,6 +223,9 @@ class Future {
   // This enables the Cast method to work across different task types
   template <typename OtherTaskT, typename OtherAllocT>
   friend class Future;
+  friend struct IpcCpu2Self;
+  friend struct IpcCpu2Gpu;
+  friend struct IpcGpu2Cpu;
 
  private:
   /** FullPtr to the task (wraps private memory with null allocator) */

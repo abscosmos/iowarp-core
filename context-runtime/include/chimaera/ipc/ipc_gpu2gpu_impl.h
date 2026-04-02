@@ -41,8 +41,8 @@ HSHM_GPU_FUN Future<TaskT> IpcGpu2Gpu::ClientSend(
       }
       auto &qlane = ipc->gpu_info_.gpu2gpu_queue->GetLane(queue_lane_id, 0);
       Future<Task> task_future(future.GetFutureShmPtr());
-      hipc::threadfence();
-      qlane.Push(task_future);
+      hipc::threadfence_system();
+      qlane.PushSystem(task_future);
     }
   }
   __syncwarp();
