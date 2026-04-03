@@ -23,19 +23,25 @@ else()
 endif()
 
 # --- Benchmark 1: Pinned host memory bandwidth/latency ---
+# Build up optional args so libnuma defs/includes reach the Clang CUDA command.
+set(_PINNED_HOST_DEFS "")
+set(_PINNED_HOST_INCDIRS "${CMAKE_CURRENT_SOURCE_DIR}")
+set(_PINNED_HOST_LIBS CUDA::cudart)
+if(HAVE_LIBNUMA)
+  list(APPEND _PINNED_HOST_DEFS HAVE_LIBNUMA=1)
+  list(APPEND _PINNED_HOST_INCDIRS ${NUMA_INCLUDE_DIR})
+  list(APPEND _PINNED_HOST_LIBS ${NUMA_LIBRARY})
+endif()
+
 add_cuda_executable(gpu_baseline_pinned_host TRUE
     bench_pinned_host.cu
     INCLUDE_DIRS
-        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${_PINNED_HOST_INCDIRS}
     LINK_LIBS
-        CUDA::cudart
+        ${_PINNED_HOST_LIBS}
+    DEFS
+        ${_PINNED_HOST_DEFS}
 )
-
-if(HAVE_LIBNUMA)
-  target_compile_definitions(gpu_baseline_pinned_host PRIVATE HAVE_LIBNUMA=1)
-  target_include_directories(gpu_baseline_pinned_host PRIVATE ${NUMA_INCLUDE_DIR})
-  target_link_libraries(gpu_baseline_pinned_host PRIVATE ${NUMA_LIBRARY})
-endif()
 
 install(TARGETS gpu_baseline_pinned_host RUNTIME DESTINATION bin)
 
