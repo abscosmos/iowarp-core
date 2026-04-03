@@ -181,6 +181,7 @@ struct GpuTimer {
 
 class PinnedBuffer {
   void  *ptr_            = nullptr;
+  void  *dev_ptr_        = nullptr;  // GPU-accessible pointer (may differ for registered mem)
   size_t size_           = 0;
   bool   numa_allocated_ = false;
 
@@ -201,7 +202,9 @@ public:
         fprintf(stderr, "numa_alloc_onnode(%zu, %d) failed\n", size, numa_node);
         exit(1);
       }
-      cudaError_t err = cudaHostRegister(ptr_, size, cudaHostRegisterPortable);
+      cudaError_t err = cudaHostRegister(ptr_, size,
+                                         cudaHostRegisterPortable |
+                                         cudaHostRegisterMapped);
       if (err != cudaSuccess) {
         fprintf(stderr, "cudaHostRegister failed after numa_alloc_onnode: %s\n"
                         "  Hint: try a smaller --bytes-per-warp or fewer warps.\n",
@@ -209,6 +212,9 @@ public:
         numa_free(ptr_, size);
         exit(1);
       }
+      // Obtain the GPU-visible pointer for use inside kernels.
+      // cudaHostRegister memory may have a different device VA than the host VA.
+      CUDA_CHECK(cudaHostGetDevicePointer(&dev_ptr_, ptr_, 0));
       numa_allocated_ = true;
     } else {
       // NUMA lib present but no NUMA hardware — fall through to cudaMallocHost
@@ -217,6 +223,7 @@ public:
                 numa_node);
       }
       CUDA_CHECK(cudaMallocHost(&ptr_, size));
+      dev_ptr_ = ptr_;  // cudaMallocHost: host and device VAs are identical
       numa_allocated_ = false;
     }
 #else
@@ -225,6 +232,7 @@ public:
               numa_node);
     }
     CUDA_CHECK(cudaMallocHost(&ptr_, size));
+    dev_ptr_ = ptr_;  // cudaMallocHost: host and device VAs are identical
     numa_allocated_ = false;
 #endif
     memset(ptr_, 0, size);
@@ -242,13 +250,19 @@ public:
 #else
     cudaFreeHost(ptr_);
 #endif
-    ptr_  = nullptr;
-    size_ = 0;
+    ptr_     = nullptr;
+    dev_ptr_ = nullptr;
+    size_    = 0;
     numa_allocated_ = false;
   }
 
+  // CPU-side host pointer (use for memset, memcpy, host-side validation)
   template <typename T = void>
   T *get() { return static_cast<T *>(ptr_); }
+
+  // GPU-side device pointer (use for kernel arguments)
+  template <typename T = void>
+  T *dev_get() { return static_cast<T *>(dev_ptr_); }
 
   size_t size() const { return size_; }
 };
