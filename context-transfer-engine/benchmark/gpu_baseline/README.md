@@ -63,8 +63,73 @@ for gpu in 0 1 2 3; do
 done
 ```
 
+## Benchmark 2: Remote HBM (`gpu_baseline_remote_hbm`)
+
+Measures GPU-to-GPU HBM bandwidth over NVLink/PCIe on a single node using NVSHMEM RMA
+operations. Warp-collective `nvshmemx_{put,get}mem_nbi_warp` calls drive the transfer;
+only PE 0 runs the kernel, PE 1 acts as the target.
+
+### Build
+
+Requires NVSHMEM (already installed in the devcontainer; `NVSHMEM_HOME` is set automatically).
+
+```bash
+cmake -B build \
+  -DWRP_CORE_ENABLE_CUDA=ON \
+  -DWRP_CORE_ENABLE_BENCHMARKS=ON \
+  -DWRP_CORE_ENABLE_NVSHMEM=ON
+cmake --build build --target gpu_baseline_remote_hbm
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--blocks N` / `--threads N` | Grid dims; threads must be a multiple of 32 |
+| `--bytes-per-warp N` | Bytes per warp; k/m/g suffix accepted; multiple of 16 |
+| `--mode put\|get\|ping-pong` | Transfer direction (default: `put`) |
+| `--src-numa N` / `--dst-numa N` | Informational: NUMA node of each GPU |
+| `--warmup N` / `--iterations N` | Warmup and timed iteration counts |
+| `--no-fence` | Skip per-iteration `nvshmem_quiet()` (pipeline mode) |
+| `--validate` | Write pattern, quiet, read back and check |
+
+### Example Runs
+
+Loopback sanity (single GPU):
+```bash
+mpirun -n 1 gpu_baseline_remote_hbm \
+  --blocks 1 --threads 32 --bytes-per-warp 4096 --iterations 5
+```
+
+Two GPUs, same node:
+```bash
+mpirun -n 2 gpu_baseline_remote_hbm \
+  --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 50 --mode put
+mpirun -n 2 gpu_baseline_remote_hbm \
+  --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 50 --mode get
+mpirun -n 2 gpu_baseline_remote_hbm \
+  --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 50 --mode ping-pong
+```
+
+NUMA sweep (4 GPUs, vary src/dst for documentation):
+```bash
+for src in 0 1 2 3; do
+  for dst in 0 1 2 3; do
+    mpirun -n 2 gpu_baseline_remote_hbm \
+      --src-numa $src --dst-numa $dst \
+      --blocks 8 --threads 256 --bytes-per-warp 1m --iterations 100 --mode put
+  done
+done
+```
+
+For large allocations (>512 MB total), set:
+```bash
+export NVSHMEM_SYMMETRIC_SIZE=<bytes>
+```
+
 ## CTest
 
+Both benchmarks have ctests:
 ```bash
 ctest --test-dir build -R gpu_baseline -V
 ```
