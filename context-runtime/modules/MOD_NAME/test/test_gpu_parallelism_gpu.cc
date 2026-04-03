@@ -48,26 +48,21 @@ extern "C" int run_gpu_parallelism_test(
   }
   cudaMemset(g_d_counter, 0, sizeof(unsigned int));
 
-  // Create client and submit task with parallelism via ToLocalGpu
-  chimaera::MOD_NAME::Client client(pool_id);
+  // Direct NewTask/Send — client Async* is host-only
+  auto *ipc = CHI_IPC;
   chi::u32 gpu_id = 0;
   chi::u32 test_value = 42;
   chi::u64 counter_addr = reinterpret_cast<chi::u64>(g_d_counter);
 
-  auto future = client.AsyncGpuSubmit(
+  auto task = ipc->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+      chi::CreateTaskId(), pool_id,
       chi::PoolQuery::ToLocalGpu(gpu_id, parallelism),
       gpu_id, test_value, counter_addr);
+  auto future = ipc->Send(task);
 
   // Wait with timeout
   bool completed = future.Wait(30.0f);
   if (!completed) {
-    auto fshm_full = future.GetFutureShm();
-    chi::FutureShm *fshm = fshm_full.ptr_;
-    if (fshm) {
-      fprintf(stderr, "[PARALLELISM] TIMEOUT: total_warps=%u cc=%u\n",
-              fshm->total_warps_,
-              fshm->completion_counter_.load());
-    }
     return -3;  // Timeout
   }
 
