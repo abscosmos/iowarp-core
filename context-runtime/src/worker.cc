@@ -316,6 +316,8 @@ bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
   if (!gpu_lane->Pop(gpu_future)) {
     return false;
   }
+  HLOG(kInfo, "Worker {}: ProcessNewTaskGpu: popped task from gpu2cpu queue",
+       worker_id_);
 
   SetCurrentRunContext(nullptr);
 
@@ -410,14 +412,11 @@ bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
     }
   }
 
-  RouteResult route_result = CHI_IPC->RouteTask(future);
-  if (route_result == RouteResult::ExecHere) {
-#if HSHM_IS_HOST
-    RunContext *run_ctx = task_full_ptr->GetRunCtx();
-    bool is_started = task_full_ptr->task_flags_.Any(TASK_STARTED);
-    ExecTask(task_full_ptr, run_ctx, is_started);
-#endif
-  }
+  // Force-enqueue to a worker lane instead of executing on the GPU worker.
+  RouteResult route_result = CHI_IPC->RouteTask(future, /*force_enqueue=*/true);
+  HLOG(kInfo, "Worker {}: ProcessNewTaskGpu: RouteTask returned {} "
+       "pool={} method={}",
+       worker_id_, (int)route_result, pool_id, method_id);
 
   return true;
 }

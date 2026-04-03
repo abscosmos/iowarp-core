@@ -46,6 +46,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/ipc_manager.h>
 #include <chimaera/singletons.h>
+#include <wrp_cte/core/core_client.h>
 #include <chrono>
 #include <thread>
 
@@ -92,14 +93,25 @@ TEST_CASE("GpuCreate - AsyncCreate from GPU kernel", "[gpu][create]") {
   auto *f = hshm::Singleton<GpuCreateFixture>::GetInstance();
   REQUIRE(g_initialized);
 
+  // Pre-create the pool on CPU to avoid GPU container registration
+  // during the kernel's GetOrCreatePool (which pauses the orchestrator
+  // and deadlocks with the running test kernel due to CDP serialization).
+  chi::PoolId target_pool_id(999, 0);
+  {
+    wrp_cte::core::Client cte_client;
+    auto f = cte_client.AsyncCreate(chi::PoolQuery::Dynamic(),
+                                     "wrp_cte_core_gpu_test",
+                                     target_pool_id);
+    f.Wait();
+    REQUIRE(f->return_code_ == 0);
+  }
+  std::this_thread::sleep_for(200ms);
+
   // Pause the GPU orchestrator so its persistent kernel does not block
   // the test kernel from being scheduled on the GPU.
   CHI_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
 
-  // Use a unique pool ID for this test
-  chi::PoolId target_pool_id(999, 0);
   int return_code = -1;
-
   int result = run_gpu_create_test("wrp_cte_core_gpu_test",
                                    target_pool_id,
                                    &return_code);

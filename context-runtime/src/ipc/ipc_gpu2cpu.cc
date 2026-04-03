@@ -45,6 +45,9 @@ void IpcGpu2Cpu::RuntimeSend(
     IpcManager *ipc, const FullPtr<Task> &task_ptr,
     RunContext *run_ctx, Container *container) {
   auto future_shm = run_ctx->future_.GetFutureShm();
+  HLOG(kInfo, "IpcGpu2Cpu::RuntimeSend: pool={} method={} device_ptr=0x{:x}",
+       task_ptr->pool_id_, task_ptr->method_,
+       (size_t)future_shm->task_device_ptr_);
 
   // Signal the device-side gpu::FutureShm so the GPU waiter sees COMPLETE
   if (future_shm->task_device_ptr_) {

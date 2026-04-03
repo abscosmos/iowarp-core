@@ -62,8 +62,8 @@ add_executable(test_reorganize_blob
 # GPU-initiated kernel compiled via add_cuda_library (clang-cuda dual-pass)
 if(WRP_CORE_ENABLE_CUDA)
   add_cuda_library(test_gpu_initiated_kernels STATIC TRUE
-      test_gpu_initiated_gpu.cc
-      test_gpu_coroutine_gpu.cc
+      gpu/test_gpu_initiated_gpu.cc
+      gpu/test_gpu_coroutine_gpu.cc
       INCLUDE_DIRS
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
           ${CMAKE_SOURCE_DIR}/context-runtime/modules/MOD_NAME/include
@@ -84,8 +84,8 @@ if(WRP_CORE_ENABLE_CUDA)
   endforeach()
 
   add_cuda_executable(test_gpu_tiered TRUE
-      test_gpu_tiered.cc
-      test_gpu_tiered_gpu.cc
+      gpu/test_gpu_tiered.cc
+      gpu/test_gpu_tiered_gpu.cc
       INCLUDE_DIRS
           ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
           ${CMAKE_SOURCE_DIR}/context-runtime/include
@@ -108,16 +108,16 @@ if(WRP_CORE_ENABLE_CUDA)
 endif()
 
 add_executable(test_cte_gpu_coroutine
-    test_gpu_coroutine.cc
+    gpu/test_gpu_coroutine.cc
 )
 
 add_executable(test_gpu_core
-    test_gpu_core.cc
+    gpu/test_gpu_core.cc
 )
 
 # Create test_gpu_create executable for GPU AsyncCreate tests
 # GPU kernel file compiled with HSHM_ENABLE_CUDA=1 so device APIs are available
-add_library(test_gpu_create_kernels OBJECT test_gpu_create_gpu.cu)
+add_library(test_gpu_create_kernels OBJECT gpu/test_gpu_create_gpu.cu)
 target_include_directories(test_gpu_create_kernels PRIVATE
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
     ${CMAKE_SOURCE_DIR}/context-runtime/include
@@ -136,7 +136,7 @@ target_compile_options(test_gpu_create_kernels PUBLIC
 )
 
 add_executable(test_gpu_create
-    test_gpu_create_cpu.cc
+    gpu/test_gpu_create_cpu.cc
     $<TARGET_OBJECTS:test_gpu_create_kernels>
 )
 set_target_properties(test_gpu_create PROPERTIES

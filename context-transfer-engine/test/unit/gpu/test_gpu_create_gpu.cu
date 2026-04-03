@@ -282,6 +282,9 @@ extern "C" int run_gpu_create_test(const char *pool_name,
   }
 
   *out_return_code = h_return_code;
+
+  // Pause orchestrator before cudaFree (device-synchronizing)
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
   cudaFree(d_pool_name);
   cudaFree(d_result);
   cudaFree(d_return_code);
