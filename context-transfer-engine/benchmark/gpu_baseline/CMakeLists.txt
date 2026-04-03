@@ -65,3 +65,106 @@ add_test(NAME gpu_baseline_pinned_host_validate
     --validate)
 set_tests_properties(gpu_baseline_pinned_host_validate PROPERTIES
   TIMEOUT 30 LABELS "gpu;msan_skip")
+
+# ============================================================
+# Benchmark 2: Remote HBM via NVSHMEM (requires WRP_CORE_ENABLE_NVSHMEM=ON)
+# ============================================================
+
+if(WRP_CORE_ENABLE_NVSHMEM)
+  # NVSHMEM_HOME env var or -DNVSHMEM_HOME=/path sets the search prefix.
+  set(_NVSHMEM_PREFIX "$ENV{NVSHMEM_HOME}" CACHE PATH "NVSHMEM install prefix")
+  if(NOT _NVSHMEM_PREFIX AND DEFINED ENV{NVSHMEM_HOME})
+    set(_NVSHMEM_PREFIX "$ENV{NVSHMEM_HOME}")
+  endif()
+
+  find_path(NVSHMEM_INCLUDE_DIR nvshmem.h
+    HINTS ${_NVSHMEM_PREFIX}/include
+    PATHS /usr/local/nvshmem/include /opt/nvshmem/include)
+  # NVSHMEM 3.x splits into nvshmem_host (shared) + nvshmem_device (static).
+  # Older versions have a single libnvshmem. Try both naming conventions.
+  find_library(NVSHMEM_HOST_LIBRARY nvshmem_host
+    HINTS ${_NVSHMEM_PREFIX}/lib
+    PATHS /usr/local/nvshmem/lib /opt/nvshmem/lib)
+  find_library(NVSHMEM_DEVICE_LIBRARY nvshmem_device
+    HINTS ${_NVSHMEM_PREFIX}/lib
+    PATHS /usr/local/nvshmem/lib /opt/nvshmem/lib)
+  # Fallback: single libnvshmem (NVSHMEM 2.x layout)
+  find_library(NVSHMEM_LIBRARY nvshmem
+    HINTS ${_NVSHMEM_PREFIX}/lib
+    PATHS /usr/local/nvshmem/lib /opt/nvshmem/lib)
+
+  if(NVSHMEM_INCLUDE_DIR AND (NVSHMEM_HOST_LIBRARY OR NVSHMEM_LIBRARY))
+    set(HAVE_NVSHMEM TRUE)
+    if(NVSHMEM_HOST_LIBRARY)
+      message(STATUS "gpu_baseline: nvshmem found (3.x layout) — host: ${NVSHMEM_HOST_LIBRARY}")
+      if(NVSHMEM_DEVICE_LIBRARY)
+        message(STATUS "gpu_baseline: nvshmem device lib: ${NVSHMEM_DEVICE_LIBRARY}")
+      endif()
+    else()
+      message(STATUS "gpu_baseline: nvshmem found at ${NVSHMEM_LIBRARY}")
+    endif()
+  else()
+    set(HAVE_NVSHMEM FALSE)
+    message(STATUS "gpu_baseline: nvshmem not found — skipping bench_remote_hbm (set NVSHMEM_HOME or install nvshmem)")
+  endif()
+else()
+  set(HAVE_NVSHMEM FALSE)
+  message(STATUS "gpu_baseline: WRP_CORE_ENABLE_NVSHMEM=OFF — skipping bench_remote_hbm")
+endif()
+
+if(HAVE_NVSHMEM)
+  # MPI is required for the standard nvshmem multi-PE launch model
+  find_package(MPI REQUIRED COMPONENTS CXX)
+
+  # Build link list: prefer 3.x split libs, fall back to single libnvshmem
+  set(_REMOTE_HBM_LIBS CUDA::cudart)
+  if(NVSHMEM_HOST_LIBRARY)
+    list(APPEND _REMOTE_HBM_LIBS ${NVSHMEM_HOST_LIBRARY})
+  endif()
+  if(NVSHMEM_DEVICE_LIBRARY)
+    list(APPEND _REMOTE_HBM_LIBS ${NVSHMEM_DEVICE_LIBRARY})
+  elseif(NVSHMEM_LIBRARY)
+    list(APPEND _REMOTE_HBM_LIBS ${NVSHMEM_LIBRARY})
+  endif()
+  list(APPEND _REMOTE_HBM_LIBS MPI::MPI_CXX)
+
+  add_cuda_executable(gpu_baseline_remote_hbm TRUE
+    bench_remote_hbm.cu
+    INCLUDE_DIRS
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${NVSHMEM_INCLUDE_DIR}
+    LINK_LIBS
+      ${_REMOTE_HBM_LIBS}
+    DEFS
+      HAVE_NVSHMEM=1
+  )
+
+  # NVSHMEM device code requires relocatable device code for NVCC
+  if(NOT WRP_CORE_CLANG_CUDA_COMPILER)
+    set_target_properties(gpu_baseline_remote_hbm PROPERTIES
+      CUDA_SEPARABLE_COMPILATION ON)
+  endif()
+
+  install(TARGETS gpu_baseline_remote_hbm RUNTIME DESTINATION bin)
+
+  # Sanity ctest (loopback: PE 0 puts to PE 0, single warp, 4 KB)
+  # Requires nvshmrun or mpirun in PATH
+  add_test(NAME gpu_baseline_remote_hbm_sanity
+    COMMAND nvshmrun -n 1 $<TARGET_FILE:gpu_baseline_remote_hbm>
+      --blocks 1 --threads 32
+      --bytes-per-warp 4096
+      --iterations 10
+      --mode put)
+  set_tests_properties(gpu_baseline_remote_hbm_sanity PROPERTIES
+    TIMEOUT 60 LABELS "gpu;nvshmem;msan_skip")
+
+  # 2-PE test (requires 2 GPUs — will fail gracefully on 1-GPU machines)
+  add_test(NAME gpu_baseline_remote_hbm_2pe
+    COMMAND nvshmrun -n 2 $<TARGET_FILE:gpu_baseline_remote_hbm>
+      --blocks 1 --threads 32
+      --bytes-per-warp 4096
+      --iterations 10
+      --mode put)
+  set_tests_properties(gpu_baseline_remote_hbm_2pe PROPERTIES
+    TIMEOUT 60 LABELS "gpu;nvshmem;multi_gpu;msan_skip")
+endif()
