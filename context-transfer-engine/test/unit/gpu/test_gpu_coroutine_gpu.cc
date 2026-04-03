@@ -96,7 +96,7 @@ extern "C" int run_gpu_leaf_task_test(chi::PoolId pool_id) {
          (void*)gpu_info.backend.data_);
 
   void *stream = hshm::GpuApi::CreateStream();
-  gpu_leaf_task_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+  gpu_leaf_task_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
       gpu_info, pool_id, d_result);
 
   cudaError_t launch_err = cudaGetLastError();
@@ -208,7 +208,7 @@ extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
   *d_rv = 0;
 
   void *stream = hshm::GpuApi::CreateStream();
-  gpu_subtask_kernel<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+  gpu_subtask_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
       gpu_info, pool_id, test_value, d_result, d_rv);
 
   cudaError_t launch_err = cudaGetLastError();
