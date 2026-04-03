@@ -269,14 +269,14 @@ int main(int argc, char **argv) {
 
     // Warmup
     pinned_host_write_kernel<<<cfg.blocks, cfg.threads>>>(
-        write_buf.get<char>(), cfg.bytes_per_warp,
+        write_buf.dev_get<char>(), cfg.bytes_per_warp,
         cfg.total_warps(), cfg.warmup_iters, use_fence);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Timed
     float ms = timed_launch([&](uint32_t iters) {
       pinned_host_write_kernel<<<cfg.blocks, cfg.threads>>>(
-          write_buf.get<char>(), cfg.bytes_per_warp,
+          write_buf.dev_get<char>(), cfg.bytes_per_warp,
           cfg.total_warps(), iters, use_fence);
     }, cfg, cfg.iterations);
 
@@ -308,14 +308,14 @@ int main(int argc, char **argv) {
 
     // Warmup
     pinned_host_read_kernel<<<cfg.blocks, cfg.threads>>>(
-        write_buf.get<char>(), cfg.bytes_per_warp,
+        write_buf.dev_get<char>(), cfg.bytes_per_warp,
         cfg.total_warps(), cfg.warmup_iters, use_fence);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // Timed
     float ms = timed_launch([&](uint32_t iters) {
       pinned_host_read_kernel<<<cfg.blocks, cfg.threads>>>(
-          write_buf.get<char>(), cfg.bytes_per_warp,
+          write_buf.dev_get<char>(), cfg.bytes_per_warp,
           cfg.total_warps(), iters, use_fence);
     }, cfg, cfg.iterations);
 
@@ -330,7 +330,7 @@ int main(int argc, char **argv) {
 
     // Warmup
     pinned_host_readwrite_kernel<<<cfg.blocks, cfg.threads>>>(
-        write_buf.get<char>(), read_buf.get<char>(),
+        write_buf.dev_get<char>(), read_buf.dev_get<char>(),
         cfg.bytes_per_warp, cfg.total_warps(), cfg.warmup_iters, use_fence);
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -341,7 +341,7 @@ int main(int argc, char **argv) {
     // Timed — bytes_moved counts both read and write sides
     float ms = timed_launch([&](uint32_t iters) {
       pinned_host_readwrite_kernel<<<cfg.blocks, cfg.threads>>>(
-          write_buf.get<char>(), read_buf.get<char>(),
+          write_buf.dev_get<char>(), read_buf.dev_get<char>(),
           cfg.bytes_per_warp, cfg.total_warps(), iters, use_fence);
     }, cfg, cfg.iterations);
 
