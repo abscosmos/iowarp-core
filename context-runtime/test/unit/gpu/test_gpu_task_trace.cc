@@ -38,7 +38,7 @@
  * Tests CPU->GPU, GPU->GPU, and GPU->CPU task paths with tracing.
  */
 
-#include "../../simple_test.h"
+#include "simple_test.h"
 
 #include <chimaera/chimaera.h>
 #include <chimaera/singletons.h>

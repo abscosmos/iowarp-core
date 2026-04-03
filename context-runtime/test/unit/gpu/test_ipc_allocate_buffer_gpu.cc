@@ -50,7 +50,7 @@
 #include <memory>
 #include <vector>
 
-#include "../simple_test.h"
+#include "simple_test.h"
 
 namespace {
 

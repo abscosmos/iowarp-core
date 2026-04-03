@@ -44,7 +44,7 @@
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 
-#include "../simple_test.h"
+#include "simple_test.h"
 
 #include <chimaera/chimaera.h>
 #include <chimaera/ipc_manager.h>
@@ -238,7 +238,7 @@ TEST_CASE("GpuRuntime - Ready For Finalize", "[gpu]") {
 
 #else  // No CUDA or ROCm
 
-#include "../simple_test.h"
+#include "simple_test.h"
 
 TEST_CASE("GpuRuntime - Skipped (no GPU support)", "[gpu]") {
   INFO("GPU runtime tests skipped: CUDA/ROCm not enabled");

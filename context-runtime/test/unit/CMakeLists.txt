@@ -92,7 +92,7 @@ set(CLIENT_RETRY_TEST_SOURCES
 # GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET test_ipc_allocate_buffer_gpu)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_SOURCES
-  test_ipc_allocate_buffer_gpu.cc
+  gpu/test_ipc_allocate_buffer_gpu.cc
 )
 
 # Create core test executable
@@ -449,7 +449,7 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   add_test(NAME ${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET} COMMAND ${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET})
 
   # BuddyAllocator benchmark-mimic GPU test
-  add_cuda_executable(test_buddy_benchmark_gpu TRUE test_buddy_benchmark_gpu.cc
+  add_cuda_executable(test_buddy_benchmark_gpu TRUE gpu/test_buddy_benchmark_gpu.cc
     INCLUDE_DIRS
       ${CHIMAERA_ROOT}/test
       ${CHIMAERA_ROOT}/modules/MOD_NAME/include
@@ -472,7 +472,7 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
 
   # GPU Runtime test executable (pure host code, compiled by g++)
   set(GPU_RUNTIME_TEST_TARGET test_chimaera_gpu_runtime)
-  set(GPU_RUNTIME_TEST_SOURCES test_gpu_runtime.cc)
+  set(GPU_RUNTIME_TEST_SOURCES gpu/test_gpu_runtime.cc)
   add_executable(${GPU_RUNTIME_TEST_TARGET} ${GPU_RUNTIME_TEST_SOURCES})
   target_include_directories(${GPU_RUNTIME_TEST_TARGET} PRIVATE
     ${CHIMAERA_ROOT}/include
@@ -529,7 +529,7 @@ endif()
 # GPU POD Transfer test — proves CPU↔GPU task transfer via cudaMemcpy
 if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   find_package(CUDAToolkit QUIET)
-  add_cuda_executable(test_gpu_pod_transfer FALSE test_gpu_pod_transfer.cu
+  add_cuda_executable(test_gpu_pod_transfer FALSE gpu/test_gpu_pod_transfer.cu
     INCLUDE_DIRS
       ${CHIMAERA_ROOT}/include
       ${CHIMAERA_ROOT}/modules/admin/include

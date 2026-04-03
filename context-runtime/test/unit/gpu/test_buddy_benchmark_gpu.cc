@@ -73,7 +73,7 @@
 #include <hermes_shm/memory/backend/gpu_shm_mmap.h>
 #include <hermes_shm/util/gpu_api.h>
 
-#include "../simple_test.h"
+#include "simple_test.h"
 
 namespace {
 
