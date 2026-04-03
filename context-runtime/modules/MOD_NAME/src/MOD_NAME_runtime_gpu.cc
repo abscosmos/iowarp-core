@@ -51,17 +51,30 @@ HSHM_GPU_FUN void GpuRuntime::SubtaskTest(
   chi::u32 num_subtasks = task->num_subtasks_;
   chi::u32 last_result = 0;
 
+  if (threadIdx.x == 0) {
+    printf("[SubtaskTest] START num_subtasks=%u test_value=%u "
+           "internal_queue=%p gpu_alloc=%p\n",
+           num_subtasks, task->test_value_,
+           (void*)ipc->gpu_info_.internal_queue,
+           (void*)ipc->gpu_alloc_);
+  }
+  __syncwarp();
+
   for (chi::u32 s = 0; s < num_subtasks; ++s) {
-    // All lanes participate: NewTask/Send are warp-cooperative
+    if (threadIdx.x == 0) printf("[SubtaskTest] iter %u: NewTask\n", s);
     auto sub = ipc->NewTask<GpuSubmitTask>(
         chi::CreateTaskId(), pool_id_, chi::PoolQuery::Local(),
         /*gpu_id=*/chi::u32(0), task->test_value_);
+    if (threadIdx.x == 0) printf("[SubtaskTest] iter %u: Send, null=%d\n",
+                                  s, (int)sub.IsNull());
     auto future = ipc->Send(sub);
-    // All lanes must enter Wait (RecvGpu uses __syncwarp)
+    if (threadIdx.x == 0) printf("[SubtaskTest] iter %u: Wait\n", s);
     future.Wait();
     if (chi::gpu::IpcManager::IsWarpScheduler()) {
       last_result = future.get()->result_value_;
+      printf("[SubtaskTest] iter %u: done result=%u\n", s, last_result);
     }
+    __syncwarp();
   }
 
   if (chi::gpu::IpcManager::IsWarpScheduler()) {

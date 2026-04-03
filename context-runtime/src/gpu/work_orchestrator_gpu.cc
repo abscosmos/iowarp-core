@@ -103,9 +103,14 @@ __global__ void chimaera_gpu_orchestrator(gpu::PoolManager *pool_mgr,
 
     // Poll until exit signal — both GPU→GPU and CPU→GPU from same thread
     // Poll until exit signal — both GPU→GPU and CPU→GPU from same thread
+    int loop_count = 0;
     while (worker.is_running_ && !control->exit_flag) {
-      worker.PollGpu2Gpu();
+      int g2g = worker.PollGpu2Gpu();
       worker.PollCpu2Gpu();
+      if (g2g > 0) {
+        printf("[ORCH-POLL] Found %d tasks (loop %d)\n", g2g, loop_count);
+      }
+      ++loop_count;
     }
 
     // Flush orchestrator profile to pinned host memory before shutdown
@@ -160,6 +165,7 @@ bool gpu::WorkOrchestrator::Launch(const IpcManagerGpuInfo &gpu_info, u32 blocks
   cudaDeviceSetLimit(cudaLimitStackSize, 32768);
   cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 8 * 1024 * 1024);
   cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, 8192);
+  cudaDeviceSetLimit(cudaLimitDevRuntimeSyncDepth, 16);  // Allow nested CDP
   cudaDeviceSetLimit(cudaLimitMallocHeapSize, 32 * 1024 * 1024);  // 32MB device heap
 
   // Create dedicated stream

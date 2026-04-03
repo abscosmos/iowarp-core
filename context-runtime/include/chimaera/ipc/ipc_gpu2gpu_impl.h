@@ -84,6 +84,7 @@ HSHM_GPU_FUN void IpcGpu2Gpu::ClientRecv(
 template <typename TaskT>
 HSHM_GPU_FUN Future<TaskT> IpcGpu2Self::ClientSend(
     IpcManager *ipc, const hipc::FullPtr<TaskT> &task_ptr) {
+  if (task_ptr.IsNull()) return Future<TaskT>();
   GpuTaskQueue *queue = ipc->gpu_info_.internal_queue
                             ? ipc->gpu_info_.internal_queue
                             : ipc->gpu_info_.gpu2gpu_queue;
@@ -111,8 +112,8 @@ HSHM_GPU_FUN Future<TaskT> IpcGpu2Self::ClientSend(
   }
   auto &qlane = queue->GetLane(lane_id, 0);
   Future<Task> task_future(future.GetFutureShmPtr());
-  hipc::threadfence();
-  qlane.Push(task_future);
+  hipc::threadfence_system();
+  qlane.PushSystem(task_future);
   return future;
 }
 

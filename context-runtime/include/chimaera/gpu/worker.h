@@ -348,6 +348,8 @@ class Worker {
     // Look up the container from the pool
     PoolId pool_id = fshm->pool_id_;
     u32 method_id = fshm->method_id_;
+    printf("[TryPop] pool=(%u,%u) method=%u is_gpu2gpu=%d\n",
+           pool_id.major_, pool_id.minor_, method_id, (int)is_gpu2gpu);
     Container *container = pool_mgr_->GetContainer(pool_id);
     if (!container) {
       DbgNoContainer(pool_id.major_, pool_id.minor_);
@@ -370,9 +372,18 @@ class Worker {
     ++prof_task_count_;
 
     // Launch CDP child kernel with fire-and-forget semantics
-    RunTask<<<grid_dim, 32>>>(container, method_id, task_ptr.ptr_,
-                               task_ptr.shm_.off_.load(), fshm, is_gpu2gpu,
-                               gpu_info_ptr_);
+    // Launch CDP child on an explicit non-blocking stream so multiple
+    // children can run concurrently (default stream serializes them).
+    cudaStream_t child_stream;
+    cudaStreamCreateWithFlags(&child_stream, cudaStreamNonBlocking);
+    RunTask<<<grid_dim, 32, 0, child_stream>>>(
+        container, method_id, task_ptr.ptr_,
+        task_ptr.shm_.off_.load(), fshm, is_gpu2gpu,
+        gpu_info_ptr_);
+    cudaError_t cdp_err = cudaGetLastError();
+    if (cdp_err != cudaSuccess) {
+      printf("[ORCH-CDP] RunTask launch FAILED: %d\n", (int)cdp_err);
+    }
 
     // Track CPU→GPU tasks for completion relay
     if (host_fshm_for_relay && num_pending_ < kMaxPendingCpu2Gpu) {

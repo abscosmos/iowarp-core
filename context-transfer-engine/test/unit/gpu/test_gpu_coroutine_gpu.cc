@@ -220,13 +220,16 @@ extern "C" int run_gpu_subtask_test(chi::PoolId pool_id,
 
   CHI_CPU_IPC->GetGpuIpcManager()->ResumeGpuOrchestrator();
 
-  // Poll for completion (10s timeout)
-  for (int i = 0; i < 100000 && *d_result == 0; ++i) {
+  // Poll for completion (30s timeout)
+  for (int i = 0; i < 300000 && *d_result == 0; ++i) {
     std::this_thread::sleep_for(std::chrono::microseconds(100));
   }
 
   *out_result_value = *d_rv;
   int result = *d_result;
+  CHI_CPU_IPC->GetGpuIpcManager()->PauseGpuOrchestrator();
+  cudaFreeHost(d_result);
+  cudaFreeHost(d_rv);
   hshm::GpuApi::DestroyStream(stream);
   return (result == 0) ? -4 : result;
 }
