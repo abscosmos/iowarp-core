@@ -101,6 +101,9 @@ if(WRP_CORE_ENABLE_CUDA)
 
   install(TARGETS wrp_cte_gpu_bench RUNTIME DESTINATION bin)
 
+  # Standalone GPU baseline microbenchmarks
+  add_subdirectory(gpu_baseline)
+
   # Regression ctests — quick smoke tests for each GPU benchmark mode.
   # Use small data (1 warp, 4KB I/O, 1 iteration) to keep runtime < 30s.
   add_test(NAME cte_gpu_bench_putblob_gpu
