@@ -256,3 +256,23 @@ if(HAVE_NVSHMEM)
   set_tests_properties(gpu_baseline_cross_node_hbm_sanity PROPERTIES
     TIMEOUT 60 LABELS "gpu;nvshmem;msan_skip")
 endif()
+
+# ============================================================
+# Benchmark 5: Cross-Node Remote Pinned Host Memory (EGM + Fabric)
+# ============================================================
+find_package(MPI QUIET COMPONENTS CXX)
+if(MPI_FOUND)
+  set(_CROSS_NODE_PINNED_LIBS CUDA::cudart CUDA::cuda_driver MPI::MPI_CXX)
+  add_cuda_executable(gpu_baseline_cross_node_pinned_host TRUE
+    bench_cross_node_pinned_host.cu
+    INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
+    LINK_LIBS ${_CROSS_NODE_PINNED_LIBS})
+  install(TARGETS gpu_baseline_cross_node_pinned_host RUNTIME DESTINATION bin)
+  add_test(NAME gpu_baseline_cross_node_pinned_host_sanity
+    COMMAND mpirun -n 1 $<TARGET_FILE:gpu_baseline_cross_node_pinned_host>
+      --blocks 1 --threads 32 --bytes-per-warp 4096 --iterations 5
+      --src-gpu-id 0 --src-numa-node 0 --dst-gpu-id 0 --dst-numa-node 0
+      --mode write-bw)
+  set_tests_properties(gpu_baseline_cross_node_pinned_host_sanity PROPERTIES
+    TIMEOUT 60 LABELS "gpu;msan_skip")
+endif()
