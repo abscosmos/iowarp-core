@@ -237,59 +237,117 @@ cmake --build build --target gpu_baseline_cross_node_hbm
 | `--no-fence` | Disable per-iteration `nvshmem_quiet()` in BW modes (pipeline mode) |
 | `--validate` | BW modes only: readback and verify data |
 
-### InfiniBand Transport Setup
+### Transport Selection
+
+The binary uses NVSHMEM's MPI bootstrap (`nvshmemx_init_attr` with `NVSHMEMX_INIT_WITH_MPI_COMM`)
+so no `NVSHMEM_BOOTSTRAP` env var is needed. Set only the network transport:
 
 ```bash
-export NVSHMEM_BOOTSTRAP=MPI
-export NVSHMEM_REMOTE_TRANSPORT=ibrc   # or: ucx
+export NVSHMEM_REMOTE_TRANSPORT=ibrc   # InfiniBand RC (most common on HPC clusters)
+# or: ucx                              # UCX (if NVSHMEM was built with UCX support)
 ```
 
-No code change needed; the binary is transport-agnostic.
+For large transfers (>512 MB total symmetric allocation):
+```bash
+export NVSHMEM_SYMMETRIC_SIZE=2147483648   # 2 GB example
+```
 
-### Example Runs
+### Loopback sanity (single node, no IB needed)
 
-Loopback sanity (single node):
+Verifies the binary runs correctly. Results reflect device-local NVSHMEM overhead, not
+real IB bandwidth or latency.
+
 ```bash
 mpirun -n 1 gpu_baseline_cross_node_hbm \
-  --blocks 1 --threads 32 --bytes-per-warp 4096 --iterations 5
+  --blocks 1 --threads 32 --bytes-per-warp 4096 --iterations 5 --mode put-bw
 ```
 
-Cross-node bandwidth (2 nodes, 1 GPU each):
+### Cross-Node Runs — Generic (`mpirun --hostfile`)
+
+Each process runs on a separate node and uses one GPU (PE 0 = node 0, PE 1 = node 1).
+The binary must be in a path accessible from both nodes (shared filesystem).
+
+**Bandwidth:**
 ```bash
+export NVSHMEM_REMOTE_TRANSPORT=ibrc
 mpirun -n 2 --hostfile hosts gpu_baseline_cross_node_hbm \
   --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 50 --mode put-bw
 mpirun -n 2 --hostfile hosts gpu_baseline_cross_node_hbm \
   --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 50 --mode get-bw
 ```
 
-Cross-node one-way latency:
+**Latency (sweep across message sizes to characterize IB latency curve):**
 ```bash
-mpirun -n 2 --hostfile hosts gpu_baseline_cross_node_hbm \
-  --mode latency --bytes-per-warp 64 --latency-iters 1000
-mpirun -n 2 --hostfile hosts gpu_baseline_cross_node_hbm \
-  --mode latency --bytes-per-warp 4096 --latency-iters 1000
+export NVSHMEM_REMOTE_TRANSPORT=ibrc
+for size in 64 256 1k 4k 16k 64k 256k 1m; do
+  mpirun -n 2 --hostfile hosts gpu_baseline_cross_node_hbm \
+    --mode latency --bytes-per-warp $size --latency-iters 1000
+done
 ```
 
-**On Delta (Slurm):** use `srun` instead of `mpirun --hostfile`. Request 2 nodes, 1 GPU
-task each, and set the IB transport:
+### Cross-Node Runs — Delta (Slurm / `srun`)
+
+Delta uses Slurm; use `srun` instead of `mpirun --hostfile`. Request 2 nodes with 1 GPU
+task per node. The binary is in your build's `bin/` directory on the shared Lustre filesystem.
+
+**Interactive / one-off run:**
 ```bash
-export NVSHMEM_REMOTE_TRANSPORT=ibrc   # or: ucx
+export NVSHMEM_REMOTE_TRANSPORT=ibrc
 srun --ntasks=2 --nodes=2 --ntasks-per-node=1 --gpus-per-task=1 \
-  gpu_baseline_cross_node_hbm \
+  /path/to/build/bin/gpu_baseline_cross_node_hbm \
   --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 50 --mode put-bw
 ```
 
+**Batch script (`bench4.sb`):**
+```bash
+#!/bin/bash
+#SBATCH --nodes=2
+#SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=1
+#SBATCH --partition=gpuA100x4        # or gpuA40x4, gpuA100x8 — check Delta docs
+#SBATCH --time=00:10:00
+#SBATCH --account=<your_account>
+
+export NVSHMEM_REMOTE_TRANSPORT=ibrc
+BIN=/path/to/build/bin/gpu_baseline_cross_node_hbm
+
+# Bandwidth
+srun $BIN --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 100 --mode put-bw
+srun $BIN --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 100 --mode get-bw
+
+# Latency sweep
+for size in 64 256 1k 4k 16k 64k 256k 1m; do
+  srun $BIN --mode latency --bytes-per-warp $size --latency-iters 1000
+done
+```
+
+Submit with `sbatch bench4.sb`. Output from PE 1 (latency) and PE 0 (bandwidth) will be
+interleaved in the Slurm output file.
+
+**Note on GPU selection on Delta:** Delta's A100 nodes have 4 GPUs. With `--ntasks-per-node=1
+--gpus-per-task=1`, Slurm assigns GPU 0 to each task. To test a specific GPU, add
+`--gpu-id N` to the benchmark flags, but note that `--gpu-id` must be set BEFORE NVSHMEM
+init (which happens at startup) — the default (GPU 0) is correct for single-GPU-per-task jobs.
+
 ### Example Output
 
-BW mode:
+BW mode (PE 0 prints):
 ```
-=== GPU Baseline Benchmark 4: Cross-Node HBM ===
+=== GPU Baseline Benchmark 4: Cross-node HBM (NVSHMEM) — BW mode ===
+Device  : NVIDIA A100-SXM4-40GB (PE 0 -> GPU 0)
+Target  : PE 1
+PEs     : 2 total
+...
 Mode          PE  Target   Warps   bytes/warp   Iters   Time(ms)   BW(GB/s)
 ------------  ----  ------  ------  ------------  ------  ----------  ----------
-put-bw           0       1      32       1048576      50      ...       12.3
+put-bw           0       1     128       1048576     100      ...       ~12.5
 ```
 
-Latency mode (printed by PE 1 — or PE 0 in loopback):
+Expected IB HDR bandwidth: ~12–15 GB/s unidirectional (200 Gb/s link, ~50% efficiency
+for kernel-initiated RDMA). Compare with intra-node NVLink (bench 2): ~300–600 GB/s.
+
+Latency mode (PE 1 prints):
 ```
 Cross-node one-way latency (send-notify, 64 B payload)
   Samples : 1000
@@ -299,15 +357,11 @@ Cross-node one-way latency (send-notify, 64 B payload)
   Max     :  3.12 us
 ```
 
-> **Note (loopback):** When run with a single PE (`mpirun -n 1`), the send and poll kernels
-> execute sequentially on the same stream, so the reported latency reflects device-local
-> NVSHMEM overhead (~0.1 µs), not real InfiniBand round-trip time. Use `mpirun -n 2`
-> across two nodes for meaningful cross-node latency numbers.
+Expected IB HDR one-way latency: ~2–4 µs for small messages (64–256 B).
 
-For large transfer sizes (>512 MB total), set:
-```bash
-export NVSHMEM_SYMMETRIC_SIZE=<bytes>
-```
+> **Note (loopback):** When run with a single PE (`mpirun -n 1`), the send and poll kernels
+> execute sequentially on the same stream, so the reported latency is ~0.1 µs (device-local
+> NVSHMEM overhead), not real IB latency. Two nodes required for meaningful numbers.
 
 ## CTest
 
