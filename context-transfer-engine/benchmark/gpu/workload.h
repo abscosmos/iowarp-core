@@ -115,7 +115,8 @@ int run_cuda_malloc_bench(uint32_t client_blocks, uint32_t client_threads,
                           uint32_t iterations);
 
 // CTE client overhead benchmark — measures AsyncPutBlob submission cost
-int run_cte_client_overhead(chi::PoolId cte_pool_id, wrp_cte::core::TagId tag_id,
+int run_cte_client_overhead(chi::PoolId bdev_pool_id,
+                            chi::PoolId cte_pool_id, wrp_cte::core::TagId tag_id,
                             uint32_t rt_blocks, uint32_t rt_threads,
                             uint32_t client_blocks, uint32_t client_threads,
                             uint64_t warp_bytes, uint32_t iterations,

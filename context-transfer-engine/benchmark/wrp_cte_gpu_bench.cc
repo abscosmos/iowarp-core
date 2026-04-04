@@ -581,7 +581,7 @@ int main(int argc, char **argv) {
 
     float avg_submit_us = 0;
     rc = run_cte_client_overhead(
-        cte_client.pool_id_, tag_id,
+        bdev_pool_id, cte_client.pool_id_, tag_id,
         cfg.rt_blocks, cfg.rt_threads,
         cfg.client_blocks, cfg.client_threads,
         cfg.warp_bytes, cfg.iterations, to_cpu,
