@@ -167,4 +167,60 @@ if(HAVE_NVSHMEM)
       --mode put)
   set_tests_properties(gpu_baseline_remote_hbm_2pe PROPERTIES
     TIMEOUT 60 LABELS "gpu;nvshmem;multi_gpu;msan_skip")
+
+  # ============================================================
+  # Benchmark 3: Bus Contention (pinned host + NVSHMEM simultaneous)
+  # ============================================================
+
+  set(_BUS_CONTENTION_LIBS ${_REMOTE_HBM_LIBS})
+  if(HAVE_LIBNUMA)
+    list(APPEND _BUS_CONTENTION_LIBS ${NUMA_LIBRARY})
+  endif()
+
+  set(_BUS_CONTENTION_DEFS HAVE_NVSHMEM=1)
+  if(HAVE_LIBNUMA)
+    list(APPEND _BUS_CONTENTION_DEFS HAVE_LIBNUMA=1)
+  endif()
+
+  set(_BUS_CONTENTION_INCDIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${NVSHMEM_INCLUDE_DIR})
+  if(HAVE_LIBNUMA)
+    list(APPEND _BUS_CONTENTION_INCDIRS ${NUMA_INCLUDE_DIR})
+  endif()
+
+  add_cuda_executable(gpu_baseline_bus_contention TRUE
+    bench_bus_contention.cu
+    INCLUDE_DIRS
+      ${_BUS_CONTENTION_INCDIRS}
+    LINK_LIBS
+      ${_BUS_CONTENTION_LIBS}
+    DEFS
+      ${_BUS_CONTENTION_DEFS}
+  )
+
+  if(NOT WRP_CORE_CLANG_CUDA_COMPILER)
+    set_target_properties(gpu_baseline_bus_contention PROPERTIES
+      CUDA_SEPARABLE_COMPILATION ON)
+  endif()
+
+  install(TARGETS gpu_baseline_bus_contention RUNTIME DESTINATION bin)
+
+  # Loopback sanity test (1 PE, single GPU — no real contention, just code path validation)
+  add_test(NAME gpu_baseline_bus_contention_loopback
+    COMMAND nvshmrun -n 1 $<TARGET_FILE:gpu_baseline_bus_contention>
+      --A-blocks 1 --A-threads 32 --A-bytes-per-warp 4096
+      --B-blocks 1 --B-threads 32 --B-bytes-per-warp 4096
+      --warmup 2 --iterations 5)
+  set_tests_properties(gpu_baseline_bus_contention_loopback PROPERTIES
+    TIMEOUT 60 LABELS "gpu;nvshmem;msan_skip")
+
+  # 2-PE contention test (requires 2 GPUs)
+  add_test(NAME gpu_baseline_bus_contention_2pe
+    COMMAND nvshmrun -n 2 $<TARGET_FILE:gpu_baseline_bus_contention>
+      --A-blocks 1 --A-threads 32 --A-bytes-per-warp 4096
+      --B-blocks 1 --B-threads 32 --B-bytes-per-warp 4096
+      --warmup 2 --iterations 5)
+  set_tests_properties(gpu_baseline_bus_contention_2pe PROPERTIES
+    TIMEOUT 60 LABELS "gpu;nvshmem;multi_gpu;msan_skip")
 endif()
