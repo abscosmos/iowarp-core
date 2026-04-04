@@ -148,9 +148,9 @@ if(HAVE_NVSHMEM)
   install(TARGETS gpu_baseline_remote_hbm RUNTIME DESTINATION bin)
 
   # Sanity ctest (loopback: PE 0 puts to PE 0, single warp, 4 KB)
-  # Requires nvshmrun or mpirun in PATH
+  # Uses mpirun (MPI bootstrap) — no nvshmrun/Hydra dependency needed
   add_test(NAME gpu_baseline_remote_hbm_sanity
-    COMMAND nvshmrun -n 1 $<TARGET_FILE:gpu_baseline_remote_hbm>
+    COMMAND mpirun -n 1 $<TARGET_FILE:gpu_baseline_remote_hbm>
       --blocks 1 --threads 32
       --bytes-per-warp 4096
       --iterations 10
@@ -160,7 +160,7 @@ if(HAVE_NVSHMEM)
 
   # 2-PE test (requires 2 GPUs — will fail gracefully on 1-GPU machines)
   add_test(NAME gpu_baseline_remote_hbm_2pe
-    COMMAND nvshmrun -n 2 $<TARGET_FILE:gpu_baseline_remote_hbm>
+    COMMAND mpirun -n 2 $<TARGET_FILE:gpu_baseline_remote_hbm>
       --blocks 1 --threads 32
       --bytes-per-warp 4096
       --iterations 10
@@ -208,7 +208,7 @@ if(HAVE_NVSHMEM)
 
   # Loopback sanity test (1 PE, single GPU — no real contention, just code path validation)
   add_test(NAME gpu_baseline_bus_contention_loopback
-    COMMAND nvshmrun -n 1 $<TARGET_FILE:gpu_baseline_bus_contention>
+    COMMAND mpirun -n 1 $<TARGET_FILE:gpu_baseline_bus_contention>
       --A-blocks 1 --A-threads 32 --A-bytes-per-warp 4096
       --B-blocks 1 --B-threads 32 --B-bytes-per-warp 4096
       --warmup 2 --iterations 5)
