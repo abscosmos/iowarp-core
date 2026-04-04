@@ -116,6 +116,13 @@ if(HAVE_NVSHMEM)
   # MPI is required for the standard nvshmem multi-PE launch model
   find_package(MPI REQUIRED COMPONENTS CXX)
 
+  # NVSHMEM 3.x headers are incompatible with Clang CUDA mode: the host API
+  # headers declare some functions __device__ and the device-define headers
+  # redeclare them as static __device__, which Clang rejects.  Force nvcc for
+  # all NVSHMEM benchmarks by temporarily clearing the Clang override.
+  set(_SAVED_CLANG_CUDA_COMPILER "${WRP_CORE_CLANG_CUDA_COMPILER}")
+  set(WRP_CORE_CLANG_CUDA_COMPILER "" CACHE INTERNAL "" FORCE)
+
   # Build link list: prefer 3.x split libs, fall back to single libnvshmem
   set(_REMOTE_HBM_LIBS CUDA::cudart)
   if(NVSHMEM_HOST_LIBRARY)
@@ -255,6 +262,9 @@ if(HAVE_NVSHMEM)
       --mode put-bw)
   set_tests_properties(gpu_baseline_cross_node_hbm_sanity PROPERTIES
     TIMEOUT 60 LABELS "gpu;nvshmem;msan_skip")
+
+  # Restore the Clang CUDA compiler override for non-NVSHMEM targets
+  set(WRP_CORE_CLANG_CUDA_COMPILER "${_SAVED_CLANG_CUDA_COMPILER}" CACHE INTERNAL "" FORCE)
 endif()
 
 # ============================================================

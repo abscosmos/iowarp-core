@@ -17,6 +17,7 @@
 
 #ifdef HAVE_NVSHMEM
 
+#include <cassert>  // NVSHMEM 3.x device headers use assert(); must be included first
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #include <cstdint>
