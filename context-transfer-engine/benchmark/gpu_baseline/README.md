@@ -10,6 +10,32 @@ cmake --build build --target gpu_baseline_pinned_host
 libnuma is auto-detected. If present (`apt-get install libnuma-dev`), NUMA-node pinning
 is enabled automatically.
 
+### Building on DeltaAI
+
+DeltaAI requires loading the CUDA and NVSHMEM modules before configuring. The exact module
+names vary — check with `module avail nvshmem` and `module avail cuda`. A typical setup:
+
+```bash
+module load cuda/12.6
+module load nvshmem        # sets NVSHMEM_HOME automatically, or check: module show nvshmem
+
+cmake -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DWRP_CORE_ENABLE_CUDA=ON \
+  -DWRP_CORE_ENABLE_BENCHMARKS=ON \
+  -DWRP_CORE_ENABLE_NVSHMEM=ON \
+  -DNVSHMEM_HOME=$NVSHMEM_HOME
+cmake --build build -j$(nproc) --target \
+  gpu_baseline_pinned_host \
+  gpu_baseline_remote_hbm \
+  gpu_baseline_bus_contention \
+  gpu_baseline_cross_node_hbm \
+  gpu_baseline_cross_node_pinned_host
+```
+
+The build output lands in `build/bin/` on the shared Lustre filesystem and is accessible
+from all nodes in your allocation.
+
 ## Benchmark 1: Pinned Host Memory (`gpu_baseline_pinned_host`)
 
 Measures GPU-to-host (write) and host-to-GPU (read) PCIe bandwidth to pinned memory.
@@ -243,9 +269,15 @@ The binary uses NVSHMEM's MPI bootstrap (`nvshmemx_init_attr` with `NVSHMEMX_INI
 so no `NVSHMEM_BOOTSTRAP` env var is needed. Set only the network transport:
 
 ```bash
-export NVSHMEM_REMOTE_TRANSPORT=ibrc   # InfiniBand RC (most common on HPC clusters)
-# or: ucx                              # UCX (if NVSHMEM was built with UCX support)
+export NVSHMEM_REMOTE_TRANSPORT=ibrc   # InfiniBand RC — standard HPC clusters
+# or: libfabric                        # HPE Slingshot (DeltaAI) — use this instead of ibrc
+# or: ucx                              # UCX backend
 ```
+
+> **DeltaAI note:** DeltaAI's inter-node fabric is HPE Slingshot, not InfiniBand RC.
+> Use `NVSHMEM_REMOTE_TRANSPORT=libfabric` (or `ucx` if that's how your NVSHMEM module
+> was built — check with `module show nvshmem` to see which transport backends are included).
+> Using `ibrc` on Slingshot will cause NVSHMEM init to fail or silently fall back to loopback.
 
 For large transfers (>512 MB total symmetric allocation):
 ```bash
@@ -305,11 +337,13 @@ srun --ntasks=2 --nodes=2 --ntasks-per-node=1 --gpus-per-task=1 \
 #SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
-#SBATCH --partition=gpuA100x4        # or gpuA40x4, gpuA100x8 — check Delta docs
+#SBATCH --partition=gpuGH200x4       # DeltaAI GH200 partition; check: sinfo -s
 #SBATCH --time=00:10:00
 #SBATCH --account=<your_account>
 
-export NVSHMEM_REMOTE_TRANSPORT=ibrc
+# DeltaAI uses HPE Slingshot — use libfabric transport, not ibrc
+export NVSHMEM_REMOTE_TRANSPORT=libfabric
+# If your NVSHMEM module was built with UCX instead: export NVSHMEM_REMOTE_TRANSPORT=ucx
 BIN=/path/to/build/bin/gpu_baseline_cross_node_hbm
 
 # Bandwidth
@@ -459,7 +493,7 @@ done
 #SBATCH --ntasks=2
 #SBATCH --ntasks-per-node=2
 #SBATCH --gpus-per-node=2
-#SBATCH --partition=gpuA100x4
+#SBATCH --partition=gpuGH200x4       # DeltaAI GH200 partition; check: sinfo -s
 #SBATCH --time=00:10:00
 #SBATCH --account=<your_account>
 
