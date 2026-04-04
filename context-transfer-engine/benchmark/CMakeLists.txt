@@ -205,7 +205,9 @@ if(WRP_CORE_ENABLE_CUDA)
   set_tests_properties(cte_gpu_synthetic_cte_validate PROPERTIES
     TIMEOUT 60 LABELS "gpu;msan_skip")
 
-  if(WRP_CORE_ENABLE_BAM AND TARGET bam)
+  # BaM synthetic benchmark: only register as ctest when BaM NVMe is enabled
+  # (BaM library may be compiled but the driver/device may not be available)
+  if(WRP_CORE_ENABLE_BAM AND WRP_CORE_ENABLE_BAM_NVME AND TARGET bam)
     add_test(NAME cte_gpu_synthetic_bam
       COMMAND wrp_cte_gpu_bench
         --test-case synthetic --workload-mode bam
@@ -213,8 +215,7 @@ if(WRP_CORE_ENABLE_CUDA)
         --io-size 4k --iterations 10
         --bam-page-size 4k --bam-cache-pages 16)
     set_tests_properties(cte_gpu_synthetic_bam PROPERTIES
-      TIMEOUT 60 LABELS "gpu;msan_skip"
-      WILL_FAIL TRUE)  # BaM driver may not be available
+      TIMEOUT 60 LABELS "gpu;msan_skip")
     list(APPEND _BAM_TEST_NAMES cte_gpu_synthetic_bam)
   endif()
 
