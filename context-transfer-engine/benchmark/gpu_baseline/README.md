@@ -363,9 +363,164 @@ Expected IB HDR one-way latency: ~2–4 µs for small messages (64–256 B).
 > execute sequentially on the same stream, so the reported latency is ~0.1 µs (device-local
 > NVSHMEM overhead), not real IB latency. Two nodes required for meaningful numbers.
 
+## Benchmark 5: Cross-Node Remote Pinned Host Memory (`gpu_baseline_cross_node_pinned_host`)
+
+Measures cross-node **EGM (Extended GPU Memory) bandwidth** (write/read) and **one-way
+send-notify latency** to a remote node's NUMA-pinned host DRAM via NVLink fabric handles.
+
+Each rank allocates host DRAM using `cuMemCreate` with `CU_MEM_LOCATION_TYPE_HOST_NUMA` +
+`CU_MEM_HANDLE_TYPE_FABRIC`, exports the handle as a `CUmemFabricHandle`, exchanges it
+with the partner rank over MPI, and maps the remote buffer into local GPU VA space via
+`cuMemImportFromShareableHandle`. The GPU then issues direct `uint4` stores/loads to the
+remote pinned host — no NVSHMEM, no IB verbs required.
+
+The binary performs a runtime check for `CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED`
+and exits with a clear error message if the GPU lacks fabric handle support.
+
+### Build
+
+No NVSHMEM required. Only MPI and the CUDA Driver API (`CUDA::cuda_driver`) are needed.
+
+```bash
+cmake -B build \
+  -DWRP_CORE_ENABLE_CUDA=ON \
+  -DWRP_CORE_ENABLE_BENCHMARKS=ON
+cmake --build build --target gpu_baseline_cross_node_pinned_host
+```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--blocks N` / `--threads N` | Grid dims; threads must be a multiple of 32 |
+| `--bytes-per-warp N` | Transfer size per warp; k/m/g suffix; multiple of 16 (default: 4096 for BW modes, 64 for latency) |
+| `--mode write-bw\|read-bw\|latency` | Measurement mode (default: `write-bw`) |
+| `--warmup N` / `--iterations N` | Warmup and timed iterations for BW modes |
+| `--latency-iters N` | Number of timed latency samples (default: 1000) |
+| `--src-gpu-id N` | GPU device ID on the source node (default: 0) |
+| `--src-numa-node N` | NUMA node for source EGM allocation (default: 0) |
+| `--dst-gpu-id N` | GPU device ID on the destination node (default: 0) |
+| `--dst-numa-node N` | NUMA node for destination EGM allocation (default: 0) |
+| `--no-fence` | Skip `__threadfence_system()` in write kernel (may show inflated BW) |
+
+### Hardware Requirements
+
+- NVIDIA GH200 (NVLink-C2C) or GB200 NVL72 (NVSwitch fabric) — these expose fabric handle support
+- `CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED` must be `1`; the binary checks at runtime
+
+> **DeltaAI note:** DeltaAI quad-GH200 nodes connect their four Grace Hopper superchips via
+> intra-node NVLink-C2C. The inter-node fabric is HPE Slingshot, **not** NVLink. As a result,
+> `CU_MEM_HANDLE_TYPE_FABRIC` works within a single quad-GH200 node (cross-socket, different
+> NUMA nodes) but **cross-node runs (2 separate DeltaAI nodes) will likely fail** because
+> Slingshot does not provide NVLink fabric handles. The interesting and supported measurement
+> on DeltaAI is **intra-node cross-NUMA**: two MPI ranks on the same node, each pinned to a
+> different socket, with `--nodes=1 --ntasks=2`. Cross-node NVLink fabric requires hardware
+> with inter-node NVSwitch (e.g. GB200 NVL72).
+
+### Loopback sanity (single node)
+
+Verifies the code path. Results reflect intra-node EGM overhead, not cross-node latency.
+On hardware without fabric support the binary will exit with a clear diagnostic.
+
+```bash
+mpirun -n 1 gpu_baseline_cross_node_pinned_host \
+  --blocks 1 --threads 32 --bytes-per-warp 4096 --iterations 5 --mode write-bw \
+  --src-gpu-id 0 --src-numa-node 0 --dst-gpu-id 0 --dst-numa-node 0
+```
+
+### Intra-Node Cross-NUMA Runs — DeltaAI (recommended)
+
+On a single DeltaAI quad-GH200 node, run two ranks pinned to different sockets. This
+measures GPU-to-remote-NUMA-DRAM bandwidth routed over NVLink-C2C — the meaningful path
+this benchmark was designed for on DeltaAI.
+
+**Bandwidth:**
+```bash
+srun --ntasks=2 --nodes=1 --ntasks-per-node=2 --gpus-per-task=1 \
+  /path/to/build/bin/gpu_baseline_cross_node_pinned_host \
+  --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 50 --mode write-bw \
+  --src-gpu-id 0 --src-numa-node 0 --dst-gpu-id 1 --dst-numa-node 3
+```
+
+**Latency sweep:**
+```bash
+for size in 64 256 1k 4k 16k; do
+  srun --ntasks=2 --nodes=1 --ntasks-per-node=2 --gpus-per-task=1 \
+    /path/to/build/bin/gpu_baseline_cross_node_pinned_host \
+    --mode latency --bytes-per-warp $size --latency-iters 1000 \
+    --src-gpu-id 0 --src-numa-node 0 --dst-gpu-id 1 --dst-numa-node 3
+done
+```
+
+**Batch script (`bench5.sb`):**
+```bash
+#!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --ntasks=2
+#SBATCH --ntasks-per-node=2
+#SBATCH --gpus-per-node=2
+#SBATCH --partition=gpuA100x4
+#SBATCH --time=00:10:00
+#SBATCH --account=<your_account>
+
+BIN=/path/to/build/bin/gpu_baseline_cross_node_pinned_host
+
+# Bandwidth (GPU 0 / NUMA 0  →  GPU 1 / NUMA 3, routed over NVLink-C2C)
+srun $BIN --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 100 --mode write-bw \
+  --src-gpu-id 0 --src-numa-node 0 --dst-gpu-id 1 --dst-numa-node 3
+srun $BIN --blocks 4 --threads 256 --bytes-per-warp 1m --iterations 100 --mode read-bw \
+  --src-gpu-id 0 --src-numa-node 0 --dst-gpu-id 1 --dst-numa-node 3
+
+# Latency sweep
+for size in 64 256 1k 4k 16k; do
+  srun $BIN --mode latency --bytes-per-warp $size --latency-iters 1000 \
+    --src-gpu-id 0 --src-numa-node 0 --dst-gpu-id 1 --dst-numa-node 3
+done
+```
+
+### Example Output
+
+BW mode (rank 0 prints):
+```
+=== GPU Baseline Benchmark 5: Cross-node Remote Pinned Host Memory (EGM) ===
+Device     : NVIDIA GH200 480GB (rank 0 -> GPU 0)
+Ranks      : 2 total
+...
+Mode          Rank  Target   Warps   bytes/warp   Iters   Time(ms)   BW(GB/s)
+------------  ----  ------  ------  ------------  ------  ----------  ----------
+write-bw         0       1     128       1048576     100      ...       ~200.0
+```
+
+Latency mode (rank 1 prints):
+```
+Cross-node EGM one-way latency (send-notify, 64 B payload)
+  Samples : 1000
+  Min     :  1.20 us
+  Median  :  1.45 us
+  Mean    :  1.52 us
+  Max     :  2.10 us
+```
+
+### Expected Numbers
+
+| Configuration | Write BW | Read BW | Latency |
+|---------------|----------|---------|---------|
+| GH200 intra-node (NVLink-C2C, local NUMA host) | ~400–500 GB/s | ~300–400 GB/s | ~0.5–1 µs |
+| GH200 cross-node NVLink fabric (4-node quad) | ~200–400 GB/s | ~150–300 GB/s | ~1–5 µs |
+| Generic cross-node (NVSwitch fabric, remote DRAM bottleneck) | ~50–200 GB/s | ~50–200 GB/s | ~1–5 µs |
+
+The bandwidth ceiling is the remote node's host DRAM bandwidth (~500 GB/s LPDDR5 on GH200),
+not the NVLink-C2C or NVLink fabric bandwidth (~900 GB/s bidirectional). Latency is
+dominated by NVLink fabric hop count and PCIe-to-DRAM write combining on the remote side.
+
+> **Note (loopback):** When run with a single rank (`mpirun -n 1`), two separate EGM
+> allocations are made locally and the send/poll kernels execute sequentially on the same
+> stream. Results reflect local EGM round-trip overhead, not cross-node fabric numbers.
+> A `(loopback: no cross-node traffic)` warning is printed in this mode.
+
 ## CTest
 
-Both benchmarks have ctests:
+All benchmarks have ctests:
 ```bash
 ctest --test-dir build -R gpu_baseline -V
 ```
