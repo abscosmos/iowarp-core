@@ -26,7 +26,10 @@ on:
 jobs:
   build-cuda-conda:
     name: Build CUDA conda package & run GPU tests
-    runs-on: ubuntu-latest-gpu-t4
+    # Self-hosted runner with NVIDIA GPU.
+    # Register: Settings > Actions > Runners > New self-hosted runner
+    # Add labels: self-hosted, gpu
+    runs-on: [self-hosted, gpu]
     timeout-minutes: 60
 
     steps:
