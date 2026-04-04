@@ -7,11 +7,13 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <vector>
 
 #ifdef HAVE_LIBNUMA
 #include <numa.h>
@@ -266,6 +268,67 @@ public:
 
   size_t size() const { return size_; }
 };
+
+// ============================================================
+// MPI error checking (only active when <mpi.h> has been included)
+// ============================================================
+
+#ifdef MPI_VERSION
+#ifndef GPU_BASELINE_MPI_CHECK_DEFINED_
+#define GPU_BASELINE_MPI_CHECK_DEFINED_
+
+#define MPI_CHECK(call)                                                   \
+  do {                                                                    \
+    int _err = (call);                                                    \
+    if (_err != MPI_SUCCESS) {                                            \
+      char _errstr[MPI_MAX_ERROR_STRING];                                 \
+      int _errlen;                                                        \
+      MPI_Error_string(_err, _errstr, &_errlen);                          \
+      fprintf(stderr, "MPI error at %s:%d: %s\n",                        \
+              __FILE__, __LINE__, _errstr);                               \
+      exit(1);                                                            \
+    }                                                                     \
+  } while (0)
+
+#endif  // GPU_BASELINE_MPI_CHECK_DEFINED_
+#endif  // MPI_VERSION
+
+// ============================================================
+// Latency statistics (shared by bench 4 and bench 5)
+// ============================================================
+
+struct LatencyStats {
+  double min_us;
+  double median_us;
+  double mean_us;
+  double max_us;
+};
+
+static inline LatencyStats compute_latency_stats(const uint64_t *cycle_deltas,
+                                                 uint32_t n_samples,
+                                                 int device_id) {
+  int clock_khz = 0;
+  CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device_id));
+  double us_per_cycle = 1000.0 / (double)clock_khz;
+
+  std::vector<double> us_vals(n_samples);
+  double sum = 0.0;
+  for (uint32_t i = 0; i < n_samples; ++i) {
+    us_vals[i] = (double)cycle_deltas[i] * us_per_cycle;
+    sum += us_vals[i];
+  }
+
+  std::sort(us_vals.begin(), us_vals.end());
+
+  LatencyStats stats;
+  stats.min_us    = us_vals.front();
+  stats.max_us    = us_vals.back();
+  stats.mean_us   = sum / (double)n_samples;
+  stats.median_us = (n_samples % 2 == 0)
+                      ? (us_vals[n_samples / 2 - 1] + us_vals[n_samples / 2]) * 0.5
+                      : us_vals[n_samples / 2];
+  return stats;
+}
 
 // ============================================================
 // Result reporting

@@ -23,7 +23,7 @@ __global__ void cross_node_pinned_write_kernel(
     char    *dst,
     uint64_t bytes_per_warp,
     uint32_t iters,
-    bool     no_fence)
+    bool     use_fence)
 {
   uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   uint32_t warp_id    = global_tid / 32;
@@ -43,8 +43,7 @@ __global__ void cross_node_pinned_write_kernel(
       dst4[i] = pattern;
     }
     __syncwarp();
-    if (!no_fence) {
-      // flush stores so they propagate across the fabric to remote host DRAM
+    if (use_fence) {
       __threadfence_system();
     }
   }
@@ -60,8 +59,7 @@ __shared__ volatile uint32_t s_cn_pinned_read_sink;
 __global__ void cross_node_pinned_read_kernel(
     const char *src,
     uint64_t    bytes_per_warp,
-    uint32_t    iters,
-    uint64_t   *sink)
+    uint32_t    iters)
 {
   uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   uint32_t warp_id    = global_tid / 32;
@@ -83,29 +81,18 @@ __global__ void cross_node_pinned_read_kernel(
   if (lane_id == 0) {
     s_cn_pinned_read_sink = acc;
   }
-  (void)sink;
 }
 
 // ============================================================
 // Kernel: single-warp sender — write payload + flag into remote EGM buffer
-//
-// For each sample:
-//   1. lane 0 writes one uint4 payload to remote_payload[iter]
-//   2. __threadfence_system() — ensure payload reaches remote host DRAM
-//   3. __syncwarp()
-//   4. lane 0 writes flag_val=1 to remote_flag[iter]
-//   5. __threadfence_system() — ensure flag is visible to remote CPU/GPU
-//   6. __syncwarp()
 // ============================================================
 
 __global__ void cross_node_pinned_latency_send_kernel(
     char             *remote_payload,   // EGM-mapped ptr to remote payload slots
     volatile uint32_t *remote_flag,     // EGM-mapped ptr to remote flag slots
-    char             *local_src,        // local staging buffer (unused data, keeps the signature general)
     uint64_t          bytes_per_warp,
     uint32_t          warmup_iters,
-    uint32_t          latency_iters,
-    int               unused)
+    uint32_t          latency_iters)
 {
   uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   uint32_t warp_id    = global_tid / 32;
@@ -137,19 +124,10 @@ __global__ void cross_node_pinned_latency_send_kernel(
     __syncwarp();
   }
 
-  (void)local_src;
-  (void)unused;
 }
 
 // ============================================================
 // Kernel: single-warp receiver — spin-poll flag, record clock64() delta
-//
-// lane 0 only; other lanes exit immediately.
-// For each sample:
-//   1. t0 = clock64()
-//   2. spin on local_flag[iter] until non-zero
-//   3. t1 = clock64()
-//   4. store t1-t0 into result_buf[iter - warmup_iters] for timed samples
 // ============================================================
 
 __global__ void cross_node_pinned_latency_poll_kernel(

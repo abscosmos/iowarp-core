@@ -28,33 +28,16 @@
 
 #ifdef HAVE_NVSHMEM
 
+#include <mpi.h>
 #include "utils.h"
 #include "kernels_pinned_host.cuh"
 #include "kernels_remote_hbm.cuh"
 #include <nvshmem.h>
 #include <nvshmemx.h>
-#include <mpi.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-
-// ============================================================
-// MPI error checking
-// ============================================================
-
-#define MPI_CHECK(call)                                                   \
-  do {                                                                    \
-    int _err = (call);                                                    \
-    if (_err != MPI_SUCCESS) {                                            \
-      char _errstr[MPI_MAX_ERROR_STRING];                                 \
-      int _errlen;                                                        \
-      MPI_Error_string(_err, _errstr, &_errlen);                          \
-      fprintf(stderr, "MPI error at %s:%d: %s\n",                        \
-              __FILE__, __LINE__, _errstr);                               \
-      exit(1);                                                            \
-    }                                                                     \
-  } while (0)
 
 // ============================================================
 // Configuration
@@ -341,7 +324,6 @@ int main(int argc, char **argv) {
   float solo_ms_b = 0.f;
 
   // ---- Solo A: PE 0 runs pinned-host write, others idle ----
-  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
   if (my_pe == 0) {
     GpuTimer timer_a;
@@ -356,7 +338,6 @@ int main(int argc, char **argv) {
   MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
   // ---- Solo B: PE 1 (or PE 0 in loopback) runs NVSHMEM put, others idle ----
-  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
   if (my_pe == 1 || n_pes == 1) {
     GpuTimer timer_b;

@@ -35,32 +35,15 @@
 
 #ifdef HAVE_NVSHMEM
 
+#include <mpi.h>
 #include "utils.h"
 #include "kernels_remote_hbm.cuh"
 #include <nvshmem.h>
 #include <nvshmemx.h>
-#include <mpi.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-
-// ============================================================
-// MPI error checking
-// ============================================================
-
-#define MPI_CHECK(call)                                                   \
-  do {                                                                    \
-    int _err = (call);                                                    \
-    if (_err != MPI_SUCCESS) {                                            \
-      char _errstr[MPI_MAX_ERROR_STRING];                                 \
-      int _errlen;                                                        \
-      MPI_Error_string(_err, _errstr, &_errlen);                          \
-      fprintf(stderr, "MPI error at %s:%d: %s\n",                        \
-              __FILE__, __LINE__, _errstr);                               \
-      exit(1);                                                            \
-    }                                                                     \
-  } while (0)
 
 // ============================================================
 // Configuration

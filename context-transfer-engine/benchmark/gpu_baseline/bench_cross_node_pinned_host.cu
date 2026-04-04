@@ -37,37 +37,20 @@
  *       [--no-fence]
  */
 
-#include "utils.h"
-#include "kernels_cross_node_pinned_host.cuh"
-
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <mpi.h>
+#include "utils.h"
+#include "kernels_cross_node_pinned_host.cuh"
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <numeric>
-#include <vector>
 
 // ============================================================
-// Error checking macros
+// CUDA Driver API error checking
 // ============================================================
-
-#define MPI_CHECK(call)                                                   \
-  do {                                                                    \
-    int _err = (call);                                                    \
-    if (_err != MPI_SUCCESS) {                                            \
-      char _errstr[MPI_MAX_ERROR_STRING];                                 \
-      int _errlen;                                                        \
-      MPI_Error_string(_err, _errstr, &_errlen);                          \
-      fprintf(stderr, "MPI error at %s:%d: %s\n",                        \
-              __FILE__, __LINE__, _errstr);                               \
-      MPI_Finalize(); exit(1);                                            \
-    }                                                                     \
-  } while (0)
 
 #define CU_CHECK(call)                                                    \
   do {                                                                    \
@@ -77,7 +60,7 @@
       cuGetErrorString(_r, &_s);                                          \
       fprintf(stderr, "CUDA Driver error at %s:%d: %s\n",                \
               __FILE__, __LINE__, _s ? _s : "unknown");                   \
-      MPI_Finalize(); exit(1);                                            \
+      exit(1);                                                            \
     }                                                                     \
   } while (0)
 
@@ -119,8 +102,8 @@ static inline void print_cross_node_pinned_args_usage(const char *prog) {
     "  --latency-iters N       Timed samples for latency mode (default: 1000)\n"
     "  --src-gpu-id N          Source GPU device ID (default: 0)\n"
     "  --src-numa-node N       NUMA node for source EGM allocation (default: 0)\n"
-    "  --dst-gpu-id N          Destination GPU device ID (default: 0)\n"
-    "  --dst-numa-node N       NUMA node for destination EGM allocation (default: 0)\n"
+    "  --dst-gpu-id N          Destination GPU device ID (loopback only; default: 0)\n"
+    "  --dst-numa-node N       NUMA node for destination EGM alloc (loopback only; default: 0)\n"
     "  --no-fence              Skip __threadfence_system() in write kernel\n"
     "  --help                  Show this message\n"
     "\n"
@@ -193,43 +176,6 @@ static inline CrossNodePinnedConfig parse_cross_node_pinned_args(int argc, char 
   }
 
   return cfg;
-}
-
-// ============================================================
-// Latency statistics (same helper as bench 4)
-// ============================================================
-
-struct LatencyStats {
-  double min_us;
-  double median_us;
-  double mean_us;
-  double max_us;
-};
-
-static LatencyStats compute_latency_stats(const uint64_t *cycle_deltas,
-                                          uint32_t n_samples,
-                                          int device_id) {
-  int clock_khz = 0;
-  CUDA_CHECK(cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device_id));
-  double us_per_cycle = 1000.0 / (double)clock_khz;
-
-  std::vector<double> us_vals(n_samples);
-  double sum = 0.0;
-  for (uint32_t i = 0; i < n_samples; ++i) {
-    us_vals[i] = (double)cycle_deltas[i] * us_per_cycle;
-    sum += us_vals[i];
-  }
-
-  std::sort(us_vals.begin(), us_vals.end());
-
-  LatencyStats stats;
-  stats.min_us    = us_vals.front();
-  stats.max_us    = us_vals.back();
-  stats.mean_us   = sum / (double)n_samples;
-  stats.median_us = (n_samples % 2 == 0)
-                      ? (us_vals[n_samples / 2 - 1] + us_vals[n_samples / 2]) * 0.5
-                      : us_vals[n_samples / 2];
-  return stats;
 }
 
 // ============================================================
@@ -467,14 +413,16 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaStreamCreate(&stream));
     GpuTimer timer;
 
+    bool use_fence = !cfg.no_fence;
+
     // warmup
     if (is_active) {
       if (cfg.mode == CrossNodePinnedMode::kWriteBw) {
         cross_node_pinned_write_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
-            write_dst, cfg.bytes_per_warp, cfg.warmup_iters, cfg.no_fence);
+            write_dst, cfg.bytes_per_warp, cfg.warmup_iters, use_fence);
       } else {
         cross_node_pinned_read_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
-            read_src, cfg.bytes_per_warp, cfg.warmup_iters, nullptr);
+            read_src, cfg.bytes_per_warp, cfg.warmup_iters);
       }
       CUDA_CHECK(cudaStreamSynchronize(stream));
     }
@@ -487,10 +435,10 @@ int main(int argc, char **argv) {
       timer.record_start(stream);
       if (cfg.mode == CrossNodePinnedMode::kWriteBw) {
         cross_node_pinned_write_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
-            write_dst, cfg.bytes_per_warp, cfg.iterations, cfg.no_fence);
+            write_dst, cfg.bytes_per_warp, cfg.iterations, use_fence);
       } else {
         cross_node_pinned_read_kernel<<<cfg.blocks, cfg.threads, 0, stream>>>(
-            read_src, cfg.bytes_per_warp, cfg.iterations, nullptr);
+            read_src, cfg.bytes_per_warp, cfg.iterations);
       }
       timer.record_stop(stream);
       elapsed_ms = timer.elapsed_ms();
@@ -617,11 +565,6 @@ int main(int argc, char **argv) {
       }
     }
 
-    // local staging buffer for sender (content doesn't matter)
-    char *local_src = nullptr;
-    CUDA_CHECK(cudaMalloc(&local_src, cfg.bytes_per_warp));
-    CUDA_CHECK(cudaMemset(local_src, 0xAB, cfg.bytes_per_warp));
-
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
@@ -636,11 +579,9 @@ int main(int argc, char **argv) {
       cross_node_pinned_latency_send_kernel<<<1, 32, 0, stream>>>(
           remote_payload_ptr,
           remote_flag_ptr,
-          local_src,
           cfg.bytes_per_warp,
           cfg.warmup_iters,
-          cfg.latency_iters,
-          0);
+          cfg.latency_iters);
     }
     if (is_receiver) {
       cross_node_pinned_latency_poll_kernel<<<1, 32, 0, stream>>>(
@@ -670,7 +611,6 @@ int main(int argc, char **argv) {
     }
 
     CUDA_CHECK(cudaStreamDestroy(stream));
-    CUDA_CHECK(cudaFree(local_src));
     if (result_buf)  { CUDA_CHECK(cudaFree(result_buf)); }
     if (result_host) { free(result_host); }
     egm_free(remote_payload);
