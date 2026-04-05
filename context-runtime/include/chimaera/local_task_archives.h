@@ -157,8 +157,12 @@ class CalculateSizeTaskArchive {
 
  private:
   hshm::ipc::CalculateSizeArchive calc_;
+  bool is_pod_ = false;
 
  public:
+  HSHM_CROSS_FUN void PushPod(bool val) { is_pod_ = val; }
+  HSHM_CROSS_FUN void PopPod() { is_pod_ = false; }
+
   HSHM_CROSS_FUN explicit CalculateSizeTaskArchive(LocalMsgType /*msg_type*/)
       {}
 
@@ -182,7 +186,11 @@ class CalculateSizeTaskArchive {
   /** Call operator */
   template <typename... Args>
   HSHM_CROSS_FUN void operator()(Args &...args) {
-    (calc_.base(args), ...);
+    if (is_pod_) {
+      calc_.range(args...);
+    } else {
+      (calc_.base(args), ...);
+    }
   }
 
   /** Write raw binary data — just accumulate size */
@@ -274,8 +282,12 @@ class LocalSaveTaskArchive : public LocalLbmBase {
  private:
   BufferT &buffer_;
   hshm::ipc::LocalSerialize<BufferT> serializer_;
+  bool is_pod_ = false;
 
  public:
+  HSHM_CROSS_FUN void PushPod(bool val) { is_pod_ = val; }
+  HSHM_CROSS_FUN void PopPod() { is_pod_ = false; }
+
   /** Mark this archive for warp-parallel write_binary calls */
   HSHM_INLINE_CROSS_FUN void SetWarpConverged(bool v) {
     serializer_.warp_converged_ = v;
@@ -377,7 +389,11 @@ class LocalSaveTaskArchive : public LocalLbmBase {
 
   template <typename... Args>
   HSHM_CROSS_FUN void operator()(Args &...args) {
-    (SerializeArg(args), ...);
+    if (is_pod_) {
+      serializer_.range(args...);
+    } else {
+      (SerializeArg(args), ...);
+    }
   }
 
  private:
@@ -498,8 +514,12 @@ class LocalLoadTaskArchive : public LocalLbmBase {
   BufferT &data_;
   hshm::ipc::LocalDeserialize<BufferT> deserializer_;
   size_t current_task_index_;
+  bool is_pod_ = false;
 
  public:
+  HSHM_CROSS_FUN void PushPod(bool val) { is_pod_ = val; }
+  HSHM_CROSS_FUN void PopPod() { is_pod_ = false; }
+
   /** Mark this archive for warp-parallel read_binary calls */
   HSHM_INLINE_CROSS_FUN void SetWarpConverged(bool v) {
     deserializer_.warp_converged_ = v;
@@ -594,7 +614,11 @@ class LocalLoadTaskArchive : public LocalLbmBase {
 
   template <typename... Args>
   HSHM_CROSS_FUN void operator()(Args &...args) {
-    (DeserializeArg(args), ...);
+    if (is_pod_) {
+      deserializer_.range(args...);
+    } else {
+      (DeserializeArg(args), ...);
+    }
   }
 
  private:
@@ -725,6 +749,10 @@ class GpuSaveTaskArchive {
   LocalMsgType msg_type_;
   hshm::priv::wrap_vector &buffer_;
   hshm::ipc::LocalSerialize<hshm::priv::wrap_vector> serializer_;
+  bool is_pod_ = false;
+
+  HSHM_CROSS_FUN void PushPod(bool val) { is_pod_ = val; }
+  HSHM_CROSS_FUN void PopPod() { is_pod_ = false; }
 
   HSHM_CROSS_FUN GpuSaveTaskArchive(LocalMsgType msg_type,
                                       hshm::priv::wrap_vector &buffer)
@@ -758,7 +786,11 @@ class GpuSaveTaskArchive {
 
   template <typename... Args>
   HSHM_CROSS_FUN void operator()(Args &...args) {
-    (void)((serializer_ << args), ...);
+    if (is_pod_) {
+      serializer_.range(args...);
+    } else {
+      (void)((serializer_ << args), ...);
+    }
   }
 
   HSHM_CROSS_FUN void write_binary(const char *data, size_t size) {
@@ -817,6 +849,10 @@ class GpuLoadTaskArchive {
   LocalMsgType msg_type_;
   hshm::priv::wrap_vector &data_;
   hshm::ipc::LocalDeserialize<hshm::priv::wrap_vector> deserializer_;
+  bool is_pod_ = false;
+
+  HSHM_CROSS_FUN void PushPod(bool val) { is_pod_ = val; }
+  HSHM_CROSS_FUN void PopPod() { is_pod_ = false; }
 
   HSHM_CROSS_FUN GpuLoadTaskArchive(hshm::priv::wrap_vector &buffer)
       : msg_type_(LocalMsgType::kSerializeIn), data_(buffer),
@@ -850,7 +886,11 @@ class GpuLoadTaskArchive {
 
   template <typename... Args>
   HSHM_CROSS_FUN void operator()(Args &...args) {
-    (void)((deserializer_ >> args), ...);
+    if (is_pod_) {
+      deserializer_.range(args...);
+    } else {
+      (void)((deserializer_ >> args), ...);
+    }
   }
 
   HSHM_CROSS_FUN void read_binary(char *data, size_t size) {

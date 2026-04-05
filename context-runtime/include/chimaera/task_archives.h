@@ -175,8 +175,12 @@ private:
   std::vector<char> buffer_;
   hshm::ipc::GlobalSerialize<std::vector<char>> serializer_;
   hshm::lbm::Transport *lbm_transport_;
+  bool is_pod_ = false;
 
 public:
+  void PushPod(bool val) { is_pod_ = val; }
+  void PopPod() { is_pod_ = false; }
+
   explicit SaveTaskArchive(MsgType msg_type,
                            hshm::lbm::Transport *lbm_transport = nullptr)
       : NetTaskArchive(msg_type),
@@ -213,7 +217,11 @@ public:
   }
 
   template <typename... Args> void operator()(Args &...args) {
-    (SerializeArg(args), ...);
+    if (is_pod_) {
+      range(args...);
+    } else {
+      (SerializeArg(args), ...);
+    }
   }
 
 private:
@@ -276,6 +284,7 @@ private:
   size_t current_task_index_;
   size_t current_bulk_index_;
   hshm::lbm::Transport *lbm_transport_;
+  bool is_pod_ = false;
 
   static const std::vector<char> &GetEmptyBuffer() {
     static const std::vector<char> empty;
@@ -328,6 +337,9 @@ public:
   LoadTaskArchive(const LoadTaskArchive &) = delete;
   LoadTaskArchive &operator=(const LoadTaskArchive &) = delete;
 
+  void PushPod(bool val) { is_pod_ = val; }
+  void PopPod() { is_pod_ = false; }
+
   template <typename T> LoadTaskArchive &operator>>(T &value) {
     if constexpr (std::is_base_of_v<Task, T>) {
       if (msg_type_ == MsgType::kSerializeIn) {
@@ -356,7 +368,11 @@ public:
   }
 
   template <typename... Args> void operator()(Args &...args) {
-    (DeserializeArg(args), ...);
+    if (is_pod_) {
+      range(args...);
+    } else {
+      (DeserializeArg(args), ...);
+    }
   }
 
 private:

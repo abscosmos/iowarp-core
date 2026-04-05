@@ -1073,10 +1073,11 @@ struct PutBlobTask : public chi::Task {
    */
   template <typename Archive>
   HSHM_CROSS_FUN void SerializeIn(Archive &ar) {
-    ar.range(pool_id_, task_id_, pool_query_, method_, task_flags_,
-             period_ns_, task_group_, return_code_, completer_,
-             tag_id_, blob_name_, offset_, size_, blob_data_,
-             score_, context_, flags_);
+    ar.PushPod(blob_name_.UsingSso());
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, offset_, size_, blob_data_,
+       score_, context_, flags_);
+    ar.PopPod();
     ar.bulk(blob_data_, size_, BULK_XFER);
   }
 
@@ -1085,8 +1086,11 @@ struct PutBlobTask : public chi::Task {
    */
   template <typename Archive>
   HSHM_CROSS_FUN void SerializeOut(Archive &ar) {
-    ar.range(return_code_, completer_, tag_id_, blob_name_,
-             offset_, size_, blob_data_, score_, context_, flags_);
+    ar.PushPod(blob_name_.UsingSso());
+    Task::SerializeOut(ar);
+    ar(tag_id_, blob_name_, offset_, size_, blob_data_,
+       score_, context_, flags_);
+    ar.PopPod();
   }
 
   /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
@@ -1191,9 +1195,10 @@ struct GetBlobTask : public chi::Task {
    */
   template <typename Archive>
   HSHM_CROSS_FUN void SerializeIn(Archive &ar) {
-    ar.range(pool_id_, task_id_, pool_query_, method_, task_flags_,
-             period_ns_, task_group_, return_code_, completer_,
-             tag_id_, blob_name_, offset_, size_, flags_, blob_data_);
+    ar.PushPod(blob_name_.UsingSso());
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_);
+    ar.PopPod();
     ar.bulk(blob_data_, size_, BULK_EXPOSE);
   }
 
@@ -1202,7 +1207,7 @@ struct GetBlobTask : public chi::Task {
    */
   template <typename Archive>
   HSHM_CROSS_FUN void SerializeOut(Archive &ar) {
-    ar.range(return_code_, completer_);
+    Task::SerializeOut(ar);
     ar.bulk(blob_data_, size_, BULK_XFER);
   }
 
