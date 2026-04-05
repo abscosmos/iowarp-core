@@ -1468,6 +1468,11 @@ class IpcManager {
   /** GPU IPC manager: owns all host-side GPU infrastructure.
    *  CPU-side IpcManager delegates GPU operations through this. */
   std::unique_ptr<gpu::IpcManager> gpu_ipc_;
+#else
+  /** Layout placeholder — keeps struct size/offsets identical whether
+   *  CUDA is enabled or not, preventing ODR violations when test binaries
+   *  link chimaera_cxx without HSHM_ENABLE_CUDA. */
+  void *gpu_ipc_placeholder_ = nullptr;
 #endif
 
  private:
