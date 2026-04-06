@@ -986,8 +986,8 @@ void *IpcManager::AllocGpuContainer(const PoolId &pool_id, u32 container_id,
 
 #endif
 
-void gpu::IpcManager::PrintGpuOrchestratorProfile() {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+void gpu::IpcManager::PrintGpuOrchestratorProfile() {
   if (!gpu_orchestrator_) return;
   auto *orch = static_cast<gpu::WorkOrchestrator *>(gpu_orchestrator_);
   if (!orch->control_) return;
@@ -1033,11 +1033,9 @@ void gpu::IpcManager::PrintGpuOrchestratorProfile() {
     printf("    placement new:         %lld  (%lld/task)\n", at_ctor, at_ctor/n);
     printf("    deserialize:           %lld  (%lld/task)\n", at_deser, at_deser/n);
   }
-#endif
 }
 
 bool gpu::IpcManager::PauseGpuOrchestrator() {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   if (!gpu_orchestrator_) {
     return false;
   }
@@ -1067,33 +1065,24 @@ bool gpu::IpcManager::PauseGpuOrchestrator() {
   orchestrator->PrepareResume();
 
   return true;
-#else
-  return false;
-#endif
 }
 
 void gpu::IpcManager::ResumeGpuOrchestrator() {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   if (!gpu_orchestrator_) {
     return;
   }
   auto *orchestrator = static_cast<gpu::WorkOrchestrator *>(gpu_orchestrator_);
   orchestrator->Resume(gpu_orchestrator_info_);
-#endif
 }
 
 void gpu::IpcManager::SetGpuOrchestratorBlocks(u32 blocks, u32 threads_per_block) {
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
   if (!gpu_orchestrator_) {
     return;
   }
   auto *orchestrator = static_cast<gpu::WorkOrchestrator *>(gpu_orchestrator_);
   orchestrator->blocks_ = blocks;
   orchestrator->threads_per_block_ = threads_per_block;
-#endif
 }
-
-#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 void gpu::IpcManager::RebuildGpu2GpuQueue(u32 gpu_id, u32 new_lanes) {
   u32 queue_depth = gpu_orchestrator_info_.gpu_queue_depth;
 
@@ -1172,8 +1161,6 @@ void gpu::IpcManager::RebuildInternalQueue(u32 gpu_id, u32 new_lanes) {
   HLOG(kInfo, "RebuildInternalQueue: Recreated internal queue with {} lanes "
        "(depth {})", new_lanes, queue_depth);
 }
-#endif
-
 
 void gpu::IpcManager::RegisterGpuAllocator(const hipc::MemoryBackendId &id,
                                        char *data, size_t capacity) {
@@ -1191,6 +1178,7 @@ IpcManagerGpuInfo gpu::IpcManager::CreateGpuAllocator(size_t gpu_memory_size,
   // Both the client and orchestrator use the same RoundRobinAllocator.
   return GetGpuInfo(gpu_id);
 }
+#endif  // HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 
 bool IpcManager::ClientInitQueues() {
   if (!queue_allocator_) {
@@ -1790,10 +1778,14 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
   // These are raw memory regions without a proper allocator — the GPU-side
   // allocator manages them. On the host we silently skip the free since the
   // memory is owned by the GPU backend and freed when it's destroyed.
-  auto git = gpu_ipc_->gpu_alloc_map_.find(alloc_key);
-  if (git != gpu_ipc_->gpu_alloc_map_.end()) {
-    return;
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  if (gpu_ipc_) {
+    auto git = gpu_ipc_->gpu_alloc_map_.find(alloc_key);
+    if (git != gpu_ipc_->gpu_alloc_map_.end()) {
+      return;
+    }
   }
+#endif
 
   HLOG(kWarning, "FreeBuffer: Could not find allocator for alloc_id ({}.{})",
        buffer_ptr.shm_.alloc_id_.major_, buffer_ptr.shm_.alloc_id_.minor_);

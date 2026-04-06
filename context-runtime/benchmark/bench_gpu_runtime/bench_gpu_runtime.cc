@@ -55,7 +55,9 @@
 #include <chimaera/bdev/bdev_tasks.h>
 #include <wrp_cte/core/core_client.h>
 #include <hermes_shm/util/logging.h>
+#if HSHM_ENABLE_CUDA
 #include <cuda_runtime.h>
+#endif
 
 #include <chrono>
 #include <cstring>
@@ -682,7 +684,9 @@ int main(int argc, char **argv) {
   // and the benchmark deadlocks.
   {
     int sm_count = 0;
+#if HSHM_ENABLE_CUDA
     cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, 0);
+#endif
     if (sm_count > 0) {
       chi::u32 total_blocks = cfg.rt_blocks + cfg.client_blocks;
       if (total_blocks > static_cast<chi::u32>(sm_count)) {

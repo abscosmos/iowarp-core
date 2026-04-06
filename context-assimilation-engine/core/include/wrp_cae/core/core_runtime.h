@@ -61,10 +61,10 @@ class Runtime : public chi::Container {
   void LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
                 hipc::FullPtr<chi::Task> task_ptr) override;
   hipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive& archive) override;
-  void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,
+  void LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive,
                      hipc::FullPtr<chi::Task> task_ptr) override;
-  hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) override;
-  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive) override;
+  void LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
   hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr, bool deep) override;
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
   void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,

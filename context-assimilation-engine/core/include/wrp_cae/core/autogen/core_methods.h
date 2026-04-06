@@ -13,15 +13,16 @@ namespace wrp_cae::core {
 
 namespace Method {
 // Inherited methods
-GLOBAL_CONST chi::u32 kCreate = 0;
-GLOBAL_CONST chi::u32 kDestroy = 1;
-GLOBAL_CONST chi::u32 kMonitor = 9;
+GLOBAL_CROSS_CONST chi::u32 kCreate = 0;
+GLOBAL_CROSS_CONST chi::u32 kDestroy = 1;
+GLOBAL_CROSS_CONST chi::u32 kMonitor = 9;
 
 // core-specific methods
-GLOBAL_CONST chi::u32 kParseOmni = 10;
-GLOBAL_CONST chi::u32 kProcessHdf5Dataset = 11;
+GLOBAL_CROSS_CONST chi::u32 kParseOmni = 10;
+GLOBAL_CROSS_CONST chi::u32 kProcessHdf5Dataset = 11;
+GLOBAL_CROSS_CONST chi::u32 kExportData = 12;
 
-GLOBAL_CONST chi::u32 kMaxMethodId = 12;
+GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 13;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -31,6 +32,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[9] = "Monitor";
     v[10] = "ParseOmni";
     v[11] = "ProcessHdf5Dataset";
+    v[12] = "ExportData";
     return v;
   }();
   return names;
