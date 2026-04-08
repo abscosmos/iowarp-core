@@ -43,7 +43,7 @@ install_miniconda() {
     MINICONDA_DIR="$HOME/miniconda3"
 
     # Detect platform
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    if [[ "$OSTYPE" == "linux"* ]]; then
         PLATFORM="Linux"
         ARCH=$(uname -m)
         if [[ "$ARCH" == "x86_64" ]]; then
@@ -182,14 +182,18 @@ else
 fi
 
 # Verify variant file exists
-RECIPE_DIR="$SCRIPT_DIR/installers/conda"
-VARIANT_FILE="$RECIPE_DIR/variants/${VARIANT}.yaml"
+if [ "$VARIANT" = "cuda" ]; then
+    RECIPE_DIR="$SCRIPT_DIR/installers/conda-cuda"
+else
+    RECIPE_DIR="$SCRIPT_DIR/installers/conda"
+fi
+VARIANT_FILE="$SCRIPT_DIR/installers/conda/variants/${VARIANT}.yaml"
 
 if [ ! -f "$VARIANT_FILE" ]; then
     echo -e "${RED}Error: Variant '$VARIANT' not found${NC}"
     echo ""
     echo -e "${YELLOW}Available variants:${NC}"
-    for f in "$RECIPE_DIR/variants"/*.yaml; do
+    for f in "$SCRIPT_DIR/installers/conda/variants"/*.yaml; do
         basename "$f" .yaml
     done
     echo ""
