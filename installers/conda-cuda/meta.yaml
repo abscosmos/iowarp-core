@@ -1,0 +1,68 @@
+{% set version = "1.0.0" %}
+{% set preset = environ.get('IOWARP_PRESET', 'cuda-delta') %}
+
+# IOWarp Core - CUDA Recipe (conda-build format)
+# For systems where CUDA is provided by the system (e.g., module load cuda on Delta)
+# Usage: IOWARP_PRESET=cuda-delta conda build installers/conda-cuda/ -c conda-forge
+
+package:
+  name: iowarp-core
+  version: {{ version }}
+
+source:
+  path: ../..
+
+build:
+  number: 0
+  string: {{ preset.replace('-', '_') }}_h{{ PKG_HASH }}
+  script_env:
+    - IOWARP_PRESET
+
+requirements:
+  build:
+    - {{ compiler('cxx') }}
+    - cmake >=3.20
+    - make
+    - pkg-config
+    # CUDA toolkit comes from the system (module load cuda), not conda
+  host:
+    - python
+    - zeromq
+    - yaml-cpp
+    - cereal
+    - msgpack-c
+    - hdf5
+    - catch2
+    # CUDA runtime comes from system (module load cuda), not conda
+  run:
+    - python
+    - zeromq
+    - yaml-cpp
+    - cereal
+    - msgpack-c
+    - hdf5
+    - catch2
+    - pyyaml
+    - msgpack-python
+    - flask
+    # CUDA runtime comes from system (module load cuda), not conda
+
+test:
+  commands:
+    - test -f $PREFIX/lib/libchimaera_cxx.so    # [linux]
+
+about:
+  home: https://www.iowarp.ai
+  license: BSD-3-Clause
+  license_file: LICENSE
+  summary: IOWarp Context Management Platform - AI-accelerated scientific workflow orchestration (CUDA)
+  description: |
+    IOWarp Core provides a unified framework for context-aware data management
+    in scientific workflows. This CUDA variant is built for systems where the
+    CUDA toolkit is provided by the system (e.g., via module load on HPC clusters).
+  dev_url: https://github.com/iowarp/clio-core
+  doc_url: https://docs.iowarp.ai
+
+extra:
+  recipe-maintainers:
+    - lukemartinlogan

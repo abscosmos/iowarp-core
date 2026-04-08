@@ -1,7 +1,7 @@
 # IOWarp Core - CUDA Variant (Delta / GH200)
 # CUDA-enabled release build using CMakePresets.json "cuda-delta" preset
 #
-# Usage: rattler-build build --recipe recipe/ --variant-config variants/cuda.yaml
+# Usage: IOWARP_PRESET=cuda-delta conda build installers/conda-cuda/ -c conda-forge
 
 preset:
   - cuda-delta
