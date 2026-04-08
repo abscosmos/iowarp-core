@@ -87,6 +87,35 @@
             }
         },
         {
+            "name": "cuda-delta",
+            "displayName": "CUDA Release for Delta (GH200, sm_90)",
+            "hidden": false,
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "WRP_CORE_ENABLE_RUNTIME": "ON",
+                "WRP_CORE_ENABLE_CTE": "ON",
+                "WRP_CORE_ENABLE_CAE": "OFF",
+                "WRP_CORE_ENABLE_CEE": "OFF",
+                "WRP_CORE_ENABLE_TESTS": "ON",
+                "WRP_CORE_ENABLE_BENCHMARKS": "ON",
+                "WRP_CORE_ENABLE_ELF": "OFF",
+                "WRP_CORE_ENABLE_CUDA": "ON",
+                "CMAKE_CUDA_ARCHITECTURES": "90",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "WRP_CORE_ENABLE_ASAN": "OFF",
+                "WRP_CORE_ENABLE_IO_URING": "OFF",
+                "WRP_CORE_ENABLE_CONDA": "ON",
+                "WRP_CORE_ENABLE_PYTHON": "ON",
+                "WRP_CORE_ENABLE_ZMQ": "ON",
+                "WRP_CORE_ENABLE_CEREAL": "ON",
+                "WRP_CORE_ENABLE_HDF5": "ON",
+                "WRP_CORE_ENABLE_RPATH": "ON",
+                "HSHM_LOG_LEVEL": "1"
+            }
+        },
+        {
             "name": "rocm-debug",
             "hidden": false,
             "generator": "Unix Makefiles",
