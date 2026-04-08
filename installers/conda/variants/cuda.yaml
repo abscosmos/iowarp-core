@@ -1,10 +1,10 @@
-# IOWarp Core - CUDA Variant
-# CUDA-enabled debug build using CMakePresets.json "cuda-debug" preset
+# IOWarp Core - CUDA Variant (Delta / GH200)
+# CUDA-enabled release build using CMakePresets.json "cuda-delta" preset
 #
 # Usage: rattler-build build --recipe recipe/ --variant-config variants/cuda.yaml
 
 preset:
-  - cuda-debug
+  - cuda-delta
 
 cuda_enabled:
   - "ON"

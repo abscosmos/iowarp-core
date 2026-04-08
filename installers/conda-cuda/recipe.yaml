@@ -1,0 +1,95 @@
+# IOWarp Core - Conda Recipe for CUDA builds (rattler-build format)
+#
+# This recipe is for CUDA-enabled builds on systems where CUDA is provided
+# by the system (e.g., via `module load cuda` on HPC clusters like Delta),
+# NOT from conda packages. Do not use this recipe on machines where CUDA
+# comes from a conda package such as cuda-toolkit.
+#
+# This recipe supports two modes:
+#   1. Preset mode: Uses CMakePresets.json directly for reproducible binary builds
+#   2. Custom mode: Allows individual cmake flag overrides for source builds
+#
+# Usage:
+#   rattler-build build --recipe installers/conda-cuda/ --variant-config installers/conda/variants/release.yaml
+#   rattler-build build --recipe installers/conda-cuda/ --variant-config installers/conda/variants/cuda.yaml
+#   rattler-build build --recipe installers/conda-cuda/ --variant-config installers/conda/variants/custom.yaml
+
+context:
+  version: "1.0.0"
+
+package:
+  name: iowarp-core
+  version: ${{ version }}
+
+source:
+  path: ../..
+
+build:
+  number: 0
+  string: ${{ preset }}_h${{ hash }}
+  script:
+    env:
+      CMAKE_GENERATOR: Ninja
+      # Suppress GCC false positive warnings from aggressive inlining (GCC bugs #99578, #100611)
+      CXXFLAGS: "-Wno-array-bounds -Wno-maybe-uninitialized -Wno-stringop-overflow"
+      CMAKE_PREFIX_PATH: ${PREFIX}
+      PKG_CONFIG_PATH: ${PREFIX}/lib/pkgconfig:${PREFIX}/share/pkgconfig
+      # NOTE: CMAKE_FIND_ROOT_PATH is passed via -D flag on cmake command line (not here) because semicolons in env vars break shell parsing
+      # Use BOTH so CMake searches conda packages AND system paths (required for system CUDA)
+      CMAKE_FIND_ROOT_PATH_MODE_LIBRARY: BOTH
+      CMAKE_FIND_ROOT_PATH_MODE_INCLUDE: BOTH
+      CMAKE_FIND_ROOT_PATH_MODE_PACKAGE: BOTH
+    content:
+      - cmake --preset=${{ preset }} -DCMAKE_INSTALL_PREFIX=${PREFIX} -DCMAKE_PREFIX_PATH=${PREFIX} -DCMAKE_FIND_ROOT_PATH="${PREFIX};/usr" -DWRP_CORE_ENABLE_CONDA=ON
+      - cmake --build build --parallel
+      - cmake --install build
+
+requirements:
+  build:
+    - ${{ compiler('cxx') }}
+    - cmake >=3.20
+    - ninja
+    - pkg-config
+    # No cuda-toolkit here — system CUDA is used via module load on HPC clusters
+  host:
+    - python
+    - zeromq
+    - yaml-cpp
+    - cereal
+    - msgpack-c
+    - hdf5
+    - catch2
+    # CUDA runtime comes from system (module load cuda), not conda
+  run:
+    - python
+    - zeromq
+    - yaml-cpp
+    - cereal
+    - msgpack-c
+    - hdf5
+    - catch2
+    # CUDA runtime comes from system (module load cuda), not conda
+    - pyyaml
+    - msgpack-python
+    - flask
+
+tests:
+  - script:
+      # Just verify the library files exist (chimaera runtime start is a daemon)
+      - test -f $PREFIX/lib/libchimaera_cxx.so || test -f $PREFIX/lib/libchimaera_cxx.dylib
+
+about:
+  homepage: https://www.iowarp.ai
+  license: BSD-3-Clause
+  license_file: LICENSE
+  summary: IOWarp Context Management Platform - AI-accelerated scientific workflow orchestration
+  description: |
+    IOWarp Core provides a unified framework for context-aware data management
+    in scientific workflows, including the Context Transfer Engine (CTE),
+    Context Assimilation Engine (CAE), and Context Exploration Engine (CEE).
+  repository: https://github.com/iowarp/clio-core
+  documentation: https://docs.iowarp.ai
+
+extra:
+  recipe-maintainers:
+    - lukemartinlogan
