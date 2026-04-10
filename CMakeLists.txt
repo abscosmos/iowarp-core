@@ -739,8 +739,18 @@ if(NOT MSVC)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-pedantic -Wno-sign-compare -Wno-missing-field-initializers")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-but-set-variable -Wno-unused-function -Wno-cast-function-type")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-self-move -Wno-format")
-        # Suppress GCC false positives in template-heavy shared memory code (Release -O3)
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-array-bounds -Wno-stringop-overflow")
+        # Suppress false positives in template-heavy shared memory code (Release -O3)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-array-bounds")
+        # -Wno-stringop-overflow/-overread are GCC-only; check before adding
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag(-Wno-stringop-overflow HAS_WNO_STRINGOP_OVERFLOW)
+        if(HAS_WNO_STRINGOP_OVERFLOW)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-stringop-overflow")
+        endif()
+        check_cxx_compiler_flag(-Wno-stringop-overread HAS_WNO_STRINGOP_OVERREAD)
+        if(HAS_WNO_STRINGOP_OVERREAD)
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-stringop-overread")
+        endif()
         # Suppress unused-result warnings (freopen/system in test code)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-result")
     endif()
@@ -750,6 +760,11 @@ if(NOT MSVC)
 
     # Release configuration
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+
+    # CUDA: allow constexpr __host__ functions in __host__ __device__ contexts
+    if(WRP_CORE_ENABLE_CUDA)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr -diag-suppress=20011,20012,20013")
+    endif()
 
     # AddressSanitizer + LeakSanitizer configuration
     if(WRP_CORE_ENABLE_ASAN)
