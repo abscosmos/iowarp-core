@@ -1822,8 +1822,7 @@ bool Future<TaskT, AllocT>::Wait(float max_sec) {
   // Busy-wait polling the complete flag
   while (!future_shm->flags_.Any(FutureT::FUTURE_COMPLETE)) {
     // Yield to other threads on GPU
-    __threadfence();
-    __nanosleep(5);
+    HSHM_THREAD_MODEL->Yield();
   }
   return true;
 #else

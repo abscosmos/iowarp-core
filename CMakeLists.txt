@@ -961,11 +961,19 @@ if(WRP_CORE_ENABLE_TESTS)
         endforeach()
     endfunction()
 
-    foreach(_component_dir
-            context-runtime
-            context-transfer-engine
-            context-assimilation-engine
-            context-exploration-engine)
+    # Only recurse into component directories that were actually added to the
+    # build (via add_subdirectory).  The previous IS_DIRECTORY check would pass
+    # for source dirs that exist on disk but were never processed by CMake,
+    # causing get_directory_property(... TESTS) to fail.
+    set(_lock_component_dirs context-runtime context-transfer-engine)
+    if(WRP_CORE_ENABLE_CAE)
+        list(APPEND _lock_component_dirs context-assimilation-engine)
+    endif()
+    if(WRP_CORE_ENABLE_CEE)
+        list(APPEND _lock_component_dirs context-exploration-engine)
+    endif()
+
+    foreach(_component_dir ${_lock_component_dirs})
         if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
             _chimaera_lock_tests_recursive(
                 "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}"
