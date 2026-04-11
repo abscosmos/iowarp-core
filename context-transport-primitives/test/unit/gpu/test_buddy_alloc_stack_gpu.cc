@@ -285,14 +285,14 @@ TEST_CASE("PrivateBuddyAllocator shifted on GPU",
     hshm::GpuApi::Free(d_count);
   }
 
-  SECTION("Single block, __shared__ allocator, GpuShmMmap backend") {
+  SECTION("Single block, __shared__ allocator, GpuMalloc backend (2)") {
     constexpr size_t kBackendSize = 4 * 1024 * 1024;  // 4 MB
     constexpr int kBlockSize = 32;
 
-    GpuShmMmap backend;
+    GpuMalloc backend;
     MemoryBackendId bid(51, 0);
     REQUIRE(backend.shm_init(bid, kBackendSize,
-                             "/test_stack_buddy_uvm", 0));
+                             "/test_stack_buddy_gpu2", 0));
 
     int *d_results = hshm::GpuApi::Malloc<int>(kBlockSize * sizeof(int));
     int *d_count = hshm::GpuApi::Malloc<int>(sizeof(int));
