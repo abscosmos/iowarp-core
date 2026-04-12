@@ -115,6 +115,7 @@ option(WRP_CORE_ENABLE_GPU_RUNTIME "Enable GPU runtime (CDP-based parallelism)" 
 option(WRP_CORE_ENABLE_ROCM "Enable ROCm support" OFF)
 option(WRP_CORE_ENABLE_NIXL "Enable NIXL (NVIDIA Inference Xfer Library) transport" OFF)
 option(WRP_CORE_ENABLE_NVSHMEM "Enable NVSHMEM GPU-to-GPU communication library" OFF)
+option(WRP_CORE_ENABLE_SYCL "Enable Intel GPU support via SYCL/oneAPI (icpx -fsycl)" OFF)
 option(WRP_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF)
 
 #------------------------------------------------------------------------------
@@ -184,6 +185,7 @@ set(HSHM_ENABLE_ENCRYPT ${WRP_CORE_ENABLE_ENCRYPT} CACHE BOOL "Enable Encrypt (c
 set(HSHM_ENABLE_ELF ${WRP_CORE_ENABLE_ELF} CACHE BOOL "Enable ELF (controlled by WRP_CORE_ENABLE_ELF)" FORCE)
 set(HSHM_ENABLE_CUDA ${WRP_CORE_ENABLE_CUDA} CACHE BOOL "Enable CUDA (controlled by WRP_CORE_ENABLE_CUDA)" FORCE)
 set(HSHM_ENABLE_ROCM ${WRP_CORE_ENABLE_ROCM} CACHE BOOL "Enable ROCm (controlled by WRP_CORE_ENABLE_ROCM)" FORCE)
+set(HSHM_ENABLE_SYCL ${WRP_CORE_ENABLE_SYCL} CACHE BOOL "Enable SYCL (controlled by WRP_CORE_ENABLE_SYCL)" FORCE)
 set(HSHM_ENABLE_IO_URING ${WRP_CORE_ENABLE_IO_URING} CACHE BOOL "Enable io_uring (controlled by WRP_CORE_ENABLE_IO_URING)" FORCE)
 set(HSHM_ENABLE_NIXL ${WRP_CORE_ENABLE_NIXL} CACHE BOOL "Enable NIXL (controlled by WRP_CORE_ENABLE_NIXL)" FORCE)
 set(HSHM_ENABLE_NVSHMEM ${WRP_CORE_ENABLE_NVSHMEM} CACHE BOOL "Enable NVSHMEM (controlled by WRP_CORE_ENABLE_NVSHMEM)" FORCE)
@@ -1013,15 +1015,15 @@ if(WRP_CORE_ENABLE_TESTS)
         endforeach()
     endfunction()
 
-    foreach(_component_dir_pair
-            "context-runtime:WRP_CORE_ENABLE_RUNTIME"
-            "context-transfer-engine:WRP_CORE_ENABLE_CTE"
-            "context-assimilation-engine:WRP_CORE_ENABLE_CAE"
-            "context-exploration-engine:WRP_CORE_ENABLE_CEE")
-        string(REPLACE ":" ";" _pair "${_component_dir_pair}")
-        list(GET _pair 0 _component_dir)
-        list(GET _pair 1 _component_flag)
-        if(${_component_flag} AND IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
+    set(_lock_dirs context-runtime context-transfer-engine)
+    if(WRP_CORE_ENABLE_CAE)
+        list(APPEND _lock_dirs context-assimilation-engine)
+    endif()
+    if(WRP_CORE_ENABLE_CEE)
+        list(APPEND _lock_dirs context-exploration-engine)
+    endif()
+    foreach(_component_dir ${_lock_dirs})
+        if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
             _chimaera_lock_tests_recursive(
                 "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}"
                 "${_lsan_opts}")
