@@ -20,12 +20,15 @@ fi
 # On headless CI runners without an NVIDIA driver, libcuda.so is missing.
 # The CUDA toolkit ships stub libraries for compile-only builds — add them
 # to LIBRARY_PATH so the linker can resolve -lcuda.
-if command -v nvcc &>/dev/null; then
-    CUDA_STUBS="$(dirname "$(find "$(dirname "$(dirname "$(command -v nvcc)")")" -name 'libcuda.so' -path '*/stubs/*' -print -quit 2>/dev/null)" 2>/dev/null)"
-    if [ -n "$CUDA_STUBS" ] && [ -d "$CUDA_STUBS" ]; then
-        export LIBRARY_PATH="${CUDA_STUBS}${LIBRARY_PATH:+:$LIBRARY_PATH}"
+for stubs_candidate in \
+    /usr/local/cuda/targets/x86_64-linux/lib/stubs \
+    /usr/local/cuda/lib64/stubs \
+    /usr/local/cuda/stubs; do
+    if [ -f "$stubs_candidate/libcuda.so" ]; then
+        export LIBRARY_PATH="${stubs_candidate}${LIBRARY_PATH:+:$LIBRARY_PATH}"
+        break
     fi
-fi
+done
 
 cmake --preset="${PRESET}" \
     -DCMAKE_INSTALL_PREFIX="${PREFIX}" \

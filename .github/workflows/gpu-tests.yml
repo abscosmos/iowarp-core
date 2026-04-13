@@ -42,16 +42,10 @@ jobs:
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cuda-toolkit-12-6
+          sudo apt-get install -y -qq cuda-toolkit-12-6 cuda-driver-dev-12-6
         fi
         echo "/usr/local/cuda/bin" >> $GITHUB_PATH
         echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> $GITHUB_ENV
-        # Add CUDA stubs so that libcuda.so (driver API) is found at link time
-        # even on runners without a physical GPU / NVIDIA driver installed.
-        STUBS_DIR="$(find /usr/local/cuda -path '*/stubs/libcuda.so' -printf '%h' -quit 2>/dev/null)"
-        if [ -n "$STUBS_DIR" ]; then
-          echo "LIBRARY_PATH=${STUBS_DIR}${LIBRARY_PATH:+:$LIBRARY_PATH}" >> $GITHUB_ENV
-        fi
 
     - name: Verify CUDA
       run: nvcc --version
