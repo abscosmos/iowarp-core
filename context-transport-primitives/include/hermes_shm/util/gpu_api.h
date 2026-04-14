@@ -67,9 +67,14 @@ class GpuApi {
   static int GetDeviceCount() {
     int ngpu = 0;
 #if HSHM_ENABLE_ROCM
-    HIP_ERROR_CHECK(hipGetDeviceCount(&ngpu));
+    if (hipGetDeviceCount(&ngpu) != hipSuccess) {
+      ngpu = 0;
+    }
 #elif HSHM_ENABLE_CUDA
-    CUDA_ERROR_CHECK(cudaGetDeviceCount(&ngpu));
+    if (cudaGetDeviceCount(&ngpu) != cudaSuccess) {
+      cudaGetLastError();  // Clear the error state
+      ngpu = 0;
+    }
 #elif HSHM_ENABLE_SYCL
     auto platforms = sycl::platform::get_platforms();
     for (auto &p : platforms) {

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 #------------------------------------------------------------------------------
-# iowarp-llm: IOWarp integration for LLM inference with llama.cpp
+# llm-hooks: IOWarp integration for LLM inference with llama.cpp
 #
 # Two integration points:
 #   kvcache/  - KV cache tiered offloading via CTE (MOONCAKE-style prefix caching)
@@ -23,7 +23,7 @@ add_subdirectory(kvcache)
 if(WRP_CORE_ENABLE_CUDA AND WRP_CORE_ENABLE_LLAMA_SERVER)
     add_subdirectory(weights)
 else()
-    message(STATUS "iowarp-llm/weights: skipped (requires CUDA + WRP_CORE_ENABLE_LLAMA_SERVER=ON)")
+    message(STATUS "llm-hooks/weights: skipped (requires CUDA + WRP_CORE_ENABLE_LLAMA_SERVER=ON)")
 endif()
 
 # NOTE: Patching of server-context and llama targets with IOWARP_LLM_KVCACHE
