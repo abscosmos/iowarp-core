@@ -188,8 +188,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libgomp1 \
     libelf1 \
+    liburing2 \
     openmpi-bin \
     libopenmpi3t64 \
+    openssh-server openssh-client \
     libblosc2-2t64 \
     libzstd1 liblz4-1 liblzma5 libbz2-1.0 libbrotli1 libsnappy1v5 \
     libzfp1 \
@@ -208,6 +210,19 @@ COPY --from=builder /root/.chimaera /root/.chimaera
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu
 ENV PATH=/usr/local/bin:${PATH}
 RUN ldconfig
+RUN mkdir -p /run/sshd
+
+# Install Python and jarvis-cd
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv git \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip3 install --break-system-packages pyyaml pandas podman-compose
+RUN cd /tmp \
+    && git clone --depth 1 --branch dev https://github.com/grc-iit/jarvis-cd.git \
+    && cd jarvis-cd \
+    && git config submodule.awesome-scienctific-applications.update none \
+    && pip3 install --break-system-packages . \
+    && cd / && rm -rf /tmp/jarvis-cd
 """
 
 

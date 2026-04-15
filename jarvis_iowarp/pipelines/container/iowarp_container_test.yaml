@@ -12,6 +12,6 @@ pkgs:
     deploy_mode: container
   - pkg_type: jarvis_iowarp.adios2_gray_scott
     deploy_mode: container
-    engine: bp5
+    engine: iowarp
     nprocs: 1
     steps: 10
