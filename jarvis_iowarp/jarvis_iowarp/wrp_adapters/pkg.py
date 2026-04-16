@@ -107,6 +107,18 @@ class WrpAdapters(Interceptor):
             },
         ]
 
+    def _find_adapter_lib(self, name):
+        """
+        Find an adapter library on the host or, for containerized pipelines,
+        assume /usr/local/lib/ inside the container.
+        """
+        if hasattr(self, 'pipeline') and self.pipeline:
+            if self.pipeline._has_containerized_packages():
+                container_path = f'/usr/local/lib/lib{name}.so'
+                self.log(f'Using container library path: {container_path}')
+                return container_path
+        return self.find_library(name)
+
     def _configure(self, **kwargs):
         """
         Configure the WRP adapters interceptor.
@@ -124,7 +136,7 @@ class WrpAdapters(Interceptor):
         has_one = False
 
         if self.config['posix']:
-            posix_lib = self.find_library('wrp_cte_posix')
+            posix_lib = self._find_adapter_lib('wrp_cte_posix')
             if posix_lib is None:
                 raise Exception('Could not find wrp_cte_posix library')
             self.env['WRP_CTE_POSIX'] = posix_lib
@@ -133,7 +145,7 @@ class WrpAdapters(Interceptor):
             has_one = True
 
         if self.config['mpiio']:
-            mpiio_lib = self.find_library('wrp_cte_mpiio')
+            mpiio_lib = self._find_adapter_lib('wrp_cte_mpiio')
             if mpiio_lib is None:
                 raise Exception('Could not find wrp_cte_mpiio library')
             self.env['WRP_CTE_MPIIO'] = mpiio_lib
@@ -142,7 +154,7 @@ class WrpAdapters(Interceptor):
             has_one = True
 
         if self.config['stdio']:
-            stdio_lib = self.find_library('wrp_cte_stdio')
+            stdio_lib = self._find_adapter_lib('wrp_cte_stdio')
             if stdio_lib is None:
                 raise Exception('Could not find wrp_cte_stdio library')
             self.env['WRP_CTE_STDIO'] = stdio_lib
@@ -151,7 +163,7 @@ class WrpAdapters(Interceptor):
             has_one = True
 
         if self.config['vfd']:
-            vfd_lib = self.find_library('wrp_cte_vfd')
+            vfd_lib = self._find_adapter_lib('wrp_cte_vfd')
             if vfd_lib is None:
                 raise Exception('Could not find wrp_cte_vfd library')
             self.env['WRP_CTE_VFD'] = vfd_lib
@@ -160,7 +172,7 @@ class WrpAdapters(Interceptor):
             has_one = True
 
         if self.config['vol']:
-            vol_lib = self.find_library('iowarp_hdf5_vol')
+            vol_lib = self._find_adapter_lib('iowarp_hdf5_vol')
             if vol_lib is None:
                 raise Exception('Could not find iowarp_hdf5_vol library')
             self.env['WRP_CTE_VOL'] = vol_lib
@@ -169,7 +181,7 @@ class WrpAdapters(Interceptor):
             has_one = True
 
         if self.config['nvidia_gds']:
-            nvidia_gds_lib = self.find_library('wrp_cte_nvidia_gds')
+            nvidia_gds_lib = self._find_adapter_lib('wrp_cte_nvidia_gds')
             if nvidia_gds_lib is None:
                 raise Exception('Could not find wrp_cte_nvidia_gds library')
             self.env['WRP_CTE_NVIDIA_GDS'] = nvidia_gds_lib
