@@ -63,8 +63,10 @@ if (WRP_CTE_ENABLE_FUSE_ADAPTER)
     add_subdirectory(libfuse)
 endif()
 
-# HDF5 VOL connector does not require ELF support (HDF5 plugin)
-add_subdirectory(hdf5_vol)
+# HDF5 VOL connector (requires HDF5 >= 2.0, does not require ELF)
+if (WRP_CORE_ENABLE_HDF5)
+    add_subdirectory(hdf5_vol)
+endif()
 
 #-----------------------------------------------------------------------------
 # Install adapter headers

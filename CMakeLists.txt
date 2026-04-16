@@ -103,7 +103,7 @@ if(WRP_CTE_ENABLE_COMPRESS)
 else()
     set(WRP_CORE_ENABLE_COMPRESS OFF)
 endif()
-option(WRP_CORE_ENABLE_HDF5 "Enable HDF5 support in CAE" ON)
+option(WRP_CORE_ENABLE_HDF5 "Enable HDF5 support in CAE" OFF)
 
 #------------------------------------------------------------------------------
 # System and Runtime Features
