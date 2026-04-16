@@ -103,7 +103,6 @@ if(WRP_CTE_ENABLE_COMPRESS)
 else()
     set(WRP_CORE_ENABLE_COMPRESS OFF)
 endif()
-option(WRP_CORE_ENABLE_HDF5 "Enable HDF5 support in CAE" ON)
 
 #------------------------------------------------------------------------------
 # System and Runtime Features
@@ -142,6 +141,7 @@ option(WRP_CTE_ENABLE_VFD "Enable HDF5 VFD adapter" OFF)
 option(WRP_CTE_ENABLE_NVIDIA_GDS_ADAPTER "Enable NVIDIA GDS adapter" OFF)
 option(WRP_CTE_ENABLE_ADIOS2_ADAPTER "Enable ADIOS2 adapter" OFF)
 option(WRP_CTE_ENABLE_FUSE_ADAPTER "Enable FUSE3 adapter" OFF)
+option(WRP_CTE_ENABLE_HDF5_VOL "Enable HDF5 VOL connector (requires HDF5 >= 2.0)" OFF)
 
 #------------------------------------------------------------------------------
 # CAE (context-assimilation-engine) Options
@@ -555,8 +555,8 @@ if(WRP_CORE_ENABLE_LIBFABRIC)
     set(LIBFABRIC_LIB_DIRS ${Libfabric_LIBRARY_DIRS})
 endif()
 
-# HDF5 (optional - for CAE component)
-if(WRP_CORE_ENABLE_HDF5)
+# HDF5 (optional - for CAE HDF5 assimilator and CTE HDF5 VOL connector)
+if(WRP_CTE_ENABLE_HDF5_VOL)
     # Try CONFIG mode first (for HDF5 installed to non-standard cmake/ directory)
     find_package(HDF5 COMPONENTS C QUIET CONFIG)
     if(NOT HDF5_FOUND)
