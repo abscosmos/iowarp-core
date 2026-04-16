@@ -1,8 +1,8 @@
 """
 This module provides classes and methods to inject WRP (IoWarp) CTE adapters.
 The WrpAdapters interceptor enables interception of various I/O APIs (POSIX,
-MPI-IO, STDIO, HDF5 VFD, NVIDIA GDS) and routes them to the Content Transfer
-Engine for intelligent data placement and transfer.
+MPI-IO, STDIO, HDF5 VFD, HDF5 VOL, NVIDIA GDS) and routes them to the Content
+Transfer Engine for intelligent data placement and transfer.
 """
 from jarvis_cd.core.pkg import Interceptor
 from jarvis_cd.util import SizeType
@@ -21,6 +21,7 @@ class WrpAdapters(Interceptor):
     - MPI-IO (MPI_File_* operations)
     - STDIO (fread, fwrite, fopen, etc.)
     - HDF5 VFD (Virtual File Driver for HDF5)
+    - HDF5 VOL (Volume connector for HDF5 dataset I/O)
     - NVIDIA GDS (GPUDirect Storage)
     """
 
@@ -68,6 +69,13 @@ class WrpAdapters(Interceptor):
                 'type': bool,
                 'default': False,
                 'help': 'Enables HDF5 Virtual File Driver for CTE'
+            },
+            {
+                'name': 'vol',
+                'msg': 'Intercept HDF5 I/O via VOL connector',
+                'type': bool,
+                'default': False,
+                'help': 'Enables HDF5 VOL connector for CTE'
             },
             {
                 'name': 'nvidia_gds',
@@ -151,6 +159,15 @@ class WrpAdapters(Interceptor):
             self.log(f'Found libwrp_cte_vfd.so at {vfd_lib}')
             has_one = True
 
+        if self.config['vol']:
+            vol_lib = self.find_library('iowarp_hdf5_vol')
+            if vol_lib is None:
+                raise Exception('Could not find iowarp_hdf5_vol library')
+            self.env['WRP_CTE_VOL'] = vol_lib
+            self.env['WRP_CTE_ROOT'] = str(pathlib.Path(vol_lib).parent.parent)
+            self.log(f'Found libiowarp_hdf5_vol.so at {vol_lib}')
+            has_one = True
+
         if self.config['nvidia_gds']:
             nvidia_gds_lib = self.find_library('wrp_cte_nvidia_gds')
             if nvidia_gds_lib is None:
@@ -203,6 +220,12 @@ class WrpAdapters(Interceptor):
             self.setenv('HDF5_PLUGIN_PATH', plugin_path_parent)
             self.setenv('HDF5_DRIVER', 'wrp_cte_vfd')
             self.log(f"Configured HDF5 VFD with plugin path: {plugin_path_parent}")
+
+        # Configure HDF5 VOL connector
+        if self.config['vol']:
+            self.prepend_env('LD_PRELOAD', self.env['WRP_CTE_VOL'])
+            self.setenv('HDF5_VOL_CONNECTOR', 'iowarp')
+            self.log(f"Added HDF5 VOL connector to LD_PRELOAD and set HDF5_VOL_CONNECTOR=iowarp")
 
         # Add NVIDIA GDS adapter to LD_PRELOAD
         if self.config['nvidia_gds']:
