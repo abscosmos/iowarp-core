@@ -829,6 +829,12 @@ bool IpcManager::InitGpuBackendsForDevice(int gpu_id, u32 queue_depth) {
       HLOG(kError, "Failed to init orchestrator backend for GPU {}", gpu_id);
       return false;
     }
+    // Register so kernel-side allocations carrying this backend's alloc_id
+    // are resolvable by CPU-side ToFullPtr (gpu_alloc_map_ lookup).
+    // Without this, ShmPtr<>s returned by CHI_IPC->AllocateBuffer() inside
+    // a kernel are unresolvable on the host, and PutBlob/GetBlob server
+    // handlers silently no-op the data copy.
+    gpu_ipc_->RegisterGpuAllocator(bid, backend->data_, backend->data_capacity_);
     gpu_ipc_->gpu_devices_[gpu_id].gpu_orchestrator_backend = std::move(backend);
   }
 
