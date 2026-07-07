@@ -128,11 +128,16 @@ __global__ void TwCopyKernel(kvhdf5::GpuDatasetHandle h, const byte_t* src) {
 }
 
 // SYNC submit: per chunk, fused Write(c) = submit-AND-WAIT (GPU blocks). Data already
-// staged by TwCopyKernel. Single block (CLIO producer guard: thread-0 enqueues).
+// staged by TwCopyKernel. GRID-STRIDE over chunks: block b submits chunks b, b+gridDim,
+// ... (each block's thread-0 enqueues via its own per-block IpcManager — the framework's
+// documented one-block-per-chunk pattern). gridDim.x == 1 reproduces the old single-block
+// serial loop byte-for-byte; gridDim.x == Count() gives one CUDA block per chunk. This is
+// the "number of GPU blocks" axis. __syncthreads is per-block, so unequal per-block trip
+// counts (Count() not divisible by gridDim.x) are safe.
 __global__ void TwSnapSyncKernel(kvhdf5::GpuDatasetHandle h) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
-    for (uint32_t c = 0; c < h.Count(); ++c) {
+    for (uint32_t c = blockIdx.x; c < h.Count(); c += gridDim.x) {
         h.Write(c);
         __syncthreads();
     }
@@ -140,21 +145,24 @@ __global__ void TwSnapSyncKernel(kvhdf5::GpuDatasetHandle h) {
 
 // ASYNC FIRE only: fire every chunk's PutBlob, no wait. Data already staged by
 // TwCopyKernel. Drained later so the puts run on the server WHILE the subsequent sim
-// steps run on the GPU.
+// steps run on the GPU. Grid-stride over chunks (see TwSnapSyncKernel).
 __global__ void TwSnapFireKernel(kvhdf5::GpuDatasetHandle h) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
-    for (uint32_t c = 0; c < h.Count(); ++c) {
+    for (uint32_t c = blockIdx.x; c < h.Count(); c += gridDim.x) {
         h.WriteAsync(c);
         __syncthreads();
     }
 }
 
-// Drain a fired snapshot's outstanding puts.
+// Drain a fired snapshot's outstanding puts. Grid-stride over chunks (see TwSnapSyncKernel).
 __global__ void TwDrainKernel(kvhdf5::GpuDatasetHandle h) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
-    for (uint32_t c = 0; c < h.Count(); ++c) { h.WriteWait(c); __syncthreads(); }
+    for (uint32_t c = blockIdx.x; c < h.Count(); c += gridDim.x) {
+        h.WriteWait(c);
+        __syncthreads();
+    }
 }
 
 // XOR the snapshot with a fixed random mask (word-wise) into a scratch buffer, so the
@@ -221,6 +229,18 @@ struct Cfg {
     // mapped host over PCIe (slower submit) and it regresses the disk-bound /
     // low-compute regime, so it is off by default.
     unsigned data_pinned  = EnvU("GSBENCH_DATA_PINNED", 0);
+    // Number of CUDA thread blocks that submit PutBlob tasks (grid dim of the
+    // fire/sync/drain kernels). Each block grid-strides over chunks, so block b's
+    // thread-0 enqueues chunks b, b+gridDim, ... This is the advisor's "number of
+    // GPU blocks" axis. Default 1 = the historical single-block serial-submit
+    // baseline; set it to `chunks` for the framework's one-block-per-chunk pattern.
+    // (EnvU coerces <=0 to the default, so the effective value is always >=1; it is
+    // clamped to `chunks` below since extra blocks would just idle.)
+    unsigned submit_blocks = EnvU("GSBENCH_SUBMIT_BLOCKS", 1);
+    // Effective submit grid: clamp the knob to chunks (more blocks than chunks idle).
+    unsigned submit_grid() const {
+        return submit_blocks < chunks ? submit_blocks : chunks;
+    }
 
     unsigned steps() const { return snaps * steps_per; }
     uint64_t cells() const { return uint64_t(N) * N; }
@@ -398,9 +418,10 @@ double RunSim(const Cfg& cfg, Grids& g, SnapFn snap, FinalizeFn finalize,
 void PrintResult(const char* arm, const Cfg& cfg, double ms, uint64_t checksum) {
     double mb = double(cfg.total_bytes()) / (1024.0 * 1024.0);
     std::fprintf(stderr,
-        "GSBENCH_RESULT arm=%s N=%u chunks=%u snaps=%u steps=%u bdev=%s "
-        "MB=%.1f ms=%.2f MBps=%.1f checksum=%llu\n",
-        arm, cfg.N, cfg.chunks, cfg.snaps, cfg.steps(), cfg.bdev.c_str(),
+        "GSBENCH_RESULT arm=%s N=%u chunks=%u blocks=%u snaps=%u steps=%u bdev=%s "
+        "pinned=%u MB=%.1f ms=%.2f MBps=%.1f checksum=%llu\n",
+        arm, cfg.N, cfg.chunks, cfg.submit_grid(), cfg.snaps, cfg.steps(),
+        cfg.bdev.c_str(), cfg.data_pinned,
         mb, ms, mb / (ms / 1000.0), (unsigned long long)checksum);
 }
 
@@ -530,14 +551,15 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
     unsigned copy_bpc = (copy_words + 255) / 256;
     if (copy_bpc < 1) copy_bpc = 1;
     if (copy_bpc > 2048) copy_bpc = 2048;
+    const unsigned submit_grid = cfg.submit_grid();  // "number of GPU blocks" axis
     auto snap = [&](unsigned si, float* v_curr) {
         float* src = masker.Apply(v_curr);   // incompressible view (or v_curr if disabled)
         const byte_t* bsrc = reinterpret_cast<const byte_t*>(src);
         TwCopyKernel<<<dim3(copy_bpc, cfg.chunks), 256>>>(ds[si].Handle(), bsrc);  // multi-block stage
         if (async) {
-            TwSnapFireKernel<<<1, 256>>>(ds[si].Handle());
+            TwSnapFireKernel<<<submit_grid, 256>>>(ds[si].Handle());
         } else {
-            TwSnapSyncKernel<<<1, 256>>>(ds[si].Handle());
+            TwSnapSyncKernel<<<submit_grid, 256>>>(ds[si].Handle());
             // Bound the CUDA pending-launch queue. The sync arm's in-kernel SubmitWait
             // spins waiting for the IN-PROCESS server to flip the completion flag. If the
             // host races ahead and fills the ~1024-deep launch queue (once the run's total
@@ -551,7 +573,7 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
         }
     };
     auto finalize = [&]() {
-        if (async) for (auto& d : ds) TwDrainKernel<<<1, 32>>>(d.Handle());
+        if (async) for (auto& d : ds) TwDrainKernel<<<submit_grid, 32>>>(d.Handle());
     };
     double ms = RunSim(cfg, g, snap, finalize, nullptr, &trace);
     FreeGrids(g);
