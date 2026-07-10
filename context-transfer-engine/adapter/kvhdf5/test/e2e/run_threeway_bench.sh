@@ -89,7 +89,7 @@ cleanup() {
 trap cleanup EXIT
 
 # A stale/killed run leaves a spinning server + shm segments that make the next run hang.
-reset_state() { pkill -9 -x kvhdf5_e2e_tests 2>/dev/null; rm -f /dev/shm/chi_*; sleep 1; }
+reset_state() { pkill -9 -x kvhdf5_e2e_test 2>/dev/null; rm -f /dev/shm/chi_*; sleep 1; }
 
 run_arm() {  # $1 = catch tag, $2 = label
     reset_state
