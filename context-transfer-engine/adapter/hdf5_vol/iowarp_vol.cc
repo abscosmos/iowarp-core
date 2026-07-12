@@ -641,6 +641,20 @@ static herr_t iowarp_dataset_close(void *obj, hid_t dxpl_id, void **req) {
   auto *dset = static_cast<iowarp_dataset_t *>(obj);
 
   /* Flush all pending async writes */
+  /* TODO(silent-data-loss): these Waits DISCARD the task return code, so a
+   * PutBlob that failed — most commonly because it did not fit in the registered
+   * bdev target, which sets return_code_ = 13 (core_runtime.cc:1155) — is
+   * reported to HDF5 as a clean success and the data is silently lost. Every
+   * other operation in this file checks GetReturnCode() and maps it to -EIO;
+   * these three AsyncPutBlob sites (here, iowarp_dataset_write, and the
+   * read-miss cache-populate path) are the only ones that do not, which
+   * suggests an oversight rather than a deliberate best-effort design.
+   * The fix is to check future->GetReturnCode() here and return -EIO / H5 error.
+   * Left unfixed deliberately this pass — the same bug in the GPU producer path
+   * is fixed via GpuCteDataset::PutStatus()/ThrowIfIoFailed(); see
+   * agents/paper-writing/traces/05-backend-ceiling.md §7 and
+   * test/e2e/backend_ceiling_test.cu. Do not "fix" the ceiling folklore instead:
+   * the backend-count ceiling does not exist; capacity is the real bound. */
   for (auto &future : dset->pending_puts) {
     future.Wait();
   }
