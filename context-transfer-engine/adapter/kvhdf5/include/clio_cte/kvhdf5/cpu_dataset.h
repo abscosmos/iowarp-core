@@ -47,8 +47,15 @@ enum class IoError : uint8_t { BadLayout, SizeMismatch, Unsupported, NotFound, B
 // Non-owning view: a Dataset is valid only while its originating File is alive
 // and not moved (it holds borrowed DatasetMeta* and backend B* into the File).
 //
-// MVP: one chunk per dataset. `data`/`out` are the full row-major array. The
-// multi-chunk gather/scatter is Phase 1+ (returns Unsupported until then).
+// MVP: one chunk per dataset. `data`/`out` are the full row-major array.
+// Write/Read reject any Layout with ChunkCount() > 1 (IoError::Unsupported) --
+// real multi-chunk tiling and concurrent I/O only exist on the GPU producer
+// path (GpuCteDataset), which is not built on top of this class.
+//
+// Not currently used outside its own unit test (dataset_io_test.cpp), and
+// there only against InMemBlobBackend -- no real CTE-backed BlobBackend
+// exists for this template, and no e2e test or benchmark instantiates it.
+// Other files only include this header for the Layout struct.
 template<BlobBackend B>
 class Dataset {
     DatasetMeta* meta_;
