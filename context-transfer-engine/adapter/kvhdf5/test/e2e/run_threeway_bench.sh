@@ -30,9 +30,13 @@
 #   GSBENCH_HDF5_DIR GSBENCH_HDF5_RDCC_MB GSBENCH_HDF5_EARLY_ALLOC            hdf5 arm
 #   GSBENCH_HDF5_DIRECT_CHUNK (0|1) GSBENCH_HDF5_STOCK (0|1)                  hdf5 tuning
 #
-# GSBENCH_RAW_INLINE selects the writer STRUCTURE for BOTH the raw and hdf5 arms:
+# GSBENCH_RAW_INLINE selects the writer STRUCTURE:
 #   0 = background writer thread (I/O overlaps compute; pairs with clio-async)
 #   1 = inline synchronous       (GPU idle during the write; pairs with clio-sync)
+# It applies to the `raw` arm here. The HDF5 arm is run BOTH ways in one sweep (this script
+# forces the var per-arm), so it always reports as two rows: hdf5_inline and hdf5_threaded.
+#
+# GSBENCH_HDF5_ASYNC=1 adds a third HDF5 row via the async I/O VOL connector (see below).
 #
 set -u
 
@@ -98,24 +102,42 @@ trap cleanup EXIT
 # A stale/killed run leaves a spinning server + shm segments that make the next run hang.
 reset_state() { pkill -9 -x kvhdf5_e2e_test 2>/dev/null; rm -f /dev/shm/chi_*; sleep 1; }
 
-run_arm() {  # $1 = catch tag, $2 = label
+run_arm() {  # $1 = catch tag, $2 = label, $3.. = extra VAR=VAL env overrides for THIS arm only
+    local tag="$1" label="$2"
+    shift 2
     reset_state
-    echo ">>> arm: $2"
+    echo ">>> arm: ${label}"
     # HDF5_VOL_CONNECTOR is process-global: if it is exported for the hdf5_async arm it also
     # attaches the async VOL to the PLAIN hdf5 arm's file, quietly costing it ~20% and making
     # the baseline look worse than it is. Strip it for every arm but hdf5_async.
     local -a pre=(env)
-    [[ "$2" == "hdf5_async" ]] || pre+=(-u HDF5_VOL_CONNECTOR)
-    timeout "${GSBENCH_TIMEOUT}" "${pre[@]}" "${GSBENCH_BIN}" "$1" 2>&1 \
+    [[ "${label}" == "hdf5_async" ]] || pre+=(-u HDF5_VOL_CONNECTOR)
+    # Per-arm overrides. Safe because every arm runs in its OWN process, so forcing e.g.
+    # GSBENCH_RAW_INLINE here cannot leak into the `raw` arm's run.
+    pre+=("$@")
+    timeout "${GSBENCH_TIMEOUT}" "${pre[@]}" "${GSBENCH_BIN}" "${tag}" 2>&1 \
         | grep -E 'GSBENCH_RESULT|GSBENCH_TRACE|\[bench\]|\[raw\]|\[hdf5|FAILED|error' \
-        | tee "${logs}/$2.log"
+        | tee "${logs}/${label}.log"
     echo "    (exit ${PIPESTATUS[0]})"
 }
 
+# The HDF5 baseline is reported as THREE distinct rows, because "HDF5" is not one number —
+# the writer structure dominates, and a reviewer will ask for each:
+#   hdf5_inline    — synchronous write, GPU idle during it. Matched semantics vs clio-sync
+#                    and hostclio (the producer blocks on I/O).
+#   hdf5_threaded  — background writer thread, write overlaps the next sim steps. Matched
+#                    semantics vs clio-async. THIS IS THE ONE THE PAPER MUST BEAT.
+#   hdf5_async     — the HDF5 Asynchronous I/O VOL connector. Measured ~1.9x SLOWER than
+#                    hdf5_threaded, so it is due diligence, not a contender.
+# The first two are the SAME test case ([gsbench_hdf5]); GSBENCH_RAW_INLINE picks the writer
+# structure, and the arm names itself accordingly (see the TEST_CASE in the .cu). Forcing the
+# var per-arm is safe: every arm is its own process, so `raw` still honours whatever the
+# caller set.
 for rep in $(seq 1 "${GSBENCH_REPEATS}"); do
     [[ "${GSBENCH_REPEATS}" -gt 1 ]] && echo "================ REPEAT ${rep}/${GSBENCH_REPEATS} ================"
     run_arm "[gsbench_raw]"      "raw"
-    run_arm "[gsbench_hdf5]"     "hdf5"
+    run_arm "[gsbench_hdf5]"     "hdf5_inline"   GSBENCH_RAW_INLINE=1
+    run_arm "[gsbench_hdf5]"     "hdf5_threaded" GSBENCH_RAW_INLINE=0
     # The HDF5 async-VOL arm is OPT-IN: it needs a thread-safe libhdf5 + Argobots + the
     # vol-async connector on LD_LIBRARY_PATH/HDF5_PLUGIN_PATH, and it ABORTS rather than
     # silently run synchronously if the connector isn't really loaded. Enable with
@@ -134,15 +156,15 @@ reset_state
 
 echo
 echo "================ BENCHMARK RESULT ================"
-cat "${logs}"/raw.log "${logs}"/hdf5.log "${logs}"/hdf5_async.log \
-    "${logs}"/hostclio.log "${logs}"/sync.log "${logs}"/async.log \
+cat "${logs}"/raw.log "${logs}"/hdf5_inline.log "${logs}"/hdf5_threaded.log \
+    "${logs}"/hdf5_async.log "${logs}"/hostclio.log "${logs}"/sync.log "${logs}"/async.log \
     2>/dev/null | grep GSBENCH_RESULT
 
 python3 - "${logs}" <<'PY' 2>/dev/null || true
 import re, sys, glob, os
 logs = sys.argv[1]
 rows = {}
-for f in ("raw", "hdf5", "hdf5_async", "hostclio", "sync", "async"):
+for f in ("raw", "hdf5_inline", "hdf5_threaded", "hdf5_async", "hostclio", "sync", "async"):
     p = os.path.join(logs, f + ".log")
     if not os.path.exists(p):
         continue
@@ -153,13 +175,13 @@ for f in ("raw", "hdf5", "hdf5_async", "hostclio", "sync", "async"):
                                 mbps=float(m.group(4)), ck=m.group(5))
 if rows:
     base = rows.get("raw", {}).get("ms")
-    print(f"\n{'arm':<10}{'MB':>9}{'ms':>11}{'MB/s':>10}{'vs raw':>9}  checksum")
-    for a in ("raw", "hdf5", "hdf5_async", "hostclio", "sync", "async"):
+    print(f"\n{'arm':<15}{'MB':>9}{'ms':>11}{'MB/s':>10}{'vs raw':>9}  checksum")
+    for a in ("raw", "hdf5_inline", "hdf5_threaded", "hdf5_async", "hostclio", "sync", "async"):
         r = rows.get(a)
         if not r:
             continue
         rel = f"{base / r['ms']:.2f}x" if base else "-"
-        print(f"{a:<10}{r['mb']:>9.1f}{r['ms']:>11.2f}{r['mbps']:>10.1f}{rel:>9}  {r['ck']}")
+        print(f"{a:<15}{r['mb']:>9.1f}{r['ms']:>11.2f}{r['mbps']:>10.1f}{rel:>9}  {r['ck']}")
     cks = {r['ck'] for r in rows.values()}
     print("\nchecksums", "MATCH (identical computation)" if len(cks) == 1 else f"DIFFER {cks}")
 PY

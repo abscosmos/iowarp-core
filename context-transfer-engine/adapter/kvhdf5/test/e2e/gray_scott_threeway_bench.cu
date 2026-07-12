@@ -1510,11 +1510,17 @@ TEST_CASE("GSBENCH clio host-driven", "[.][integration][gpu][gsbench][gsbench_ho
 // The conventional path (GPU -> D2H -> HDF5), and the baseline the paper is measured
 // against. Needs no CLIO server, like raw. Compiled only when HDF5 was found.
 #if GSBENCH_HAVE_HDF5
+// The row is named for the writer STRUCTURE, not the sink, so that a sweep which runs this
+// arm twice (GSBENCH_RAW_INLINE=1 then =0) emits two distinguishable rows:
+//   hdf5_inline   — synchronous H5Dwrite; the GPU idles during it. Matched semantics vs
+//                   clio-sync and hostclio (the producer blocks on I/O).
+//   hdf5_threaded — background writer thread; the write overlaps the next sim steps. Matched
+//                   semantics vs clio-async. THIS is the baseline the paper must beat.
 TEST_CASE("GSBENCH hdf5", "[.][integration][gpu][gsbench][gsbench_hdf5]") {
     Cfg cfg;
     uint64_t checksum = 0;
     double ms = RunHdf5Arm(cfg, &checksum);
-    PrintResult("hdf5", cfg, ms, checksum);
+    PrintResult(cfg.raw_inline ? "hdf5_inline" : "hdf5_threaded", cfg, ms, checksum);
     REQUIRE(ms > 0.0);
 }
 
