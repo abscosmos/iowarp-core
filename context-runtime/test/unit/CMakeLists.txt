@@ -530,6 +530,39 @@ if(CLIO_CORE_ENABLE_CUDA)
   )
 endif()
 
+# gpu2cpu ring backpressure: a producer-only kernel that submits far more tasks
+# than `queue_depth` parks inside ring_buffer::Emplace()'s wait-for-space spin.
+# Asserts the CPU consumer still drains every one of them. See the file header
+# for how this relates to the gsbench chunks*snaps > queue_depth deadlock.
+if(CLIO_CORE_ENABLE_CUDA)
+  add_cuda_executable(test_gpu2cpu_backpressure FALSE
+    gpu/test_gpu2cpu_backpressure_gpu.cc
+    INCLUDE_DIRS
+      ${CLIO_RUN_ROOT}/include
+      ${CLIO_RUN_ROOT}/test
+      ${CLIO_RUN_ROOT}/modules/MOD_NAME/include
+      ${CLIO_RUN_ROOT}/modules/admin/include
+    LINK_LIBS
+      clio_run_cxx
+      clio_run_cxx_gpu
+      clio_admin_client
+      clio_MOD_NAME_client
+      ctp::cuda_cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(test_gpu2cpu_backpressure PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME cr_gpu2cpu_backpressure_cuda COMMAND test_gpu2cpu_backpressure
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_gpu2cpu_backpressure_cuda PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10501"
+    TIMEOUT 180
+    LABELS "gpu;cuda;backpressure"
+  )
+endif()
+
 if(CLIO_CORE_ENABLE_ROCM)
   add_rocm_gpu_executable(test_gpu_kernel_stress FALSE
     gpu/test_gpu_kernel_stress_gpu.cc
