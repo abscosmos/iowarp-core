@@ -27,6 +27,12 @@
 #   GSBENCH_N GSBENCH_CHUNKS GSBENCH_SNAPS GSBENCH_STEPS_PER   grid / chunking / schedule
 #   GSBENCH_BDEV (file|ram) GSBENCH_BDEV_CAP_MB GSBENCH_BDEV_PATH   CLIO storage
 #   GSBENCH_RAW_ODIRECT (0|1) GSBENCH_RAW_FSYNC (0|1) GSBENCH_DISK_DIR   raw storage
+#   GSBENCH_HDF5_DIR GSBENCH_HDF5_RDCC_MB GSBENCH_HDF5_EARLY_ALLOC            hdf5 arm
+#   GSBENCH_HDF5_DIRECT_CHUNK (0|1) GSBENCH_HDF5_STOCK (0|1)                  hdf5 tuning
+#
+# GSBENCH_RAW_INLINE selects the writer STRUCTURE for BOTH the raw and hdf5 arms:
+#   0 = background writer thread (I/O overlaps compute; pairs with clio-async)
+#   1 = inline synchronous       (GPU idle during the write; pairs with clio-sync)
 #
 set -u
 
@@ -61,8 +67,9 @@ export GSBENCH_BDEV_PATH="${GSBENCH_BDEV_PATH:-${GSBENCH_SCRATCH}/clio_bdev.dat}
 export GSBENCH_RAW_ODIRECT="${GSBENCH_RAW_ODIRECT:-0}"
 export GSBENCH_RAW_FSYNC="${GSBENCH_RAW_FSYNC:-1}"
 export GSBENCH_DISK_DIR="${GSBENCH_DISK_DIR:-${GSBENCH_SCRATCH}/raw_out}"
+export GSBENCH_HDF5_DIR="${GSBENCH_HDF5_DIR:-${GSBENCH_SCRATCH}/hdf5_out}"
 
-mkdir -p "${GSBENCH_SCRATCH}" "${GSBENCH_DISK_DIR}"
+mkdir -p "${GSBENCH_SCRATCH}" "${GSBENCH_DISK_DIR}" "${GSBENCH_HDF5_DIR}"
 
 # --- iowarp runtime env -----------------------------------------------------------------
 bin_dir="$(dirname "${GSBENCH_BIN}")"
@@ -82,7 +89,7 @@ fi
 
 logs="$(mktemp -d)"
 cleanup() {
-    rm -rf "${logs}" "${GSBENCH_DISK_DIR}" 2>/dev/null
+    rm -rf "${logs}" "${GSBENCH_DISK_DIR}" "${GSBENCH_HDF5_DIR}" 2>/dev/null
     rm -f "${GSBENCH_BDEV_PATH}" 2>/dev/null
     [[ -n "${nt1_conf}" ]] && rm -f "${nt1_conf}" 2>/dev/null
 }
@@ -94,8 +101,13 @@ reset_state() { pkill -9 -x kvhdf5_e2e_test 2>/dev/null; rm -f /dev/shm/chi_*; s
 run_arm() {  # $1 = catch tag, $2 = label
     reset_state
     echo ">>> arm: $2"
-    timeout "${GSBENCH_TIMEOUT}" "${GSBENCH_BIN}" "$1" 2>&1 \
-        | grep -E 'GSBENCH_RESULT|GSBENCH_TRACE|\[bench\]|\[raw\]|FAILED|error' \
+    # HDF5_VOL_CONNECTOR is process-global: if it is exported for the hdf5_async arm it also
+    # attaches the async VOL to the PLAIN hdf5 arm's file, quietly costing it ~20% and making
+    # the baseline look worse than it is. Strip it for every arm but hdf5_async.
+    local -a pre=(env)
+    [[ "$2" == "hdf5_async" ]] || pre+=(-u HDF5_VOL_CONNECTOR)
+    timeout "${GSBENCH_TIMEOUT}" "${pre[@]}" "${GSBENCH_BIN}" "$1" 2>&1 \
+        | grep -E 'GSBENCH_RESULT|GSBENCH_TRACE|\[bench\]|\[raw\]|\[hdf5|FAILED|error' \
         | tee "${logs}/$2.log"
     echo "    (exit ${PIPESTATUS[0]})"
 }
@@ -103,6 +115,17 @@ run_arm() {  # $1 = catch tag, $2 = label
 for rep in $(seq 1 "${GSBENCH_REPEATS}"); do
     [[ "${GSBENCH_REPEATS}" -gt 1 ]] && echo "================ REPEAT ${rep}/${GSBENCH_REPEATS} ================"
     run_arm "[gsbench_raw]"      "raw"
+    run_arm "[gsbench_hdf5]"     "hdf5"
+    # The HDF5 async-VOL arm is OPT-IN: it needs a thread-safe libhdf5 + Argobots + the
+    # vol-async connector on LD_LIBRARY_PATH/HDF5_PLUGIN_PATH, and it ABORTS rather than
+    # silently run synchronously if the connector isn't really loaded. Enable with
+    # GSBENCH_HDF5_ASYNC=1 after setting (see the async-VOL build under /opt):
+    #   export LD_LIBRARY_PATH=/opt/vol-async/lib:/opt/hdf5ts/lib:/opt/argobots/lib:$LD_LIBRARY_PATH
+    #   export HDF5_PLUGIN_PATH=/opt/vol-async/lib
+    #   export HDF5_VOL_CONNECTOR="async under_vol=0;under_info={}"
+    if [[ "${GSBENCH_HDF5_ASYNC:-0}" == "1" ]]; then
+        run_arm "[gsbench_hdf5_async]" "hdf5_async"
+    fi
     run_arm "[gsbench_hostclio]" "hostclio"
     run_arm "[gsbench_sync]"     "sync"
     run_arm "[gsbench_async]"    "async"
@@ -111,14 +134,15 @@ reset_state
 
 echo
 echo "================ BENCHMARK RESULT ================"
-cat "${logs}"/raw.log "${logs}"/hostclio.log "${logs}"/sync.log "${logs}"/async.log \
+cat "${logs}"/raw.log "${logs}"/hdf5.log "${logs}"/hdf5_async.log \
+    "${logs}"/hostclio.log "${logs}"/sync.log "${logs}"/async.log \
     2>/dev/null | grep GSBENCH_RESULT
 
 python3 - "${logs}" <<'PY' 2>/dev/null || true
 import re, sys, glob, os
 logs = sys.argv[1]
 rows = {}
-for f in ("raw", "hostclio", "sync", "async"):
+for f in ("raw", "hdf5", "hdf5_async", "hostclio", "sync", "async"):
     p = os.path.join(logs, f + ".log")
     if not os.path.exists(p):
         continue
@@ -130,7 +154,7 @@ for f in ("raw", "hostclio", "sync", "async"):
 if rows:
     base = rows.get("raw", {}).get("ms")
     print(f"\n{'arm':<10}{'MB':>9}{'ms':>11}{'MB/s':>10}{'vs raw':>9}  checksum")
-    for a in ("raw", "hostclio", "sync", "async"):
+    for a in ("raw", "hdf5", "hdf5_async", "hostclio", "sync", "async"):
         r = rows.get(a)
         if not r:
             continue

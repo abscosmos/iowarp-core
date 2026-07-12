@@ -25,6 +25,39 @@ kvhdf5_add_gpu_test_target(kvhdf5_e2e_tests WITH_KVHDF5_HEADERS
         backend_ceiling_test.cu
 )
 
+# The gsbench `hdf5` arm (the conventional GPU->D2H->HDF5 baseline) needs libhdf5.
+# The root CMakeLists only looks for HDF5 under CLIO_CTE_ENABLE_HDF5_VOL, which is
+# off in most builds, so find it locally instead of forcing that option on (which
+# would also pull in the VOL connector). The arm is guarded by GSBENCH_HAVE_HDF5 in
+# gray_scott_threeway_bench.cu, so the target still builds — minus that one arm —
+# when HDF5 is absent.
+if(NOT HDF5_FOUND)
+    find_package(HDF5 QUIET COMPONENTS C)
+    if(NOT HDF5_FOUND)
+        find_package(HDF5 QUIET COMPONENTS C CONFIG)
+    endif()
+endif()
+if(HDF5_FOUND)
+    if(NOT HDF5_LIBRARIES)
+        # CONFIG mode exports namespaced targets but may not set HDF5_LIBRARIES.
+        foreach(_h5 HDF5::HDF5 hdf5::hdf5-shared hdf5-shared hdf5::hdf5-static hdf5-static)
+            if(TARGET ${_h5})
+                set(HDF5_LIBRARIES ${_h5})
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(NOT HDF5_INCLUDE_DIRS AND HDF5_INCLUDE_DIR)
+        set(HDF5_INCLUDE_DIRS ${HDF5_INCLUDE_DIR})
+    endif()
+    message(STATUS "gsbench hdf5 arm: ENABLED (HDF5 ${HDF5_VERSION} at ${HDF5_INCLUDE_DIRS})")
+    target_include_directories(kvhdf5_e2e_tests PRIVATE ${HDF5_INCLUDE_DIRS})
+    target_link_libraries(kvhdf5_e2e_tests ${HDF5_LIBRARIES})
+    target_compile_definitions(kvhdf5_e2e_tests PRIVATE GSBENCH_HAVE_HDF5=1)
+else()
+    message(STATUS "gsbench hdf5 arm: DISABLED (HDF5 not found)")
+endif()
+
 # Convenience target for the three-way Gray-Scott I/O benchmark. The gsbench
 # arms are hidden ([.]) Catch2 cases inside kvhdf5_e2e_tests; each must run in
 # its OWN process (clio's per-process GPU-backend ceiling), so a wrapper script
