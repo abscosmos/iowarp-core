@@ -22,6 +22,7 @@ kvhdf5_add_gpu_test_target(kvhdf5_e2e_tests WITH_KVHDF5_HEADERS
         gray_scott_async_e2e_test.cu
         dataset_refire_probe_test.cu
         gray_scott_threeway_bench.cu
+        backend_ceiling_test.cu
 )
 
 # Convenience target for the three-way Gray-Scott I/O benchmark. The gsbench

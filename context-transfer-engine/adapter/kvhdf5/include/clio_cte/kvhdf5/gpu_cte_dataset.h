@@ -206,6 +206,37 @@ public:
     [[nodiscard]] byte_t* DeviceData() const { return host_descs_[0].data; }
     [[nodiscard]] uint64_t Bytes() const { return host_descs_[0].size; }
 
+    // ---- I/O completion status -------------------------------------------
+    // A PutBlob whose bytes do not fit in the registered bdev target FAILS in the
+    // runtime, which records it correctly (core_runtime.cc:1155 sets
+    // task->return_code_ = 10 + alloc_result). The device-side submit path then
+    // discards that code: GpuDatasetHandle::SubmitWait only spins on the
+    // completion flag, and Write()/Read() return void — so a producer kernel
+    // cannot signal its own I/O failure, and the blob is lost SILENTLY. That is
+    // how the "~16 backend ceiling" was misdiagnosed; see
+    // test/e2e/backend_ceiling_test.cu and traces/05-backend-ceiling.md.
+    //
+    // These accessors surface the code the runtime already wrote. The task
+    // backend is kPinnedHost (mandatory — see Init), so its slots are directly
+    // CPU-readable and no device-side ABI change is needed. Call these AFTER
+    // synchronizing the submitting kernel; a nonzero code means the data did not
+    // land (10 + 3 == 13 is "bdev out of capacity").
+    [[nodiscard]] int PutStatus(uint32_t c) const {
+        return reinterpret_cast<const cte::PodPutBlobTask*>(
+            task_base_ + static_cast<uint64_t>(c) * kSlotPair)->GetReturnCode();
+    }
+    [[nodiscard]] int GetStatus(uint32_t c) const {
+        return reinterpret_cast<const cte::PodGetBlobTask*>(
+            task_base_ + static_cast<uint64_t>(c) * kSlotPair + kPutSlot)->GetReturnCode();
+    }
+
+    /** Index of the first chunk whose Put failed, or -1 if every chunk landed. */
+    [[nodiscard]] int FirstFailedPut() const {
+        for (uint32_t c = 0; c < count_; ++c)
+            if (PutStatus(c) != 0) return static_cast<int>(c);
+        return -1;
+    }
+
 private:
     void Init(clio::run::IpcManagerGpuInfo info, cte::TagId tag,
               cstd::span<const ChunkSpec> specs, uint32_t pool_size = 0,
