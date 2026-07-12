@@ -14,7 +14,11 @@
 // carries a pointer to the device ChunkDesc array + the count, so its size is
 // independent of N.
 //
-// This is NOT a BlobBackend — its surface is Handle(), not WriteChunk/ReadChunk.
+// The surface is Handle(), not a host-callable WriteChunk/ReadChunk chunk store:
+// the host only preallocates and stamps task slots, and the device submits its own
+// I/O from inside the compute kernel. An earlier host-orchestrated CPU control
+// plane (File/Dataset over a synchronous BlobBackend concept) could not express
+// that inversion and was deleted rather than carried forward.
 // It owns three device allocations, so it is move-only and frees them in the dtor.
 
 #include "defines.h"

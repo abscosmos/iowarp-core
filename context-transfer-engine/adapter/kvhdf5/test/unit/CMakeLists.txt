@@ -7,7 +7,6 @@ find_package(CUDAToolkit REQUIRED)
 
 add_executable(kvhdf5_unit_tests
     chunking_test.cpp
-    dataset_io_test.cpp
     tag_path_test.cpp
 )
 
