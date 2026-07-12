@@ -19,7 +19,7 @@
 
 #include "defines.h"
 #include "chunking.h"
-#include "cpu_dataset.h"  // Layout, DatasetMeta
+#include "dataset_meta.h"  // Layout, DatasetMeta
 #include "gpu_dataset_handle.h"
 #include "tag_resolve.h"  // ResolveTagId (path->TagId)
 
