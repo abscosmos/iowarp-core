@@ -576,6 +576,20 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
         if (async) for (auto& d : ds) TwDrainKernel<<<submit_grid, 32>>>(d.Handle());
     };
     double ms = RunSim(cfg, g, snap, finalize, nullptr, &trace);
+
+    // A PutBlob that does not fit in the bdev FAILS, and until recently did so
+    // SILENTLY (the runtime set task->return_code_ but the GPU submit path threw
+    // it away — see backend_ceiling_test.cu). For a benchmark that is not merely
+    // data loss: we would report I/O throughput for bytes that never reached
+    // storage, and the more we dropped the FASTER we would look. Those numbers
+    // would be fiction. So a lost write is fatal here — abort rather than publish
+    // a fraudulent measurement. Size the bdev: GSBENCH_BDEV_CAP_MB must be >=
+    // snaps * snapshot_bytes (default: 12 * 156.25 MiB, so 3072 MB is ample).
+    ctp::GpuApi::Synchronize();  // async arm's drain kernels must land first
+    for (unsigned s = 0; s < ds.size(); ++s)
+        ds[s].ThrowIfIoFailed(
+            ("gsbench snapshot " + std::to_string(s)).c_str());
+
     FreeGrids(g);
     trace.Report(async ? "async" : "sync");   // GSBENCH_TRACE=1: emit phase breakdown
     *checksum = ChecksumSnapshots(tags, cfg);

@@ -66,6 +66,9 @@ class GpuCteDataset {
     std::vector<ChunkDesc> host_descs_;   // host mirror (for host accessors + H2D)
     uint32_t count_ = 0;
     uint32_t pool_ = 0;                    // resident data buffers M (M==count_ if unpooled)
+    // Set once any I/O-status accessor is called. Purely for the destructor's
+    // "you never checked" warning; mutable so the accessors stay const.
+    mutable bool io_checked_ = false;
 
     GpuDatasetHandle handle_{};
 
@@ -181,7 +184,17 @@ public:
                         pool_size, data_kind);
     }
 
-    ~GpuCteDataset() { Free(); }
+    // Loud, non-fatal safety net. A failed PutBlob means the data is GONE, and
+    // before this the loss was completely silent (see the I/O status accessors
+    // above). We deliberately do NOT throw: a destructor that throws terminates,
+    // and a lost write does not corrupt the caller's computation — only its
+    // output. So the library REPORTS and the caller DECIDES (ThrowIfIoFailed()
+    // is there for callers who consider a lost write fatal). What must never
+    // happen again is losing the data and saying nothing.
+    ~GpuCteDataset() {
+        WarnIfIoFailureUnchecked();
+        Free();
+    }
 
     GpuCteDataset(const GpuCteDataset&) = delete;
     GpuCteDataset& operator=(const GpuCteDataset&) = delete;
@@ -230,11 +243,38 @@ public:
             task_base_ + static_cast<uint64_t>(c) * kSlotPair + kPutSlot)->GetReturnCode();
     }
 
-    /** Index of the first chunk whose Put failed, or -1 if every chunk landed. */
+    /**
+     * Index of the first chunk whose Put failed, or -1 if every chunk landed.
+     * Calling this (or IoFailed()) marks the dataset's I/O status as INSPECTED,
+     * which suppresses the destructor's "never checked" warning below.
+     */
     [[nodiscard]] int FirstFailedPut() const {
+        io_checked_ = true;
         for (uint32_t c = 0; c < count_; ++c)
             if (PutStatus(c) != 0) return static_cast<int>(c);
         return -1;
+    }
+
+    /** True if ANY chunk's Put failed (its data did not land). Marks as checked. */
+    [[nodiscard]] bool IoFailed() const { return FirstFailedPut() >= 0; }
+
+    /**
+     * Throwing form, for callers whose output is worthless if a write was lost —
+     * the Gray-Scott benchmark above all, since a dropped write there would mean
+     * reporting I/O throughput for bytes that never reached storage.
+     *
+     * The library itself never throws on your behalf (a failed Put does not
+     * corrupt the computation, only the output — that is the caller's call to
+     * make, not ours). This is the opt-in way to say "a lost write is fatal".
+     */
+    void ThrowIfIoFailed(const char* what = "GpuCteDataset") const {
+        int c = FirstFailedPut();
+        if (c < 0) return;
+        throw std::runtime_error(
+            std::string(what) + ": PutBlob FAILED on chunk " + std::to_string(c) +
+            " (rc=" + std::to_string(PutStatus(static_cast<uint32_t>(c))) +
+            "; 13 == bdev out of capacity). The data did NOT land. Size the bdev "
+            "to at least the total bytes written.");
     }
 
 private:
@@ -385,6 +425,28 @@ private:
         return fp;
     }
 
+    /**
+     * Destructor safety net: shout if a Put failed and NOBODY EVER LOOKED.
+     *
+     * Guarded on task_base_/count_ so a moved-from shell (MoveFrom nulls both) is
+     * silent, and on io_checked_ so a caller who already inspected the status --
+     * and has therefore handled it however they chose -- is not nagged.
+     */
+    void WarnIfIoFailureUnchecked() const {
+        if (io_checked_ || task_base_ == nullptr || count_ == 0) return;
+        for (uint32_t c = 0; c < count_; ++c) {
+            int rc = PutStatus(c);
+            if (rc == 0) continue;
+            HLOG(kError,
+                 "GpuCteDataset: chunk {} PutBlob FAILED (rc={}, 13 == bdev out "
+                 "of capacity) and its status was NEVER CHECKED -- THE DATA WAS "
+                 "SILENTLY LOST. Call ThrowIfIoFailed()/IoFailed() after "
+                 "submitting, and size the bdev to at least the total bytes "
+                 "written.", c, rc);
+            return;  // one line per dataset is enough; don't spam per chunk
+        }
+    }
+
     void Free() {
         if (!desc_alloc_.IsNull()) ipc_->FreeGpuBackend(gpu_id_, desc_alloc_);
         if (!data_alloc_.IsNull()) ipc_->FreeGpuBackend(gpu_id_, data_alloc_);
@@ -404,6 +466,8 @@ private:
         count_ = o.count_;
         pool_ = o.pool_;
         handle_ = o.handle_;
+        io_checked_ = o.io_checked_;
+        o.io_checked_ = true;  // moved-from shell owns nothing; never warn for it
         o.task_alloc_.SetNull();
         o.data_alloc_.SetNull();
         o.desc_alloc_.SetNull();
