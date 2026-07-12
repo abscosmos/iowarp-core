@@ -224,6 +224,39 @@ struct Cfg {
     // write to commit). Without it, a buffered raw write just lands in RAM/page-cache and
     // isn't really persisted — doing less work than CLIO. Default on.
     unsigned raw_fsync    = EnvU("GSBENCH_RAW_FSYNC", 1);
+    // DURABILITY PARITY FOR THE CLIO ARMS. CLIO's kFile bdev opens its backing file with a
+    // plain O_RDWR|O_CREAT (fs_bdev_transport.cc) — no O_DIRECT, no O_SYNC — and NOTHING in
+    // the bdev or AsyncIO stack ever calls fsync/fdatasync. So a PutBlob that "completed"
+    // has only reached the OS page cache, while the raw and hdf5 arms fdatasync every
+    // snapshot and are therefore timed against the actual device.
+    //
+    // That is not a small effect, it is a measurement-invalidating one: on this box the
+    // durable write ceiling is ~1145 MB/s (dd conv=fdatasync, incompressible) and the
+    // buffered ceiling ~1810 MB/s, yet the async arm was reporting up to 2263 MB/s —
+    // i.e. FASTER THAN THE DISK CAN PHYSICALLY ACCEPT BYTES, durable or not. Those bytes
+    // were still in RAM when the clock stopped. Any "N GB/s to disk" claim built on that
+    // is fiction, and the arm that skips the flush looks fastest precisely because it did
+    // less work.
+    //
+    // On: fdatasync the bdev's backing file inside the timed region, so every arm is held
+    // to one standard. Off (0): the historical, non-durable behaviour — kept only so the
+    // artifact can be reproduced and quantified.
+    unsigned clio_fsync = EnvU0("GSBENCH_CLIO_FSYNC", 1);
+    // cudaHostRegister the hostclio arm's shm staging buffer.
+    //
+    // hostclio D2Hs into a CLIO shm buffer, which CUDA sees as ordinary pageable memory, so
+    // the copy goes through CUDA's bounce-buffer path: 17.2 GB/s instead of the 25.0 GB/s a
+    // registered buffer gets (measured; ~109 ms vs ~75 ms for the 1875 MB payload).
+    //
+    // The GPU-producer arms do NOT pay this: the kRam bdev allocates its pages with
+    // GpuApi::MallocHost (mem_bdev_transport.cc), i.e. already pinned, so the server's
+    // device->host copy was always on the fast path. hostclio exists precisely to isolate
+    // "what does GPU-initiation buy?" from "what does the CLIO backend buy?", so leaving its
+    // one D2H on the slow path would inflate OUR OWN headline number by handicapping the
+    // control. It is worth ~34 ms/run, which moved the GPU-initiation claim from 1.84x to
+    // 2.00x — i.e. most of the difference between an honest result and a flattering one.
+    // Default on; set 0 to reproduce the handicapped measurement.
+    unsigned hostclio_pin = EnvU0("GSBENCH_HOSTCLIO_PIN", 1);
     // XOR each snapshot with a random mask so persisted bytes are incompressible (else the
     // mostly-zero Gray-Scott field compresses away on btrfs zstd, voiding disk comparisons).
     unsigned incompressible = EnvU("GSBENCH_INCOMPRESSIBLE", 1);
@@ -296,6 +329,17 @@ struct Cfg {
     // returns — can be ruled in or out as the cause of that arm's slowdown: run `hdf5` at
     // nbuf=snaps and see whether it collapses too.
     unsigned hdf5_nbuf = EnvU("GSBENCH_HDF5_NBUF", 3);
+    // Pinned (cudaMallocHost) vs pageable (malloc) staging buffers for the hdf5 arm.
+    //
+    // Pinned looks like the obvious choice — it is what raw uses, and it makes the D2H
+    // ~2x faster. But raw ALSO splits its writes into <=1 MiB pwrites, and its comment says
+    // why: "a single huge pwrite from CUDA-pinned memory hit a ~5x-slow kernel path on this
+    // box". HDF5's sec2 driver issues ONE write() per chunk — 39 MiB at the default geometry
+    // — straight out of whatever buffer we hand it, so with a pinned buffer the hdf5 arm
+    // walks into exactly the kernel path raw was written to dodge, and no HDF5-side knob can
+    // reach it. Pageable trades a slower D2H for a write that runs at full speed.
+    // Which wins is an empirical question at each geometry, hence the knob.
+    unsigned hdf5_pinned = EnvU0("GSBENCH_HDF5_PINNED", 1);
     // H5Pset_meta_block_size: how much file space HDF5 grabs at a time for metadata. The
     // chunk index for a 6400-chunk dataset is not small and the 2 KB default makes it
     // dribble out; 2 MB is worth ~6% at 6400 chunks and costs nothing at 4. 0 = leave
@@ -481,11 +525,19 @@ double RunSim(const Cfg& cfg, Grids& g, SnapFn snap, FinalizeFn finalize,
 
 void PrintResult(const char* arm, const Cfg& cfg, double ms, uint64_t checksum) {
     double mb = double(cfg.total_bytes()) / (1024.0 * 1024.0);
+    // durable= is the flush state THIS arm ran under, so a result line can never be
+    // mistaken for a durable one when it isn't: raw/hdf5 fdatasync per snapshot
+    // (GSBENCH_RAW_FSYNC), the CLIO arms fdatasync the bdev at the end of the timed region
+    // (GSBENCH_CLIO_FSYNC). A RAM bdev / tmpfs target is never durable by construction.
+    const bool clio_arm = (std::strcmp(arm, "raw") != 0 &&
+                           std::strncmp(arm, "hdf5", 4) != 0);
+    const unsigned durable = clio_arm ? (cfg.clio_fsync && cfg.bdev == "file")
+                                      : cfg.raw_fsync;
     std::fprintf(stderr,
         "GSBENCH_RESULT arm=%s N=%u chunks=%u blocks=%u snaps=%u steps=%u bdev=%s "
-        "pinned=%u MB=%.1f ms=%.2f MBps=%.1f checksum=%llu\n",
+        "pinned=%u durable=%u MB=%.1f ms=%.2f MBps=%.1f checksum=%llu\n",
         arm, cfg.N, cfg.chunks, cfg.submit_grid(), cfg.snaps, cfg.steps(),
-        cfg.bdev.c_str(), cfg.data_pinned,
+        cfg.bdev.c_str(), cfg.data_pinned, durable,
         mb, ms, mb / (ms / 1000.0), (unsigned long long)checksum);
 }
 
@@ -534,6 +586,18 @@ struct BenchEnv {
         std::fprintf(stderr, "[bench] server ready\n");
     }
 };
+
+// Flush CLIO's kFile bdev to the device (see Cfg::clio_fsync for why this must exist).
+// fdatasync flushes the INODE's dirty pages, so any fd on the file works — we do not need
+// the bdev's own descriptor. No-op for a kRam bdev (nothing to flush) or when disabled.
+// MUST be called inside the timed region, after the GPU work has landed.
+void ClioBdevSync(const Cfg& cfg) {
+    if (!cfg.clio_fsync || cfg.bdev != "file") return;
+    int fd = open(cfg.bdev_path.c_str(), O_RDONLY);
+    if (fd < 0) return;                      // bdev file gone => nothing to flush
+    fdatasync(fd);                           // Linux permits fsync on a read-only fd
+    close(fd);
+}
 
 clio::cte::core::TagId MakeTag(const char* name) {
     auto t = CLIO_CTE_CLIENT->AsyncGetOrCreateTag(name);
@@ -638,6 +702,11 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
     };
     auto finalize = [&]() {
         if (async) for (auto& d : ds) TwDrainKernel<<<submit_grid, 32>>>(d.Handle());
+        // The drain kernels must land before we can flush what they wrote: only then has
+        // the server issued every PutBlob's write() into the page cache. (Harmless for the
+        // sync arm — it already synchronizes per snapshot.)
+        ctp::GpuApi::Synchronize();
+        ClioBdevSync(cfg);   // durability parity with raw/hdf5 — see Cfg::clio_fsync
     };
     double ms = RunSim(cfg, g, snap, finalize, nullptr, &trace);
 
@@ -687,6 +756,21 @@ double RunHostClioArm(const Cfg& cfg, const char* prefix, uint64_t* checksum) {
     ctp::ipc::FullPtr<char> buf = CLIO_CPU_IPC->AllocateBuffer(gbytes);
     REQUIRE(!buf.IsNull());
 
+    // Put this arm's D2H on the same pinned fast path the GPU-producer arms already enjoy
+    // (see Cfg::hostclio_pin). Done OUTSIDE the timed region, matching raw/hdf5, whose
+    // pinned buffers are likewise allocated before RunSim.
+    bool registered = false;
+    if (cfg.hostclio_pin) {
+        cudaError_t rc = cudaHostRegister(buf.ptr_, gbytes, cudaHostRegisterDefault);
+        registered = (rc == cudaSuccess);
+        if (!registered)
+            std::fprintf(stderr,
+                "[hostclio] WARNING: cudaHostRegister failed (%s); D2H stays on the slow "
+                "pageable path and this arm is handicapped vs sync/async\n",
+                cudaGetErrorString(rc));
+    }
+    std::fprintf(stderr, "[hostclio] shm staging buffer registered=%d\n", int(registered));
+
     Masker masker(cfg.N, cfg.incompressible != 0);
     Grids g = MakeGrids(cfg.N);
     auto snap = [&](unsigned si, float* v_curr) {
@@ -702,9 +786,12 @@ double RunHostClioArm(const Cfg& cfg, const char* prefix, uint64_t* checksum) {
             REQUIRE(t->GetReturnCode() == 0);
         }
     };
-    auto finalize = [&]() {};
+    auto finalize = [&]() {
+        ClioBdevSync(cfg);   // durability parity with raw/hdf5 — see Cfg::clio_fsync
+    };
     double ms = RunSim(cfg, g, snap, finalize, nullptr);
     FreeGrids(g);
+    if (registered) cudaHostUnregister(buf.ptr_);
     *checksum = ChecksumSnapshots(tags, cfg);
     return ms;
 }
@@ -1119,14 +1206,29 @@ private:
 // opening it in Run() rather than in the constructor keeps every HDF5 call on one thread,
 // which a non-threadsafe libhdf5 requires. It also means dataset creation overlaps compute,
 // which is what a real background-checkpoint code gets too.
+// Allocate / free an hdf5 staging buffer, pinned or pageable (see Cfg::hdf5_pinned).
+uint8_t* Hdf5AllocBuf(const Cfg& cfg, uint64_t bytes) {
+    uint8_t* p = nullptr;
+    if (cfg.hdf5_pinned) {
+        REQUIRE(cudaMallocHost(reinterpret_cast<void**>(&p), bytes) == cudaSuccess);
+    } else {
+        p = static_cast<uint8_t*>(std::malloc(bytes));
+        REQUIRE(p != nullptr);
+    }
+    return p;
+}
+void Hdf5FreeBuf(const Cfg& cfg, uint8_t* p) {
+    if (!p) return;
+    if (cfg.hdf5_pinned) cudaFreeHost(p); else std::free(p);
+}
+
 class Hdf5Writer {
 public:
     Hdf5Writer(const Cfg& cfg, std::string path, uint64_t gbytes, unsigned nbuf)
         : cfg_(cfg), path_(std::move(path)), gbytes_(gbytes) {
         bufs_.resize(nbuf);
         for (unsigned i = 0; i < nbuf; ++i) {
-            REQUIRE(cudaMallocHost(reinterpret_cast<void**>(&bufs_[i]), gbytes_)
-                    == cudaSuccess);          // pinned: fast D2H, same as raw
+            bufs_[i] = Hdf5AllocBuf(cfg_, gbytes_);
             free_.push_back(int(i));
         }
         th_ = std::thread([this] { Run(); });
@@ -1160,7 +1262,7 @@ public:
         { std::lock_guard<std::mutex> lk(m_); done_ = true; }
         cv_work_.notify_one();
         th_.join();
-        for (auto* b : bufs_) cudaFreeHost(b);
+        for (auto* b : bufs_) Hdf5FreeBuf(cfg_, b);
         *writer_ms = writer_ms_;
         if (!err_.empty()) throw std::runtime_error("hdf5 writer thread: " + err_);
     }
@@ -1258,8 +1360,7 @@ double RunHdf5Arm(const Cfg& cfg, uint64_t* checksum) {
         Hdf5Sink sink(cfg);
         sink.Open(path);
         sink.PrecreateAll();      // outside the timed region (parity — see Cfg::hdf5_precreate)
-        uint8_t* buf = nullptr;
-        REQUIRE(cudaMallocHost(reinterpret_cast<void**>(&buf), gbytes) == cudaSuccess);
+        uint8_t* buf = Hdf5AllocBuf(cfg, gbytes);
         Grids g = MakeGrids(cfg.N);
         double write_ms = 0;
         auto snap = [&](unsigned si, float* v_curr) {
@@ -1272,7 +1373,7 @@ double RunHdf5Arm(const Cfg& cfg, uint64_t* checksum) {
         auto finalize = [&]() { sink.Close(); };
         double ms = RunSim(cfg, g, snap, finalize, nullptr);
         FreeGrids(g);
-        cudaFreeHost(buf);
+        Hdf5FreeBuf(cfg, buf);
         std::fprintf(stderr, "[hdf5] total=%.1f ms  write=%.1f ms  (inline, GPU idle)\n",
                      ms, write_ms);
         *checksum = Hdf5ReadbackChecksum(path, cfg, gbytes);
@@ -1340,8 +1441,7 @@ double RunHdf5AsyncArm(const Cfg& cfg, uint64_t* checksum) {
 
     // One pinned buffer per snapshot (see the buffer contract above).
     std::vector<uint8_t*> bufs(cfg.snaps, nullptr);
-    for (unsigned s = 0; s < cfg.snaps; ++s)
-        REQUIRE(cudaMallocHost(reinterpret_cast<void**>(&bufs[s]), gbytes) == cudaSuccess);
+    for (unsigned s = 0; s < cfg.snaps; ++s) bufs[s] = Hdf5AllocBuf(cfg, gbytes);
 
     hid_t es = H5EScreate();
     H5CHK(es);
@@ -1365,7 +1465,7 @@ double RunHdf5AsyncArm(const Cfg& cfg, uint64_t* checksum) {
 
     H5CHK(H5ESclose(es));
     sink.Close();
-    for (auto* b : bufs) cudaFreeHost(b);
+    for (auto* b : bufs) Hdf5FreeBuf(cfg, b);
     std::fprintf(stderr, "[hdf5_async] total=%.1f ms  (event-set fire-all + drain-at-end)\n",
                  ms);
     *checksum = Hdf5ReadbackChecksum(path, cfg, gbytes);
