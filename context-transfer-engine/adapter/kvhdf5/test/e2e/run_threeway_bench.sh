@@ -117,7 +117,7 @@ run_arm() {  # $1 = catch tag, $2 = label, $3.. = extra VAR=VAL env overrides fo
     pre+=("$@")
     timeout "${GSBENCH_TIMEOUT}" "${pre[@]}" "${GSBENCH_BIN}" "${tag}" 2>&1 \
         | grep -E 'GSBENCH_RESULT|GSBENCH_TRACE|\[bench\]|\[raw\]|\[hdf5|FAILED|error' \
-        | tee "${logs}/${label}.log"
+        | tee "${logs}/${label}.rep${rep}.log"
     echo "    (exit ${PIPESTATUS[0]})"
 }
 
@@ -156,32 +156,49 @@ reset_state
 
 echo
 echo "================ BENCHMARK RESULT ================"
-cat "${logs}"/raw.log "${logs}"/hdf5_inline.log "${logs}"/hdf5_threaded.log \
-    "${logs}"/hdf5_async.log "${logs}"/hostclio.log "${logs}"/sync.log "${logs}"/async.log \
-    2>/dev/null | grep GSBENCH_RESULT
+cat "${logs}"/*.rep*.log 2>/dev/null | grep GSBENCH_RESULT
 
+# Aggregate ACROSS REPEATS. Each repeat wrote its own <arm>.rep<N>.log, so a run with
+# GSBENCH_REPEATS>1 reports the MEDIAN (robust to a single cold-cache outlier) together with the
+# spread, instead of silently showing only whichever repeat happened to run last.
 python3 - "${logs}" <<'PY' 2>/dev/null || true
-import re, sys, glob, os
+import re, sys, glob, os, statistics
 logs = sys.argv[1]
+ARMS = ("raw", "hdf5_inline", "hdf5_threaded", "hdf5_async", "hostclio", "sync", "async")
+PAT = re.compile(r'GSBENCH_RESULT .*arm=(\S+).*MB=([\d.]+) ms=([\d.]+) MBps=([\d.]+) checksum=(\d+)')
+
 rows = {}
-for f in ("raw", "hdf5_inline", "hdf5_threaded", "hdf5_async", "hostclio", "sync", "async"):
-    p = os.path.join(logs, f + ".log")
-    if not os.path.exists(p):
-        continue
-    m = re.search(r'GSBENCH_RESULT .*arm=(\S+).*MB=([\d.]+) ms=([\d.]+) MBps=([\d.]+) checksum=(\d+)',
-                  open(p).read())
-    if m:
-        rows[m.group(1)] = dict(mb=float(m.group(2)), ms=float(m.group(3)),
-                                mbps=float(m.group(4)), ck=m.group(5))
+for a in ARMS:
+    samples, mb, cks = [], None, set()
+    for p in sorted(glob.glob(os.path.join(logs, a + ".rep*.log"))):
+        m = PAT.search(open(p).read())
+        if m:
+            samples.append(float(m.group(3)))   # ms
+            mb = float(m.group(2))
+            cks.add(m.group(5))
+    if samples:
+        rows[a] = dict(mb=mb, ms=statistics.median(samples), n=len(samples),
+                       lo=min(samples), hi=max(samples), cks=cks)
+
 if rows:
     base = rows.get("raw", {}).get("ms")
-    print(f"\n{'arm':<15}{'MB':>9}{'ms':>11}{'MB/s':>10}{'vs raw':>9}  checksum")
-    for a in ("raw", "hdf5_inline", "hdf5_threaded", "hdf5_async", "hostclio", "sync", "async"):
+    print(f"\n{'arm':<15}{'MB':>9}{'ms(med)':>11}{'MB/s':>10}{'vs raw':>9}{'spread':>9}{'n':>4}  checksum")
+    for a in ARMS:
         r = rows.get(a)
         if not r:
             continue
+        mbps = r['mb'] / (r['ms'] / 1000.0)
         rel = f"{base / r['ms']:.2f}x" if base else "-"
-        print(f"{a:<15}{r['mb']:>9.1f}{r['ms']:>11.2f}{r['mbps']:>10.1f}{rel:>9}  {r['ck']}")
-    cks = {r['ck'] for r in rows.values()}
-    print("\nchecksums", "MATCH (identical computation)" if len(cks) == 1 else f"DIFFER {cks}")
+        # spread = (max-min)/median, i.e. how much the repeats disagreed. Large => distrust the row.
+        spread = f"{100.0 * (r['hi'] - r['lo']) / r['ms']:.1f}%" if r['n'] > 1 else "-"
+        ck = next(iter(r['cks'])) if len(r['cks']) == 1 else "VARIES!"
+        print(f"{a:<15}{r['mb']:>9.1f}{r['ms']:>11.2f}{mbps:>10.1f}{rel:>9}{spread:>9}{r['n']:>4}  {ck}")
+
+    # A checksum must be identical across every arm AND every repeat, or the arms did not all
+    # compute the same thing and the whole table is meaningless.
+    allck = set()
+    for r in rows.values():
+        allck |= r['cks']
+    print("\nchecksums", "MATCH (identical computation)" if len(allck) == 1
+          else f"DIFFER {allck}  <-- TABLE IS INVALID")
 PY
