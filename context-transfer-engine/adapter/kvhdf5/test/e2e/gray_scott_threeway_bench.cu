@@ -50,6 +50,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -345,6 +346,23 @@ struct Cfg {
     // dribble out; 2 MB is worth ~6% at 6400 chunks and costs nothing at 4. 0 = leave
     // HDF5's default alone.
     unsigned hdf5_meta_block_kb = EnvU0("GSBENCH_HDF5_META_BLOCK_KB", 2048);
+    // PAGE-FAULT PARITY between the file-backed arms (raw/hdf5) and the CLIO arms.
+    //
+    // raw and hdf5 write into a FRESH file. ftruncate() and H5D_ALLOC_TIME_EARLY set the
+    // file SIZE but leave it SPARSE, so the first store to each page faults it in and the
+    // kernel zeroes it — INSIDE the timed region. The CLIO arms never pay this: their kRam
+    // bdev is preallocated pinned memory built at server startup, i.e. off the clock.
+    //
+    // Measured with dd on /dev/shm at 1875 MB: fresh pages 505 ms (~3700 MB/s) vs
+    // already-allocated pages 256 ms (~7300 MB/s). ~250 ms — ~40% of those arms' runtime —
+    // was pure page-allocation cost charged to raw/hdf5 and to nobody else. That is not a
+    // storage-path difference, it is an artifact of who allocated first.
+    //
+    // On (default): write real zeros over the output file's full extent BEFORE RunSim, so
+    // the timed writes land on pages that already exist — the steady state CLIO's bdev is
+    // handed for free. Off (0): the historical, unfair behaviour, kept so the artifact can
+    // be reproduced and quantified. EnvU0, not EnvU: 0 must mean 0.
+    unsigned prefault = EnvU0("GSBENCH_PREFAULT", 1);
     // Effective submit grid: clamp the knob to chunks (more blocks than chunks idle).
     unsigned submit_grid() const {
         return submit_blocks < chunks ? submit_blocks : chunks;
@@ -815,6 +833,29 @@ void WriteAllAt(int fd, off_t off, const void* data, size_t bytes) {
     }
 }
 
+// Fault in the whole [0, bytes) extent of an ALREADY-CREATED file by writing real zeros
+// over it (see Cfg::prefault). Call BEFORE RunSim — never inside the timed region.
+//
+// Deliberately opens its OWN fd, WITHOUT O_DIRECT and WITHOUT O_TRUNC: the arm's real fd may
+// be O_DIRECT (GSBENCH_RAW_ODIRECT=1), whose alignment rules a plain zero buffer would
+// violate, and O_TRUNC would throw away the ftruncate the caller just did. The arm's fd is
+// left completely undisturbed; this fd is closed before the run starts.
+void PrefaultFile(const std::string& path, uint64_t bytes) {
+    int fd = open(path.c_str(), O_WRONLY);   // no O_DIRECT, no O_TRUNC, no O_CREAT
+    REQUIRE(fd >= 0);
+    constexpr size_t kBlk = 4u << 20;
+    std::vector<uint8_t> zeros(kBlk, 0);
+    off_t off = 0;
+    while (uint64_t(off) < bytes) {
+        size_t want = size_t(std::min<uint64_t>(kBlk, bytes - uint64_t(off)));
+        ssize_t n = pwrite(fd, zeros.data(), want, off);
+        if (n < 0) { if (errno == EINTR) continue; close(fd); throw std::runtime_error("prefault pwrite"); }
+        off += n;
+    }
+    fdatasync(fd);
+    close(fd);
+}
+
 // A competent (deliberately NOT maximally-tuned) decoupled writer: ONE background thread
 // + a small pinned-buffer pool (standard double-buffered checkpoint I/O). It lets disk
 // I/O OVERLAP the subsequent sim steps instead of stalling inline — the same structural
@@ -940,6 +981,9 @@ double RunRawArm(const Cfg& cfg, uint64_t* checksum) {
         int fd = open(path.c_str(), flags, 0644);
         REQUIRE(fd >= 0);
         REQUIRE(ftruncate(fd, off_t(cfg.snaps) * off_t(wbytes)) == 0);
+        // ftruncate only sizes the file; the pages are still sparse. Fault them in now, off
+        // the clock, so we time the write and not the kernel's page allocator (Cfg::prefault).
+        if (cfg.prefault) PrefaultFile(path, uint64_t(cfg.snaps) * wbytes);
         uint8_t* buf = nullptr;
         REQUIRE(cudaMallocHost(reinterpret_cast<void**>(&buf), wbytes) == cudaSuccess);
         std::memset(buf + gbytes, 0, wbytes - gbytes);
@@ -966,6 +1010,9 @@ double RunRawArm(const Cfg& cfg, uint64_t* checksum) {
 
     BgWriter writer(path, gbytes, wbytes, /*nbuf=*/3, cfg.snaps,
                     /*odirect=*/cfg.raw_odirect != 0, /*do_fsync=*/cfg.raw_fsync != 0);
+    // The ctor has open()ed + ftruncate()d the file; fault its pages in through a separate
+    // non-O_DIRECT fd, still BEFORE RunSim starts the clock (Cfg::prefault).
+    if (cfg.prefault) PrefaultFile(path, uint64_t(cfg.snaps) * wbytes);
     Grids g = MakeGrids(cfg.N);
     auto snap = [&](unsigned si, float* v_curr) {
         int idx;
@@ -1071,6 +1118,23 @@ public:
         for (unsigned s = 0; s < cfg_.snaps; ++s) dsets_[s] = CreateDataset(s);
     }
 
+    // PAGE-FAULT PARITY (Cfg::prefault). H5D_ALLOC_TIME_EARLY reserves the dataset's file
+    // space but leaves the file sparse, so the timed H5Dwrite would fault in and zero every
+    // page — a cost the CLIO arms' preallocated bdev never pays. Write a zero-filled host
+    // buffer once to EVERY dataset, through the SAME write path the timed run uses, so the
+    // timed run merely OVERWRITES existing pages. Call OUTSIDE the timed region.
+    //
+    // PREFAULT IMPLIES PRECREATE for the hdf5 arms: WriteSnap creates the dataset lazily when
+    // !hdf5_precreate, so a prefault pass would create every dataset and the timed WriteSnap
+    // would then H5Dcreate the same name again and fail. The callers force hdf5_precreate on
+    // (on a local Cfg copy) whenever prefault is on, and PrecreateAll() runs first.
+    //
+    // Do NOT pwrite raw zeros at the HDF5 file's fd — that would flatten its metadata.
+    void PrefaultAll(const void* zeros) {
+        if (!cfg_.prefault || !cfg_.hdf5_precreate) return;
+        for (unsigned s = 0; s < cfg_.snaps; ++s) WriteSnap(s, zeros);
+    }
+
     // Persist one snapshot from a host buffer holding the full N*N masked grid.
     void WriteSnap(unsigned si, const void* host) {
         const bool pre = cfg_.hdf5_precreate != 0;
@@ -1104,11 +1168,16 @@ public:
     // pool would let the next D2H overwrite bytes that have not been written out yet. That
     // is silent corruption, and it would show up as a checksum mismatch (it did, before this
     // comment existed).
+    //
+    // When the datasets were precreated (which prefault forces — see PrefaultAll) we write
+    // into the already-open handle and let Close() close it, exactly as the sync WriteSnap
+    // does; only the create+close move off the event set, the write itself is still async.
     void WriteSnapAsync(unsigned si, const void* host, hid_t es) {
-        hid_t dset = CreateDatasetAsync(si, es);
+        const bool pre = cfg_.hdf5_precreate != 0;
+        hid_t dset = pre ? dsets_[si] : CreateDatasetAsync(si, es);
         H5CHK(H5Dwrite_async(dset, H5T_NATIVE_FLOAT, H5S_ALL, H5S_ALL, H5P_DEFAULT, host,
                              es));
-        H5CHK(H5Dclose_async(dset, es));
+        if (!pre) H5CHK(H5Dclose_async(dset, es));
     }
 
     void Close() {
@@ -1124,6 +1193,40 @@ public:
         char name[64] = {0};
         ssize_t n = H5VLget_connector_name(file_, name, sizeof(name));
         return n > 0 && std::strcmp(name, "async") == 0;
+    }
+
+    // vol-async's OWN drain API (H5Fwait, "gov.lbl.async.file.wait"), reached through the
+    // public VOL optional-op interface so we do not have to link the connector's static
+    // libasynchdf5 into this binary.
+    //
+    // Why not just H5ESwait? Because H5ESwait is the connector's SLOW drain. Its
+    // H5VL_async_request_wait() releases the HDF5 global mutex, waits on the task, and then
+    // re-acquires the mutex in a retry loop whose backoff is a hard-coded usleep(1000000) —
+    // ONE SECOND per retry (h5_async_vol.c:22827). Every H5ESwait that finds work still
+    // outstanding therefore costs a whole-second-quantised ~2 s of pure sleep, regardless of
+    // how many bytes it drained (measured: 1 wait -> 2.00 s, 12 waits -> 24.00 s, same 1875
+    // MB either way). H5Fwait reaches H5VL_async_file_wait(), which does the same job and
+    // re-acquires the mutex with NO backoff sleep at all. Same semantics, no fixed tax.
+    //
+    // We still H5ESwait afterwards, for error reporting: by then every task is done, so each
+    // request takes request_wait's is_done early-out and never touches the mutex.
+    //
+    // NOT the default, though (GSBENCH_HDF5_ASYNC_FWAIT), because it trades one pathology for
+    // another: H5VL_async_file_wait re-acquires the mutex in a loop with NO sleep at all
+    // (h5_async_vol.c:2945), so under CPU oversubscription it busy-spins against the very
+    // Argobots thread it is waiting on and effectively livelocks.
+    // Returns false if the op is unavailable (i.e. connector not loaded) -> caller falls back.
+    bool FileWait() const {
+        static int op = -2;   // -2 = not looked up yet, -1 = unavailable
+        if (op == -2) {
+            if (H5VLfind_opt_operation(H5VL_SUBCLS_FILE, "gov.lbl.async.file.wait", &op) < 0)
+                op = -1;
+        }
+        if (op < 0) return false;
+        H5VL_optional_args_t args;
+        args.op_type = op;
+        args.args = nullptr;
+        return H5VLfile_optional_op(file_, &args, H5P_DEFAULT, H5ES_NONE) >= 0;
     }
 
 private:
@@ -1277,6 +1380,13 @@ private:
         try {
             sink.Open(path_);
             sink.PrecreateAll();   // outside the timed region: ctor blocks until we get here
+            // Same window, same reason: fault in the file's pages (Cfg::prefault). Must run on
+            // THIS thread (libhdf5 is not thread-safe) and it is safe to borrow bufs_[0] — the
+            // producer cannot have Acquire()d anything yet, it is still blocked in the ctor.
+            if (cfg_.prefault && !bufs_.empty()) {
+                std::memset(bufs_[0], 0, gbytes_);
+                sink.PrefaultAll(bufs_[0]);
+            }
             SignalReady();
             for (;;) {
                 std::pair<int, unsigned> job;
@@ -1342,7 +1452,13 @@ uint64_t Hdf5ReadbackChecksum(const std::string& path, const Cfg& cfg, uint64_t 
 //       raw-threaded and clio-async);
 //   1 = inline synchronous — GPU idle during the write (pairs with raw-inline, hostclio
 //       and clio-sync).
-double RunHdf5Arm(const Cfg& cfg, uint64_t* checksum) {
+double RunHdf5Arm(const Cfg& cfg_in, uint64_t* checksum) {
+    // Local copy: PREFAULT IMPLIES PRECREATE for this arm (Hdf5Sink::PrefaultAll explains
+    // why — the lazy H5Dcreate in WriteSnap would collide with the prefault pass). Hdf5Sink /
+    // Hdf5Writer hold a Cfg&, so this copy must outlive them: it does, it is this frame.
+    Cfg cfg = cfg_in;
+    if (cfg.prefault) cfg.hdf5_precreate = 1;
+
     EnsureDir(cfg.hdf5_dir);
     const uint64_t gbytes = cfg.grid_bytes();
     const std::string path = cfg.hdf5_dir + "/checkpoint.h5";
@@ -1361,6 +1477,10 @@ double RunHdf5Arm(const Cfg& cfg, uint64_t* checksum) {
         sink.Open(path);
         sink.PrecreateAll();      // outside the timed region (parity — see Cfg::hdf5_precreate)
         uint8_t* buf = Hdf5AllocBuf(cfg, gbytes);
+        if (cfg.prefault) {       // also outside the timed region (Cfg::prefault)
+            std::memset(buf, 0, gbytes);
+            sink.PrefaultAll(buf);
+        }
         Grids g = MakeGrids(cfg.N);
         double write_ms = 0;
         auto snap = [&](unsigned si, float* v_curr) {
@@ -1421,7 +1541,13 @@ double RunHdf5Arm(const Cfg& cfg, uint64_t* checksum) {
 // Requires the connector to actually be loaded at run time (HDF5_VOL_CONNECTOR=async,
 // HDF5_PLUGIN_PATH, and a thread-safe libhdf5). Without it the _async calls silently run
 // synchronously, so we ABORT rather than quietly report a mislabelled inline arm as async.
-double RunHdf5AsyncArm(const Cfg& cfg, uint64_t* checksum) {
+double RunHdf5AsyncArm(const Cfg& cfg_in, uint64_t* checksum) {
+    // Prefault implies precreate here too (see RunHdf5Arm / Hdf5Sink::PrefaultAll). The zero
+    // pass is a SYNCHRONOUS H5Dwrite to every dataset before the async phase begins, so no
+    // async op is in flight while it runs; WriteSnapAsync then writes into the open handles.
+    Cfg cfg = cfg_in;
+    if (cfg.prefault) cfg.hdf5_precreate = 1;
+
     EnsureDir(cfg.hdf5_dir);
     const uint64_t gbytes = cfg.grid_bytes();
     const std::string path = cfg.hdf5_dir + "/checkpoint_async.h5";
@@ -1443,25 +1569,79 @@ double RunHdf5AsyncArm(const Cfg& cfg, uint64_t* checksum) {
     std::vector<uint8_t*> bufs(cfg.snaps, nullptr);
     for (unsigned s = 0; s < cfg.snaps; ++s) bufs[s] = Hdf5AllocBuf(cfg, gbytes);
 
+    sink.PrecreateAll();                 // outside the timed region
+    if (cfg.prefault) {                  // ditto — synchronous zero pass (Cfg::prefault)
+        std::memset(bufs[0], 0, gbytes);
+        sink.PrefaultAll(bufs[0]);
+    }
+
     hid_t es = H5EScreate();
     H5CHK(es);
 
-    Grids g = MakeGrids(cfg.N);
-    auto snap = [&](unsigned si, float* v_curr) {
-        // Same D2H as raw/hdf5/hostclio, into THIS snapshot's own buffer.
-        cudaMemcpy(bufs[si], masker.Apply(v_curr), gbytes, cudaMemcpyDeviceToHost);
-        sink.WriteSnapAsync(si, bufs[si], es);   // returns immediately; VOL drains it
+    // Instrumentation (GSBENCH_HDF5_ASYNC_TRACE=1): where does the time actually go?
+    // d2h  = the cudaMemcpy per snapshot,  fire = the _async issue calls (should be ~0 if the
+    // connector really is deferring), wait = the tail H5ESwait drain, sync = final fdatasync.
+    const bool trace_async = EnvU0("GSBENCH_HDF5_ASYNC_TRACE", 0) != 0;
+    // Drain the event set after every snapshot instead of once at the end. Bounds the
+    // connector's memory growth and lets each write overlap the NEXT snapshot's compute.
+    const unsigned drain_every = EnvU0("GSBENCH_HDF5_ASYNC_DRAIN_EVERY", 0);
+    // Drain through the connector's own H5Fwait before H5ESwait (see Hdf5Sink::FileWait).
+    // ON by default because it is worth 3.4x on this arm and nothing to any other arm:
+    // 2305 ms -> 679 ms at N=6400/snaps=12, by not paying H5ESwait's 2 s of hard-coded
+    // mutex backoff. Set GSBENCH_HDF5_ASYNC_FWAIT=0 to drain with H5ESwait alone.
+    //
+    // CAVEAT, and the reason for the escape hatch: H5VL_async_file_wait re-acquires the
+    // HDF5 global mutex by BUSY-SPINNING with no backoff whatsoever, so if the machine is
+    // CPU-oversubscribed it spins against the Argobots thread it is waiting on. Measured:
+    // a run that takes 0.68 s on an idle box had not finished after 10 MINUTES with 64
+    // spinners on 32 cores. The benchmark itself is single-threaded + one Argobots ES, so
+    // it never provokes this — but do not run the sweep next to a busy build.
+    const bool use_fwait = EnvU0("GSBENCH_HDF5_ASYNC_FWAIT", 1) != 0;
+    double t_d2h = 0, t_fire = 0, t_wait = 0, t_sync = 0;
+    using Clk = std::chrono::steady_clock;
+    auto secs = [](Clk::time_point a, Clk::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
     };
-    auto finalize = [&]() {                      // tail-drain, inside the timed region
+    auto drain = [&]() {
+        if (use_fwait) sink.FileWait();   // no-op + fall through to H5ESwait if unsupported
         size_t n_in_progress = 0;
         hbool_t err_occurred = 0;
         H5CHK(H5ESwait(es, H5ES_WAIT_FOREVER, &n_in_progress, &err_occurred));
         if (err_occurred)
             throw std::runtime_error("hdf5_async: an async HDF5 operation failed");
+    };
+
+    Grids g = MakeGrids(cfg.N);
+    auto snap = [&](unsigned si, float* v_curr) {
+        // Same D2H as raw/hdf5/hostclio, into THIS snapshot's own buffer.
+        auto a = Clk::now();
+        cudaMemcpy(bufs[si], masker.Apply(v_curr), gbytes, cudaMemcpyDeviceToHost);
+        auto b = Clk::now();
+        sink.WriteSnapAsync(si, bufs[si], es);   // returns immediately; VOL drains it
+        auto c = Clk::now();
+        if (drain_every && (si + 1) % drain_every == 0) drain();
+        auto d = Clk::now();
+        t_d2h += secs(a, b);
+        t_fire += secs(b, c);
+        t_wait += secs(c, d);
+    };
+    auto finalize = [&]() {                      // tail-drain, inside the timed region
+        auto a = Clk::now();
+        drain();
+        auto b = Clk::now();
         if (cfg.raw_fsync) sink.Sync();
+        auto c = Clk::now();
+        t_wait += secs(a, b);
+        t_sync += secs(b, c);
     };
     double ms = RunSim(cfg, g, snap, finalize, nullptr);
     FreeGrids(g);
+    if (trace_async)
+        std::fprintf(stderr,
+                     "[hdf5_async] BREAKDOWN d2h=%.1f fire=%.1f wait=%.1f sync=%.1f "
+                     "other(compute)=%.1f ms\n",
+                     t_d2h, t_fire, t_wait, t_sync,
+                     ms - t_d2h - t_fire - t_wait - t_sync);
 
     H5CHK(H5ESclose(es));
     sink.Close();
