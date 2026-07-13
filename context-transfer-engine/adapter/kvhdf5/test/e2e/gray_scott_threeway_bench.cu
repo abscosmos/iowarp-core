@@ -708,6 +708,29 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
     if (copy_bpc < 1) copy_bpc = 1;
     if (copy_bpc > 2048) copy_bpc = 2048;
     const unsigned submit_grid = cfg.submit_grid();  // "number of GPU blocks" axis
+    // CUDA 12 loads a kernel's device code lazily, ON ITS FIRST LAUNCH
+    // (CUDA_MODULE_LOADING=LAZY is the default). That load is a DEVICE-WIDE
+    // synchronizing operation: until everything already queued on the GPU has
+    // drained, no work on ANY other stream can be dispatched. The async arm
+    // queues ~86 ms of compute and then, without ever synchronizing, issues the
+    // first-ever TwDrainKernel launch from finalize() — so the lazy load lands
+    // behind the whole queue and pins the entire device for its duration. The
+    // server's D2H copies (on their own non-blocking streams) cannot run, so
+    // async degenerates to compute + io instead of max(compute, io). Measured:
+    // 162 ms -> 94 ms once the kernels are resident, with drain_ms 75 -> 6.
+    //
+    // cudaFuncGetAttributes forces the load without launching anything, so the
+    // one-time cost stays out of the timed region where it belongs. Any CLIO GPU
+    // application that queues a deep kernel pipeline and expects the server's I/O
+    // to overlap it needs the same warm-up (or CUDA_MODULE_LOADING=EAGER) — a
+    // cold first launch anywhere in that pipeline serializes the whole device.
+    {
+        cudaFuncAttributes fa;
+        cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwCopyKernel));
+        cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapFireKernel));
+        cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapSyncKernel));
+        cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwDrainKernel));
+    }
     auto snap = [&](unsigned si, float* v_curr) {
         float* src = masker.Apply(v_curr);   // incompressible view (or v_curr if disabled)
         const byte_t* bsrc = reinterpret_cast<const byte_t*>(src);

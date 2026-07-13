@@ -81,6 +81,25 @@ export CLIO_BIND_ADDR="${CLIO_BIND_ADDR:-127.0.0.1}"
 export CHI_REPO_PATH="${CHI_REPO_PATH:-${bin_dir}}"
 export LD_LIBRARY_PATH="${bin_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
+# CUDA 12 defaults to CUDA_MODULE_LOADING=LAZY: a kernel's device code is loaded on its FIRST
+# launch, and that load is a DEVICE-WIDE SYNCHRONIZING driver op — nothing on any other stream
+# dispatches until everything already queued on the GPU drains. The async arm queues ~86 ms of
+# compute and then issues its first-ever TwDrainKernel launch, which therefore lands BEHIND that
+# whole queue and pins the device for its duration: the bdev worker's D2H copies (and even a 1 KB
+# memset) sit unexecuted, so I/O never overlaps compute. Measured: async 165 ms -> 94 ms with
+# EAGER, on otherwise unmodified code.
+#
+# EAGER is set for EVERY arm, not just the CLIO ones, so the treatment is uniform. Verified: no
+# other arm's timing moves (raw/hdf5_*/hostclio/sync are flat within run-to-run noise) — they
+# never paid this cost, so this is not crediting them for something they don't have. It only
+# moves a one-time, per-process module load out of the timed region, which is where a
+# process-startup cost belongs.
+#
+# The benchmark ALSO pre-warms its CLIO kernels in-code (cudaFuncGetAttributes, see the .cu), so a
+# direct run of the binary without this script still measures correctly. Under EAGER that pre-warm
+# is a no-op.
+export CUDA_MODULE_LOADING="${CUDA_MODULE_LOADING:-EAGER}"
+
 # The CLIO arms must run at a single server worker (num_threads=1): the concurrent-put-safe
 # substrate for multi-chunk async snapshots. Generate the config unless the caller supplied
 # one.
