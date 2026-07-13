@@ -29,7 +29,7 @@
  *   GSBENCH_CHUNKS       chunks per snapshot dataset         default 4
  *   GSBENCH_SNAPS        number of snapshots (<= ~12!)       default 4
  *   GSBENCH_STEPS_PER    sim steps between snapshots         default 8
- *   GSBENCH_BDEV         ram | file  (CLIO arms)             default ram
+ *   GSBENCH_BDEV         ram | pinned | file  (CLIO arms)    default ram
  *   GSBENCH_BDEV_CAP_MB  bdev capacity (MB)                  default 512
  *   GSBENCH_BDEV_PATH    kFile path (CLIO arms)              default ./gsbench_bdev.dat
  *   GSBENCH_DISK_DIR     raw-arm output dir                  default ./gsbench_raw_out
@@ -249,9 +249,13 @@ struct Cfg {
     // the copy goes through CUDA's bounce-buffer path: 17.2 GB/s instead of the 25.0 GB/s a
     // registered buffer gets (measured; ~109 ms vs ~75 ms for the 1875 MB payload).
     //
-    // The GPU-producer arms do NOT pay this: the kRam bdev allocates its pages with
-    // GpuApi::MallocHost (mem_bdev_transport.cc), i.e. already pinned, so the server's
-    // device->host copy was always on the fast path. hostclio exists precisely to isolate
+    // The GPU-producer arms are on a different footing: the kRam bdev's pages are pageable
+    // `new char[]` (mem_bdev_transport.cc), but they are now allocated AND pre-faulted in
+    // Init() whenever the bdev has an explicit capacity, so its D2H at least lands on warm
+    // pageable memory rather than the cold-fault floor; GSBENCH_BDEV=pinned selects the
+    // kPinned bdev, whose pages ARE cudaMallocHost'd and thus on the true DMA fast path.
+    // Either way that is a property of the bdev, not of the staging buffer this knob is
+    // about. hostclio exists precisely to isolate
     // "what does GPU-initiation buy?" from "what does the CLIO backend buy?", so leaving its
     // one D2H on the slow path would inflate OUR OWN headline number by handicapping the
     // control. It is worth ~34 ms/run, which moved the GPU-initiation claim from 1.84x to
@@ -350,8 +354,10 @@ struct Cfg {
     //
     // raw and hdf5 write into a FRESH file. ftruncate() and H5D_ALLOC_TIME_EARLY set the
     // file SIZE but leave it SPARSE, so the first store to each page faults it in and the
-    // kernel zeroes it — INSIDE the timed region. The CLIO arms never pay this: their kRam
-    // bdev is preallocated pinned memory built at server startup, i.e. off the clock.
+    // kernel zeroes it — INSIDE the timed region. The CLIO arms do not pay this: the kRam
+    // bdev's pages are pageable `new char[]`, but a bdev created with an explicit capacity
+    // allocates and pre-faults them all in Init(), at server startup, i.e. off the clock.
+    // (The kPinned bdev, GSBENCH_BDEV=pinned, likewise cudaMallocHost's its pages in Init.)
     //
     // Measured with dd on /dev/shm at 1875 MB: fresh pages 505 ms (~3700 MB/s) vs
     // already-allocated pages 256 ms (~7300 MB/s). ~250 ms — ~40% of those arms' runtime —
@@ -584,10 +590,14 @@ struct BenchEnv {
 
         const clio::run::u64 cap = clio::run::u64(cfg.cap_mb) << 20;
         const bool is_file = (cfg.bdev == "file");
-        const bdev::BdevType type = is_file ? bdev::BdevType::kFile
-                                            : bdev::BdevType::kRam;
-        // For kFile the bdev name IS the on-disk file path (O_DIRECT). For kRam it is
-        // just an identifier.
+        // "pinned" is kRam's page-locked sibling: same in-memory bdev, but its pages are
+        // cudaMallocHost'd, so the server's device->host copy is a true DMA instead of a
+        // driver-staged bounce through pageable memory.
+        const bdev::BdevType type = is_file     ? bdev::BdevType::kFile
+                                    : (cfg.bdev == "pinned") ? bdev::BdevType::kPinned
+                                                             : bdev::BdevType::kRam;
+        // For kFile the bdev name IS the on-disk file path (O_DIRECT). For kRam/kPinned it
+        // is just an identifier.
         const std::string name = is_file ? cfg.bdev_path : std::string("gsbench_ram");
         clio::run::PoolId bdev_pool_id(960, 0);
         bdev::Client bclient(bdev_pool_id);
