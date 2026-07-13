@@ -23,7 +23,17 @@ kvhdf5_add_gpu_test_target(kvhdf5_e2e_tests WITH_KVHDF5_HEADERS
         dataset_refire_probe_test.cu
         gray_scott_threeway_bench.cu
         backend_ceiling_test.cu
+        occupancy_bench.cu
 )
+
+# The occupancy bench measures per-kernel register / shared-memory / spill usage,
+# so it needs ptxas to SAY what it allocated. Scoped to this one source file to
+# keep the rest of the build quiet. Note the target is built with
+# CUDA_SEPARABLE_COMPILATION, so these compile-time numbers are pre-device-link;
+# `cuobjdump -res-usage bin/kvhdf5_e2e_tests` gives the post-link ground truth
+# and is what the reported table uses.
+set_source_files_properties(occupancy_bench.cu PROPERTIES
+    COMPILE_OPTIONS "-Xptxas=-v")
 
 # The gsbench `hdf5` arm (the conventional GPU->D2H->HDF5 baseline) needs libhdf5.
 # The root CMakeLists only looks for HDF5 under CLIO_CTE_ENABLE_HDF5_VOL, which is
