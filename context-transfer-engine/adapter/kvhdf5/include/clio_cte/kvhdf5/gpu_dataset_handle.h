@@ -65,7 +65,11 @@ struct GpuDatasetHandle {
 
     // Submit chunk c's pre-built Put/Get task and wait. Thread-0 of the block
     // enqueues; all other threads no-op (iowarp's threadIdx==0 producer guard).
-    __device__ void Write(uint32_t c) const { Submit(c, chunks_[c].put_fp); }
+    // Probing defaults to true so callers that don't specify it keep the exact
+    // prior codegen; the bench opts into Write<false>/WriteAsync<false> to shed
+    // the SendIn submit-probe registers on its hot non-probing runs.
+    template<bool Probing = true>
+    __device__ void Write(uint32_t c) const { Submit<Probing>(c, chunks_[c].put_fp); }
     __device__ void Read(uint32_t c) const { Submit(c, chunks_[c].get_fp); }
 
     // Async split of Write/Read (the "Phase 2" overlap path): *Async fires the
@@ -76,7 +80,8 @@ struct GpuDatasetHandle {
     // clobber another chunk's buffer while its put is still draining. Thread-0
     // only; pair every *Async(c) with exactly one *Wait(c) before the kernel
     // exits (the host Synchronize waits the kernel, not the server's puts).
-    __device__ void WriteAsync(uint32_t c) const { SubmitAsync(c, chunks_[c].put_fp); }
+    template<bool Probing = true>
+    __device__ void WriteAsync(uint32_t c) const { SubmitAsync<Probing>(c, chunks_[c].put_fp); }
     __device__ void ReadAsync(uint32_t c) const { SubmitAsync(c, chunks_[c].get_fp); }
     __device__ void WriteWait(uint32_t c) const { SubmitWait(c, chunks_[c].put_fp); }
     __device__ void ReadWait(uint32_t c) const { SubmitWait(c, chunks_[c].get_fp); }
@@ -92,9 +97,9 @@ struct GpuDatasetHandle {
     __device__ void ReadWait() const { SubmitWait(0, chunks_[0].get_fp); }
 
 private:
-    template<typename TaskT>
+    template<bool Probing = true, typename TaskT>
     __device__ void Submit(uint32_t c, const ctp::ipc::FullPtr<TaskT>& fp) const {
-        SubmitAsync(c, fp);
+        SubmitAsync<Probing>(c, fp);
         SubmitWait(c, fp);
     }
 
@@ -107,7 +112,7 @@ private:
     // the fence/push hops without a signature change) and on the ChunkDesc (so
     // this chunk's later *Wait can find the same record). Every probe branch is
     // dead when the probe is off.
-    template<typename TaskT>
+    template<bool Probing = true, typename TaskT>
     __device__ void SubmitAsync(uint32_t c, const ctp::ipc::FullPtr<TaskT>& fp) const {
         auto* ipc = clio::run::gpu::IpcManager::GetBlockIpcManager();
         if (clio::run::gpu::IpcManager::GetGpuThreadId() != 0) return;
@@ -116,7 +121,7 @@ private:
             ipc->probe_slot_ = slot;
             chunks_[c].probe_slot = slot;
         }
-        (void)ipc->Send(fp);
+        (void)ipc->Send<Probing>(fp);
     }
 
     // Drain fp's task: thread-0 polls task->fut_.is_complete_. The task is now

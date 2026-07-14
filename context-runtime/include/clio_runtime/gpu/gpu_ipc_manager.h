@@ -119,11 +119,11 @@ class IpcManager {
    * thread per CUDA block actually performs the enqueue; other threads
    * receive an empty future (mirrors today's threadIdx==0 guard).
    */
-  template <typename TaskT>
+  template <bool Probing = true, typename TaskT>
   CTP_CROSS_FUN gpu::Future<TaskT> Send(
       const ctp::ipc::FullPtr<TaskT> &task_ptr) {
 #if CTP_IS_GPU || CTP_IS_SYCL_DEVICE
-    return IpcGpu2Cpu::SendIn(this, task_ptr);
+    return IpcGpu2Cpu::SendIn<Probing>(this, task_ptr);
 #else
     (void)task_ptr;
     return gpu::Future<TaskT>();
