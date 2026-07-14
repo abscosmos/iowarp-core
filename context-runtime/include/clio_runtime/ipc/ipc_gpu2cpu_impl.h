@@ -64,6 +64,11 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
 
   CTP_DEVICE_FENCE_SYSTEM();
   auto &qlane = ipc->gpu_info_.gpu2cpu_queue->GetLane(0, 0);
+  // TODO(ring): Push's return value is dropped. Latent today -- the gpu2cpu lane
+  // is WAIT_FOR_SPACE, so Push blocks until a slot frees and cannot fail. But it
+  // becomes a SILENT TASK DROP the instant this lane is switched to
+  // ERROR_ON_NO_SPACE, and a dropped task hangs WriteWait forever. Propagate the
+  // bool up through SubmitAsync / WriteAsync before changing this lane's flags.
   qlane.Push(task_future);
   return future;
 }

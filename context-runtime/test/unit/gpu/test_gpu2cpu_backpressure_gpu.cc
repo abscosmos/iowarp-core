@@ -16,39 +16,42 @@
  * outruns the ring does not fail -- it PARKS ON THE DEVICE and waits for the CPU
  * to drain. The CPU side (ring_buffer::PopUnlocked) is what advances `head_`.
  *
- * Two cases here:
+ * Three cases here, all of which must pass:
  *
  *   1. "producer fills the ring exactly" -- submits depth-1 tasks, so no
- *      producer ever has to wait for space. This PASSES and guards the normal
- *      path.
+ *      producer ever has to wait for space. Guards the normal path.
  *
- *   2. "producer OVERRUNS the ring" -- submits several times the ring depth, so
- *      producers must block in Emplace's wait-for-space spin. THIS CURRENTLY
- *      DEADLOCKS, and is therefore opt-in (set CLIO_TEST_GPU2CPU_OVERRUN=1).
+ *   2. "producer OVERRUNS the ring" -- 3x depth, so producers must block in
+ *      Emplace's wait-for-space spin and be drained by the CPU.
+ *
+ *   3. "producer OVERRUNS the ring hard" -- 16x depth.
  *
  * ---------------------------------------------------------------------------
- * BUG reproduced by case 2 (gpu2cpu ring: consumer stops advancing head_)
+ * The bug these cases pin (FIXED -- keep them green)
  * ---------------------------------------------------------------------------
- * Submitting 3072 tasks into a depth-1025 ring wedges with this exact state:
+ * Cases 2 and 3 used to deadlock. Emplace's wait-for-space spin re-read head_
+ * with head_.load_device(), which is implemented as atomicAdd(&head_, 0) -- a
+ * read-modify-WRITE, not a load. This ring lives in PINNED HOST MEMORY and its
+ * consumer is the CPU, so a device-scope RMW against it is not coherent with
+ * the host: each parked GPU producer wrote its stale cached head_ straight back
+ * over the value PopUnlocked's head_.store_system(head + 1) had just stored.
+ * The consumer's progress was erased as fast as it was made, head_ froze, and
+ * the parked producers spun forever on a head_ that could never move.
  *
- *     head=0  tail=3072  depth=1025
- *     slots the CPU sees READY = 1023   (not ready: slot 0 and slot 1024)
- *     tasks actually executed by the CPU = exactly ONE
+ * The signature was unmistakable -- the CPU would complete a pop or two and
+ * then head_ would read back as its pre-park value:
  *
- * i.e. every producer successfully claimed a tail and 1023 of them landed their
- * entry, the CPU consumer popped exactly ONE entry (clearing that slot's ready
- * bit) -- and then `head_` stayed at 0 forever. Slot 1024 being unready is
- * correct (its producer is legitimately parked waiting for space). But because
- * `head_` never advances past the slot that was already consumed, PopUnlocked
- * re-reads that same slot, finds its ready bit cleared, returns false, and the
- * consumer never makes progress again. The parked producers are waiting on a
- * `head_` that will never move => deadlock.
+ *     head=1024  tail=4099  depth=1025
+ *     entries the CPU sees READY = 1023
+ *     tasks actually executed by the CPU = 2      <-- its stores were lost
  *
- * Once this is fixed, delete the CLIO_TEST_GPU2CPU_OVERRUN gate so the overrun
- * case runs by default: a blocking producer MUST be drainable.
+ * Fix: the gpu2cpu lane is now a RING_BUFFER_HOST_CONSUMER ring, so the spin
+ * re-reads head_ with a pure volatile load (load_system) that cannot clobber.
+ * See RING_BUFFER_HOST_CONSUMER in ring_buffer.h.
  *
- * FULL WRITE-UP -- evidence, the refuted theories (do not re-derive them), what
- * is still unproven, and the fix: see GPU2CPU_RING_DEADLOCK.md next to this file.
+ * FULL WRITE-UP: agents/paper-writing/traces/12-ring-backpressure-fix.md, and
+ * GPU2CPU_RING_DEADLOCK.md next to this file (which records the refuted
+ * theories -- do not re-derive them).
  *
  * Suffix `_gpu.cc` so NVCC/HIPCC compiles it, matching its sibling
  * test_gpu_kernel_stress_gpu.cc.
@@ -248,17 +251,6 @@ TEST_CASE("gpu2cpu: producer overruns the ring", "[gpu2cpu][backpressure]") {
   using namespace chi_test_gpu_stress;
   EnsureInit();
 
-  // KNOWN BUG -- opt-in. See the file header: overrunning the ring parks the
-  // producers in Emplace's wait-for-space spin, and the CPU consumer then stops
-  // advancing head_, so nothing ever drains. Gated so CI stays green; remove the
-  // gate once the ring is fixed.
-  if (std::getenv("CLIO_TEST_GPU2CPU_OVERRUN") == nullptr) {
-    std::fprintf(stderr,
-                 "[BACKPRESSURE] SKIPPED (known deadlock). Set "
-                 "CLIO_TEST_GPU2CPU_OVERRUN=1 to reproduce.\n");
-    return;
-  }
-
   auto *ipc = CLIO_CPU_IPC;
   clio::run::IpcManagerGpuInfo info =
       ipc->GetGpuIpcManager()->GetGpuInfo(/*gpu_id=*/0);
@@ -267,6 +259,23 @@ TEST_CASE("gpu2cpu: producer overruns the ring", "[gpu2cpu][backpressure]") {
 
   // 3x the ring depth: producers must block in Emplace at least twice over.
   REQUIRE(RunOverrun(static_cast<clio::run::u32>(depth * 3)));
+}
+
+TEST_CASE("gpu2cpu: producer overruns the ring hard", "[gpu2cpu][backpressure]") {
+  using namespace chi_test_gpu_stress;
+  EnsureInit();
+
+  auto *ipc = CLIO_CPU_IPC;
+  clio::run::IpcManagerGpuInfo info =
+      ipc->GetGpuIpcManager()->GetGpuInfo(/*gpu_id=*/0);
+  REQUIRE(info.gpu2cpu_queue != nullptr);
+  const size_t depth = info.gpu2cpu_queue->GetLane(0, 0).GetDepth();
+
+  // 16x the ring depth. This is far past anything gsbench asks for
+  // (chunks * snaps == the number of gpu2cpu submissions; the arm that used to
+  // hang was 128 chunks x 12 snaps = 1536). A blocking producer must be
+  // drainable at any overrun ratio, so this is the real invariant.
+  REQUIRE(RunOverrun(static_cast<clio::run::u32>(depth * 16)));
 }
 
 #endif  // !CTP_IS_DEVICE_PASS
