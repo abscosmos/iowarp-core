@@ -456,6 +456,16 @@ class ring_buffer : public ShmContainer<AllocT> {
   bool Push(const T& val) { return Emplace(val); }
 
   /**
+   * TODO(ring): DEAD CODE -- PushSystem() has zero callers tree-wide, as does
+   * PopDevice() below. Since the gpu2cpu lane became a RING_BUFFER_HOST_CONSUMER
+   * ring (whose Emplace already does the right thing for a host consumer),
+   * PushSystem is largely redundant with it. Either delete both, or fold
+   * PushSystem's behaviour into the HostConsumer branch so there is ONE
+   * producer path per scope rather than two that can drift apart. Note the
+   * stale cross-reference this already caused: Emplace's spin used to cite
+   * "see PopDevice comment" to justify a device-scope load -- pointing at dead
+   * code -- which is how the host-consumer deadlock got in.
+   *
    * Push with system-scope atomics for GPU→CPU visibility.
    *
    * Use this when a GPU thread pushes to a ring buffer that a CPU thread
@@ -560,6 +570,16 @@ class ring_buffer : public ShmContainer<AllocT> {
         return false;
       }
     }
+    // TODO(ring): a ring with NONE of WaitForSpace / ErrorOnNoSpace /
+    // DynamicSize takes no capacity branch at all -- it silently OVERWRITES a
+    // live, unconsumed entry when full and still returns true.
+    // circular_mpsc_ring_buffer is exactly that shape (MPSC | FIXED_SIZE), and
+    // it is what backs the telemetry logs and admin SystemStats. "Circular" is
+    // doing a lot of unstated work here: the overwrite is silent, so a producer
+    // cannot tell a full ring from an empty one. Likely the same shape as the
+    // known "PutBlob silently succeeds when the bdev is full" bug -- worth
+    // checking whether that queue is one of these. Decide whether overwrite is
+    // genuinely intended and document it, or give this case an explicit branch.
 
     // Emplace into queue at our slot
     size_t idx = tail % queue.size();
