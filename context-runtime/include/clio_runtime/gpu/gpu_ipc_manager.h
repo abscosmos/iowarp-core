@@ -159,6 +159,12 @@ class IpcManager {
 
   IpcManagerGpuInfo gpu_info_;
 
+  /** Submit-probe record the caller claimed for the Send now in flight.
+   *  The IpcManager is __shared__ (per CUDA block) and only thread 0 submits, so
+   *  the producer claims a slot, parks it here, and SendIn stamps into it — no
+   *  signature change to Send()/SendIn(). Meaningless when the probe is off. */
+  u32 probe_slot_ = gpu::kProbeNoSlot;
+
   // ================================================================
   // Host-only: per-device queues + client backend registration
   // ================================================================

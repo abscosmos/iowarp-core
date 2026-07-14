@@ -46,6 +46,11 @@ struct ChunkDesc {
     ctp::ipc::FullPtr<cte::PodGetBlobTask> get_fp;
     byte_t* data = nullptr;     // this chunk's registered device blob buffer
     uint64_t size = 0;
+    // Submit-probe record claimed by this chunk's in-flight *Async, read back by
+    // its matching *Wait. Needed because the fire and the drain are separate
+    // calls (the async path fires every chunk before draining any), so the slot
+    // cannot live in a per-block scratch. kProbeNoSlot = probe off.
+    uint32_t probe_slot = clio::run::gpu::kProbeNoSlot;
 };
 
 struct GpuDatasetHandle {
@@ -60,8 +65,8 @@ struct GpuDatasetHandle {
 
     // Submit chunk c's pre-built Put/Get task and wait. Thread-0 of the block
     // enqueues; all other threads no-op (iowarp's threadIdx==0 producer guard).
-    __device__ void Write(uint32_t c) const { Submit(chunks_[c].put_fp); }
-    __device__ void Read(uint32_t c) const { Submit(chunks_[c].get_fp); }
+    __device__ void Write(uint32_t c) const { Submit(c, chunks_[c].put_fp); }
+    __device__ void Read(uint32_t c) const { Submit(c, chunks_[c].get_fp); }
 
     // Async split of Write/Read (the "Phase 2" overlap path): *Async fires the
     // chunk's pre-built task WITHOUT waiting; *Wait drains it later. Firing many
@@ -71,35 +76,46 @@ struct GpuDatasetHandle {
     // clobber another chunk's buffer while its put is still draining. Thread-0
     // only; pair every *Async(c) with exactly one *Wait(c) before the kernel
     // exits (the host Synchronize waits the kernel, not the server's puts).
-    __device__ void WriteAsync(uint32_t c) const { SubmitAsync(chunks_[c].put_fp); }
-    __device__ void ReadAsync(uint32_t c) const { SubmitAsync(chunks_[c].get_fp); }
-    __device__ void WriteWait(uint32_t c) const { SubmitWait(chunks_[c].put_fp); }
-    __device__ void ReadWait(uint32_t c) const { SubmitWait(chunks_[c].get_fp); }
+    __device__ void WriteAsync(uint32_t c) const { SubmitAsync(c, chunks_[c].put_fp); }
+    __device__ void ReadAsync(uint32_t c) const { SubmitAsync(c, chunks_[c].get_fp); }
+    __device__ void WriteWait(uint32_t c) const { SubmitWait(c, chunks_[c].put_fp); }
+    __device__ void ReadWait(uint32_t c) const { SubmitWait(c, chunks_[c].get_fp); }
 
     // Single-chunk convenience: target chunk 0.
     __device__ byte_t* Data() const { return chunks_[0].data; }
     __device__ uint64_t Size() const { return chunks_[0].size; }
-    __device__ void Write() const { Submit(chunks_[0].put_fp); }
-    __device__ void Read() const { Submit(chunks_[0].get_fp); }
-    __device__ void WriteAsync() const { SubmitAsync(chunks_[0].put_fp); }
-    __device__ void WriteWait() const { SubmitWait(chunks_[0].put_fp); }
-    __device__ void ReadAsync() const { SubmitAsync(chunks_[0].get_fp); }
-    __device__ void ReadWait() const { SubmitWait(chunks_[0].get_fp); }
+    __device__ void Write() const { Submit(0, chunks_[0].put_fp); }
+    __device__ void Read() const { Submit(0, chunks_[0].get_fp); }
+    __device__ void WriteAsync() const { SubmitAsync(0, chunks_[0].put_fp); }
+    __device__ void WriteWait() const { SubmitWait(0, chunks_[0].put_fp); }
+    __device__ void ReadAsync() const { SubmitAsync(0, chunks_[0].get_fp); }
+    __device__ void ReadWait() const { SubmitWait(0, chunks_[0].get_fp); }
 
 private:
     template<typename TaskT>
-    __device__ void Submit(const ctp::ipc::FullPtr<TaskT>& fp) const {
-        SubmitAsync(fp);
-        SubmitWait(fp);
+    __device__ void Submit(uint32_t c, const ctp::ipc::FullPtr<TaskT>& fp) const {
+        SubmitAsync(c, fp);
+        SubmitWait(c, fp);
     }
 
     // Fire fp's task; thread-0 enqueues, others no-op. Discards the returned
     // future — SubmitWait rebuilds it from fp's slot (below), so nothing needs
     // to be retained across the fire/drain gap.
+    //
+    // `c` is carried only for the submit probe: it claims this submit's record
+    // and parks the slot both on the block-shared IpcManager (so SendIn can stamp
+    // the fence/push hops without a signature change) and on the ChunkDesc (so
+    // this chunk's later *Wait can find the same record). Every probe branch is
+    // dead when the probe is off.
     template<typename TaskT>
-    __device__ void SubmitAsync(const ctp::ipc::FullPtr<TaskT>& fp) const {
+    __device__ void SubmitAsync(uint32_t c, const ctp::ipc::FullPtr<TaskT>& fp) const {
         auto* ipc = clio::run::gpu::IpcManager::GetBlockIpcManager();
         if (clio::run::gpu::IpcManager::GetGpuThreadId() != 0) return;
+        if (ipc->gpu_info_.probe_.On()) {
+            uint32_t slot = clio::run::gpu::ProbeClaim(ipc->gpu_info_.probe_);
+            ipc->probe_slot_ = slot;
+            chunks_[c].probe_slot = slot;
+        }
         (void)ipc->Send(fp);
     }
 
@@ -109,10 +125,30 @@ private:
     // from fp alone — a fresh gpu::Future over the same task slot reads the same
     // completion flag the CPU worker flips. No stored future is needed.
     template<typename TaskT>
-    __device__ void SubmitWait(const ctp::ipc::FullPtr<TaskT>& fp) const {
+    __device__ void SubmitWait(uint32_t c, const ctp::ipc::FullPtr<TaskT>& fp) const {
         if (clio::run::gpu::IpcManager::GetGpuThreadId() != 0) return;
+        auto* ipc = clio::run::gpu::IpcManager::GetBlockIpcManager();
+        clio::run::gpu::SubmitProbeRec* prec =
+            clio::run::gpu::ProbeRec(ipc->gpu_info_.probe_, chunks_[c].probe_slot);
+        // Held in registers across the spin; committed after it. Both clocks: the
+        // wall clock to join against the CPU's SendOut, the cycle counter to give
+        // this record its own cycles->ns ratio (same block, so clock64 is coherent
+        // with the c_* stamps SendIn took above).
+        unsigned long long w_begin_ns = 0, w_begin_cy = 0;
+        if (prec) {
+            w_begin_ns = clio::run::gpu::ProbeNowNs();
+            w_begin_cy = clio::run::gpu::ProbeCycles();
+        }
         clio::run::gpu::Future<TaskT> fut(fp, sizeof(TaskT));
         fut.Wait();
+        if (prec) {
+            const unsigned long long w_end_cy = clio::run::gpu::ProbeCycles();
+            const unsigned long long w_end_ns = clio::run::gpu::ProbeNowNs();
+            prec->d_wait_begin = w_begin_ns;
+            prec->d_wait_end = w_end_ns;
+            prec->c_wait_begin = w_begin_cy;
+            prec->c_wait_end = w_end_cy;
+        }
     }
 #endif  // CTP_IS_GPU_COMPILER
 };

@@ -12,6 +12,7 @@
 #include "clio_ctp/util/gpu_api.h"
 #include "clio_runtime/gpu/future.h"
 #include "clio_runtime/gpu/gpu_ipc_manager.h"
+#include "clio_runtime/gpu/submit_probe.h"
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/singletons.h"
 #include "clio_runtime/worker.h"
@@ -32,6 +33,11 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   if (!gpu_lane->Pop(gpu_future)) {
     return false;
   }
+  // Sample the clock the instant the Pop succeeds — before any decoding — so the
+  // cross-domain poll latency (device push -> CPU observes) is not inflated by
+  // this function's own prologue.
+  auto &probe = gpu::SubmitProbe::Get();
+  const unsigned long long t_pop = probe.On() ? gpu::SubmitProbe::NowNs() : 0;
   const u32 worker_id = worker->GetId();
   HLOG(kDebug, "IpcGpu2Cpu::RecvIn: worker {} popped task from gpu2cpu queue",
        worker_id);
@@ -121,6 +127,12 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
 
   auto chi_fshm = future.GetFutureShm();
   chi_fshm->origin_ = ClientOrigin::kClientGpu2Cpu;
+  // Hand the probe record to the task itself. Every downstream hop (the
+  // coroutine start, SendOut) reaches it through this pointer — no lookup, no
+  // lock, and nothing at all for tasks the probe never opened.
+  chi_fshm->probe_rec_ = reinterpret_cast<uintptr_t>(probe.Open(
+      reinterpret_cast<unsigned long long>(gpu_task_raw), t_pop, worker_id,
+      worker->GetIdleIterations(), worker->GetCurrentSleepUs()));
   // Stash the device-side task pointer + size so SendOut can H2D-copy the
   // mutated POD back and flip the task's completion flag (cudaMemcpy when in
   // kDeviceMem). The Task is its own completion record — no gpu::FutureShm.
@@ -151,7 +163,16 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   // deserialized, so RouteTask / the worker have an active RunContext.
   future.GetTaskPtr()->BeginRunContext();
 
+  // The forced dispatch hop. RecvIn always passes force_enqueue=true, so this is
+  // an unconditional worker->worker queue push (+ a possible AwakenWorker
+  // signal) that a CPU-originated task can sometimes skip via ExecHere.
+  auto *prec =
+      reinterpret_cast<gpu::SubmitProbeHostRec *>(chi_fshm->probe_rec_);
+  if (prec) prec->t_pre_route = gpu::SubmitProbe::NowNs();
+
   RouteResult route_result = ipc->RouteTask(future, /*force_enqueue=*/true);
+
+  if (prec) prec->t_post_route = gpu::SubmitProbe::NowNs();
   HLOG(kDebug,
        "IpcGpu2Cpu::RecvIn: worker {} RouteTask returned {} pool={} method={}",
        worker_id, (int)route_result, pool_id, method_id);
@@ -190,6 +211,10 @@ void IpcGpu2Cpu::SendOut(
        task_ptr->pool_id_, task_ptr->method_);
   Task *host_task = task_ptr.get();
 
+  auto *prec =
+      reinterpret_cast<gpu::SubmitProbeHostRec *>(future_shm->probe_rec_);
+  if (prec) prec->t_sendout_begin = gpu::SubmitProbe::NowNs();
+
   if (future_shm->gpu_task_device_ptr_ && future_shm->gpu_task_size_) {
     // kDeviceMem: writeback the mutated POD (is_complete_ still 0 here), then
     // flip the completion flag separately at its device address. is_complete_
@@ -210,6 +235,11 @@ void IpcGpu2Cpu::SendOut(
   // Mark complete: for kPinnedHost / kManagedUvm this storage is shared with
   // the device (the kernel's volatile poll sees it); also wakes host waiters.
   host_task->SetComplete();
+
+  // Stamped immediately after SetComplete, not at function exit: this is the
+  // instant the flag the device is spinning on became writable-visible, so it is
+  // the left edge of the completion-visibility window (t_sendout_end -> d_wait_end).
+  if (prec) prec->t_sendout_end = gpu::SubmitProbe::NowNs();
 
   // Producer-only model: the client owns the device-memory backend that holds
   // the task — the runtime does not free it.

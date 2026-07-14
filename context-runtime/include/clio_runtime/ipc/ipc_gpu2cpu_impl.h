@@ -9,6 +9,7 @@
 #define CLIO_RUNTIME_INCLUDE_IPC_GPU2CPU_IMPL_H_
 
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
+#include "clio_runtime/gpu/submit_probe.h"
 #include "clio_ctp/util/gpu_intrinsics.h"
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
@@ -45,11 +46,34 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
     return future;
   }
 
+  // Submit-path probe (off unless armed): the caller parked its record slot on
+  // the block-shared IpcManager. Every stamp below is held in a REGISTER and the
+  // record is written once, after the Push — so the probe's own global stores land
+  // outside the region it is timing and cannot inflate it.
+#if CTP_IS_GPU_COMPILER
+  gpu::SubmitProbeRec *prec =
+      gpu::ProbeRec(ipc->gpu_info_.probe_, ipc->probe_slot_);
+  unsigned long long p_enter_ns = 0, p_enter_cy = 0, p_fields_cy = 0,
+                     p_prefence_cy = 0, p_postfence_cy = 0;
+  if (prec) {
+    // globaltimer first, clock64 last: the cycle counter defines hop 1's left
+    // edge, so the (slower) special-register read of globaltimer must not sit
+    // between it and the field stores.
+    p_enter_ns = gpu::ProbeNowNs();
+    p_enter_cy = gpu::ProbeCycles();
+  }
+#endif
+
   // Self-contained Task: stamp its POD size + clear its completion flag in the
   // embedded FutureInfo (no co-located gpu::FutureShm).
   const u32 task_size = static_cast<u32>(sizeof(TaskT));
   task_ptr.ptr_->fut_.task_size_ = task_size;
   task_ptr.ptr_->fut_.is_complete_.store(0);
+
+#if CTP_IS_GPU_COMPILER
+  // Hop 1 boundary: the task-field stores are done; the fence has not run yet.
+  if (prec) p_fields_cy = gpu::ProbeCycles();
+#endif
 
   future = gpu::Future<TaskT>(task_ptr, task_size);
 
@@ -62,7 +86,21 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
   task_for_queue.ptr_ = static_cast<Task *>(task_ptr.ptr_);
   gpu::Future<Task> task_future(task_for_queue, task_size);
 
+#if CTP_IS_GPU_COMPILER
+  // Everything from here to c_pushed is the true price of GPU initiation: a
+  // PCIe-visible system-scope flush plus one lock-free tail bump.
+  if (prec) p_prefence_cy = gpu::ProbeCycles();
+#endif
+
   CTP_DEVICE_FENCE_SYSTEM();
+
+#if CTP_IS_GPU_COMPILER
+  // Splits the fence from the push. The design claims the fence is what GPU
+  // initiation costs; the ring lane lives in PINNED HOST memory, so the push's own
+  // atomics cross PCIe too. These must be separated or the wrong one gets blamed.
+  if (prec) p_postfence_cy = gpu::ProbeCycles();
+#endif
+
   auto &qlane = ipc->gpu_info_.gpu2cpu_queue->GetLane(0, 0);
   // TODO(ring): Push's return value is dropped. Latent today -- the gpu2cpu lane
   // is WAIT_FOR_SPACE, so Push blocks until a slot frees and cannot fail. But it
@@ -70,6 +108,24 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
   // ERROR_ON_NO_SPACE, and a dropped task hangs WriteWait forever. Propagate the
   // bool up through SubmitAsync / WriteAsync before changing this lane's flags.
   qlane.Push(task_future);
+
+#if CTP_IS_GPU_COMPILER
+  if (prec) {
+    // Close the measured region on the cycle counter FIRST, then read the wall
+    // clock, then commit — so neither the globaltimer read nor these stores are
+    // charged to the push.
+    const unsigned long long p_pushed_cy = gpu::ProbeCycles();
+    const unsigned long long p_pushed_ns = gpu::ProbeNowNs();
+    prec->task_ptr = reinterpret_cast<unsigned long long>(task_ptr.ptr_);
+    prec->d_enter = p_enter_ns;
+    prec->d_pushed = p_pushed_ns;
+    prec->c_enter = p_enter_cy;
+    prec->c_fields = p_fields_cy;
+    prec->c_prefence = p_prefence_cy;
+    prec->c_postfence = p_postfence_cy;
+    prec->c_pushed = p_pushed_cy;
+  }
+#endif
   return future;
 }
 #endif  // CTP_IS_GPU_COMPILER || CTP_IS_SYCL_COMPILER
