@@ -511,6 +511,90 @@ struct PhaseTrace {
     }
 };
 
+// Direct measurement of the PRODUCER-BLOCKING device-to-host copy (GSBENCH_D2H_TRACE=1),
+// i.e. the stall GPUH5 eliminates: a host-mediated writer cannot start until the D2H that
+// produces its buffer has landed. Used by every host-mediated arm (raw / hdf5 / hdf5_async
+// / hostclio) at its single cudaMemcpy site.
+//
+// WHY EVENTS, AND NOT A HOST CLOCK AROUND THE cudaMemcpy. RunSim issues steps_per
+// GsStepKernels with NO synchronize before calling snap(), so the host runs ahead and the
+// GPU still holds most of the snapshot's compute when snap() is entered. A cudaMemcpy on
+// the default stream blocks the host until that whole backlog drains AND THEN copies, so a
+// host clock around it measures `compute_tail + mask + copy` — it grows with steps_per and
+// is NOT a measurement of the copy. (This is exactly the bug the old hdf5_async t_d2h had;
+// both numbers are reported below so the conflation is visible rather than assumed.)
+//
+// cudaEventRecord on the default stream is ordered IN STREAM, so the opening event fires
+// only once the mask kernel has retired, and the closing one once the copy has. Their delta
+// is the copy alone, on the GPU's own timeline, with zero perturbation: we only record in
+// the hot loop (~1us, no stall) and read every cudaEventElapsedTime after RunSim's closing
+// Synchronize. A cudaDeviceSynchronize-then-host-clock would give the same answer but would
+// drain the pipeline mid-loop; events do not.
+//
+// Reported per copy:
+//   copy_ms  — GPU-timeline duration of the D2H alone. THE NUMBER. Bandwidth is bytes/copy_ms.
+//   block_ms — host wall-clock across the cudaMemcpy call: what the producer thread actually
+//              loses, = compute_tail + copy. Reported only to expose the difference.
+struct D2HTrace {
+    bool on_;
+    uint64_t bytes_;                       // bytes moved per copy (constant across snapshots)
+    std::vector<cudaEvent_t> a_, b_;       // copy-start / copy-end, one pair per snapshot
+    std::vector<double> block_ms_;         // host-observed block, one per snapshot
+    unsigned i_ = 0;                       // next slot
+
+    D2HTrace(bool on, unsigned snaps, uint64_t bytes) : on_(on), bytes_(bytes) {
+        if (!on_) return;
+        a_.resize(snaps); b_.resize(snaps); block_ms_.assign(snaps, 0.0);
+        for (unsigned i = 0; i < snaps; ++i) {
+            cudaEventCreate(&a_[i]); cudaEventCreate(&b_[i]);
+        }
+    }
+    ~D2HTrace() {
+        if (!on_) return;
+        for (auto e : a_) cudaEventDestroy(e);
+        for (auto e : b_) cudaEventDestroy(e);
+    }
+
+    // Drop-in for `cudaMemcpy(dst, src, bytes_, cudaMemcpyDeviceToHost)`. Untraced when off.
+    void Copy(void* dst, const void* src) {
+        if (!on_ || i_ >= a_.size()) {
+            cudaMemcpy(dst, src, bytes_, cudaMemcpyDeviceToHost);
+            return;
+        }
+        const unsigned i = i_++;
+        auto h0 = std::chrono::steady_clock::now();
+        cudaEventRecord(a_[i]);
+        cudaMemcpy(dst, src, bytes_, cudaMemcpyDeviceToHost);
+        cudaEventRecord(b_[i]);
+        block_ms_[i] = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - h0).count();
+    }
+
+    // MUST be called after RunSim returns (i.e. after the closing Synchronize).
+    void Report(const char* arm) {
+        if (!on_ || i_ == 0) return;
+        double tot_copy = 0, tot_block = 0;
+        std::fprintf(stderr, "GSBENCH_D2H arm=%s per-snapshot:\n", arm);
+        for (unsigned i = 0; i < i_; ++i) {
+            float c = 0;
+            cudaEventElapsedTime(&c, a_[i], b_[i]);
+            tot_copy += c; tot_block += block_ms_[i];
+            std::fprintf(stderr,
+                "GSBENCH_D2H   snap=%2u copy_ms=%8.3f block_ms=%8.3f GBps=%6.2f\n",
+                i, c, block_ms_[i],
+                double(bytes_) / (double(c) / 1e3) / 1e9);
+        }
+        const double mean_copy = tot_copy / double(i_);
+        std::fprintf(stderr,
+            "GSBENCH_D2H arm=%s copies=%u bytes_per_copy=%llu total_MB=%.1f "
+            "copy_ms=%.3f block_ms=%.3f mean_copy_ms=%.3f GBps=%.2f\n",
+            arm, i_, (unsigned long long)bytes_,
+            double(bytes_) * double(i_) / (1024.0 * 1024.0),
+            tot_copy, tot_block, mean_copy,
+            double(bytes_) / (mean_copy / 1e3) / 1e9);
+    }
+};
+
 // The ONE timed sim loop shared by every arm. `snap(si, v_curr)` persists snapshot si;
 // `finalize()` runs inside the timed region (async drain). No per-step Synchronize so
 // the stream can overlap; one Synchronize closes the region. Returns wall-clock ms and
@@ -823,10 +907,11 @@ double RunHostClioArm(const Cfg& cfg, const char* prefix, uint64_t* checksum) {
     std::fprintf(stderr, "[hostclio] shm staging buffer registered=%d\n", int(registered));
 
     Masker masker(cfg.N, cfg.incompressible != 0);
+    D2HTrace d2h(EnvU0("GSBENCH_D2H_TRACE", 0) != 0, cfg.snaps, gbytes);
     Grids g = MakeGrids(cfg.N);
     auto snap = [&](unsigned si, float* v_curr) {
         // Same host D2H as raw: pull the (incompressible) current grid into the host buffer.
-        cudaMemcpy(buf.ptr_, masker.Apply(v_curr), gbytes, cudaMemcpyDeviceToHost);
+        d2h.Copy(buf.ptr_, masker.Apply(v_curr));
         // Then persist each chunk to CLIO from the host (synchronous wait == durable).
         for (unsigned c = 0; c < cfg.chunks; ++c) {
             ctp::ipc::ShmPtr<> shm = buf.shm_.template Cast<void>();
@@ -842,6 +927,7 @@ double RunHostClioArm(const Cfg& cfg, const char* prefix, uint64_t* checksum) {
     };
     double ms = RunSim(cfg, g, snap, finalize, nullptr);
     FreeGrids(g);
+    d2h.Report("hostclio");
     if (registered) cudaHostUnregister(buf.ptr_);
     *checksum = ChecksumSnapshots(tags, cfg);
     return ms;
@@ -1008,6 +1094,7 @@ double RunRawArm(const Cfg& cfg, uint64_t* checksum) {
     const uint64_t wbytes = (gbytes + kAlign - 1) & ~(kAlign - 1);  // O_DIRECT length
     const std::string path = cfg.disk_dir + "/checkpoint.bin";
     Masker masker(cfg.N, cfg.incompressible != 0);
+    D2HTrace d2h(EnvU0("GSBENCH_D2H_TRACE", 0) != 0, cfg.snaps, gbytes);
 
     if (cfg.raw_inline) {
         int flags = O_WRONLY | O_CREAT | O_TRUNC | (cfg.raw_odirect ? O_DIRECT : 0);
@@ -1023,7 +1110,7 @@ double RunRawArm(const Cfg& cfg, uint64_t* checksum) {
         Grids g = MakeGrids(cfg.N);
         double write_ms = 0;
         auto snap = [&](unsigned si, float* v_curr) {
-            cudaMemcpy(buf, masker.Apply(v_curr), gbytes, cudaMemcpyDeviceToHost);
+            d2h.Copy(buf, masker.Apply(v_curr));
             auto a = std::chrono::steady_clock::now();          // GPU idle during this write
             WriteAllAt(fd, off_t(si) * off_t(wbytes), buf, wbytes);
             if (cfg.raw_fsync) fdatasync(fd);
@@ -1033,6 +1120,7 @@ double RunRawArm(const Cfg& cfg, uint64_t* checksum) {
         auto finalize = [&]() {};
         double ms = RunSim(cfg, g, snap, finalize, nullptr);
         FreeGrids(g);
+        d2h.Report("raw_inline");
         close(fd);
         cudaFreeHost(buf);
         std::fprintf(stderr, "[raw] total=%.1f ms  write=%.1f ms  (inline, GPU idle)\n",
@@ -1052,13 +1140,14 @@ double RunRawArm(const Cfg& cfg, uint64_t* checksum) {
         uint8_t* buf = writer.Acquire(&idx);
         // SYNCHRONOUS D2H on the DEFAULT stream (ordered after the step / mask kernel), then
         // hand the buffer to the writer, which writes it while the NEXT sim steps run.
-        cudaMemcpy(buf, masker.Apply(v_curr), gbytes, cudaMemcpyDeviceToHost);
+        d2h.Copy(buf, masker.Apply(v_curr));
         writer.Submit(idx, si);
     };
     double writer_ms = 0;
     auto finalize = [&]() { writer.Finish(&writer_ms); };  // drain inside timed region
     double ms = RunSim(cfg, g, snap, finalize, nullptr);
     FreeGrids(g);
+    d2h.Report("raw_threaded");
     std::fprintf(stderr,
         "[raw] total=%.1f ms  writer-busy=%.1f ms (overlapped with compute)  nbuf=3\n",
         ms, writer_ms);
@@ -1496,6 +1585,7 @@ double RunHdf5Arm(const Cfg& cfg_in, uint64_t* checksum) {
     const uint64_t gbytes = cfg.grid_bytes();
     const std::string path = cfg.hdf5_dir + "/checkpoint.h5";
     Masker masker(cfg.N, cfg.incompressible != 0);
+    D2HTrace d2h(EnvU0("GSBENCH_D2H_TRACE", 0) != 0, cfg.snaps, gbytes);
 
     const char* mode = cfg.hdf5_stock ? "STOCK (untuned)" : "tuned";
     std::fprintf(stderr,
@@ -1517,7 +1607,7 @@ double RunHdf5Arm(const Cfg& cfg_in, uint64_t* checksum) {
         Grids g = MakeGrids(cfg.N);
         double write_ms = 0;
         auto snap = [&](unsigned si, float* v_curr) {
-            cudaMemcpy(buf, masker.Apply(v_curr), gbytes, cudaMemcpyDeviceToHost);
+            d2h.Copy(buf, masker.Apply(v_curr));
             auto a = std::chrono::steady_clock::now();      // GPU idle during this write
             sink.WriteSnap(si, buf);
             write_ms += std::chrono::duration<double, std::milli>(
@@ -1526,6 +1616,7 @@ double RunHdf5Arm(const Cfg& cfg_in, uint64_t* checksum) {
         auto finalize = [&]() { sink.Close(); };
         double ms = RunSim(cfg, g, snap, finalize, nullptr);
         FreeGrids(g);
+        d2h.Report("hdf5_inline");
         Hdf5FreeBuf(cfg, buf);
         std::fprintf(stderr, "[hdf5] total=%.1f ms  write=%.1f ms  (inline, GPU idle)\n",
                      ms, write_ms);
@@ -1538,13 +1629,14 @@ double RunHdf5Arm(const Cfg& cfg_in, uint64_t* checksum) {
     auto snap = [&](unsigned si, float* v_curr) {
         int idx;
         uint8_t* buf = writer.Acquire(&idx);
-        cudaMemcpy(buf, masker.Apply(v_curr), gbytes, cudaMemcpyDeviceToHost);
+        d2h.Copy(buf, masker.Apply(v_curr));
         writer.Submit(idx, si);
     };
     double writer_ms = 0;
     auto finalize = [&]() { writer.Finish(&writer_ms); };   // drain inside timed region
     double ms = RunSim(cfg, g, snap, finalize, nullptr);
     FreeGrids(g);
+    d2h.Report("hdf5_threaded");
     std::fprintf(stderr,
         "[hdf5] total=%.1f ms  writer-busy=%.1f ms (overlapped with compute)  nbuf=%u\n",
         ms, writer_ms, cfg.hdf5_nbuf);
@@ -1644,11 +1736,17 @@ double RunHdf5AsyncArm(const Cfg& cfg_in, uint64_t* checksum) {
             throw std::runtime_error("hdf5_async: an async HDF5 operation failed");
     };
 
+    // t_d2h below is the ORIGINAL, CONFLATED figure: a host clock around a cudaMemcpy that
+    // is queued behind steps_per un-drained GsStepKernels, so it charges the snapshot's
+    // compute tail to the copy (see D2HTrace). It is kept, and still printed, so the clean
+    // event-measured copy can be compared against it directly rather than silently replacing
+    // it. GSBENCH_D2H_TRACE=1 prints the clean one; they should differ by ~compute/snapshot.
+    D2HTrace d2h(EnvU0("GSBENCH_D2H_TRACE", 0) != 0, cfg.snaps, gbytes);
     Grids g = MakeGrids(cfg.N);
     auto snap = [&](unsigned si, float* v_curr) {
         // Same D2H as raw/hdf5/hostclio, into THIS snapshot's own buffer.
         auto a = Clk::now();
-        cudaMemcpy(bufs[si], masker.Apply(v_curr), gbytes, cudaMemcpyDeviceToHost);
+        d2h.Copy(bufs[si], masker.Apply(v_curr));
         auto b = Clk::now();
         sink.WriteSnapAsync(si, bufs[si], es);   // returns immediately; VOL drains it
         auto c = Clk::now();
@@ -1669,10 +1767,11 @@ double RunHdf5AsyncArm(const Cfg& cfg_in, uint64_t* checksum) {
     };
     double ms = RunSim(cfg, g, snap, finalize, nullptr);
     FreeGrids(g);
+    d2h.Report("hdf5_async");
     if (trace_async)
         std::fprintf(stderr,
-                     "[hdf5_async] BREAKDOWN d2h=%.1f fire=%.1f wait=%.1f sync=%.1f "
-                     "other(compute)=%.1f ms\n",
+                     "[hdf5_async] BREAKDOWN d2h=%.1f(CONFLATED: includes compute tail) "
+                     "fire=%.1f wait=%.1f sync=%.1f other(compute)=%.1f ms\n",
                      t_d2h, t_fire, t_wait, t_sync,
                      ms - t_d2h - t_fire - t_wait - t_sync);
 
