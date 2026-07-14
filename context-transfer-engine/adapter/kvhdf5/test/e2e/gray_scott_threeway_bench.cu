@@ -140,11 +140,12 @@ __global__ void TwCopyKernel(kvhdf5::GpuDatasetHandle h, const byte_t* src) {
 // serial loop byte-for-byte; gridDim.x == Count() gives one CUDA block per chunk. This is
 // the "number of GPU blocks" axis. __syncthreads is per-block, so unequal per-block trip
 // counts (Count() not divisible by gridDim.x) are safe.
-__global__ void TwSnapSyncKernel(kvhdf5::GpuDatasetHandle h) {
+template <bool kProbing>
+__global__ __launch_bounds__(256) void TwSnapSyncKernel(kvhdf5::GpuDatasetHandle h) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
     for (uint32_t c = blockIdx.x; c < h.Count(); c += gridDim.x) {
-        h.Write(c);
+        h.Write<kProbing>(c);
         __syncthreads();
     }
 }
@@ -152,17 +153,27 @@ __global__ void TwSnapSyncKernel(kvhdf5::GpuDatasetHandle h) {
 // ASYNC FIRE only: fire every chunk's PutBlob, no wait. Data already staged by
 // TwCopyKernel. Drained later so the puts run on the server WHILE the subsequent sim
 // steps run on the GPU. Grid-stride over chunks (see TwSnapSyncKernel).
-__global__ void TwSnapFireKernel(kvhdf5::GpuDatasetHandle h) {
+template <bool kProbing>
+__global__ __launch_bounds__(256) void TwSnapFireKernel(kvhdf5::GpuDatasetHandle h) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
     for (uint32_t c = blockIdx.x; c < h.Count(); c += gridDim.x) {
-        h.WriteAsync(c);
+        h.WriteAsync<kProbing>(c);
         __syncthreads();
     }
 }
 
+// Explicitly instantiate both submit-kernel variants. Without this nvcc does not
+// emit/register the device code for a __global__ template instantiation that is
+// only implicitly ODR-used (via <<<>>> launch / address-of), so a launch of the
+// missing variant fails at runtime with cudaErrorInvalidDeviceFunction (98).
+template __global__ void TwSnapSyncKernel<false>(kvhdf5::GpuDatasetHandle);
+template __global__ void TwSnapSyncKernel<true>(kvhdf5::GpuDatasetHandle);
+template __global__ void TwSnapFireKernel<false>(kvhdf5::GpuDatasetHandle);
+template __global__ void TwSnapFireKernel<true>(kvhdf5::GpuDatasetHandle);
+
 // Drain a fired snapshot's outstanding puts. Grid-stride over chunks (see TwSnapSyncKernel).
-__global__ void TwDrainKernel(kvhdf5::GpuDatasetHandle h) {
+__global__ __launch_bounds__(32) void TwDrainKernel(kvhdf5::GpuDatasetHandle h) {
     CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
     (void)g_ipc_manager;
     for (uint32_t c = blockIdx.x; c < h.Count(); c += gridDim.x) {
@@ -1039,8 +1050,15 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
     {
         cudaFuncAttributes fa;
         cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwCopyKernel));
-        cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapFireKernel));
-        cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapSyncKernel));
+        // Warm whichever submit-kernel instantiation this run actually launches
+        // (see the probe.on_ branch at the launch site below).
+        if (probe.on_) {
+            cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapFireKernel<true>));
+            cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapSyncKernel<true>));
+        } else {
+            cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapFireKernel<false>));
+            cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapSyncKernel<false>));
+        }
         cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwDrainKernel));
     }
     auto snap = [&](unsigned si, float* v_curr) {
@@ -1048,9 +1066,13 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
         const byte_t* bsrc = reinterpret_cast<const byte_t*>(src);
         TwCopyKernel<<<dim3(copy_bpc, cfg.chunks), 256>>>(ds[si].Handle(), bsrc);  // multi-block stage
         if (async) {
-            TwSnapFireKernel<<<submit_grid, 256>>>(ds[si].Handle());
+            // Instantiate the non-probing kernel unless the submit probe is armed
+            // this run — the <false> path drops SendIn's probe registers.
+            if (probe.on_) TwSnapFireKernel<true><<<submit_grid, 256>>>(ds[si].Handle());
+            else TwSnapFireKernel<false><<<submit_grid, 256>>>(ds[si].Handle());
         } else {
-            TwSnapSyncKernel<<<submit_grid, 256>>>(ds[si].Handle());
+            if (probe.on_) TwSnapSyncKernel<true><<<submit_grid, 256>>>(ds[si].Handle());
+            else TwSnapSyncKernel<false><<<submit_grid, 256>>>(ds[si].Handle());
             // Bound the CUDA pending-launch queue. The sync arm's in-kernel SubmitWait
             // spins waiting for the IN-PROCESS server to flip the completion flag. If the
             // host races ahead and fills the ~1024-deep launch queue (once the run's total
@@ -2018,6 +2040,62 @@ double RunHdf5AsyncArm(const Cfg& cfg_in, uint64_t* checksum) {
 #endif  // GSBENCH_HAVE_HDF5
 
 }  // namespace
+
+// ---- kernel register-usage report (no simulation, no CLIO server) ----------
+// numRegs/sharedSizeBytes/localSizeBytes are fixed by the compiled binary, not by
+// which arm actually runs, so one process can report every kernel used across all
+// arms in a single shot. localSizeBytes > 0 means the compiler spilled registers to
+// local memory — a genuine register-pressure signal, not just informational.
+TEST_CASE("GSBENCH kernel register report",
+          "[.][gpu][gsbench][gsbench_kernel_regs]") {
+    struct KernelInfo {
+        const char* name;
+        const char* arm;
+        const void* fn;
+    };
+    const KernelInfo kernels[] = {
+        {"GsStepKernel", "all", reinterpret_cast<const void*>(GsStepKernel)},
+        {"MaskKernel", "all", reinterpret_cast<const void*>(MaskKernel)},
+        {"TwCopyKernel", "clio-sync,clio-async",
+         reinterpret_cast<const void*>(TwCopyKernel)},
+        {"TwSnapSyncKernel", "clio-sync",
+         reinterpret_cast<const void*>(TwSnapSyncKernel<false>)},
+        {"TwSnapFireKernel", "clio-async",
+         reinterpret_cast<const void*>(TwSnapFireKernel<false>)},
+        {"TwDrainKernel", "clio-async",
+         reinterpret_cast<const void*>(TwDrainKernel)},
+    };
+    int regs[6];
+    for (unsigned i = 0; i < 6; ++i) {
+        cudaFuncAttributes attr{};
+        REQUIRE(cudaFuncGetAttributes(&attr, kernels[i].fn) == cudaSuccess);
+        regs[i] = attr.numRegs;
+        std::fprintf(stderr,
+            "GSBENCH_KERNEL_REGS kernel=%s arm=%s regs=%d smem=%zu lmem=%zu "
+            "maxThreadsPerBlock=%d\n",
+            kernels[i].name, kernels[i].arm, attr.numRegs, attr.sharedSizeBytes,
+            attr.localSizeBytes, attr.maxThreadsPerBlock);
+    }
+    // indices into `kernels`/`regs`: 0=GsStepKernel 1=MaskKernel(excluded, shared test
+    // artifact) 2=TwCopyKernel 3=TwSnapSyncKernel 4=TwSnapFireKernel 5=TwDrainKernel
+    const int kGsStep = regs[0];
+    struct ArmTotal {
+        const char* arm;
+        int total;
+    };
+    const ArmTotal arm_totals[] = {
+        {"raw/hdf5/hdf5-async/hostclio", kGsStep},
+        {"clio-sync", kGsStep + regs[2] + regs[3]},
+        {"clio-async", kGsStep + regs[2] + regs[4] + regs[5]},
+    };
+    const int baseline = arm_totals[0].total;
+    for (const auto& a : arm_totals) {
+        const double pct_increase = 100.0 * double(a.total - baseline) / double(baseline);
+        std::fprintf(stderr,
+            "GSBENCH_KERNEL_REGS_ARM_TOTAL arm=\"%s\" total_regs=%d vs_baseline=%+.1f%%\n",
+            a.arm, a.total, pct_increase);
+    }
+}
 
 // ---- the three arm TEST_CASEs (run each in its OWN process) ----------------
 
