@@ -52,11 +52,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if !CTP_IS_DEVICE_PASS
@@ -178,6 +180,58 @@ __global__ void MaskKernel(uint32_t* dst, const uint32_t* src, const uint32_t* m
                            unsigned words) {
     unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < words) dst[i] = src[i] ^ mask[i];
+}
+
+// ---- Submit-path hop breakdown (GSBENCH_SUBMIT_PROBE=1) ---------------------
+//
+// Splits one GPU-initiated PutBlob into its hops (see clio_runtime/gpu/submit_probe.h).
+// The device half stamps %globaltimer into DEVICE global memory; the host half stamps
+// CLOCK_MONOTONIC. The two halves are joined offline on the task POD's address, which
+// requires putting them on a common clock — hence ProbeClockOffset below.
+//
+// Both dumps are raw per-submit CSVs. Nothing is averaged here on purpose: a busy-spin
+// poll latency reported without its distribution is not a measurement.
+//
+// NOTE: these two ping kernels must live at file (not anonymous-namespace) scope, like
+// every other __global__ above — nvcc's device-link step (-rdc=true, needed for this
+// target) cannot resolve a __global__ function's host-side launch stub when the kernel
+// is defined inside an unnamed namespace, and fails at the final host link instead.
+
+// Device sees the host's flag write, stamps immediately. Bounds the offset from below.
+__global__ void ProbePingA(volatile unsigned* flag, unsigned long long* out) {
+    while (*flag == 0u) {}
+    *out = clio::run::gpu::ProbeNowNs();
+}
+
+// Device stamps, then publishes to pinned memory the host is spinning on. Bounds the
+// offset from above. The stamp is taken BEFORE the store so the store's own PCIe latency
+// falls inside the bound rather than corrupting it.
+__global__ void ProbePingB(volatile unsigned long long* out) {
+    unsigned long long t = clio::run::gpu::ProbeNowNs();
+    *out = t;
+}
+
+// Characterizes the two device clocks against each other.
+//   out[0] = smallest nonzero step %globaltimer takes — its true resolution. On Ada this
+//            comes back ~1024 ns, which is why no fine hop may be timed with it.
+//   out[1] / out[2] = wall ns and SM cycles over the same spin -> the SM clock.
+// The cycles->ns ratio used in the analysis is derived PER RECORD from the long
+// enter->wait span instead (it sees the real boost state under load); this kernel is the
+// independent cross-check on that, and the fallback where no long span exists.
+__global__ void ProbeClockCalKernel(unsigned long long* out) {
+    const unsigned long long t0 = clio::run::gpu::ProbeNowNs();
+    const unsigned long long c0 = clio::run::gpu::ProbeCycles();
+    unsigned long long prev = t0, mn = ~0ull, t = t0;
+    while (t - t0 < 20000000ull) {          // 20 ms
+        t = clio::run::gpu::ProbeNowNs();
+        const unsigned long long d = t - prev;
+        if (d > 0 && d < mn) mn = d;
+        prev = t;
+    }
+    const unsigned long long c1 = clio::run::gpu::ProbeCycles();
+    out[0] = mn;
+    out[1] = t - t0;
+    out[2] = c1 - c0;
 }
 
 #if !CTP_IS_DEVICE_PASS
@@ -595,6 +649,173 @@ struct D2HTrace {
     }
 };
 
+// host_ns ~= device_globaltimer_ns + offset. Neither one-way latency is observable on its
+// own, so we bracket: ping A gives a lower bound on the offset, ping B an upper bound, and
+// the true offset lies between. The bracket's half-width IS the measurement's uncertainty
+// and is reported alongside every cross-domain hop — a poll latency quoted to a tighter
+// precision than this would be a lie.
+// NOTE: %globaltimer's ~1024 ns quantization can make this bracket come back INVERTED
+// (hi < lo, i.e. a negative half-width). That is not a bug in the bounds — it is the two
+// bounds landing inside a single timer tick. The honest uncertainty on a cross-domain hop
+// is therefore max(err_ns, globaltimer_tick_ns), and the analysis applies that floor.
+//
+// The offset also DRIFTS: %globaltimer and CLOCK_MONOTONIC are independent oscillators and
+// run ~20 ppm apart on this box, which is tens of microseconds over a single run — larger
+// than the poll latency being measured. A one-shot offset therefore silently corrupts both
+// cross-domain hops (it showed up as a physically impossible NEGATIVE completion-visibility
+// time that grew with run length). So the offset is measured TWICE, at the run's start and
+// end, each stamped with the host clock, and the analysis interpolates between them.
+struct ProbeClockOffset {
+    long long est_ns = 0;   // midpoint of the bracket
+    long long err_ns = 0;   // half-width: the honest error bar on hops 3 and 8
+    long long lo_ns = 0;    // raw bounds, kept so the analysis can see the inversion
+    long long hi_ns = 0;
+    long long at_host_ns = 0;  // host clock when this anchor was taken (for the lerp)
+
+    static ProbeClockOffset Measure(unsigned reps = 200) {
+        ProbeClockOffset o;
+        unsigned* flag = nullptr;
+        unsigned long long* stamp = nullptr;
+        cudaHostAlloc(&flag, sizeof(unsigned), cudaHostAllocMapped);
+        cudaHostAlloc(&stamp, sizeof(unsigned long long), cudaHostAllocMapped);
+
+        long long lo = LLONG_MIN;   // max over A: offset >= h - d
+        long long hi = LLONG_MAX;   // min over B: offset <= h - d
+        for (unsigned i = 0; i < reps; ++i) {
+            // --- A: host -> device
+            *flag = 0; *stamp = 0;
+            ProbePingA<<<1, 1>>>(flag, stamp);
+            // Let the kernel reach its spin before releasing it, so the kernel-launch
+            // latency is not charged to the one-way trip we are bounding.
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            long long h = (long long)clio::run::gpu::SubmitProbe::NowNs();
+            *flag = 1;
+            cudaDeviceSynchronize();
+            long long d = (long long)*stamp;
+            if (d > 0) lo = std::max(lo, h - d);
+
+            // --- B: device -> host
+            *stamp = 0;
+            ProbePingB<<<1, 1>>>(stamp);
+            unsigned long long seen = 0;
+            while ((seen = *(volatile unsigned long long*)stamp) == 0ull) {}
+            long long h2 = (long long)clio::run::gpu::SubmitProbe::NowNs();
+            cudaDeviceSynchronize();
+            hi = std::min(hi, h2 - (long long)seen);
+        }
+        cudaFreeHost(flag);
+        cudaFreeHost(stamp);
+        o.lo_ns = lo;
+        o.hi_ns = hi;
+        o.est_ns = (lo + hi) / 2;
+        o.err_ns = (hi - lo) / 2;
+        o.at_host_ns = (long long)clio::run::gpu::SubmitProbe::NowNs();
+        return o;
+    }
+};
+
+struct SubmitProbeHarness {
+    bool on_ = false;
+    unsigned cap_ = 0;
+    clio::run::gpu::SubmitProbeRec* d_recs_ = nullptr;
+    unsigned* d_counter_ = nullptr;
+    ProbeClockOffset off_;             // anchor 1: taken at arm time
+    ProbeClockOffset off_end_;         // anchor 2: taken at dump time (drift correction)
+    unsigned long long tick_ns_ = 0;   // %globaltimer resolution (the fine-hop floor)
+    double sm_ghz_ = 0.0;              // SM clock, for the cycles->ns cross-check
+
+    // Arms both halves and hands the device half to the kernel via gpu_info. MUST run
+    // before the datasets are built — they snapshot gpu_info by value into every handle.
+    SubmitProbeHarness(bool on, unsigned cap, clio::run::IpcManagerGpuInfo* gpu_info)
+        : on_(on), cap_(cap) {
+        if (!on_) return;
+        cudaMalloc(&d_recs_, size_t(cap_) * sizeof(clio::run::gpu::SubmitProbeRec));
+        cudaMemset(d_recs_, 0, size_t(cap_) * sizeof(clio::run::gpu::SubmitProbeRec));
+        cudaMalloc(&d_counter_, sizeof(unsigned));
+        cudaMemset(d_counter_, 0, sizeof(unsigned));
+        gpu_info->probe_.recs = d_recs_;
+        gpu_info->probe_.counter = d_counter_;
+        gpu_info->probe_.cap = cap_;
+        clio::run::gpu::SubmitProbe::Get().Enable(cap_);
+        off_ = ProbeClockOffset::Measure();
+
+        unsigned long long* cal = nullptr;
+        cudaMalloc(&cal, 3 * sizeof(unsigned long long));
+        ProbeClockCalKernel<<<1, 1>>>(cal);
+        cudaDeviceSynchronize();
+        unsigned long long h[3] = {0, 0, 0};
+        cudaMemcpy(h, cal, sizeof(h), cudaMemcpyDeviceToHost);
+        cudaFree(cal);
+        tick_ns_ = h[0];
+        sm_ghz_ = h[1] ? double(h[2]) / double(h[1]) : 0.0;
+        std::fprintf(stderr,
+            "GSBENCH_PROBE clock_offset_ns=%lld err_ns=%lld (host = device + offset) "
+            "globaltimer_tick_ns=%llu sm_ghz=%.3f\n",
+            off_.est_ns, off_.err_ns, tick_ns_, sm_ghz_);
+    }
+
+    void Dump(const char* arm, const char* dir) {
+        if (!on_) return;
+        // Second clock anchor, taken as soon after the timed region as possible: the
+        // device<->host offset drifts, and every cross-domain hop is interpolated between
+        // this anchor and the one taken at arm time.
+        off_end_ = ProbeClockOffset::Measure();
+        unsigned n = 0;
+        cudaMemcpy(&n, d_counter_, sizeof(unsigned), cudaMemcpyDeviceToHost);
+        if (n > cap_) {
+            std::fprintf(stderr,
+                "GSBENCH_PROBE WARNING arm=%s: %u submits but capacity %u — "
+                "%u records DROPPED; raise the cap before trusting this run\n",
+                arm, n, cap_, n - cap_);
+            n = cap_;
+        }
+        std::vector<clio::run::gpu::SubmitProbeRec> recs(n);
+        cudaMemcpy(recs.data(), d_recs_,
+                   size_t(n) * sizeof(clio::run::gpu::SubmitProbeRec),
+                   cudaMemcpyDeviceToHost);
+
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/probe_dev_%s.csv", dir, arm);
+        if (FILE* f = std::fopen(path, "w")) {
+            std::fprintf(f, "task_ptr,seq,d_enter,d_pushed,d_wait_begin,d_wait_end,"
+                            "c_enter,c_fields,c_prefence,c_postfence,c_pushed,"
+                            "c_wait_begin,c_wait_end\n");
+            for (unsigned i = 0; i < n; ++i) {
+                const auto& r = recs[i];
+                std::fprintf(f,
+                             "%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                             r.task_ptr, i, r.d_enter, r.d_pushed, r.d_wait_begin,
+                             r.d_wait_end, r.c_enter, r.c_fields, r.c_prefence,
+                             r.c_postfence, r.c_pushed, r.c_wait_begin, r.c_wait_end);
+            }
+            std::fclose(f);
+        }
+        std::snprintf(path, sizeof(path), "%s/probe_host_%s.csv", dir, arm);
+        clio::run::gpu::SubmitProbe::Get().Dump(path);
+
+        std::snprintf(path, sizeof(path), "%s/probe_meta_%s.csv", dir, arm);
+        if (FILE* f = std::fopen(path, "w")) {
+            std::fprintf(f, "arm,dev_records,host_records,clock_offset_ns,clock_err_ns,"
+                            "clock_at_ns,clock_offset_end_ns,clock_err_end_ns,"
+                            "clock_at_end_ns,globaltimer_tick_ns,sm_ghz\n");
+            std::fprintf(f, "%s,%u,%u,%lld,%lld,%lld,%lld,%lld,%lld,%llu,%.4f\n", arm, n,
+                         clio::run::gpu::SubmitProbe::Get().Count(), off_.est_ns,
+                         off_.err_ns, off_.at_host_ns, off_end_.est_ns, off_end_.err_ns,
+                         off_end_.at_host_ns, tick_ns_, sm_ghz_);
+            std::fclose(f);
+        }
+        std::fprintf(stderr,
+            "GSBENCH_PROBE arm=%s dev_records=%u host_records=%u -> %s/probe_*_%s.csv\n",
+            arm, n, clio::run::gpu::SubmitProbe::Get().Count(), dir, arm);
+    }
+
+    ~SubmitProbeHarness() {
+        if (!on_) return;
+        cudaFree(d_recs_);
+        cudaFree(d_counter_);
+    }
+};
+
 // The ONE timed sim loop shared by every arm. `snap(si, v_curr)` persists snapshot si;
 // `finalize()` runs inside the timed region (async drain). No per-step Synchronize so
 // the stream can overlap; one Synchronize closes the region. Returns wall-clock ms and
@@ -777,6 +998,13 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
     clio::run::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(0);
     REQUIRE(gpu_info.gpu2cpu_queue != nullptr);
 
+    // Arm the submit probe BEFORE the datasets are built: MakeSnapDatasets copies
+    // gpu_info by value into every GpuDatasetHandle, so a probe attached afterwards
+    // would never reach the kernel. Capacity covers one submit per chunk per snapshot
+    // with slack; Dump() shouts if the cap was exceeded rather than silently truncating.
+    SubmitProbeHarness probe(EnvU0("GSBENCH_SUBMIT_PROBE", 0) != 0,
+                             cfg.snaps * cfg.chunks + 64, &gpu_info);
+
     std::vector<kvhdf5::GpuCteDataset> ds;
     std::vector<clio::cte::core::TagId> tags;
     MakeSnapDatasets(ipc, gpu_info, prefix, cfg, ds, tags);
@@ -860,6 +1088,9 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
 
     FreeGrids(g);
     trace.Report(async ? "async" : "sync");   // GSBENCH_TRACE=1: emit phase breakdown
+    // Dumped only after ThrowIfIoFailed above: a breakdown from a run with failed puts
+    // would be timing an I/O that never happened.
+    probe.Dump(async ? "async" : "sync", EnvS("GSBENCH_PROBE_DIR", ".").c_str());
     *checksum = ChecksumSnapshots(tags, cfg);
     return ms;
 }
