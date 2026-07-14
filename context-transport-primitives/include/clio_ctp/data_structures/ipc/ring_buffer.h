@@ -68,7 +68,25 @@ enum RingQueueFlag : uint32_t {
   /** Fixed-size buffer (no dynamic resizing) */
   RING_BUFFER_FIXED_SIZE = 0x20,
   /** Serialize Pop() with a ctp::Mutex (enables multi-consumer / MPMC) */
-  RING_BUFFER_LOCK_POP = 0x40
+  RING_BUFFER_LOCK_POP = 0x40,
+  /**
+   * The consumer of this ring is the HOST, and the ring lives in pinned host
+   * memory. Set this on any ring a GPU kernel produces into but a CPU thread
+   * drains (e.g. the gpu2cpu lane).
+   *
+   * It makes the WAIT_FOR_SPACE spin re-read head_ with a system-scope
+   * (volatile) load instead of a device-scope one. This is a correctness
+   * requirement, not a tuning knob: load_device() is implemented as
+   * atomicAdd(&head_, 0), i.e. a read-modify-WRITE. A device-scope RMW against
+   * pinned host memory is not coherent with the host, so a parked GPU producer
+   * spinning on it writes its stale cached head_ straight back over the value
+   * the CPU consumer just stored -- destroying the consumer's progress and
+   * wedging the ring forever. A volatile load only reads, so it cannot clobber.
+   *
+   * Leave this CLEAR when the consumer is a GPU (device memory), where the
+   * device-scope load is both correct and faster.
+   */
+  RING_BUFFER_HOST_CONSUMER = 0x80
 };
 
 /**
@@ -208,6 +226,8 @@ class ring_buffer : public ShmContainer<AllocT> {
       (FLAGS & RING_BUFFER_ERROR_ON_NO_SPACE) != 0;
   static constexpr bool DynamicSize = (FLAGS & RING_BUFFER_DYNAMIC_SIZE) != 0;
   static constexpr bool LockPop = (FLAGS & RING_BUFFER_LOCK_POP) != 0;
+  static constexpr bool HostConsumer =
+      (FLAGS & RING_BUFFER_HOST_CONSUMER) != 0;
   static constexpr bool IsAtomic = IsMPSC;
 
   using entry_vector = vector<entry_type, AllocT>;
@@ -511,8 +531,20 @@ class ring_buffer : public ShmContainer<AllocT> {
     if constexpr (WaitForSpace) {
       size_t size = tail - head + 1;
       while (size >= queue.size()) {
-        // Use load_device() for cross-SM L2 visibility (see PopDevice comment)
-        head = head_.load_device();
+        if constexpr (HostConsumer) {
+          // The CPU advances head_ (PopUnlocked's head_.store_system). Re-read
+          // it with a system-scope volatile load: it is a PURE READ. We must
+          // not use load_device() here -- that is atomicAdd(&head_, 0), a
+          // read-modify-WRITE, and a device-scope RMW on pinned host memory is
+          // not coherent with the host. A parked producer spinning on it writes
+          // its stale cached head_ back over the store the CPU consumer just
+          // made, so the consumer's progress is erased and the ring wedges.
+          head = head_.load_system();
+        } else {
+          // GPU consumer (device memory): device-scope load is correct for
+          // cross-SM L2 visibility and is ~10x cheaper than system scope.
+          head = head_.load_device();
+        }
         size = tail - head + 1;
       }
     } else if constexpr (ErrorOnNoSpace) {
