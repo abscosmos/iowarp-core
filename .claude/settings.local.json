@@ -83,7 +83,8 @@
       "Read(//home/joshua/.claude-grc/projects/**)",
       "Read(//home/joshua/**)",
       "WebFetch(domain:www.pdsw.org)",
-      "Bash(docker exec *)"
+      "Bash(docker exec *)",
+      "Bash(docker start *)"
     ],
     "deny": [],
     "ask": []
