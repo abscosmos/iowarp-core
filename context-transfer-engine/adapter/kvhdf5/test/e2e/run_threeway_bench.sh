@@ -160,9 +160,11 @@ for rep in $(seq 1 "${GSBENCH_REPEATS}"); do
     # The HDF5 async-VOL arm is OPT-IN: it needs a thread-safe libhdf5 + Argobots + the
     # vol-async connector on LD_LIBRARY_PATH/HDF5_PLUGIN_PATH, and it ABORTS rather than
     # silently run synchronously if the connector isn't really loaded. Enable with
-    # GSBENCH_HDF5_ASYNC=1 after setting (see the async-VOL build under /opt):
-    #   export LD_LIBRARY_PATH=/opt/vol-async/lib:/opt/hdf5ts/lib:/opt/argobots/lib:$LD_LIBRARY_PATH
-    #   export HDF5_PLUGIN_PATH=/opt/vol-async/lib
+    # GSBENCH_HDF5_ASYNC=1 after setting (see the async-VOL build under /opt). Use the
+    # nomemcpy build: the stock /opt/vol-async is built ENABLE_WRITE_MEMCPY=ON, whose
+    # internal copy path livelocks in Argobots at scale (>=12 in-flight datasets).
+    #   export LD_LIBRARY_PATH=/opt/vol-async-nomemcpy/lib:/opt/hdf5ts/lib:/opt/argobots/lib:$LD_LIBRARY_PATH
+    #   export HDF5_PLUGIN_PATH=/opt/vol-async-nomemcpy/lib
     #   export HDF5_VOL_CONNECTOR="async under_vol=0;under_info={}"
     if [[ "${GSBENCH_HDF5_ASYNC:-0}" == "1" ]]; then
         run_arm "[gsbench_hdf5_async]" "hdf5_async"
