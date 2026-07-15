@@ -699,3 +699,59 @@ if(CAE_LABELING_ENABLED)
 
   install(TARGETS test_cae_label_client DESTINATION bin)
 endif()
+
+#------------------------------------------------------------------------------
+# ChunkedDatasetWriter (.h5 export) tests
+#------------------------------------------------------------------------------
+# The HDF5-writing half of ExportData: reconstructing a kvhdf5 dataset (a __meta
+# description + its chunk blobs) as a real N-D chunked HDF5 dataset.
+#
+# Deliberately NOT built with add_cae_unit_test(): that helper links the CLIO
+# client libraries and runs the test against a live runtime (CLIO_WITH_RUNTIME=1).
+# ChunkedDatasetWriter touches no CLIO types at all -- it takes a chunk name and
+# its bytes -- so this test needs only libhdf5 and stays fast and hermetic. That
+# separation is the whole point of hdf5_export.h: inside the ExportData coroutine
+# these mechanics could not be tested without a runtime, a server, and a GPU.
+#------------------------------------------------------------------------------
+if(HDF5_ENABLED)
+  add_executable(cae_hdf5_export_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/hdf5_export/test_hdf5_export.cc
+  )
+
+  target_include_directories(cae_hdf5_export_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../core/include                       # clio_cae/core/hdf5_export.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../context-transfer-engine/adapter/kvhdf5/include  # kvhdf5/meta_blob.h
+    ${HDF5_INCLUDE_DIRS}
+  )
+
+  target_link_libraries(cae_hdf5_export_test PRIVATE ${HDF5_LIBRARIES})
+
+  set_target_properties(cae_hdf5_export_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+  )
+
+  add_test(NAME cae_hdf5_export COMMAND cae_hdf5_export_test)
+  set_tests_properties(cae_hdf5_export PROPERTIES TIMEOUT 60)
+
+  install(TARGETS cae_hdf5_export_test DESTINATION bin)
+endif()
+
+#------------------------------------------------------------------------------
+# ExportData integration test (.h5 export against a live runtime, no GPU)
+#------------------------------------------------------------------------------
+# Exercises the Runtime::ExportData task coroutine end to end: seed a tag with a
+# __meta blob + chunk blobs via host CTE PutBlob, export it to .h5, and read the
+# file back. Uses add_cae_unit_test so it runs against a spawned runtime
+# (CLIO_WITH_RUNTIME=1). Needs a GPU nowhere -- the store format is identical no
+# matter who wrote the blobs.
+#------------------------------------------------------------------------------
+if(HDF5_ENABLED)
+  add_cae_unit_test(cae_export_data
+    ${CMAKE_CURRENT_SOURCE_DIR}/export_data/test_export_data.cc
+    EXTRA_LIBS ${HDF5_LIBRARIES}
+    EXTRA_INCLUDES
+      ${HDF5_INCLUDE_DIRS}
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../../context-transfer-engine/adapter/kvhdf5/include
+  )
+endif()
