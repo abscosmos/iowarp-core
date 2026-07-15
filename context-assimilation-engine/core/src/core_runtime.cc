@@ -41,6 +41,9 @@
 // ChunkedDatasetWriter + DTypeToH5: the HDF5-writing half of ExportData, kept out
 // of this file so it is testable without a runtime, a server, or a GPU.
 #include <clio_cae/core/hdf5_export.h>
+// ChunkedDatasetReader + H5ToDType: the HDF5-reading half of ImportData, kept out
+// for the same reason.
+#include <clio_cae/core/hdf5_import.h>
 #endif
 
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
@@ -776,6 +779,140 @@ clio::run::TaskResume Runtime::ExportData(clio::run::shared_ptr<ExportDataTask> 
          task->bytes_exported_, output_path);
   }
 
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ImportData(clio::run::shared_ptr<ImportDataTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->result_code_ = 0;
+  task->bytes_imported_ = 0;
+
+  const std::string tag_name = task->tag_name_.str();
+  const std::string input_path = task->input_path_.str();
+  const std::string format = task->format_.str();
+
+  HLOG(kInfo, "ImportData: tag='{}', input='{}', format='{}'", tag_name,
+       input_path, format);
+
+  if (format != "hdf5") {
+    HLOG(kError, "ImportData: unsupported format '{}' (only 'hdf5')", format);
+    task->result_code_ = -1;
+    task->error_message_ =
+        clio::run::priv::string("Unsupported import format", CTP_MALLOC);
+    CLIO_CO_RETURN;
+  }
+
+#ifdef CLIO_CAE_ENABLE_HDF5
+  // Open the dataset and derive its kvhdf5 layout. All the HDF5 mechanics live
+  // in ChunkedDatasetReader (hdf5_import.h) so they are unit-testable without a
+  // runtime or a GPU; this coroutine only moves bytes into the store. The
+  // in-file dataset path IS the tag name -- the exact inverse of ExportData.
+  ChunkedDatasetReader reader;
+  if (!reader.Open(input_path, tag_name)) {
+    HLOG(kError,
+         "ImportData: cannot import dataset '{}' from '{}' (missing/unreadable, "
+         "or an unsupported element type or shape)",
+         tag_name, input_path);
+    task->result_code_ = -2;
+    task->error_message_ = clio::run::priv::string(
+        "Failed to open importable HDF5 dataset", CTP_MALLOC);
+    CLIO_CO_RETURN;
+  }
+  const kvhdf5::MetaBlob meta = reader.Meta();
+
+  // Resolve (or create) the destination tag.
+  auto tag_future = cte_client_->AsyncGetOrCreateTag(tag_name);
+  CLIO_CO_AWAIT(tag_future);
+  const auto &tag_id = tag_future->tag_id_;
+  if (tag_id.IsNull()) {
+    HLOG(kError, "ImportData: could not get/create tag '{}'", tag_name);
+    task->result_code_ = -3;
+    task->error_message_ =
+        clio::run::priv::string("Tag create failed", CTP_MALLOC);
+    CLIO_CO_RETURN;
+  }
+
+  auto *ipc_manager = CLIO_IPC;
+
+  // Publish __meta first, so the tag is self-describing even if the chunk loop is
+  // interrupted -- a consumer that sees any chunk can always recover the layout.
+  {
+    ctp::ipc::FullPtr<char> meta_buf =
+        ipc_manager->AllocateBuffer(sizeof(kvhdf5::MetaBlob));
+    if (meta_buf.IsNull()) {
+      HLOG(kError, "ImportData: __meta allocation failed");
+      task->result_code_ = -4;
+      task->error_message_ = clio::run::priv::string(
+          "Meta buffer allocation failed", CTP_MALLOC);
+      CLIO_CO_RETURN;
+    }
+    kvhdf5::EncodeMeta(meta, meta_buf.ptr_);
+    auto put_meta = cte_client_->AsyncPutBlob(
+        tag_id, kvhdf5::kMetaBlobName, 0, sizeof(kvhdf5::MetaBlob),
+        meta_buf.shm_.template Cast<void>(), 1.0f, clio::cte::core::Context(), 0);
+    CLIO_CO_AWAIT(put_meta);
+    const int rc = put_meta->return_code_;
+    ipc_manager->FreeBuffer(meta_buf);
+    if (rc != 0) {
+      HLOG(kError, "ImportData: failed to write __meta for tag '{}' (rc {})",
+           tag_name, rc);
+      task->result_code_ = -5;
+      task->error_message_ =
+          clio::run::priv::string("Meta PutBlob failed", CTP_MALLOC);
+      CLIO_CO_RETURN;
+    }
+  }
+
+  // Stream the chunks through ONE reused buffer -- each PutBlob is awaited before
+  // the next read overwrites it, so peak memory is a single chunk (unless the
+  // dataset had to collapse to one chunk; see the reader's chunking policy).
+  const clio::run::u64 chunk_bytes = meta.ChunkBytes();
+  const clio::run::u64 chunk_count = meta.ChunkCount();
+  ctp::ipc::FullPtr<char> buf = ipc_manager->AllocateBuffer(chunk_bytes);
+  if (buf.IsNull()) {
+    HLOG(kError, "ImportData: chunk allocation failed ({} bytes)", chunk_bytes);
+    task->result_code_ = -6;
+    task->error_message_ =
+        clio::run::priv::string("Chunk buffer allocation failed", CTP_MALLOC);
+    CLIO_CO_RETURN;
+  }
+
+  for (clio::run::u64 k = 0; k < chunk_count; ++k) {
+    std::string chunk_name;
+    if (!reader.ReadChunk(k, buf.ptr_, static_cast<size_t>(chunk_bytes),
+                          &chunk_name)) {
+      HLOG(kError, "ImportData: failed to read chunk {} of '{}'", k, tag_name);
+      ipc_manager->FreeBuffer(buf);
+      task->result_code_ = -7;
+      task->error_message_ =
+          clio::run::priv::string("Chunk read failed", CTP_MALLOC);
+      CLIO_CO_RETURN;
+    }
+    auto put = cte_client_->AsyncPutBlob(
+        tag_id, chunk_name, 0, chunk_bytes, buf.shm_.template Cast<void>(), 1.0f,
+        clio::cte::core::Context(), 0);
+    CLIO_CO_AWAIT(put);
+    if (put->return_code_ != 0) {
+      HLOG(kError, "ImportData: PutBlob failed for chunk '{}' (rc {})",
+           chunk_name, put->return_code_);
+      ipc_manager->FreeBuffer(buf);
+      task->result_code_ = -8;
+      task->error_message_ =
+          clio::run::priv::string("Chunk PutBlob failed", CTP_MALLOC);
+      CLIO_CO_RETURN;
+    }
+    task->bytes_imported_ += chunk_bytes;
+  }
+
+  ipc_manager->FreeBuffer(buf);
+  HLOG(kInfo, "ImportData: imported '{}' from '{}' ({} chunks, {} bytes)",
+       tag_name, input_path, chunk_count, task->bytes_imported_);
+#else
+  task->result_code_ = -9;
+  task->error_message_ =
+      clio::run::priv::string("HDF5 support not compiled in", CTP_MALLOC);
+#endif
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

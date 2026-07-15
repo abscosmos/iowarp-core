@@ -59,6 +59,12 @@ inline constexpr const char* kMetaBlobName = "__meta";
 // two agree, so they cannot drift.
 inline constexpr size_t kMetaMaxDims = 8;
 
+// Longest chunk-coordinate blob name. Mirrors chunking::kMaxBlobNameLen (31),
+// which lives in the CUDA header this leaf cannot include. ChunkCoordToName
+// below refuses to emit a name past this, exactly as chunking::ChunkCoordToName
+// does, so the two agree on which coordinates are nameable.
+inline constexpr size_t kMetaMaxBlobNameLen = 31;
+
 // Element type of a dataset.
 //
 // Deliberately HDF5-AGNOSTIC. kvhdf5 does not link libhdf5 and must not start:
@@ -170,6 +176,18 @@ struct MetaBlob {
         }
         return idx;
     }
+
+    // Inverse of ChunkLinearIndex: recover the chunk COORDINATE from its
+    // row-major linear index. Walks dims back-to-front because the last dim is
+    // the least significant digit of the mixed-radix index. Precondition: `idx`
+    // is in [0, ChunkCount()) and `out_coord` has `rank` slots.
+    void ChunkCoordFromLinearIndex(uint64_t idx, uint64_t* out_coord) const {
+        for (uint32_t i = rank; i-- > 0;) {
+            const uint64_t n = dims[i] / chunk_dims[i];
+            out_coord[i] = idx % n;
+            idx /= n;
+        }
+    }
 };
 
 static_assert(sizeof(MetaBlob) == 24 + 2 * 8 * kMetaMaxDims,
@@ -212,6 +230,28 @@ inline void EncodeMeta(const MetaBlob& m, void* out) {
         }
     }
     return digit_in_field;  // must not end on '_'
+}
+
+// Emit the chunk-coordinate blob name for `coord` (a `rank`-entry coordinate)
+// into `*out`. A CUDA-free twin of chunking::ChunkCoordToName producing the
+// IDENTICAL string -- decimal fields in row-major order joined by '_', no
+// leading zeros -- so a name minted here addresses the same blob the device
+// generator would. Returns false (leaving `*out` untouched) on a bad argument
+// or if the name would exceed kMetaMaxBlobNameLen, exactly as the device twin
+// refuses it. The inverse of ParseChunkName.
+[[nodiscard]] inline bool ChunkCoordToName(const uint64_t* coord, uint32_t rank,
+                                           std::string* out) {
+    if (coord == nullptr || out == nullptr || rank == 0 || rank > kMetaMaxDims) {
+        return false;
+    }
+    std::string name;
+    for (uint32_t i = 0; i < rank; ++i) {
+        if (i != 0) name.push_back('_');
+        name += std::to_string(coord[i]);
+    }
+    if (name.size() > kMetaMaxBlobNameLen) return false;
+    *out = std::move(name);
+    return true;
 }
 
 // Parse a chunk-coordinate blob name into `out_coord` (at least `rank` slots).

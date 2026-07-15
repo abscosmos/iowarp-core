@@ -209,3 +209,59 @@ TEST_CASE("ParseChunkName is the exact inverse of ChunkCoordToName", "[meta_blob
         CHECK(parsed[2] == coord[2]);
     }
 }
+
+TEST_CASE("meta_blob ChunkCoordToName matches the device generator", "[meta_blob]") {
+    // The CUDA-free twin used by the importer must emit the SAME string as
+    // chunking::ChunkCoordToName, or an imported chunk would land under a name
+    // the kvhdf5 reader never looks for.
+    const uint64_t dims[3]       = {8, 6, 4};
+    const uint64_t chunk_dims[3] = {2, 3, 2};
+    const cstd::span<const uint64_t> d{dims, 3};
+    const cstd::span<const uint64_t> cd{chunk_dims, 3};
+
+    const uint64_t n = chunking::ChunkCount(d, cd);
+    for (uint64_t i = 0; i < n; ++i) {
+        uint64_t coord[3] = {};
+        chunking::ChunkIndexToCoord(i, d, cd, {coord, 3});
+
+        char buf[chunking::kMaxBlobNameLen + 1];
+        auto name_span = chunking::ChunkCoordToName({coord, 3}, buf);
+        REQUIRE_FALSE(name_span.empty());
+        const std::string device_name(name_span.data(), name_span.size());
+
+        std::string host_name;
+        REQUIRE(ChunkCoordToName(coord, 3, &host_name));
+        CHECK(host_name == device_name);
+    }
+
+    // A name past the length cap is refused, exactly as the device twin refuses it.
+    const uint64_t huge[1] = {12345678901234567890ull};  // 20 digits
+    std::string overflow_name(chunking::kMaxBlobNameLen, 'x');  // pre-set sentinel
+    // rank 2 of the 20-digit value => "..._..." well over 31 chars.
+    const uint64_t pair[2] = {huge[0], huge[0]};
+    CHECK_FALSE(ChunkCoordToName(pair, 2, &overflow_name));
+    CHECK(overflow_name.size() == kMetaMaxBlobNameLen);  // untouched on failure
+}
+
+TEST_CASE("ChunkCoordFromLinearIndex inverts ChunkLinearIndex", "[meta_blob]") {
+    // Round-trip every chunk index of a 3-D layout through coord and back.
+    MetaBlob m;
+    m.rank = 3;
+    m.dtype = static_cast<uint32_t>(DType::kF64);
+    m.elem_size = 8;
+    m.dims[0] = 8;       m.dims[1] = 6;       m.dims[2] = 4;
+    m.chunk_dims[0] = 2; m.chunk_dims[1] = 3; m.chunk_dims[2] = 2;
+    REQUIRE(m.Valid());
+
+    const uint64_t n = m.ChunkCount();
+    REQUIRE(n == 4u * 2u * 2u);
+    for (uint64_t i = 0; i < n; ++i) {
+        uint64_t coord[kMetaMaxDims] = {};
+        m.ChunkCoordFromLinearIndex(i, coord);
+        CHECK(m.ChunkLinearIndex(coord) == i);
+        // Every coordinate stays within its per-dim chunk count.
+        for (uint32_t k = 0; k < m.rank; ++k) {
+            CHECK(coord[k] < m.dims[k] / m.chunk_dims[k]);
+        }
+    }
+}

@@ -755,3 +755,54 @@ if(HDF5_ENABLED)
       ${CMAKE_CURRENT_SOURCE_DIR}/../../../context-transfer-engine/adapter/kvhdf5/include
   )
 endif()
+
+#------------------------------------------------------------------------------
+# ChunkedDatasetReader (.h5 import) tests
+#------------------------------------------------------------------------------
+# The HDF5-reading half of ImportData: turning a real HDF5 dataset into the
+# kvhdf5 store form (a __meta description + one raw chunk per coordinate). Like
+# the export writer test, this touches NO CLIO types -- it builds .h5 files and
+# reads them back -- so it needs only libhdf5 and stays fast and hermetic,
+# instead of running against a live runtime with add_cae_unit_test().
+#------------------------------------------------------------------------------
+if(HDF5_ENABLED)
+  add_executable(cae_hdf5_import_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/hdf5_import/test_hdf5_import.cc
+  )
+
+  target_include_directories(cae_hdf5_import_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../core/include                       # clio_cae/core/hdf5_import.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../context-transfer-engine/adapter/kvhdf5/include  # kvhdf5/meta_blob.h
+    ${HDF5_INCLUDE_DIRS}
+  )
+
+  target_link_libraries(cae_hdf5_import_test PRIVATE ${HDF5_LIBRARIES})
+
+  set_target_properties(cae_hdf5_import_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+  )
+
+  add_test(NAME cae_hdf5_import COMMAND cae_hdf5_import_test)
+  set_tests_properties(cae_hdf5_import PROPERTIES TIMEOUT 60)
+
+  install(TARGETS cae_hdf5_import_test DESTINATION bin)
+endif()
+
+#------------------------------------------------------------------------------
+# ImportData integration test (.h5 import against a live runtime, no GPU)
+#------------------------------------------------------------------------------
+# Exercises the Runtime::ImportData task coroutine end to end: build a .h5,
+# import it, and read the tag's blobs back from CTE. Also runs the full
+# store -> file -> store round trip through ExportData + ImportData. Needs a GPU
+# nowhere -- the store format is identical no matter who wrote the blobs.
+#------------------------------------------------------------------------------
+if(HDF5_ENABLED)
+  add_cae_unit_test(cae_import_data
+    ${CMAKE_CURRENT_SOURCE_DIR}/import_data/test_import_data.cc
+    EXTRA_LIBS ${HDF5_LIBRARIES}
+    EXTRA_INCLUDES
+      ${HDF5_INCLUDE_DIRS}
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../../context-transfer-engine/adapter/kvhdf5/include
+  )
+endif()
