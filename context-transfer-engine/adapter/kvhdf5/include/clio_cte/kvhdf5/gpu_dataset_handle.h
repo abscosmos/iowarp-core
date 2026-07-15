@@ -56,10 +56,19 @@ struct ChunkDesc {
 struct GpuDatasetHandle {
     clio::run::IpcManagerGpuInfo info_;
     ChunkDesc* chunks_ = nullptr;   // device array, count_ entries
-    uint32_t count_ = 0;
+    uint32_t count_ = 0;            // N chunks
+    // The bounded-pool contract, carried by value so WritePipelined can enforce it
+    // without the caller re-deriving it. Two uint32s; the handle must stay small
+    // (it is a kernel parameter). pool_ == count_ and grid_ == pool_ for an
+    // unpooled dataset, which is exactly depth D == 1 over N buffers.
+    uint32_t pool_ = 0;             // M resident data buffers (host maps c -> c % M)
+    uint32_t grid_ = 0;             // G producer blocks; G divides M; D = M / G
 
 #if CTP_IS_GPU_COMPILER
     __device__ uint32_t Count() const { return count_; }
+    __device__ uint32_t PoolSize() const { return pool_; }
+    __device__ uint32_t GridSize() const { return grid_; }
+    __device__ uint32_t Depth() const { return pool_ / grid_; }
     __device__ byte_t* Data(uint32_t c) const { return chunks_[c].data; }
     __device__ uint64_t Size(uint32_t c) const { return chunks_[c].size; }
 
@@ -85,6 +94,134 @@ struct GpuDatasetHandle {
     __device__ void ReadAsync(uint32_t c) const { SubmitAsync(c, chunks_[c].get_fp); }
     __device__ void WriteWait(uint32_t c) const { SubmitWait(c, chunks_[c].put_fp); }
     __device__ void ReadWait(uint32_t c) const { SubmitWait(c, chunks_[c].get_fp); }
+
+    // ---- Bounded-pool double buffering: fill + fire, one fused kernel --------
+    //
+    // Streams ALL N chunks this block owns through the dataset's M resident data
+    // buffers, keeping at most D = M/G Puts in flight per block. This is the ONLY
+    // supported way to produce into a POOLED dataset (M < N), and it encodes the
+    // discipline so a caller cannot get it wrong.
+    //
+    // Why fill and fire MUST be fused. The old bench shape — one kernel fills all
+    // N buffers, a second kernel fires all N Puts — is CORRECT ONLY at M == N.
+    // With M < N the fill kernel writes chunk c and chunk c+M into the SAME
+    // buffer before either is submitted, so the first chunk's payload is gone
+    // before anyone reads it. There is no fix for that outside a fused loop.
+    //
+    // Exclusivity (free, no host-mapping change). The host maps chunk c's buffer
+    // to c % M. Block b walks c = b, b+G, b+2G, ...; for c = b + i*G,
+    // c % M == b + (i mod D)*G. So block b touches exactly {b, b+G, ...,
+    // b+(D-1)*G} — stride-G — and distinct b are distinct residues mod G, so no
+    // two blocks ever share a buffer.
+    //
+    // The invariant. Given exclusivity, chunk c's buffer is next claimed by chunk
+    // c + D*G == c + M. The reuse distance is exactly M, so the whole pipeline
+    // reduces to: DRAIN c-M BEFORE FILLING c. Endpoints collapse for free —
+    //   D == 1   (M == G): wait(c-G) == the previous chunk this block did =>
+    //                      fully synchronous, one buffer per block.
+    //   D == N/G (M == N): c-M < 0 always => the in-loop wait never fires and
+    //                      everything drains in the tail => today's fire-all.
+    // One code path, no special-casing.
+    //
+    // `fill(c, data, size)` is invoked BLOCK-WIDE (every thread) to fill chunk c's
+    // buffer. It must be uniform across the block (no divergent __syncthreads()).
+    //
+    // THE LOAD-BEARING LINE is the __syncthreads() immediately after the wait.
+    // WriteWait is THREAD-0-ONLY (iowarp's producer guard). Without that barrier a
+    // non-zero thread races straight into `fill` and clobbers the buffer while
+    // chunk c-M's Put is still draining on the CPU side => SILENT DATA CORRUPTION
+    // of an already-submitted chunk. Every other sync here is ordinary hygiene;
+    // that one is the entire safety property.
+    //
+    // Grid: launch with gridDim.x == GridSize(). We stride by the handle's own G
+    // (not gridDim.x) so an OVERSIZED launch is harmless — surplus blocks own no
+    // chunks and return. An UNDERSIZED launch leaves chunks unwritten, which any
+    // read-back catches loudly; it cannot corrupt.
+    // TailDrain: whether this kernel also drains the <= D Puts still in flight when
+    // its chunk walk ends. It is NOT what enforces the buffer-reuse invariant —
+    // the in-loop WriteWait(c-M) is — so deferring it does not weaken correctness,
+    // and it costs REAL overlap:
+    //
+    //   With TailDrain=true the kernel cannot RETIRE until this dataset's last D
+    //   Puts have landed. Anything queued behind it on the stream (the next
+    //   snapshot's compute) is therefore held behind THIS snapshot's I/O, and the
+    //   pipeline degenerates to compute + io per snapshot instead of
+    //   max(compute, io). At M == N the tail condition (c + M >= N) is true for
+    //   EVERY chunk, so it collapses all the way to "fire all, then drain all,
+    //   in-kernel" — i.e. it performs like the synchronous arm, which is exactly
+    //   what we measured (pooled ~= sync ~2.1 s, vs async ~1.7 s).
+    //
+    // TailDrain=false leaves those <= D Puts in flight past kernel exit; the CALLER
+    // MUST drain them (a WriteWait over every chunk — idempotent for the ones the
+    // loop already drained, since the wait just polls an already-set completion
+    // flag) BEFORE it reads the blobs back, destroys the dataset, or REFILLS ANY OF
+    // ITS BUFFERS. Safe when each producer launch owns its own dataset (the
+    // one-dataset-per-snapshot shape): nothing refills those buffers in between, so
+    // the drain can be deferred to a single kernel at the end — which is precisely
+    // how the fire-all path already overlaps I/O with later compute.
+    //
+    // Re-launching this kernel on the SAME dataset with TailDrain=false and no
+    // intervening drain is a buffer-reuse race: chunk c would be refilled while the
+    // previous launch's Put on c may still be draining. Default is true (safe).
+    //
+    // *** TailDrain=false REQUIRES a PRE-WARMED drain kernel. This is a CORRECTNESS
+    // requirement, not a perf tuning knob — get it wrong and you DEADLOCK. ***
+    //
+    // CUDA 12 defaults to CUDA_MODULE_LOADING=LAZY: a kernel's device code is loaded
+    // on its FIRST launch, and that load is a device-wide SYNCHRONIZING driver
+    // operation. With TailDrain=false the producer kernel is still RESIDENT and
+    // spinning in WriteWait when the host issues the drain kernel. If that drain
+    // launch is the drain kernel's first, its lazy module load blocks the device —
+    // including the CUDA calls the CPU-side CTE server needs to COMPLETE the very
+    // Puts the producer is spinning on. The producer waits on the server, the server
+    // waits on the module load, the module load waits on the producer to retire.
+    // Nothing moves. (Same mechanism as the cold-launch device serialization written
+    // up in context-runtime/test/unit/gpu/GPU_SUBMIT_SERIALIZES_DEVICE.md, but
+    // escalated from "serializes" to "hangs", because here the two kernels are
+    // mutually dependent rather than merely queued.)
+    //
+    // Fix: force the module load WITHOUT launching, before the producer goes
+    // resident — cudaFuncGetAttributes on the drain kernel (and on this one), or
+    // CUDA_MODULE_LOADING=EAGER in the environment. A cudaDeviceSynchronize between
+    // the producer and the drain also "fixes" it, but that sync is exactly the
+    // overlap the deferral exists to buy, so it defeats the purpose.
+    // TailDrain=true has no such hazard: it never leaves a producer resident across
+    // another kernel's launch.
+    template<bool Probing = true, bool TailDrain = true, typename FillFn>
+    __device__ void WritePipelined(FillFn fill) const {
+        const uint32_t g = grid_, m = pool_, n = count_, b = blockIdx.x;
+        if (b >= g) return;  // surplus blocks own no chunks
+        for (uint32_t c = b; c < n; c += g) {
+            // Reclaim this chunk's buffer from the chunk that used it M ago. THIS is
+            // the invariant; it stays put regardless of TailDrain.
+            if (c >= m) WriteWait(c - m);   // thread-0 only
+            __syncthreads();                // <-- ALL threads wait for that drain
+            fill(c, chunks_[c].data, chunks_[c].size);
+            // Each thread publishes its own stores system-wide; the CPU-side Put
+            // reads this buffer, and SendIn's fence only covers thread 0.
+            __threadfence_system();
+            __syncthreads();
+            WriteAsync<Probing>(c);         // thread-0 only; do NOT wait here
+        }
+        // Tail: the chunks this block fired whose buffers were never re-claimed
+        // (c + M >= N) are still in flight. At most D of them.
+        if (TailDrain) {
+            for (uint32_t c = b; c < n; c += g)
+                if (c + m >= n) WriteWait(c);
+            __syncthreads();
+        }
+    }
+
+    // Deferred companion to WritePipelined<..., TailDrain=false>: drain every chunk
+    // this block owns. Idempotent for chunks the pipelined loop already drained (the
+    // wait polls a completion flag that is already set), so it is safe to run over
+    // the whole range rather than tracking which <= D are outstanding.
+    __device__ void WriteDrainAll() const {
+        const uint32_t g = grid_, n = count_, b = blockIdx.x;
+        if (b >= g) return;
+        for (uint32_t c = b; c < n; c += g) WriteWait(c);
+        __syncthreads();
+    }
 
     // Single-chunk convenience: target chunk 0.
     __device__ byte_t* Data() const { return chunks_[0].data; }

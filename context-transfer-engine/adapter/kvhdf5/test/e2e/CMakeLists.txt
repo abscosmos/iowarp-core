@@ -24,7 +24,15 @@ kvhdf5_add_gpu_test_target(kvhdf5_e2e_tests WITH_KVHDF5_HEADERS
         gray_scott_threeway_bench.cu
         backend_ceiling_test.cu
         occupancy_bench.cu
+        pooled_double_buffer_test.cu
 )
+
+# The pooled double-buffer test is the reference user of the fused
+# WritePipelined producer, so it is also where that kernel's register/spill cost
+# is measured. Same rationale as occupancy_bench below: ptxas has to SAY what it
+# allocated. (Pre-device-link, as noted there.)
+set_source_files_properties(pooled_double_buffer_test.cu PROPERTIES
+    COMPILE_OPTIONS "-Xptxas=-v")
 
 # The occupancy bench measures per-kernel register / shared-memory / spill usage,
 # so it needs ptxas to SAY what it allocated. Scoped to this one source file to

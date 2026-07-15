@@ -182,6 +182,49 @@ __global__ __launch_bounds__(32) void TwDrainKernel(kvhdf5::GpuDatasetHandle h) 
     }
 }
 
+// ---- POOLED arm: fill + fire fused into ONE kernel --------------------------
+//
+// The sync/async arms are a THREE-kernel shape: TwCopyKernel stages every chunk's bytes
+// into its own device buffer, then TwSnapFire/SyncKernel submits, then (async) TwDrainKernel
+// waits. That shape is only correct at M == N — with a bounded pool (M < N) the copy kernel
+// would refill chunk c+M's shared buffer before chunk c's PutBlob has drained. So the pooled
+// arm replaces all three with GpuDatasetHandle::WritePipelined: per block, wait(c-M) -> fill
+// -> fence -> fireAsync(c), with a tail that drains the <= D still in flight.
+//
+// The fill now runs on G blocks (the dataset's producer grid), not on the copy_bpc * chunks
+// blocks TwCopyKernel used, so G must be large enough to saturate HBM or the arm is
+// memory-parallelism-bound — which has nothing to do with pooling.
+//
+// TAIL DRAIN IS DEFERRED (TailDrain=false). The in-loop WriteWait(c-M) is what enforces the
+// buffer-reuse invariant; the tail wait never did. Keeping the tail IN-kernel only forces the
+// kernel to stay resident until this snapshot's last <= D Puts land, which holds the NEXT
+// snapshot's compute behind this snapshot's I/O — at M == N it degenerates to "fire all, drain
+// all, in-kernel", i.e. exactly the synchronous arm. (Measured: pooled ~2.1 s == sync, vs async
+// ~1.7 s.) So the pooled arm defers the drain to finalize() and drains with TwDrainKernel per
+// snapshot dataset, precisely as the async arm does. Safe because each launch owns its own
+// snapshot dataset — nothing refills those buffers before the drain.
+struct TwPooledFill {
+    const byte_t* src;   // masked snapshot grid; chunk c is src[c*n .. c*n+n)
+    // BLOCK-WIDE (every thread), word-wise, block-strided — the same copy TwCopyKernel does
+    // for one chunk, minus the extra gridDim.x blocks. Uniform across the block.
+    __device__ void operator()(uint32_t c, byte_t* dst, uint64_t n) const {
+        const uint32_t* s = reinterpret_cast<const uint32_t*>(src + uint64_t(c) * n);
+        uint32_t* d = reinterpret_cast<uint32_t*>(dst);
+        const uint64_t words = n >> 2;
+        for (uint64_t i = threadIdx.x; i < words; i += blockDim.x) d[i] = s[i];
+    }
+};
+
+template <bool kProbing>
+__global__ __launch_bounds__(256) void TwSnapPooledKernel(kvhdf5::GpuDatasetHandle h,
+                                                          const byte_t* src) {
+    CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
+    (void)g_ipc_manager;
+    h.WritePipelined<kProbing, /*TailDrain=*/false>(TwPooledFill{src});
+}
+template __global__ void TwSnapPooledKernel<false>(kvhdf5::GpuDatasetHandle, const byte_t*);
+template __global__ void TwSnapPooledKernel<true>(kvhdf5::GpuDatasetHandle, const byte_t*);
+
 // XOR the snapshot with a fixed random mask (word-wise) into a scratch buffer, so the
 // PERSISTED bytes are high-entropy / incompressible — otherwise the Gray-Scott field is
 // mostly zeros and a compressing filesystem (e.g. btrfs zstd) makes the "disk I/O" nearly
@@ -352,6 +395,20 @@ struct Cfg {
     // (EnvU coerces <=0 to the default, so the effective value is always >=1; it is
     // clamped to `chunks` below since extra blocks would just idle.)
     unsigned submit_blocks = EnvU("GSBENCH_SUBMIT_BLOCKS", 1);
+    // POOLED arm only: M, the number of RESIDENT per-chunk data buffers a snapshot's
+    // dataset holds. N chunks stream through M buffers (chunk c uses buffer c % M), so the
+    // device-side payload footprint is M * chunk_bytes instead of N * chunk_bytes. 0 (the
+    // default) means M == N: no pooling, one buffer per chunk — the CONTROL that isolates
+    // the cost of FUSING fill+fire from the cost of POOLING. The pipeline depth (in-flight
+    // Puts per block) is D = M / G, with G = GSBENCH_SUBMIT_BLOCKS; the dataset ctor throws
+    // unless G divides M and G <= M <= N.
+    unsigned pool = EnvU0("GSBENCH_POOL", 0);
+    // Force the CLIO kernels' device code resident BEFORE the timed region
+    // (cudaFuncGetAttributes). CUDA 12 loads a kernel's module on its FIRST launch and that
+    // load is a DEVICE-WIDE sync, which lands behind the async arm's queued compute and
+    // pins the whole device — killing the compute/IO overlap (162 ms -> 94 ms once warm).
+    // Default 1 (the fix ON). Set 0 to measure the cold-launch penalty deliberately.
+    unsigned prewarm = EnvU0("GSBENCH_PREWARM", 1);
 
     // ---- hdf5 arm ----------------------------------------------------------
     // Output dir for the HDF5 arm's single checkpoint file (one dataset per snapshot,
@@ -967,10 +1024,17 @@ std::vector<byte_t> HostReadBlob(clio::cte::core::TagId tag, const std::string& 
 
 // Pre-create `snaps` snapshot datasets (distinct path => distinct tag). Kept well under
 // the ~16-large-backend ceiling by the caller (snaps <= ~12).
+//
+// pool_size (M) / grid_size (G) carry the bounded-pool contract to the dataset: M resident
+// data buffers, G producer blocks, pipeline depth D = M/G. 0/0 (the sync and async arms)
+// means M == N and G == M, i.e. one buffer per chunk — the historical shape those two arms
+// require, since their fill (TwCopyKernel) and their fire are SEPARATE kernels and would
+// otherwise clobber a shared buffer. Only the pooled arm passes nonzero values.
 void MakeSnapDatasets(clio::run::IpcManager* ipc, clio::run::IpcManagerGpuInfo gpu_info,
                       const char* prefix, const Cfg& cfg,
                       std::vector<kvhdf5::GpuCteDataset>& out,
-                      std::vector<clio::cte::core::TagId>& tags) {
+                      std::vector<clio::cte::core::TagId>& tags,
+                      unsigned pool_size = 0, unsigned grid_size = 0) {
     kvhdf5::Layout layout{/*dims=*/{cfg.cells()},
                           /*chunk_dims=*/{cfg.cells() / cfg.chunks},
                           /*elem_size=*/sizeof(float)};
@@ -984,7 +1048,7 @@ void MakeSnapDatasets(clio::run::IpcManager* ipc, clio::run::IpcManagerGpuInfo g
         std::snprintf(path, sizeof(path), "%s/v/step_%04u", prefix, s);
         out.emplace_back(kvhdf5::GpuCteDataset::FromPath(
             ipc, gpu_info, /*gpu_id=*/0, CLIO_CTE_CLIENT, path, layout,
-            /*pool_size=*/0, data_kind));
+            pool_size, data_kind, grid_size));
         tags.push_back(MakeTag(kvhdf5::tagpath::CanonicalTag(path).c_str()));
     }
 }
@@ -1002,8 +1066,27 @@ uint64_t ChecksumSnapshots(const std::vector<clio::cte::core::TagId>& tags,
     return h;
 }
 
-// Run a CLIO arm (async=false -> sync). Returns ms; fills checksum from persisted bytes.
-double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* checksum) {
+// The three GPU-producer submission shapes.
+//   kSync   — TwCopyKernel, then Write(c) = fire-AND-wait per chunk. GPU blocks on every put.
+//   kAsync  — TwCopyKernel, then WriteAsync(c) for every chunk, drained by a host-issued
+//             TwDrainKernel per snapshot at the END of the run. Needs one buffer per chunk
+//             (M == N), which is exactly what makes its device payload footprint N * S.
+//   kPooled — ONE fused TwSnapPooledKernel per snapshot: fill+fire+drain inside
+//             WritePipelined, streaming N chunks through M buffers at depth D = M/G.
+enum class ClioMode { kSync, kAsync, kPooled };
+
+const char* ClioModeName(ClioMode m) {
+    switch (m) {
+        case ClioMode::kSync:   return "sync";
+        case ClioMode::kAsync:  return "async";
+        default:                return "pooled";
+    }
+}
+
+// Run a CLIO arm. Returns ms; fills checksum from persisted bytes.
+double RunClioArm(const Cfg& cfg, ClioMode mode, const char* prefix, uint64_t* checksum) {
+    const bool async = (mode == ClioMode::kAsync);
+    const bool pooled = (mode == ClioMode::kPooled);
     auto* ipc = CLIO_CPU_IPC;
     REQUIRE(ipc->GetGpuIpcManager() != nullptr);
     clio::run::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(0);
@@ -1016,13 +1099,32 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
     SubmitProbeHarness probe(EnvU0("GSBENCH_SUBMIT_PROBE", 0) != 0,
                              cfg.snaps * cfg.chunks + 64, &gpu_info);
 
+    // The pooled arm is the only one that carries a (M, G) pool contract into the dataset;
+    // sync/async keep the historical M == N, G == M shape (0/0). G is the SAME
+    // GSBENCH_SUBMIT_BLOCKS knob the other arms use for their submit grid — for pooled it is
+    // also the fill grid, since fill and fire are fused into one launch.
+    const unsigned pool_m = pooled ? cfg.pool : 0u;
+    const unsigned pool_g = pooled ? cfg.submit_grid() : 0u;
+
     std::vector<kvhdf5::GpuCteDataset> ds;
     std::vector<clio::cte::core::TagId> tags;
-    MakeSnapDatasets(ipc, gpu_info, prefix, cfg, ds, tags);
+    MakeSnapDatasets(ipc, gpu_info, prefix, cfg, ds, tags, pool_m, pool_g);
+    if (pooled) {
+        const uint64_t chunk_bytes = cfg.grid_bytes() / cfg.chunks;
+        std::fprintf(stderr,
+            "GSBENCH_POOLED N=%u M=%u G=%u D=%u chunk_bytes=%llu "
+            "resident_data_bytes=%llu (unpooled M=N would be %llu)\n",
+            ds[0].ChunkCount(), ds[0].PoolSize(), ds[0].GridSize(), ds[0].Depth(),
+            (unsigned long long)chunk_bytes,
+            (unsigned long long)(uint64_t(ds[0].PoolSize()) * chunk_bytes),
+            (unsigned long long)(uint64_t(cfg.chunks) * chunk_bytes));
+    }
 
     Masker masker(cfg.N, cfg.incompressible != 0);
     Grids g = MakeGrids(cfg.N);
-    PhaseTrace trace(EnvU("GSBENCH_TRACE", 0) != 0, cfg.snaps, async);
+    // pooled, like async, defers its outstanding Puts to a tail drain in finalize(), so it
+    // gets a drain bucket too.
+    PhaseTrace trace(EnvU("GSBENCH_TRACE", 0) != 0, cfg.snaps, async || pooled);
     // Grid sizing for the decoupled bulk copy: one gridDim.y per chunk, enough blocks/chunk
     // (each thread copies one 4-byte word, grid-strided) to saturate HBM.
     const uint64_t copy_chunk_bytes = cfg.grid_bytes() / cfg.chunks;
@@ -1047,7 +1149,10 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
     // application that queues a deep kernel pipeline and expects the server's I/O
     // to overlap it needs the same warm-up (or CUDA_MODULE_LOADING=EAGER) — a
     // cold first launch anywhere in that pipeline serializes the whole device.
-    {
+    //
+    // GSBENCH_PREWARM=0 skips the whole thing, so the cold-launch penalty can be measured
+    // rather than merely asserted. Default 1 (fix on).
+    if (cfg.prewarm) {
         cudaFuncAttributes fa;
         cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwCopyKernel));
         // Warm whichever submit-kernel instantiation this run actually launches
@@ -1055,15 +1160,26 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
         if (probe.on_) {
             cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapFireKernel<true>));
             cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapSyncKernel<true>));
+            cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapPooledKernel<true>));
         } else {
             cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapFireKernel<false>));
             cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapSyncKernel<false>));
+            cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwSnapPooledKernel<false>));
         }
         cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwDrainKernel));
     }
     auto snap = [&](unsigned si, float* v_curr) {
         float* src = masker.Apply(v_curr);   // incompressible view (or v_curr if disabled)
         const byte_t* bsrc = reinterpret_cast<const byte_t*>(src);
+        if (pooled) {
+            // ONE kernel: fill + fire + bounded drain, at grid == the dataset's G. No
+            // TwCopyKernel, no TwSnapFireKernel, no TwDrainKernel — that is the point.
+            if (probe.on_)
+                TwSnapPooledKernel<true><<<ds[si].GridSize(), 256>>>(ds[si].Handle(), bsrc);
+            else
+                TwSnapPooledKernel<false><<<ds[si].GridSize(), 256>>>(ds[si].Handle(), bsrc);
+            return;
+        }
         TwCopyKernel<<<dim3(copy_bpc, cfg.chunks), 256>>>(ds[si].Handle(), bsrc);  // multi-block stage
         if (async) {
             // Instantiate the non-probing kernel unless the submit probe is armed
@@ -1086,7 +1202,19 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
         }
     };
     auto finalize = [&]() {
+        // Both fire-and-defer arms drain here, at the END of the timed region, so each
+        // snapshot's I/O overlaps the NEXT snapshot's compute instead of blocking it.
+        //
+        // async  : TwCopyKernel + TwSnapFireKernel left every chunk in flight.
+        // pooled : WritePipelined<TailDrain=false> left the last <= D per block in flight.
+        //          TwDrainKernel is reused as-is rather than adding a kernel: it strides
+        //          c = blockIdx.x; c < Count(); c += gridDim.x, so launched at grid == G it
+        //          walks exactly the same chunk partition the pooled producer did, and
+        //          WriteWait on an already-drained chunk just re-polls a completion flag
+        //          that is already set (idempotent) — so the ones the in-loop wait already
+        //          drained cost nothing.
         if (async) for (auto& d : ds) TwDrainKernel<<<submit_grid, 32>>>(d.Handle());
+        if (pooled) for (auto& d : ds) TwDrainKernel<<<d.GridSize(), 32>>>(d.Handle());
         // The drain kernels must land before we can flush what they wrote: only then has
         // the server issued every PutBlob's write() into the page cache. (Harmless for the
         // sync arm — it already synchronizes per snapshot.)
@@ -1109,10 +1237,10 @@ double RunClioArm(const Cfg& cfg, bool async, const char* prefix, uint64_t* chec
             ("gsbench snapshot " + std::to_string(s)).c_str());
 
     FreeGrids(g);
-    trace.Report(async ? "async" : "sync");   // GSBENCH_TRACE=1: emit phase breakdown
+    trace.Report(ClioModeName(mode));   // GSBENCH_TRACE=1: emit phase breakdown
     // Dumped only after ThrowIfIoFailed above: a breakdown from a run with failed puts
     // would be timing an I/O that never happened.
-    probe.Dump(async ? "async" : "sync", EnvS("GSBENCH_PROBE_DIR", ".").c_str());
+    probe.Dump(ClioModeName(mode), EnvS("GSBENCH_PROBE_DIR", ".").c_str());
     *checksum = ChecksumSnapshots(tags, cfg);
     return ms;
 }
@@ -2112,7 +2240,7 @@ TEST_CASE("GSBENCH clio sync", "[.][integration][gpu][gsbench][gsbench_sync]") {
     Cfg cfg;
     static BenchEnv env(cfg);
     uint64_t checksum = 0;
-    double ms = RunClioArm(cfg, /*async=*/false, "results/gsbench/sync", &checksum);
+    double ms = RunClioArm(cfg, ClioMode::kSync, "results/gsbench/sync", &checksum);
     PrintResult("sync", cfg, ms, checksum);
     REQUIRE(ms > 0.0);
 }
@@ -2163,8 +2291,24 @@ TEST_CASE("GSBENCH clio async", "[.][integration][gpu][gsbench][gsbench_async]")
     Cfg cfg;
     static BenchEnv env(cfg);
     uint64_t checksum = 0;
-    double ms = RunClioArm(cfg, /*async=*/true, "results/gsbench/async", &checksum);
+    double ms = RunClioArm(cfg, ClioMode::kAsync, "results/gsbench/async", &checksum);
     PrintResult("async", cfg, ms, checksum);
+    REQUIRE(ms > 0.0);
+}
+
+// Bounded-pool double buffering: ONE fused fill+fire kernel per snapshot, N chunks streamed
+// through M = GSBENCH_POOL resident buffers by G = GSBENCH_SUBMIT_BLOCKS blocks at pipeline
+// depth D = M/G. GSBENCH_POOL=0 (default) => M == N: the CONTROL run, which fuses fill+fire
+// but reuses no buffer, so it separates the cost of FUSING from the cost of POOLING.
+//
+// Its checksum MUST equal sync's and async's — same computation, same persisted bytes. A
+// difference is a buffer-reuse race, not a tuning artifact.
+TEST_CASE("GSBENCH clio pooled", "[.][integration][gpu][gsbench][gsbench_pooled]") {
+    Cfg cfg;
+    static BenchEnv env(cfg);
+    uint64_t checksum = 0;
+    double ms = RunClioArm(cfg, ClioMode::kPooled, "results/gsbench/pooled", &checksum);
+    PrintResult("pooled", cfg, ms, checksum);
     REQUIRE(ms > 0.0);
 }
 
