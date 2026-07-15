@@ -430,6 +430,19 @@ struct Cfg {
     // instead of H5Dwrite(). Legal here because chunk c is exactly rows
     // [c*N/chunks, (c+1)*N/chunks) x N, which is contiguous in the row-major host buffer.
     unsigned hdf5_direct_chunk = EnvU0("GSBENCH_HDF5_DIRECT_CHUNK", 0);
+    // The "typical non-expert user" baseline (arm `hdf5_naive`): a default HDF5 setup with
+    // NO optimizations. Overrides the tuned knobs above — high-level H5Dwrite of the whole
+    // array, DEFAULT (late/incremental) alloc, default chunk cache, default fill. Structurally
+    // identical to hdf5_inline (synchronous, GPU idle during the write, same per-snapshot
+    // durability); only the HDF5 dataset config differs. Exists so the tuning can be shown to be
+    // worth something against a representative untuned reference.
+    unsigned hdf5_naive = EnvU0("GSBENCH_HDF5_NAIVE", 0);
+    // Layout for the naive arm: 0 = CONTIGUOUS (no H5Pset_chunk — the most default thing a naive
+    // user gets); 1 = CHUNKED at the same {N/chunks, N} geometry as the tuned/CLIO arms, but
+    // still otherwise untuned (default alloc/cache/fill, high-level H5Dwrite). Lets the naive
+    // baseline choose the pure-default layout or the milder "chunked-but-untuned" middle ground.
+    // Only consulted when hdf5_naive is set.
+    unsigned hdf5_naive_chunked = EnvU0("GSBENCH_HDF5_NAIVE_CHUNKED", 0);
     // Create all `snaps` datasets BEFORE the timed region rather than one per snapshot
     // inside it. The motivation is PARITY: the CLIO arms call MakeSnapDatasets() (tag +
     // per-chunk backend registration) before RunSim, and the raw arm ftruncate()s its file
@@ -1643,7 +1656,9 @@ public:
         const bool pre = cfg_.hdf5_precreate != 0;
         hid_t dset = pre ? dsets_[si] : CreateDataset(si);
 
-        if (cfg_.hdf5_direct_chunk) {
+        // Naive forces the high-level H5Dwrite of the whole array (H5Dwrite_chunk is illegal on
+        // a contiguous dataset anyway).
+        if (cfg_.hdf5_direct_chunk && !cfg_.hdf5_naive) {
             const auto* p = static_cast<const uint8_t*>(host);
             for (unsigned c = 0; c < cfg_.chunks; ++c) {
                 hsize_t off[2] = {hsize_t(c) * hsize_t(rows_), 0};
@@ -1743,15 +1758,20 @@ private:
         H5CHK(*space);
         *dcpl = H5Pcreate(H5P_DATASET_CREATE);
         H5CHK(*dcpl);
-        H5CHK(H5Pset_chunk(*dcpl, 2, cdims));   // geometry parity with the CLIO arms
-        if (!cfg_.hdf5_stock) {
+        // Naive contiguous: leave the DCPL at its default -> CONTIGUOUS layout, no fill/alloc
+        // tuning. Naive chunked (GSBENCH_HDF5_NAIVE_CHUNKED): chunk at the tuned geometry but
+        // still skip the fill/alloc tuning. Non-naive: chunk + full tuning (gated by stock).
+        const bool chunk_it = !cfg_.hdf5_naive || cfg_.hdf5_naive_chunked;
+        if (chunk_it)
+            H5CHK(H5Pset_chunk(*dcpl, 2, cdims));   // geometry parity with the CLIO arms
+        if (!cfg_.hdf5_stock && !cfg_.hdf5_naive) {
             H5CHK(H5Pset_fill_time(*dcpl, H5D_FILL_TIME_NEVER));
             if (cfg_.hdf5_early_alloc)
                 H5CHK(H5Pset_alloc_time(*dcpl, H5D_ALLOC_TIME_EARLY));
         }
 
         *dapl = H5P_DEFAULT;
-        if (!cfg_.hdf5_stock) {
+        if (!cfg_.hdf5_stock && !cfg_.hdf5_naive) {
             *dapl = H5Pcreate(H5P_DATASET_ACCESS);
             H5CHK(*dapl);
             // nslots wants to be prime-ish and comfortably > the chunk count (HDF5 hashes
@@ -1968,7 +1988,9 @@ double RunHdf5Arm(const Cfg& cfg_in, uint64_t* checksum) {
     Masker masker(cfg.N, cfg.incompressible != 0);
     D2HTrace d2h(EnvU0("GSBENCH_D2H_TRACE", 0) != 0, cfg.snaps, gbytes);
 
-    const char* mode = cfg.hdf5_stock ? "STOCK (untuned)" : "tuned";
+    const char* mode = cfg.hdf5_naive ? (cfg.hdf5_naive_chunked ? "NAIVE (chunked, untuned)"
+                                                                : "NAIVE (contiguous, untuned)")
+                     : cfg.hdf5_stock ? "STOCK (untuned)" : "tuned";
     std::fprintf(stderr,
         "[hdf5] %s: vfd=%s rdcc=%uMB early_alloc=%u direct_chunk=%u precreate=%u "
         "metablk=%uKB fsync=%u chunk=%ux%u\n",
@@ -2270,6 +2292,23 @@ TEST_CASE("GSBENCH hdf5", "[.][integration][gpu][gsbench][gsbench_hdf5]") {
     uint64_t checksum = 0;
     double ms = RunHdf5Arm(cfg, &checksum);
     PrintResult(cfg.raw_inline ? "hdf5_inline" : "hdf5_threaded", cfg, ms, checksum);
+    REQUIRE(ms > 0.0);
+}
+
+// The typical-user, unoptimized HDF5 baseline: contiguous layout by default (or chunked via
+// GSBENCH_HDF5_NAIVE_CHUNKED), high-level H5Dwrite of the whole array, default alloc/cache/fill.
+// Structurally identical to hdf5_inline (synchronous,
+// GPU idle during the write, same per-snapshot durability) — only the dataset config differs,
+// so it always runs the inline structure regardless of GSBENCH_RAW_INLINE. Reuses Hdf5Sink and
+// RunHdf5Arm via the hdf5_naive flag. Its checksum MUST equal the other HDF5 arms' at the same
+// config (same logical float data). Expected to land near/below raw_inline.
+TEST_CASE("GSBENCH hdf5 naive", "[.][integration][gpu][gsbench][gsbench_hdf5_naive]") {
+    Cfg cfg;
+    cfg.hdf5_naive = 1;
+    cfg.raw_inline = 1;   // synchronous/GPU-idle structure, matching hdf5_inline
+    uint64_t checksum = 0;
+    double ms = RunHdf5Arm(cfg, &checksum);
+    PrintResult("hdf5_naive", cfg, ms, checksum);
     REQUIRE(ms > 0.0);
 }
 
