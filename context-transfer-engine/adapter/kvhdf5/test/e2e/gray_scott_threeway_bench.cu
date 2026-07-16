@@ -1181,6 +1181,49 @@ double RunClioArm(const Cfg& cfg, ClioMode mode, const char* prefix, uint64_t* c
         }
         cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwDrainKernel));
     }
+    // ---- Bound host run-ahead for the POOLED arm (GSBENCH_PACE) --------------
+    // The sync arm's Synchronize() below guards a deadlock the pooled arm ALSO has. The
+    // taxonomy there — "sync waits per snapshot so it needs this; the async arm must NOT
+    // do this ... it never wedges (its waits are deferred to the end drain)" — sorts arms
+    // into waits-now vs defers-all. POOLED IS A HYBRID and fell through that gap: its
+    // in-loop WriteWait(c-M) (gpu_dataset_handle.h:197, reached ONLY when M < N) leaves
+    // the producer RESIDENT and spinning on the in-process server exactly like sync's
+    // SubmitWait — so it CAN wedge — while its deferred tail drain made it look like
+    // async, so it inherited async's exemption. It has sync's hazard and async's guard.
+    // Measured: every M < N wedges once (snaps-1)*(steps_per+2) crosses ~1024 (990
+    // completes, 1034 wedges), independent of M, D, chunks and gpu_queue_depth.
+    //
+    // It cannot use sync's per-snapshot Synchronize(): that caps in-flight work at ONE
+    // snapshot and would destroy the cross-snapshot overlap this arm exists to measure.
+    // So: a sliding window instead of a barrier. cudaEventSynchronize blocks the HOST
+    // only — it adds no stream dependency (that would be cudaStreamWaitEvent) and never
+    // stalls the GPU, which keeps consuming whatever is already queued. Waiting on the
+    // event K snapshots back therefore leaves K snapshots in flight BY CONSTRUCTION, and
+    // costs nothing: the GPU is the bottleneck, so run-ahead past a few snapshots buys no
+    // throughput — the queue only has to stay non-empty to keep the GPU fed. (This is NOT
+    // the mid-loop cudaEventSynchronize the PhaseTrace comment warns about: that one waits
+    // on the JUST-recorded event, i.e. K == 0, which does drain the pipe. These are
+    // separate, timing-disabled events and K >= 2.)
+    //
+    // K is DERIVED from one snapshot's launch cost (steps_per GsStepKernels + MaskKernel +
+    // producer) against HALF the ~1024-deep queue, so raising steps_per cannot silently
+    // walk it into the cliff. GSBENCH_PACE overrides it; GSBENCH_PACE=0 disables pacing and
+    // restores the wedge — that switch is how the no-perf-penalty A/B is measured. EnvU0,
+    // not EnvU: EnvU coerces 0 to the default, which would silently pace BOTH sides of that
+    // A/B and fake the result.
+    const unsigned pace_dflt = 512u / (cfg.steps_per + 2u);
+    const unsigned pace_k = EnvU0("GSBENCH_PACE", pace_dflt < 2u ? 2u : pace_dflt);
+    std::vector<cudaEvent_t> pace_ev;
+    if (pooled && pace_k) {
+        pace_ev.resize(cfg.snaps);
+        for (auto& e : pace_ev) cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+    }
+    auto pace = [&](unsigned si) {
+        if (pace_ev.empty()) return;          // not pooled, or GSBENCH_PACE=0
+        cudaEventRecord(pace_ev[si]);
+        if (si >= pace_k) cudaEventSynchronize(pace_ev[si - pace_k]);
+    };
+
     auto snap = [&](unsigned si, float* v_curr) {
         float* src = masker.Apply(v_curr);   // incompressible view (or v_curr if disabled)
         const byte_t* bsrc = reinterpret_cast<const byte_t*>(src);
@@ -1191,6 +1234,7 @@ double RunClioArm(const Cfg& cfg, ClioMode mode, const char* prefix, uint64_t* c
                 TwSnapPooledKernel<true><<<ds[si].GridSize(), 256>>>(ds[si].Handle(), bsrc);
             else
                 TwSnapPooledKernel<false><<<ds[si].GridSize(), 256>>>(ds[si].Handle(), bsrc);
+            pace(si);   // bound run-ahead; see GSBENCH_PACE above
             return;
         }
         TwCopyKernel<<<dim3(copy_bpc, cfg.chunks), 256>>>(ds[si].Handle(), bsrc);  // multi-block stage
@@ -1235,6 +1279,8 @@ double RunClioArm(const Cfg& cfg, ClioMode mode, const char* prefix, uint64_t* c
         ClioBdevSync(cfg);   // durability parity with raw/hdf5 — see Cfg::clio_fsync
     };
     double ms = RunSim(cfg, g, snap, finalize, nullptr, &trace);
+    // finalize() closed with a Synchronize, so the device is idle and these are dead.
+    for (auto& e : pace_ev) cudaEventDestroy(e);
 
     // A PutBlob that does not fit in the bdev FAILS, and until recently did so
     // SILENTLY (the runtime set task->return_code_ but the GPU submit path threw
