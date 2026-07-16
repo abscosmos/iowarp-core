@@ -89,7 +89,9 @@ bdev_cap() { local t; t=$(total_mb "$1" "$2"); echo $(( t * 3 / 2 + 1024 )); }
 run_arm() {
     local study="$1" cfgkey="$2" rep="$3" arm="$4" tag="$5"
     local log="$LOGDIR/${study}__${cfgkey}__${arm}__rep${rep}.log"
-    local resultpat='GSBENCH_RESULT|GSBENCH_POOLED'
+    # Only a real result line counts. GSBENCH_POOLED is the pooled arm's descriptor,
+    # printed BEFORE the work: matching it made a hung pooled run look cached/ok.
+    local resultpat='GSBENCH_RESULT'
 
     # resumable: skip if a good result already on disk
     if [[ -f "$log" ]] && grep -qE "$resultpat" "$log"; then
