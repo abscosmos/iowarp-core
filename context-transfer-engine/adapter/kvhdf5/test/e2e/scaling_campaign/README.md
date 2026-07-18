@@ -130,6 +130,10 @@ steps=96`, both tiers; runs the `pooled` arm at each M plus one `async` fire-all
 - **Why G=8, chunks=128:** G must divide M and be large enough to saturate HBM; G=8 divides all
   M values and 128 chunks gives a meaningful pool range. `pooled` is a *memory* result, not a
   speed rival to `async`.
+- **Pacing (leave it on):** the `pooled` arm bounds host run-ahead automatically via
+  `GSBENCH_PACE` (auto = `max(2, 512/(steps_per+2))` snapshots), keeping producer submission and
+  CUDA launch queueing balanced. The default needs no knob. **Do not set `GSBENCH_PACE=0`** at
+  these settings — it disables pacing and the bounded-pool (M<N) runs deadlock.
 
 ### Repeats
 3 everywhere; **5 on headline configs** — `C steps8_ram` (the headline regime), `C steps8_file`
@@ -270,3 +274,7 @@ logic keeps everything already done.
 - **Stale build:** see §1. Always rebuild from HEAD; a stale lib silently shifts every number.
 - **`submit_blocks`:** the bench default is 1 (single fill block), which serializes the fill and
   understates the GPU arms. The campaign sets `GSBENCH_SUBMIT_BLOCKS=chunks` everywhere.
+- **Pooled descriptor ≠ result:** the `pooled` arm prints a `GSBENCH_POOLED N=… M=… G=… D=…`
+  descriptor line *before* it does the work. The resume/ok detector keys on `GSBENCH_RESULT`
+  only — do not add `GSBENCH_POOLED` to the result pattern, or a run that dies after the
+  descriptor but before finishing is miscounted as a completed result.
