@@ -114,9 +114,11 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
+#include <timeapi.h>
 #include <filesystem>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winmm.lib")
 #else
 #error \
     "Must define either CTP_ENABLE_PROCFS_SYSINFO or CTP_ENABLE_WINDOWS_SYSINFO"
@@ -949,6 +951,31 @@ void SystemInfo::TerminateChild(SpawnedProcess &proc, int grace_ms) {
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 #endif
+
+void SystemInfo::RequestTimerResolutionFromEnv() {
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  // Diagnostic / workaround knob for the tick-quantized waits behind the
+  // Windows TCP latency (issue #768). WaitForMultipleObjectsEx and ::Sleep
+  // expire their timeouts only at timer interrupts (~15.6ms default), so a
+  // Wait(100us) that nothing signals wakes up to 15.6ms late. Setting
+  // CLIO_WIN_TIMER_MS=1 raises this process's timer resolution to 1ms
+  // (timeBeginPeriod is per-process since Windows 10 2004, so BOTH the
+  // daemon and the client must set it). Never released deliberately: the
+  // request must live as long as the process serves traffic.
+  static bool requested = false;
+  if (requested) return;
+  const char *env = std::getenv("CLIO_WIN_TIMER_MS");
+  if (env == nullptr || *env == '\0') return;
+  UINT ms = static_cast<UINT>(std::atoi(env));
+  if (ms == 0) return;
+  MMRESULT rc = ::timeBeginPeriod(ms);
+  requested = true;
+  // This file sits below the logging layer; a diagnostic knob still deserves
+  // one line of confirmation.
+  std::fprintf(stderr, "SystemInfo: timeBeginPeriod(%u) -> %s\n", ms,
+               rc == TIMERR_NOERROR ? "ok" : "FAILED");
+#endif
+}
 
 void SystemInfo::SleepForUs(size_t us) {
   if (us == 0) return;

@@ -187,6 +187,8 @@ bool IpcManager::ClientInit() {
   if (is_initialized_) {
     return true;
   }
+  // Optional Windows timer-resolution bump (CLIO_WIN_TIMER_MS, issue #768).
+  ctp::SystemInfo::RequestTimerResolutionFromEnv();
 
   // Resolve the client IPC mode. An explicit CLIO_IPC_MODE forces that exact
   // transport (no probing); when unset, auto-select the fastest path that is
@@ -412,6 +414,8 @@ bool IpcManager::ClientInit() {
 }
 
 bool IpcManager::ServerInit() {
+  // Optional Windows timer-resolution bump (CLIO_WIN_TIMER_MS, issue #768).
+  ctp::SystemInfo::RequestTimerResolutionFromEnv();
   if (is_initialized_) {
     return true;
   }
