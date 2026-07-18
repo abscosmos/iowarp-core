@@ -2037,6 +2037,15 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
     if (wake_lane) {
       AwakenWorker(wake_lane);
     }
+    HLOG(kDebug,
+         "[TRACE768] t={} EnqueueNetTask prio={} was_empty={} wake_lane={} "
+         "lane_tid={} send_lane_set={} recv_lane_set={} net_lane_set={}",
+         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), priority_idx, was_empty, wake_lane != nullptr,
+         wake_lane ? wake_lane->GetTid() : -1, net_send_lane_ != nullptr,
+         net_recv_lane_ != nullptr, net_lane_ != nullptr);
+  } else {
+    HLOG(kDebug, "[TRACE768] t={} EnqueueNetTask prio={} was_empty=FALSE (no wake)",
+         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), priority_idx);
   }
 
   HLOG(kDebug,
