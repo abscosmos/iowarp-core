@@ -138,13 +138,61 @@ inline std::string LocalZmqIpcPath(u32 port) {
 
 // Constructor and destructor removed - handled by CTP singleton pattern
 
+// Auto-select the fastest client IPC transport that is actually usable, when
+// CLIO_IPC_MODE is unset. Probe order (fastest first, issue #768):
+//
+//   1. SHM  -- a same-host runtime always creates its main shared segment
+//              (ServerInitShm is unconditional), so the segment existing means
+//              a local server is up and the shared-memory data path is usable.
+//   2. IPC  -- a unix-domain (AF_UNIX) socket the server bound for the local
+//              control path; only present when the server itself runs in IPC
+//              mode (or on macOS, issue #482). Probed by the socket file.
+//   3. TCP  -- always available; the cross-host and last-resort fallback.
+//
+// The probes are cheap and side-effect free (an open/close on the segment
+// handle; a filesystem stat on the socket path). An explicit CLIO_IPC_MODE
+// bypasses this entirely.
+IpcMode IpcManager::SelectBestIpcMode() {
+  ConfigManager *config = CLIO_CONFIG_MANAGER;
+
+  // 1. SHM: is the server's main segment present on this host?
+  if (config) {
+    std::string main_seg = config->GetSharedMemorySegmentName(kMainSegment);
+    if (ctp::SystemInfo::SharedMemoryExists(main_seg)) {
+      HLOG(kDebug, "SelectBestIpcMode: SHM segment '{}' present -> SHM",
+           main_seg);
+      return IpcMode::kShm;
+    }
+    HLOG(kDebug, "SelectBestIpcMode: SHM segment '{}' absent", main_seg);
+  }
+
+  // 2. IPC: did the server bind a local unix-domain socket?
+  u32 port = GetEffectivePort();
+  std::string ipc_path =
+      ctp::SystemInfo::GetMemfdPath("clio_" + std::to_string(port) + ".ipc");
+  std::error_code ec;
+  if (std::filesystem::exists(ipc_path, ec) && !ec) {
+    HLOG(kDebug, "SelectBestIpcMode: IPC socket '{}' present -> IPC", ipc_path);
+    return IpcMode::kIpc;
+  }
+  HLOG(kDebug, "SelectBestIpcMode: IPC socket '{}' absent", ipc_path);
+
+  // 3. TCP: always available.
+  HLOG(kDebug, "SelectBestIpcMode: falling back to TCP");
+  return IpcMode::kTcp;
+}
+
 bool IpcManager::ClientInit() {
   HLOG(kDebug, "IpcManager::ClientInit");
   if (is_initialized_) {
     return true;
   }
 
-  // Parse CLIO_IPC_MODE environment variable (default: TCP).
+  // Resolve the client IPC mode. An explicit CLIO_IPC_MODE forces that exact
+  // transport (no probing); when unset, auto-select the fastest path that is
+  // actually available. On this host a same-host SHM round-trip is ~190x
+  // faster than TCP and ~5x faster than the unix-socket path (issue #768), so
+  // defaulting to TCP left the slowest transport as the default.
   if (const char *ipc_mode_env = clio::run::env::GetCompat("IPC_MODE")) {
     std::string mode_str(ipc_mode_env);
     if (mode_str == "SHM" || mode_str == "shm") {
@@ -152,13 +200,19 @@ bool IpcManager::ClientInit() {
     } else if (mode_str == "IPC" || mode_str == "ipc") {
       ipc_mode_ = IpcMode::kIpc;
     } else {
-      ipc_mode_ = IpcMode::kTcp;  // Default
+      ipc_mode_ = IpcMode::kTcp;
     }
+    HLOG(kInfo, "IpcManager::ClientInit: IPC mode = {} (from CLIO_IPC_MODE)",
+         ipc_mode_ == IpcMode::kShm   ? "SHM"
+         : ipc_mode_ == IpcMode::kIpc ? "IPC"
+                                      : "TCP");
+  } else {
+    ipc_mode_ = SelectBestIpcMode();
+    HLOG(kInfo, "IpcManager::ClientInit: IPC mode = {} (auto-selected)",
+         ipc_mode_ == IpcMode::kShm   ? "SHM"
+         : ipc_mode_ == IpcMode::kIpc ? "IPC"
+                                      : "TCP");
   }
-  HLOG(kInfo, "IpcManager::ClientInit: IPC mode = {}",
-       ipc_mode_ == IpcMode::kShm   ? "SHM"
-       : ipc_mode_ == IpcMode::kIpc ? "IPC"
-                                    : "TCP");
 
   // Parse retry timeout environment variable
   // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds

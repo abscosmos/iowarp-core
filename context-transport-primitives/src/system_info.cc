@@ -603,6 +603,18 @@ void SystemInfo::CloseSharedMemory(File &file) {
 #endif
 }
 
+bool SystemInfo::SharedMemoryExists(const std::string &name) {
+  // Open-then-close: cheaper than shm_attach (no header/data mapping) and
+  // side-effect free. A same-host runtime always creates its main segment
+  // (ServerInitShm is unconditional), so segment-present == local server up.
+  File probe;
+  if (!OpenSharedMemory(probe, name)) {
+    return false;
+  }
+  CloseSharedMemory(probe);
+  return true;
+}
+
 void SystemInfo::DestroySharedMemory(const std::string &name) {
 #if CTP_ENABLE_PROCFS_SYSINFO
 #if __linux__

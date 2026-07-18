@@ -213,6 +213,11 @@ class SystemInfo {
 
   CTP_DLL static void CloseSharedMemory(File &file);
 
+  /** True if a shared-memory segment named `name` currently exists.
+   *  A cheap open-then-close probe (no mapping); used to detect whether a
+   *  same-host runtime is present without fully attaching. */
+  CTP_DLL static bool SharedMemoryExists(const std::string &name);
+
   CTP_DLL static void DestroySharedMemory(const std::string &name);
 
   CTP_DLL static void *MapPrivateMemory(size_t size);
