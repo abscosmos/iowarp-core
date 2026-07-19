@@ -213,6 +213,11 @@ class SystemInfo {
 
   CTP_DLL static void CloseSharedMemory(File &file);
 
+  /** True if a shared-memory segment named `name` currently exists.
+   *  A cheap open-then-close probe (no mapping); used to detect whether a
+   *  same-host runtime is present without fully attaching. */
+  CTP_DLL static bool SharedMemoryExists(const std::string &name);
+
   CTP_DLL static void DestroySharedMemory(const std::string &name);
 
   CTP_DLL static void *MapPrivateMemory(size_t size);
@@ -313,6 +318,12 @@ class SystemInfo {
    *  system_info.cc so <windows.h> never leaks into headers. us == 0 returns
    *  immediately. */
   CTP_DLL static void SleepForUs(size_t us);
+
+  /** Windows: raise this process's timer-interrupt resolution when the env
+   *  var CLIO_WIN_TIMER_MS is set (e.g. 1 -> timeBeginPeriod(1)). No-op
+   *  elsewhere or when unset. Diagnostic/workaround for tick-quantized
+   *  timeout waits (issue #768); per-process since Windows 10 2004. */
+  CTP_DLL static void RequestTimerResolutionFromEnv();
 
   /** IPv4/IPv6 addresses bound to local interfaces (loopback included). */
   CTP_DLL static std::vector<std::string> GetLocalInterfaceIps();

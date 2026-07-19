@@ -1261,6 +1261,15 @@ class IpcManager {
   bool ClientInitShm();
 
   /**
+   * Pick the fastest usable client IPC transport when CLIO_IPC_MODE is unset.
+   * Probes SHM (same-host segment present), then IPC (local unix socket
+   * present), then falls back to TCP. See the definition for the rationale
+   * (issue #768).
+   * @return the selected IpcMode
+   */
+  IpcMode SelectBestIpcMode();
+
+  /**
    * Initialize priority queues for server
    * @return true if successful, false otherwise
    */

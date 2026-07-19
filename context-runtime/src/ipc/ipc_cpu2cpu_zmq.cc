@@ -204,6 +204,8 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       lane_ref.Push(future);
       // Always signal — see ipc_cpu2cpu_impl.h for the race.
       ipc->AwakenWorker(&lane_ref);
+      HLOG(kDebug, "[TRACE768] t={} RecvIn ingested task mode={} lane_tid={}",
+           std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), (int)mode, lane_ref.GetTid());
 
       did_work = true;
       tasks_received++;
@@ -292,6 +294,8 @@ bool IpcCpu2CpuZmq::SendOut(
     const size_t client_send_bound = ipc->GetNetQueueSize(priority);
     for (size_t send_i = 0; send_i < client_send_bound; ++send_i) {
       if (!ipc->TryPopNetTask(priority, queued_future)) break;
+      HLOG(kDebug, "[TRACE768] t={} SendOut popped queued response prio={}",
+           std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), (int)priority);
       auto origin_task = queued_future.GetTaskPtr();
       if (origin_task.IsNull()) continue;
 
