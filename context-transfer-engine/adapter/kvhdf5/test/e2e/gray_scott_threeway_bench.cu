@@ -215,6 +215,16 @@ struct TwPooledFill {
     }
 };
 
+// NOTE (2026-07-18, persistent-kernel redesign): the planned long-running/persistent snapshot
+// kernel (loops over snapshots in-kernel, double-buffers across them, WriteWait to reclaim a
+// group) measured ~55 registers -> 66.7% occupancy on sm_89 @ blockDim=256 (static ptxas), two
+// tiers below the 100% that separate relaunched compute+submit kernels reach. We ACCEPT the worse
+// occupancy (going persistent on purpose). The register pressure is the Submit/SubmitWait machinery
+// (Future<TaskT>, IpcManager pointer-chasing, probe timestamps) + loop-carried state held resident
+// together, not the stencil. TODO: test whether `__launch_bounds__(256, 6)` is a net win — it
+// forces <=40 regs / 100% occupancy but spills ~24 B/thread (16 store + 8 load) into the inner loop;
+// for a memory-bound stencil that may cost more than the extra 2 resident blocks buy, so measure at
+// runtime before adopting.
 template <bool kProbing>
 __global__ __launch_bounds__(256) void TwSnapPooledKernel(kvhdf5::GpuDatasetHandle h,
                                                           const byte_t* src) {
