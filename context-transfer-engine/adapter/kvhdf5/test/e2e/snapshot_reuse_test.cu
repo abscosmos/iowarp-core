@@ -219,28 +219,6 @@ uint64_t ReadBackChecksum(const std::vector<clio::cte::core::TagId>& tags) {
     return h;
 }
 
-// NON-throwing read-back for the negative control: returns true only if EVERY
-// snapshot's every chunk landed (GetBlob rc == 0) AND its bytes exactly match the
-// host expectation. Any missing/failed blob or any wrong byte -> false. Unlike
-// ReadBackChecksum it must not REQUIRE, because under the no-drain race a Get can
-// legitimately fail and that is itself evidence the drain was load-bearing.
-bool ReadBackAllOk(const std::vector<clio::cte::core::TagId>& tags) {
-    for (uint32_t s = 0; s < tags.size(); ++s)
-        for (unsigned c = 0; c < kChunks; ++c) {
-            ctp::ipc::FullPtr<char> buf = CLIO_CPU_IPC->AllocateBuffer(kChunkBytes);
-            if (buf.IsNull()) return false;
-            std::memset(buf.ptr_, 0, kChunkBytes);
-            auto t = CLIO_CTE_CLIENT->AsyncGetBlob(
-                tags[s], std::to_string(c), /*offset=*/clio::run::u64(0), kChunkBytes,
-                /*flags=*/clio::run::u32(0), buf.shm_.template Cast<void>());
-            t.Wait();
-            if (t->GetReturnCode() != 0) return false;
-            for (uint64_t i = 0; i < kChunkBytes; ++i)
-                if (static_cast<byte_t>(buf.ptr_[i]) != SnapByte(s, c, i)) return false;
-        }
-    return true;
-}
-
 // ---- the REUSED-2-GROUP path (the thing under test) ------------------------
 // 2 datasets serve `snaps` snapshots: snapshot s uses group s % 2, re-armed to
 // tags[s]. Before refilling a group at snapshot s (s >= kGroups), its snap-(s-2)
@@ -251,7 +229,7 @@ bool ReadBackAllOk(const std::vector<clio::cte::core::TagId>& tags) {
 // sub-allocator arena granularity (a ~2 MiB arena grabbed on the first device alloc,
 // later allocs fit inside), so it does NOT resolve the real 0.5 vs 1.5 MiB
 // difference and must not be asserted on.
-unsigned RunReused(clio::run::IpcManager* ipc, clio::run::IpcManagerGpuInfo gpu_info,
+uint64_t RunReused(clio::run::IpcManager* ipc, clio::run::IpcManagerGpuInfo gpu_info,
                    const std::vector<clio::cte::core::TagId>& tags, bool drain) {
     const unsigned snaps = static_cast<unsigned>(tags.size());
     kvhdf5::Layout layout = SnapLayout();
@@ -298,7 +276,13 @@ unsigned RunReused(clio::run::IpcManager* ipc, clio::run::IpcManagerGpuInfo gpu_
     for (unsigned g = 0; g < kGroups && g < snaps; ++g)
         groups[g].ThrowIfIoFailed("snapshot_reuse(final)");
 
-    return (snaps < kGroups) ? snaps : kGroups;   // live groups (bounded in snaps)
+    // MEASURED resident device payload = sum of the live groups' registered data
+    // backends. Bounded (kGroups groups) regardless of snaps — assert on THIS, not
+    // a hardcoded group count.
+    uint64_t resident = 0;
+    for (unsigned g = 0; g < kGroups && g < snaps; ++g)
+        resident += groups[g].DeviceDataBytes();
+    return resident;
 }
 
 // Like RunReused(drain=true) but the DEVICE picks each snapshot's tag from a
@@ -350,7 +334,7 @@ unsigned RunReusedDeviceStamp(clio::run::IpcManager* ipc,
 // arm). Never reuses a slot, so it can never hit the reuse race — the reference
 // the reused path must match byte-for-byte. Returns the number of datasets held
 // live (== snaps): the LINEAR footprint the reused path replaces.
-unsigned RunFresh(clio::run::IpcManager* ipc, clio::run::IpcManagerGpuInfo gpu_info,
+uint64_t RunFresh(clio::run::IpcManager* ipc, clio::run::IpcManagerGpuInfo gpu_info,
                   const std::vector<clio::cte::core::TagId>& tags) {
     const unsigned snaps = static_cast<unsigned>(tags.size());
     kvhdf5::Layout layout = SnapLayout();
@@ -382,7 +366,10 @@ unsigned RunFresh(clio::run::IpcManager* ipc, clio::run::IpcManagerGpuInfo gpu_i
     std::fprintf(stderr, "[reuse]   fresh  snaps=%u: %u live datasets, cudaMemGetInfo "
                  "delta=%.2f MiB (informational)\n",
                  snaps, snaps, double(dev_delta) / 1048576.0);
-    return snaps;   // linear in snaps
+    // MEASURED resident device payload across ALL held-live datasets — linear in snaps.
+    uint64_t resident = 0;
+    for (unsigned s = 0; s < snaps; ++s) resident += all[s].DeviceDataBytes();
+    return resident;
 }
 
 std::vector<clio::cte::core::TagId> MakeSnapTags(const char* prefix, unsigned snaps) {
@@ -414,26 +401,24 @@ TEST_CASE("GPU snapshot double-buffering: 2 groups reused across N snapshots, "
     // while the fresh path holds `snaps` datasets live. The device payload footprint
     // is (#live datasets) × snap_bytes, so kGroups groups = a fixed 2 × snap_bytes
     // regardless of snaps.
-    unsigned prev_reuse_live = 0;
+    uint64_t prev_reuse_bytes = 0;
     for (unsigned snaps : {6u, 12u}) {
         const uint64_t expect = ExpectedChecksum(snaps);
 
         auto reuse_tags = MakeSnapTags("kvhdf5_reuse/snap_", snaps);
-        unsigned reuse_live = RunReused(ipc, gpu_info, reuse_tags, /*drain=*/true);
+        uint64_t reuse_bytes = RunReused(ipc, gpu_info, reuse_tags, /*drain=*/true);
         uint64_t reuse_sum = ReadBackChecksum(reuse_tags);
 
         auto fresh_tags = MakeSnapTags("kvhdf5_fresh/snap_", snaps);
-        unsigned fresh_live = RunFresh(ipc, gpu_info, fresh_tags);
+        uint64_t fresh_bytes = RunFresh(ipc, gpu_info, fresh_tags);
         uint64_t fresh_sum = ReadBackChecksum(fresh_tags);
 
         std::fprintf(stderr,
-            "[reuse] snaps=%2u snap_bytes=%.2f MiB | reused: sum=0x%016llx live=%u "
-            "(%.2f MiB) | fresh: sum=0x%016llx live=%u (%.2f MiB)\n",
+            "[reuse] snaps=%2u snap_bytes=%.2f MiB | reused: sum=0x%016llx resident=%.2f MiB "
+            "| fresh: sum=0x%016llx resident=%.2f MiB\n",
             snaps, double(snap_bytes) / 1048576.0,
-            (unsigned long long)reuse_sum, reuse_live,
-            double(reuse_live) * double(snap_bytes) / 1048576.0,
-            (unsigned long long)fresh_sum, fresh_live,
-            double(fresh_live) * double(snap_bytes) / 1048576.0);
+            (unsigned long long)reuse_sum, double(reuse_bytes) / 1048576.0,
+            (unsigned long long)fresh_sum, double(fresh_bytes) / 1048576.0);
 
         // (1) reuse is byte-correct vs the independent host expectation,
         // (2) and byte-identical to the fresh (never-reusing) control.
@@ -446,14 +431,17 @@ TEST_CASE("GPU snapshot double-buffering: 2 groups reused across N snapshots, "
         REQUIRE(fresh_sum == expect);
         REQUIRE(reuse_sum == fresh_sum);
 
-        // (3) bounded memory: the reused path holds exactly kGroups buffer groups
-        // live regardless of snaps (constant, and the SAME at snaps=6 and snaps=12);
-        // the fresh path holds `snaps` — strictly more, and growing.
-        REQUIRE(reuse_live == kGroups);
-        REQUIRE(fresh_live == snaps);
-        REQUIRE(reuse_live < fresh_live);
-        if (prev_reuse_live) REQUIRE(reuse_live == prev_reuse_live);  // flat across snaps
-        prev_reuse_live = reuse_live;
+        // (3) bounded memory — MEASURED device payload (summed from each live
+        // dataset's registered data backend, not a hardcoded count). The reused
+        // path holds exactly kGroups groups' worth regardless of snaps (constant,
+        // and identical at snaps=6 and snaps=12); the fresh path holds `snaps`
+        // worth. A regression that stopped bounding the reused path (e.g. held all
+        // N snapshots live) would push reuse_bytes to snaps*snap_bytes and trip this.
+        REQUIRE(reuse_bytes == static_cast<uint64_t>(kGroups) * snap_bytes);
+        REQUIRE(fresh_bytes == static_cast<uint64_t>(snaps) * snap_bytes);
+        REQUIRE(reuse_bytes < fresh_bytes);
+        if (prev_reuse_bytes) REQUIRE(reuse_bytes == prev_reuse_bytes);  // flat across snaps
+        prev_reuse_bytes = reuse_bytes;
     }
 
     std::fprintf(stderr, "[reuse] OK: 2 groups served every snapshot byte-identical to "
@@ -492,49 +480,30 @@ TEST_CASE("GPU snapshot double-buffering: device-stamped tag routes correctly "
     REQUIRE(live == kGroups);        // still only 2 buffer groups live
 }
 
-// NEGATIVE CONTROL: drop the reuse drain and require that the run is UNSAFE. If
-// dropping the drain still produced every correct byte with no failed Put, the drain
-// would not be load-bearing and the positive test above would be proving nothing.
+// WHY THERE IS NO EXECUTABLE SNAPSHOT-LEVEL "drop the drain" NEGATIVE CONTROL HERE.
 //
-// Dropping the drain can surface as EITHER of two things, and both count as "the
-// drain was load-bearing": (a) a Put/Get FAILS (the host re-arms tag_id_ or refills
-// a buffer while the CPU worker is still mid-Put on it) — RunReused throws via
-// ThrowIfIoFailed, or a read-back Get returns nonzero; or (b) the Put silently
-// persists the wrong (later-snapshot) bytes. So we assert NOT (ran clean AND every
-// byte correct), tolerating the failure path instead of REQUIRE-aborting on it.
-TEST_CASE("GPU snapshot double-buffering: dropping the reuse drain is unsafe "
-          "(negative control)",
-          "[integration][gpu][cte][reuse][doublebuf]") {
-    (void)kvhdf5::itest::SharedCteEnv();
-    auto* ipc = CLIO_CPU_IPC;
-    clio::run::IpcManagerGpuInfo gpu_info =
-        ipc->GetGpuIpcManager()->GetGpuInfo(/*gpu_id=*/0);
-    REQUIRE(gpu_info.gpu2cpu_queue != nullptr);
-    PrewarmKernels();
-
-    const unsigned snaps = 12;   // enough reuse cycles to lose the race
-
-    auto tags = MakeSnapTags("kvhdf5_reuse_nodrain/snap_", snaps);
-
-    bool put_failed = false;
-    try {
-        RunReused(ipc, gpu_info, tags, /*drain=*/false);
-    } catch (const std::exception& e) {
-        put_failed = true;   // a Put failed under the no-drain race (ThrowIfIoFailed)
-        std::fprintf(stderr, "[reuse] negative control: Put FAILED (%s)\n", e.what());
-    }
-    // Non-throwing read-back: true only if every blob landed AND every byte matches.
-    const bool all_bytes_ok = put_failed ? false : ReadBackAllOk(tags);
-
-    std::fprintf(stderr,
-        "[reuse] negative control (no reuse drain): put_failed=%d all_bytes_ok=%d -> %s\n",
-        int(put_failed), int(all_bytes_ok),
-        (put_failed || !all_bytes_ok) ? "UNSAFE as required (drain is load-bearing)"
-                                      : "UNEXPECTEDLY SAFE");
-
-    // The drain is load-bearing iff the no-drain run was NOT (clean AND fully correct).
-    REQUIRE((put_failed || !all_bytes_ok));
-}
+// The obvious negative control — reuse a group WITHOUT draining its prior Put and
+// assert corruption — cannot be a sound, safe assertion at the SNAPSHOT level,
+// because dropping the drain here re-fires the same TASK SLOT while its previous
+// submission may still be in flight. That is a contract violation (the reuse
+// invariant is: drain a slot's prior Put before re-arming/re-firing it), and it is
+// UNDEFINED behaviour with no clean, assertable outcome:
+//   - it may silently corrupt data (the buffer is overwritten mid-Put) — but only
+//     if the race is lost, which is TIMING-DEPENDENT (a fast server drains first and
+//     the run comes out clean), so "MUST corrupt" is inherently flaky; and/or
+//   - it can hang (the reused slot carries a stale, still-in-flight run_ctx_, which
+//     RecvIn's completion-guarded reset deliberately will NOT free — see
+//     ipc_gpu2cpu.cc — so the second fire is mis-driven and never completes).
+// A test that must trigger UB to pass is neither deterministic nor safe for CI.
+//
+// The drain's load-bearing property is instead proven by two SAFE tests:
+//   1. the POSITIVE test above — reuse is byte-identical ONLY because each group is
+//      drained before refill; remove the drain from RunReused (drain=false) by hand
+//      to observe the hazard during manual investigation, under a timeout.
+//   2. pooled_double_buffer_test.cu — the deterministic, in-bounds negative control
+//      for the SAME buffer-reuse race at the pipeline-depth level: it sweeps M and
+//      requires byte-identical output, and a missing WriteWait(c-M) barrier there
+//      moves the checksum. That is where the teeth live.
 
 #endif  // !CTP_IS_DEVICE_PASS
 

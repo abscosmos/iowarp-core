@@ -67,6 +67,7 @@ class GpuCteDataset {
     uint32_t count_ = 0;
     uint32_t pool_ = 0;                    // resident data buffers M (M==count_ if unpooled)
     uint32_t grid_ = 0;                    // producer grid G (blocks); G divides M
+    uint64_t data_bytes_ = 0;              // registered DATA backend size (device payload)
     // Set once any I/O-status accessor is called. Purely for the destructor's
     // "you never checked" warning; mutable so the accessors stay const.
     mutable bool io_checked_ = false;
@@ -226,6 +227,11 @@ public:
     [[nodiscard]] uint32_t ChunkCount() const { return count_; }
     // Resident data-buffer count M (== ChunkCount() when unpooled).
     [[nodiscard]] uint32_t PoolSize() const { return pool_; }
+    // Bytes of DEVICE payload this dataset holds resident: the registered data
+    // backend size (M * chunk_bytes when pooled, else the sum of chunk sizes).
+    // This is the figure that must stay bounded when buffer groups are reused
+    // across snapshots — measure THIS, not a dataset count.
+    [[nodiscard]] uint64_t DeviceDataBytes() const { return data_bytes_; }
 
     // ---- The producer-launch contract (was "grid == M"; now generalized) ----
     // The producer kernel MUST launch grid == GridSize(), and G == GridSize()
@@ -447,6 +453,7 @@ private:
         }
         const uint64_t data_bytes =
             pooling ? static_cast<uint64_t>(pool_) * slot_bytes : total_data;
+        data_bytes_ = data_bytes;
 
         // (a) Task backend: count_ * (put-slot + get-slot), + pad.
         // MUST be kPinnedHost, matching the gpu_vector adapter reference.
@@ -609,6 +616,7 @@ private:
         count_ = o.count_;
         pool_ = o.pool_;
         grid_ = o.grid_;
+        data_bytes_ = o.data_bytes_;
         handle_ = o.handle_;
         io_checked_ = o.io_checked_;
         o.io_checked_ = true;  // moved-from shell owns nothing; never warn for it
