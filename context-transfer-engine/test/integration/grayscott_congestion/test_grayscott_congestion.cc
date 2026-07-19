@@ -51,12 +51,16 @@
  *   GS_GET_PASSES read-back passes per output       (default 2)
  *   GS_OUTPUT_TIMEOUT_SEC per-output stall cutoff   (default 300)
  */
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <unistd.h>  // _exit
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
@@ -101,6 +105,26 @@ int main() {
                 " get_passes=" + std::to_string(get_passes) +
                 " (put payload/output = " + std::to_string(out_mb) + " MB)");
 
+  // Hard watchdog: Future::Wait() blocks with NO timeout, so a fully-stalled
+  // first future would otherwise never reach the in-loop stall checks (this is
+  // exactly the parked-forever state the Delta ranks were found in). If the
+  // whole run overshoots its budget, report the stall and _exit(42).
+  static std::atomic<bool> g_done{false};
+  const double budget =
+      out_timeout * outputs + 120.0;  // all outputs + startup slack
+  std::thread([node, budget] {
+    auto t0 = std::chrono::steady_clock::now();
+    while (!g_done.load()) {
+      std::this_thread::sleep_for(std::chrono::seconds(2));
+      if (SecsSince(t0) > budget) {
+        Log(node, "WATCHDOG: run exceeded " + std::to_string(budget) +
+                      "s with futures still pending — STALL (collapse)");
+        std::fflush(nullptr);
+        _exit(42);
+      }
+    }
+  }).detach();
+
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
     Log(node, "FAIL: CLIO_INIT(kClient) failed");
     return 2;
@@ -111,10 +135,18 @@ int main() {
   core.Init(clio::run::PoolId(kCtePoolMajor, 0));
 
   // Per-node tag: the cross-node traffic comes from HashBlobToContainer's
-  // per-blob-name scatter, not from where the tag lives.
+  // per-blob-name scatter, not from where the tag lives. Dynamic() is the
+  // intended cluster-visible tag creation (as in the #714 cross-node blob
+  // test). NOTE (robustness finding, #774): with PoolQuery::Local() here — a
+  // node-local tag — cross-node hash-routed Puts neither complete nor error:
+  // the client parks forever in Future::Wait() (the very signature the Delta
+  // ranks showed). Reproduce that mode with GS_TAG_LOCAL=1.
   const std::string tag_name = "gs_congest_n" + std::to_string(node);
+  const bool tag_local = std::getenv("GS_TAG_LOCAL") &&
+                         std::atoi(std::getenv("GS_TAG_LOCAL")) != 0;
   auto mk = core.AsyncGetOrCreateTag(tag_name, clio::cte::core::TagId::GetNull(),
-                                     clio::run::PoolQuery::Local());
+                                     tag_local ? clio::run::PoolQuery::Local()
+                                               : clio::run::PoolQuery::Dynamic());
   mk.Wait();
   if (mk->GetReturnCode() != 0 || mk->tag_id_.IsNull()) {
     Log(node, "FAIL: GetOrCreateTag rc=" + std::to_string(mk->GetReturnCode()));
@@ -150,8 +182,12 @@ int main() {
         futs.push_back(core.AsyncPutBlob(tag, name, 0, blob_bytes,
                                          bufs[i].shm_.template Cast<void>()));
       }
+      const bool trace = std::getenv("GS_TRACE") != nullptr;
       for (int i = 0; i < blobs; ++i) {
+        if (trace) Log(node, "waiting put o" + std::to_string(r) + " b" + std::to_string(i));
         futs[i].Wait();
+        if (trace) Log(node, "done    put o" + std::to_string(r) + " b" + std::to_string(i) +
+                                 " rc=" + std::to_string(futs[i]->GetReturnCode()));
         if (futs[i]->GetReturnCode() != 0) {
           Log(node, "PUT rc=" + std::to_string(futs[i]->GetReturnCode()) +
                         " output=" + std::to_string(r) +
@@ -209,6 +245,7 @@ int main() {
                   std::to_string(t_get) + "s");
   }
 
+  g_done.store(true);
   for (auto &b : bufs) ipc->FreeBuffer(b);
 
   if (stalled) {
