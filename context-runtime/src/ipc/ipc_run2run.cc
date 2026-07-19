@@ -370,6 +370,26 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     const clio::run::TaskInfo &task_info,
     clio::run::LoadTaskArchive &archive,
     ctp::lbm::Transport *lbm_transport) {
+  // Receipt is proof of life (issue #774): a task arriving from a node we had
+  // SWIM-marked dead proves it is alive NOW. Without this, a one-sided death
+  // verdict is TERMINAL: our revival probes to the "dead" node are themselves
+  // gated on IsAlive (SendIn queues them for retry, never sends), and nothing
+  // else clears the flag — meanwhile every response we owe that node (data,
+  // probe ACKs, heartbeat replies) parks in send_out_retry_ until the 30s
+  // drop. Observed live: node 2 held node 1 "dead" indefinitely while
+  // ingesting node 1's healthy probe traffic the whole time, wedging the
+  // entire remote half of the workload.
+  {
+    clio::run::u64 sender = task_info.task_id_.node_id_;
+    auto *im = CLIO_IPC;
+    if (im != nullptr && sender != im->GetNodeId() && !im->IsAlive(sender)) {
+      HLOG(kWarning,
+           "[RecvIn] node {} was marked dead but just sent us a task — "
+           "reviving it (receipt is proof of life)",
+           sender);
+      im->SetAlive(sender);
+    }
+  }
   auto container =
       pool_manager->GetStaticContainer(task_info.pool_id_).get();
   if (!container) {
