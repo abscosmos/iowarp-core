@@ -49,6 +49,7 @@
 #include <clio_cte/kvhdf5/tag_path.h>         // CanonicalTag
 
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>   // Option A: grid.sync() across a resident cooperative grid
 
 #include <algorithm>
 #include <chrono>
@@ -181,6 +182,130 @@ __global__ __launch_bounds__(32) void TwDrainKernel(kvhdf5::GpuDatasetHandle h) 
         __syncthreads();
     }
 }
+
+// REUSE arm's fire kernel: like TwSnapFireKernel (async fire, no wait), but first
+// device-stamps each chunk's destination tag from a host-pre-built table. This is
+// the tag-table addressing that lets a FIXED set of reused buffer groups serve all
+// snapshots — 2 groups instead of one dataset per snapshot — while each snapshot
+// still lands in its OWN dataset (tag_table[snap]) under the same chunk-coordinate
+// key (no `_pi` suffix). SetTag writes tag_id_ on the pinned task POD; WriteAsync's
+// __threadfence_system publishes it before the task is enqueued (see SetTag). The
+// group's buffers were just refilled by TwCopyKernel; the caller drains this group's
+// PRIOR snapshot out of it first (drain-before-refill) so the reuse is race-free.
+// Non-probing only — the reuse arm is not on the submit-probe path. Grid-stride over
+// chunks (see TwSnapSyncKernel).
+__global__ __launch_bounds__(256) void ReuseFireKernel(
+    kvhdf5::GpuDatasetHandle h, const clio::cte::core::TagId* tag_table, uint32_t snap) {
+    CLIO_GPU_INIT(h.info_, /*ipc_ptr=*/nullptr);
+    (void)g_ipc_manager;
+    for (uint32_t c = blockIdx.x; c < h.Count(); c += gridDim.x) {
+        h.SetTag(c, tag_table[snap]);
+        h.WriteAsync</*Probing=*/false>(c);
+        __syncthreads();
+    }
+}
+
+// ---- OPTION A: the PERSISTENT (resident, cooperative) producer kernel --------
+//
+// ONE cudaLaunchCooperativeKernel runs the ENTIRE snapshot loop in-kernel — the "move the
+// snapshot loop into a persistent kernel" design (DESIGN §7 "Option A"). The relaunch arms get a
+// grid-wide barrier between timesteps for free from the kernel-launch boundary; a resident kernel
+// must supply it explicitly with cooperative-groups grid.sync(), because the global Gray-Scott
+// stencil reads neighbours that live in other blocks (periodic BCs). At each snapshot boundary it
+// device-stamps tag_table[s] and fires the Put into double-buffered group s%2 (2 reused groups),
+// draining group s-2 first (the acquire). Same bounded 2-group memory + device self-addressing as
+// the reuse arm; the difference under test is resident-cooperative vs relaunched.
+//
+// DEADLOCK SAFETY (DESIGN §8): the in-kernel WriteWait (acquire + tail drain) spins on the CPU
+// server. A resident cooperative grid occupies the whole device, so the server MUST be able to
+// complete Puts WITHOUT any device operation — i.e. the data backend MUST be kPinnedHost (server
+// reads pinned data + sets the pinned completion flag, no D2H). With kDeviceMem the server's D2H
+// cannot run while the grid is resident and the acquire deadlocks. The launcher enforces pinned
+// data. Prewarm (cudaFuncGetAttributes) before launch is a correctness requirement (cold-launch).
+namespace cg = cooperative_groups;
+// Async == true: fire the snapshot's Puts and defer draining to the next reuse / the tail (the
+// double-buffered producer, the persistent analog of gpuh5). Async == false: fire-AND-WAIT each
+// chunk in-kernel (h.Write), so the GPU blocks on every PutBlob and there is no overlap — the
+// persistent analog of gpuh5_sync. The acquire + tail drain stay in both (idempotent / instant
+// under sync, since each snapshot's Put is already complete before its group is reused).
+template <bool Async>
+__global__ void GsPersistentKernel(
+    float* u0, float* v0, float* u1, float* v1,
+    kvhdf5::GpuDatasetHandle h0, kvhdf5::GpuDatasetHandle h1,
+    const clio::cte::core::TagId* tag_table, const uint32_t* mask,
+    GsParams p, unsigned N, unsigned num_snaps, unsigned steps_per) {
+    CLIO_GPU_INIT(h0.info_, /*ipc_ptr=*/nullptr);
+    (void)g_ipc_manager;
+    cg::grid_group grid = cg::this_grid();
+    const unsigned cells = N * N;
+    const unsigned gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned gstride = gridDim.x * blockDim.x;
+
+    float* uc = u0; float* vc = v0; float* un = u1; float* vn = v1;
+    for (unsigned s = 0; s < num_snaps; ++s) {
+        kvhdf5::GpuDatasetHandle h = (s & 1u) ? h1 : h0;
+        // ACQUIRE: drain group (s%2)'s snapshot s-2 Puts before its buffers are refilled below.
+        // Thread-0 per block, grid-strided over chunks (WriteWait no-ops for other threads).
+        if (s >= 2u)
+            for (uint32_t c = blockIdx.x; c < h.Count(); c += gridDim.x)
+                h.WriteWait(c);
+        grid.sync();   // every block's acquire done before any thread refills the buffers
+
+        // COMPUTE steps_per Gray-Scott steps in-kernel; grid.sync() is the grid-wide barrier
+        // between steps (identical math to GsStepKernel). Ping-pong via local pointer swap
+        // (every thread swaps identically, so uc/vc stay consistent grid-wide).
+        for (unsigned t = 0; t < steps_per; ++t) {
+            for (unsigned gid = gtid; gid < cells; gid += gstride) {
+                unsigned x = gid % N, y = gid / N;
+                unsigned xm = (x == 0) ? (N - 1) : (x - 1);
+                unsigned xp = (x == N - 1) ? 0u : (x + 1);
+                unsigned ym = (y == 0) ? (N - 1) : (y - 1);
+                unsigned yp = (y == N - 1) ? 0u : (y + 1);
+                float ucv = uc[gid], vcv = vc[gid];
+                float lap_u = uc[y*N+xm] + uc[y*N+xp] + uc[ym*N+x] + uc[yp*N+x] - 4.f*ucv;
+                float lap_v = vc[y*N+xm] + vc[y*N+xp] + vc[ym*N+x] + vc[yp*N+x] - 4.f*vcv;
+                float uvv = ucv * vcv * vcv;
+                un[gid] = ucv + p.dt * (p.Du * lap_u - uvv + p.F * (1.f - ucv));
+                vn[gid] = vcv + p.dt * (p.Dv * lap_v + uvv - (p.F + p.k) * vcv);
+            }
+            grid.sync();
+            float* tu = uc; uc = un; un = tu;
+            float* tv = vc; vc = vn; vn = tv;
+        }
+
+        // SUBMIT: vc now holds snapshot s. Fill group (s%2)'s chunk buffers (masked, matching
+        // the relaunch arms' MaskKernel), stamp tag_table[s], fire. Grid-strided over chunks; one
+        // block owns each chunk (block-local __syncthreads), thread-0 fires.
+        const unsigned chunk_cells = cells / h.Count();
+        const uint32_t* vsrc = reinterpret_cast<const uint32_t*>(vc);
+        for (uint32_t c = blockIdx.x; c < h.Count(); c += gridDim.x) {
+            uint32_t* dst = reinterpret_cast<uint32_t*>(h.Data(c));
+            for (unsigned i = threadIdx.x; i < chunk_cells; i += blockDim.x) {
+                unsigned gid = c * chunk_cells + i;
+                uint32_t val = vsrc[gid];
+                if (mask) val ^= mask[gid];
+                dst[i] = val;
+            }
+            __threadfence_system();
+            __syncthreads();
+            h.SetTag(c, tag_table[s]);
+            if (Async) h.WriteAsync</*Probing=*/false>(c);   // fire, drain later (thread-0)
+            else       h.Write</*Probing=*/false>(c);        // fire-AND-WAIT (thread-0)
+            __syncthreads();
+        }
+        grid.sync();   // every block's fire done before the next iteration's acquire
+    }
+    // TAIL: drain the last <= 2 groups still in flight (already complete under Async==false).
+    for (uint32_t c = blockIdx.x; c < h0.Count(); c += gridDim.x) h0.WriteWait(c);
+    if (num_snaps >= 2u)
+        for (uint32_t c = blockIdx.x; c < h1.Count(); c += gridDim.x) h1.WriteWait(c);
+}
+template __global__ void GsPersistentKernel<true>(
+    float*, float*, float*, float*, kvhdf5::GpuDatasetHandle, kvhdf5::GpuDatasetHandle,
+    const clio::cte::core::TagId*, const uint32_t*, GsParams, unsigned, unsigned, unsigned);
+template __global__ void GsPersistentKernel<false>(
+    float*, float*, float*, float*, kvhdf5::GpuDatasetHandle, kvhdf5::GpuDatasetHandle,
+    const clio::cte::core::TagId*, const uint32_t*, GsParams, unsigned, unsigned, unsigned);
 
 // ---- POOLED arm: fill + fire fused into ONE kernel --------------------------
 //
@@ -339,10 +464,13 @@ struct Cfg {
     // when the raw target is a RAM tier (tmpfs, which rejects O_DIRECT) — the fair
     // software-path comparison vs CLIO's kRam bdev.
     unsigned raw_odirect  = EnvU("GSBENCH_RAW_ODIRECT", 1);
-    // Raw arm fsync per snapshot: DURABILITY PARITY with CLIO (whose bdev waits for each
-    // write to commit). Without it, a buffered raw write just lands in RAM/page-cache and
-    // isn't really persisted — doing less work than CLIO. Default on.
-    unsigned raw_fsync    = EnvU("GSBENCH_RAW_FSYNC", 1);
+    // Raw arm fsync per snapshot (also gates the hdf5 arms' per-snapshot H5Fflush+fdatasync):
+    // DURABILITY PARITY with CLIO (whose bdev waits for each write to commit). Without it, a
+    // buffered raw/hdf5 write just lands in RAM/page-cache and isn't really persisted — doing
+    // less work than CLIO. Default on. EnvU0 (not EnvU) so GSBENCH_RAW_FSYNC=0 actually turns
+    // it OFF: EnvU coerces 0 to the default, which would silently keep raw/hdf5 durable while a
+    // matched-non-durable comparison drops CLIO's flush — flattering CLIO. 0 must mean 0.
+    unsigned raw_fsync    = EnvU0("GSBENCH_RAW_FSYNC", 1);
     // DURABILITY PARITY FOR THE CLIO ARMS. CLIO's kFile bdev opens its backing file with a
     // plain O_RDWR|O_CREAT (fs_bdev_transport.cc) — no O_DIRECT, no O_SYNC — and NOTHING in
     // the bdev or AsyncIO stack ever calls fsync/fdatasync. So a PutBlob that "completed"
@@ -361,6 +489,15 @@ struct Cfg {
     // to one standard. Off (0): the historical, non-durable behaviour — kept only so the
     // artifact can be reproduced and quantified.
     unsigned clio_fsync = EnvU0("GSBENCH_CLIO_FSYNC", 1);
+    // PER-SNAPSHOT durability for the CLIO arms (checkpoint semantics): drain THIS snapshot's
+    // Puts + fdatasync the bdev file INSIDE the snapshot loop, so a crash loses at most the
+    // in-flight snapshot — the same guarantee raw/hdf5 give with per-snapshot fdatasync
+    // (GSBENCH_RAW_FSYNC). This deliberately SERIALIZES the async/reuse arms (their whole point
+    // is to fire-and-drain-in-background; forcing durability each snapshot removes that overlap),
+    // so it is the honest apples-to-apples DURABLE comparison vs the HDF5 arms — and it shows the
+    // real cost of checkpoint durability under the async design. Needs a file bdev (fdatasync
+    // target) and clio_fsync on. 0 (default) = the end-of-run flush only. EnvU0 so 0 means 0.
+    unsigned clio_persnap = EnvU0("GSBENCH_CLIO_PERSNAP", 0);
     // cudaHostRegister the hostclio arm's shm staging buffer.
     //
     // hostclio D2Hs into a CLIO shm buffer, which CUDA sees as ordinary pageable memory, so
@@ -578,6 +715,9 @@ struct Masker {
         MaskKernel<<<b, t>>>(d_scratch_, reinterpret_cast<uint32_t*>(v), d_mask_, cells_);
         return reinterpret_cast<float*>(d_scratch_);
     }
+    // Raw device mask pointer for arms that XOR inline (the persistent kernel), or nullptr when
+    // incompressibility is off. Same fixed-seed mask Apply() uses, so persisted bytes match.
+    const uint32_t* MaskPtr() const { return on_ ? d_mask_ : nullptr; }
 };
 
 // FNV-1a over a host byte buffer (cross-arm "identical computation" proof).
@@ -1233,6 +1373,16 @@ double RunClioArm(const Cfg& cfg, ClioMode mode, const char* prefix, uint64_t* c
         cudaEventRecord(pace_ev[si]);
         if (si >= pace_k) cudaEventSynchronize(pace_ev[si - pace_k]);
     };
+    // PER-SNAPSHOT durability (GSBENCH_CLIO_PERSNAP): drain THIS snapshot's Puts to the bdev,
+    // then fdatasync the bdev file — inside the loop. Deliberately serializes the async/pooled
+    // arms (removes the fire-and-defer overlap) so the DURABLE comparison vs raw/hdf5 is
+    // apples-to-apples: crash loses at most the in-flight snapshot. No-op unless armed.
+    auto durable_persnap = [&](kvhdf5::GpuDatasetHandle h) {
+        if (!cfg.clio_persnap) return;
+        TwDrainKernel<<<submit_grid, 32>>>(h);   // land this snapshot's writes into the bdev
+        ctp::GpuApi::Synchronize();
+        ClioBdevSync(cfg);                        // fdatasync the bdev backing file
+    };
 
     auto snap = [&](unsigned si, float* v_curr) {
         float* src = masker.Apply(v_curr);   // incompressible view (or v_curr if disabled)
@@ -1244,6 +1394,7 @@ double RunClioArm(const Cfg& cfg, ClioMode mode, const char* prefix, uint64_t* c
                 TwSnapPooledKernel<true><<<ds[si].GridSize(), 256>>>(ds[si].Handle(), bsrc);
             else
                 TwSnapPooledKernel<false><<<ds[si].GridSize(), 256>>>(ds[si].Handle(), bsrc);
+            durable_persnap(ds[si].Handle());   // per-snapshot durable (no-op unless armed)
             pace(si);   // bound run-ahead; see GSBENCH_PACE above
             return;
         }
@@ -1267,6 +1418,7 @@ double RunClioArm(const Cfg& cfg, ClioMode mode, const char* prefix, uint64_t* c
             // overlap, and it never wedges (its waits are deferred to the end drain).
             ctp::GpuApi::Synchronize();
         }
+        durable_persnap(ds[si].Handle());   // per-snapshot durable (no-op unless armed)
     };
     auto finalize = [&]() {
         // Both fire-and-defer arms drain here, at the END of the timed region, so each
@@ -1310,6 +1462,275 @@ double RunClioArm(const Cfg& cfg, ClioMode mode, const char* prefix, uint64_t* c
     // Dumped only after ThrowIfIoFailed above: a breakdown from a run with failed puts
     // would be timing an I/O that never happened.
     probe.Dump(ClioModeName(mode), EnvS("GSBENCH_PROBE_DIR", ".").c_str());
+    *checksum = ChecksumSnapshots(tags, cfg);
+    return ms;
+}
+
+// REUSE arm (DESIGN §7 "Option B", relaunched): the async arm's well-parallelized
+// separate kernels (GsStepKernel for every step, TwCopyKernel to stage, WriteAsync to
+// fire), with three deltas that make snapshot payload memory CONSTANT in the number of
+// snapshots and keep addressing on the device:
+//   1. TWO reused buffer GROUPS (round-robin snap % 2) replace the one-dataset-per-
+//      snapshot array, so resident device payload is ~2 x snapshot, flat in snaps.
+//   2. DRAIN-BEFORE-REFILL: before a group is reused at snapshot s, an in-stream
+//      TwDrainKernel waits for snapshot s-2's Puts out of that group to drain, so
+//      refilling its buffers cannot race the server's read (the load-bearing buffer-
+//      availability barrier; dropping it corrupts — proven by pooled_double_buffer_test
+//      and snapshot_reuse_test, which own the negative-control teeth).
+//   3. DEVICE TAG-STAMP: ReuseFireKernel sets task->tag_id_ = tag_table[s] from a host-
+//      pre-built device-visible TagId table, so each snapshot still persists to its own
+//      dataset (path .../step_000s, key = chunk coordinate, no `_pi`).
+// NOT fused and NOT cooperative — compute stays the plain full-grid GsStepKernel (26
+// regs / 100%), and the kernel-launch boundary is the free grid-wide barrier between
+// timesteps. (Option A makes the whole loop resident with cooperative grid.sync(); this
+// relaunched arm is the baseline it is measured against.) Its checksum MUST equal
+// sync's/async's — identical computation and persisted bytes.
+double RunReuseArm(const Cfg& cfg, const char* prefix, uint64_t* checksum) {
+    auto* ipc = CLIO_CPU_IPC;
+    REQUIRE(ipc->GetGpuIpcManager() != nullptr);
+    clio::run::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(0);
+    REQUIRE(gpu_info.gpu2cpu_queue != nullptr);
+
+    const kvhdf5::Layout layout{/*dims=*/{cfg.cells()},
+                                /*chunk_dims=*/{cfg.cells() / cfg.chunks},
+                                /*elem_size=*/sizeof(float)};
+    REQUIRE(layout.ChunkCount() == cfg.chunks);
+    const auto data_kind = cfg.data_pinned
+        ? kvhdf5::GpuCteDataset::MemKind::kPinnedHost
+        : kvhdf5::GpuCteDataset::MemKind::kDeviceMem;
+
+    // One tag per snapshot (distinct dataset), resolved off the hot path, plus a
+    // device-visible TagId table the fire kernel indexes by snapshot.
+    std::vector<clio::cte::core::TagId> tags;
+    tags.reserve(cfg.snaps);
+    for (unsigned s = 0; s < cfg.snaps; ++s) {
+        char path[160];
+        std::snprintf(path, sizeof(path), "%s/v/step_%04u", prefix, s);
+        tags.push_back(MakeTag(kvhdf5::tagpath::CanonicalTag(path).c_str()));
+    }
+    clio::cte::core::TagId* d_tag_table = nullptr;
+    REQUIRE(cudaMalloc(&d_tag_table,
+                       cfg.snaps * sizeof(clio::cte::core::TagId)) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d_tag_table, tags.data(),
+                       cfg.snaps * sizeof(clio::cte::core::TagId),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    // The FIXED set of buffer groups (2, or 1 if snaps==1), constructed ONCE and reused.
+    // Their construction tag is irrelevant (the fire kernel overrides it per snapshot via
+    // SetTag), but the layout — chunk coordinates + chunk bytes — is shared.
+    const unsigned ngroups = std::min(2u, cfg.snaps);
+    std::vector<kvhdf5::GpuCteDataset> groups;
+    groups.reserve(ngroups);
+    for (unsigned gi = 0; gi < ngroups; ++gi) {
+        char path[160];
+        std::snprintf(path, sizeof(path), "%s/v/group_%u", prefix, gi);
+        groups.emplace_back(kvhdf5::GpuCteDataset::FromPath(
+            ipc, gpu_info, /*gpu_id=*/0, CLIO_CTE_CLIENT, path, layout,
+            /*pool_size=*/0, data_kind, /*grid_size=*/0));
+    }
+    {
+        const uint64_t chunk_bytes = cfg.grid_bytes() / cfg.chunks;
+        uint64_t resident = 0;
+        for (auto& d : groups) resident += d.DeviceDataBytes();
+        std::fprintf(stderr,
+            "GSBENCH_REUSE groups=%u resident_data_bytes=%llu (async M=N x snaps "
+            "would be %llu)\n",
+            ngroups, (unsigned long long)resident,
+            (unsigned long long)(uint64_t(cfg.chunks) * chunk_bytes * cfg.snaps));
+    }
+
+    Masker masker(cfg.N, cfg.incompressible != 0);
+    Grids g = MakeGrids(cfg.N);
+    PhaseTrace trace(EnvU("GSBENCH_TRACE", 0) != 0, cfg.snaps, /*async=*/true);
+
+    const uint64_t copy_chunk_bytes = cfg.grid_bytes() / cfg.chunks;
+    const unsigned copy_words = unsigned(copy_chunk_bytes / sizeof(uint32_t));
+    unsigned copy_bpc = (copy_words + 255) / 256;
+    if (copy_bpc < 1) copy_bpc = 1;
+    if (copy_bpc > 2048) copy_bpc = 2048;
+    const unsigned submit_grid = cfg.submit_grid();
+
+    if (cfg.prewarm) {
+        cudaFuncAttributes fa;
+        cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwCopyKernel));
+        cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(ReuseFireKernel));
+        cudaFuncGetAttributes(&fa, reinterpret_cast<const void*>(TwDrainKernel));
+    }
+
+    // Bound host run-ahead (GSBENCH_PACE). Like the pooled arm, this arm has a RESIDENT
+    // in-loop wait — the drain-before-refill TwDrainKernel spins on the in-process server
+    // — so if the host floods the ~1024-deep CUDA launch queue while that drain is parked,
+    // the server can't make progress from the same process and it DEADLOCKS. A sliding
+    // cudaEventSynchronize window K snapshots back leaves K snapshots in flight and never
+    // stalls the GPU (host-only wait). Free: the GPU is the bottleneck, so run-ahead past a
+    // few snapshots buys no throughput. GSBENCH_PACE=0 disables it (to measure the wedge).
+    const unsigned pace_dflt = 512u / (cfg.steps_per + 2u);
+    const unsigned pace_k = EnvU0("GSBENCH_PACE", pace_dflt < 2u ? 2u : pace_dflt);
+    std::vector<cudaEvent_t> pace_ev;
+    if (pace_k) {
+        pace_ev.resize(cfg.snaps);
+        for (auto& e : pace_ev) cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+    }
+    auto pace = [&](unsigned si) {
+        if (pace_ev.empty()) return;
+        cudaEventRecord(pace_ev[si]);
+        if (si >= pace_k) cudaEventSynchronize(pace_ev[si - pace_k]);
+    };
+
+    auto snap = [&](unsigned si, float* v_curr) {
+        const unsigned gi = si % ngroups;
+        float* src = masker.Apply(v_curr);
+        const byte_t* bsrc = reinterpret_cast<const byte_t*>(src);
+        // DRAIN-BEFORE-REFILL: reclaim this group's buffers from snapshot si-ngroups,
+        // in-stream (the WriteWait completes before the copy below refills). Without it
+        // the copy races the server's read of the prior snapshot => corruption.
+        if (si >= ngroups)
+            TwDrainKernel<<<submit_grid, 32>>>(groups[gi].Handle());
+        TwCopyKernel<<<dim3(copy_bpc, cfg.chunks), 256>>>(groups[gi].Handle(), bsrc);
+        ReuseFireKernel<<<submit_grid, 256>>>(groups[gi].Handle(), d_tag_table, si);
+        // PER-SNAPSHOT durability (GSBENCH_CLIO_PERSNAP): drain THIS snapshot's Puts to the
+        // bdev + fdatasync, inside the loop. Serializes the arm (removes the fire-and-defer
+        // overlap) so the DURABLE comparison vs raw/hdf5 is apples-to-apples. No-op unless armed.
+        if (cfg.clio_persnap) {
+            TwDrainKernel<<<submit_grid, 32>>>(groups[gi].Handle());
+            ctp::GpuApi::Synchronize();
+            ClioBdevSync(cfg);
+        }
+        pace(si);
+    };
+    auto finalize = [&]() {
+        for (auto& d : groups) TwDrainKernel<<<submit_grid, 32>>>(d.Handle());
+        ctp::GpuApi::Synchronize();
+        ClioBdevSync(cfg);   // durability parity with raw/hdf5 — see Cfg::clio_fsync
+    };
+
+    double ms = RunSim(cfg, g, snap, finalize, nullptr, &trace);
+    for (auto& e : pace_ev) cudaEventDestroy(e);
+
+    ctp::GpuApi::Synchronize();
+    // Best-effort I/O-failure check on the reused groups (each holds only its LAST
+    // snapshot's per-slot status; a mid-run failure also shows as a read-back checksum
+    // mismatch, which is the primary cross-arm correctness gate).
+    for (unsigned gi = 0; gi < ngroups; ++gi)
+        groups[gi].ThrowIfIoFailed(("gsbench reuse group " + std::to_string(gi)).c_str());
+
+    FreeGrids(g);
+    cudaFree(d_tag_table);
+    trace.Report("reuse");
+    *checksum = ChecksumSnapshots(tags, cfg);
+    return ms;
+}
+
+// PERSISTENT arm (DESIGN §7 "Option A"): the whole snapshot loop in ONE resident cooperative
+// kernel (GsPersistentKernel), head-to-head against the relaunched reuse/async arms. Same 2 reused
+// groups + device tag-stamp + bounded memory; the difference is resident-cooperative (grid.sync())
+// vs relaunched. FORCES kPinnedHost data — the in-kernel WriteWait would deadlock a resident grid
+// against the server's D2H otherwise (see GsPersistentKernel). Its checksum MUST equal the other
+// arms'.
+double RunPersistentArm(const Cfg& cfg, const char* prefix, uint64_t* checksum,
+                        bool async_submit = true) {
+    // Select the resident-kernel submit mode: async fire (double-buffered producer) or
+    // fire-AND-wait per snapshot (the persistent analog of gpuh5_sync).
+    const void* kfn = async_submit
+        ? reinterpret_cast<const void*>(GsPersistentKernel<true>)
+        : reinterpret_cast<const void*>(GsPersistentKernel<false>);
+    auto* ipc = CLIO_CPU_IPC;
+    REQUIRE(ipc->GetGpuIpcManager() != nullptr);
+    clio::run::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(0);
+    REQUIRE(gpu_info.gpu2cpu_queue != nullptr);
+
+    const kvhdf5::Layout layout{/*dims=*/{cfg.cells()},
+                                /*chunk_dims=*/{cfg.cells() / cfg.chunks},
+                                /*elem_size=*/sizeof(float)};
+    REQUIRE(layout.ChunkCount() == cfg.chunks);
+    // MANDATORY kPinnedHost data: the server must complete Puts with no device op while the
+    // cooperative grid is resident (see GsPersistentKernel's deadlock note).
+    const auto data_kind = kvhdf5::GpuCteDataset::MemKind::kPinnedHost;
+
+    std::vector<clio::cte::core::TagId> tags;
+    tags.reserve(cfg.snaps);
+    for (unsigned s = 0; s < cfg.snaps; ++s) {
+        char path[160];
+        std::snprintf(path, sizeof(path), "%s/v/step_%04u", prefix, s);
+        tags.push_back(MakeTag(kvhdf5::tagpath::CanonicalTag(path).c_str()));
+    }
+    clio::cte::core::TagId* d_tag_table = nullptr;
+    REQUIRE(cudaMalloc(&d_tag_table,
+                       cfg.snaps * sizeof(clio::cte::core::TagId)) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d_tag_table, tags.data(),
+                       cfg.snaps * sizeof(clio::cte::core::TagId),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    const unsigned ngroups = std::min(2u, cfg.snaps);
+    std::vector<kvhdf5::GpuCteDataset> groups;
+    groups.reserve(2);
+    for (unsigned gi = 0; gi < ngroups; ++gi) {
+        char path[160];
+        std::snprintf(path, sizeof(path), "%s/v/group_%u", prefix, gi);
+        groups.emplace_back(kvhdf5::GpuCteDataset::FromPath(
+            ipc, gpu_info, /*gpu_id=*/0, CLIO_CTE_CLIENT, path, layout,
+            /*pool_size=*/0, data_kind, /*grid_size=*/0));
+    }
+    // The kernel always dereferences BOTH handles (h0/h1 params + the tail drain). If snaps==1
+    // there is only one real group; point h1 at group 0 so h1's Count()/WriteWait are harmless
+    // (its snapshot-1 branch never fires and the tail drain of group 0 is idempotent).
+    kvhdf5::GpuDatasetHandle h0 = groups[0].Handle();
+    kvhdf5::GpuDatasetHandle h1 = (ngroups > 1 ? groups[1] : groups[0]).Handle();
+    {
+        const uint64_t chunk_bytes = cfg.grid_bytes() / cfg.chunks;
+        uint64_t resident = 0;
+        for (auto& d : groups) resident += d.DeviceDataBytes();
+        std::fprintf(stderr,
+            "GSBENCH_PERSISTENT groups=%u resident_data_bytes=%llu (async M=N x snaps would be "
+            "%llu)\n", ngroups, (unsigned long long)resident,
+            (unsigned long long)(uint64_t(cfg.chunks) * chunk_bytes * cfg.snaps));
+    }
+
+    Masker masker(cfg.N, cfg.incompressible != 0);
+    Grids g = MakeGrids(cfg.N);
+
+    // Occupancy-sized grid: cooperative launch requires the whole grid co-resident. Grid-stride
+    // (compute over cells, I/O over chunks) makes any grid <= that limit correct.
+    int dev = 0; cudaGetDevice(&dev);
+    int num_sm = 0;
+    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev);
+    const int block = 256;
+    int blocks_per_sm = 0;
+    REQUIRE(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, kfn, block, 0) == cudaSuccess);
+    REQUIRE(blocks_per_sm > 0);   // 0 => the kernel can't be co-resident (cooperative launch fails)
+    const int grid = num_sm * blocks_per_sm;
+    std::fprintf(stderr, "GSBENCH_PERSISTENT grid=%d (%d SMs x %d blocks/SM) block=%d\n",
+                 grid, num_sm, blocks_per_sm, block);
+
+    // Prewarm is a CORRECTNESS requirement (cold-launch deadlock): force the module resident
+    // before the timed cooperative launch.
+    if (cfg.prewarm) {
+        cudaFuncAttributes fa;
+        cudaFuncGetAttributes(&fa, kfn);
+    }
+
+    unsigned N = cfg.N, snaps = cfg.snaps, steps_per = cfg.steps_per;
+    const uint32_t* d_mask = masker.MaskPtr();
+    void* args[] = {&g.u_curr, &g.v_curr, &g.u_next, &g.v_next, &h0, &h1,
+                    &d_tag_table, &d_mask, const_cast<GsParams*>(&kGs),
+                    &N, &snaps, &steps_per};
+
+    ctp::GpuApi::Synchronize();   // settle the seed before timing
+    auto t0 = std::chrono::steady_clock::now();
+    cudaError_t lerr = cudaLaunchCooperativeKernel(
+        const_cast<void*>(kfn), dim3(grid), dim3(block), args, 0, 0);
+    REQUIRE(lerr == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    ClioBdevSync(cfg);   // durability parity (end flush) — matches the other CLIO arms
+
+    for (unsigned gi = 0; gi < ngroups; ++gi)
+        groups[gi].ThrowIfIoFailed(("gsbench persistent group " + std::to_string(gi)).c_str());
+
+    FreeGrids(g);
+    cudaFree(d_tag_table);
     *checksum = ChecksumSnapshots(tags, cfg);
     return ms;
 }
@@ -2314,12 +2735,16 @@ TEST_CASE("GSBENCH raw disk (no CLIO)", "[.][integration][gpu][gsbench][gsbench_
     REQUIRE(ms > 0.0);
 }
 
-TEST_CASE("GSBENCH clio sync", "[.][integration][gpu][gsbench][gsbench_sync]") {
+// Tag alias [gsbench_sync] kept for back-compat with the older sweep/campaign scripts
+// (run_bench_sweep.sh, run_submit_probe_sweep.sh, scaling_campaign/run_campaign.sh); the
+// canonical name is gpuh5_sync.
+TEST_CASE("GSBENCH gpuh5 sync",
+          "[.][integration][gpu][gsbench][gsbench_gpuh5_sync][gsbench_sync]") {
     Cfg cfg;
     static BenchEnv env(cfg);
     uint64_t checksum = 0;
-    double ms = RunClioArm(cfg, ClioMode::kSync, "results/gsbench/sync", &checksum);
-    PrintResult("sync", cfg, ms, checksum);
+    double ms = RunClioArm(cfg, ClioMode::kSync, "results/gsbench/gpuh5_sync", &checksum);
+    PrintResult("gpuh5_sync", cfg, ms, checksum);
     REQUIRE(ms > 0.0);
 }
 
@@ -2382,12 +2807,14 @@ TEST_CASE("GSBENCH hdf5 async-VOL",
 }
 #endif
 
-TEST_CASE("GSBENCH clio async", "[.][integration][gpu][gsbench][gsbench_async]") {
+// Tag alias [gsbench_async] kept for back-compat (canonical name gpuh5_noreuse).
+TEST_CASE("GSBENCH gpuh5 noreuse",
+          "[.][integration][gpu][gsbench][gsbench_gpuh5_noreuse][gsbench_async]") {
     Cfg cfg;
     static BenchEnv env(cfg);
     uint64_t checksum = 0;
-    double ms = RunClioArm(cfg, ClioMode::kAsync, "results/gsbench/async", &checksum);
-    PrintResult("async", cfg, ms, checksum);
+    double ms = RunClioArm(cfg, ClioMode::kAsync, "results/gsbench/gpuh5_noreuse", &checksum);
+    PrintResult("gpuh5_noreuse", cfg, ms, checksum);
     REQUIRE(ms > 0.0);
 }
 
@@ -2404,6 +2831,49 @@ TEST_CASE("GSBENCH clio pooled", "[.][integration][gpu][gsbench][gsbench_pooled]
     uint64_t checksum = 0;
     double ms = RunClioArm(cfg, ClioMode::kPooled, "results/gsbench/pooled", &checksum);
     PrintResult("pooled", cfg, ms, checksum);
+    REQUIRE(ms > 0.0);
+}
+
+// REUSE arm (DESIGN §7 "Option B", relaunched): async's shape but memory constant in
+// snapshots — 2 reused buffer groups (snap % 2) with drain-before-refill and an in-kernel
+// device tag-stamp, so each snapshot still lands in its own dataset. GPU-initiated,
+// bounded-both-sides memory, O(1) device state; NOT fused/cooperative (that is Option A).
+// Its checksum MUST equal sync's/async's — same computation, same persisted bytes.
+// Tag alias [gsbench_reuse] kept for back-compat (canonical name gpuh5 — the DEFAULT design).
+TEST_CASE("GSBENCH gpuh5 (reuse; default)",
+          "[.][integration][gpu][gsbench][gsbench_gpuh5][gsbench_reuse]") {
+    Cfg cfg;
+    static BenchEnv env(cfg);
+    uint64_t checksum = 0;
+    double ms = RunReuseArm(cfg, "results/gsbench/gpuh5", &checksum);
+    PrintResult("gpuh5", cfg, ms, checksum);
+    REQUIRE(ms > 0.0);
+}
+
+// PERSISTENT arm (DESIGN §7 "Option A"): the whole snapshot loop in ONE resident cooperative
+// kernel (grid.sync() between timesteps), fired against the relaunched reuse/async arms. Same
+// bounded 2-group memory + device self-addressing; forces kPinnedHost data (deadlock safety).
+// Checksum MUST equal sync's/async's/reuse's.
+TEST_CASE("GSBENCH clio persistent", "[.][integration][gpu][gsbench][gsbench_persistent]") {
+    Cfg cfg;
+    static BenchEnv env(cfg);
+    uint64_t checksum = 0;
+    double ms = RunPersistentArm(cfg, "results/gsbench/persistent", &checksum);
+    PrintResult("persistent", cfg, ms, checksum);
+    REQUIRE(ms > 0.0);
+}
+
+// persistent_sync: the resident cooperative kernel but with SYNCHRONOUS submit (fire-AND-wait
+// each snapshot in-kernel, no double buffering / no overlap) -- the persistent analog of
+// gpuh5_sync. Isolates the resident-vs-relaunch axis for the synchronous submission model.
+TEST_CASE("GSBENCH clio persistent_sync",
+          "[.][integration][gpu][gsbench][gsbench_persistent_sync]") {
+    Cfg cfg;
+    static BenchEnv env(cfg);
+    uint64_t checksum = 0;
+    double ms = RunPersistentArm(cfg, "results/gsbench/persistent_sync", &checksum,
+                                 /*async_submit=*/false);
+    PrintResult("persistent_sync", cfg, ms, checksum);
     REQUIRE(ms > 0.0);
 }
 

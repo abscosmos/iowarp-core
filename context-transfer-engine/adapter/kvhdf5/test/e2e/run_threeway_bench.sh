@@ -170,8 +170,10 @@ for rep in $(seq 1 "${GSBENCH_REPEATS}"); do
         run_arm "[gsbench_hdf5_async]" "hdf5_async"
     fi
     run_arm "[gsbench_hostclio]" "hostclio"
-    run_arm "[gsbench_sync]"     "sync"
-    run_arm "[gsbench_async]"    "async"
+    run_arm "[gsbench_gpuh5_sync]"    "gpuh5_sync"
+    run_arm "[gsbench_gpuh5_noreuse]" "gpuh5_noreuse"
+    run_arm "[gsbench_gpuh5]"         "gpuh5"
+    run_arm "[gsbench_persistent]"    "persistent"
 done
 reset_state
 
