@@ -1515,10 +1515,14 @@ double RunReuseArm(const Cfg& cfg, const char* prefix, uint64_t* checksum) {
                        cfg.snaps * sizeof(clio::cte::core::TagId),
                        cudaMemcpyHostToDevice) == cudaSuccess);
 
-    // The FIXED set of buffer groups (2, or 1 if snaps==1), constructed ONCE and reused.
-    // Their construction tag is irrelevant (the fire kernel overrides it per snapshot via
-    // SetTag), but the layout — chunk coordinates + chunk bytes — is shared.
-    const unsigned ngroups = std::min(2u, cfg.snaps);
+    // The buffer groups (GSBENCH_GROUPS, default 2; capped at snaps), constructed ONCE and
+    // reused round-robin (snap % ngroups) with drain-before-refill. Their construction tag is
+    // irrelevant (the fire kernel overrides it per snapshot via SetTag), but the layout —
+    // chunk coordinates + chunk bytes — is shared. EnvU floors any value <=0 to the default,
+    // so ngroups is always >=1 and the modulus below is safe. This sweeps the inter-snapshot
+    // depth (snapshots in flight); 1 = fully serialized (drain every snapshot), 2 = double
+    // buffer. Persistent arm stays fixed at 2 (its kernel takes exactly two handles).
+    const unsigned ngroups = std::min(EnvU("GSBENCH_GROUPS", 2), cfg.snaps);
     std::vector<kvhdf5::GpuCteDataset> groups;
     groups.reserve(ngroups);
     for (unsigned gi = 0; gi < ngroups; ++gi) {
