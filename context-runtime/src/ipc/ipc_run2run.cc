@@ -822,6 +822,11 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
 
   std::unique_lock<std::mutex> _rqlk(retry_queues_mutex_);
 
+  // Replicas whose delivery timed out; their ORIGIN tasks must be failed after
+  // the lock is dropped (HandleTaskProgressResult takes send_map_mutex_ and can
+  // complete the origin via EndTask — neither belongs under retry_queues_mutex_).
+  std::vector<std::pair<clio::run::u64, clio::run::u32>> send_in_failures;
+
   for (auto it = send_in_retry_.begin(); it != send_in_retry_.end();) {
     float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
     float task_timeout = kRun2RunRetryTimeoutSec;
@@ -833,7 +838,18 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
     if (elapsed >= task_timeout) {
       HLOG(kError, "[RetryQueue] SendIn task timed out after {}s for node {}",
            elapsed, it->target_node_id);
-      it->task->SetReturnCode(kRun2RunNetworkTimeoutRC);
+      // Do NOT just drop the entry: the replica copy's return code is invisible
+      // to anyone, the origin task stays in send_map_ with this replica
+      // unaccounted, and the client's Future::Wait() hangs FOREVER (issue #774
+      // — the gray-scott L=512 writers parked at output 1: a receiver that
+      // grinds >30s under large-payload load looks exactly like an
+      // undeliverable peer). Account the replica as gone via the #628 path so
+      // the origin completes with kRun2RunNetworkTimeoutRC — the client gets a
+      // retryable ERROR instead of an infinite hang. (The task_id_ of the
+      // retry entry's copy carries net_key = send_map key and its replica_id.)
+      send_in_failures.emplace_back(
+          static_cast<clio::run::u64>(it->task->task_id_.net_key_),
+          it->task->task_id_.replica_id_);
       it = send_in_retry_.erase(it);
     } else if (ipc_manager->IsAlive(it->target_node_id)) {
       if (RetrySendToNode(*it, it->target_node_id)) {
@@ -860,6 +876,16 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
       }
       ++it;
     }
+  }
+
+  // Fail the origins of timed-out SendIn replicas outside the retry lock
+  // (mirrors the unlock dance the SendOut retry below already uses).
+  if (!send_in_failures.empty()) {
+    _rqlk.unlock();
+    for (const auto &f : send_in_failures) {
+      HandleTaskProgressResult(f.first, f.second, /*gone=*/true);
+    }
+    _rqlk.lock();
   }
 
   for (auto it = send_out_retry_.begin(); it != send_out_retry_.end();) {

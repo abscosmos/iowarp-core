@@ -60,7 +60,7 @@ run_phase() {
     # Bounded wait on both producers; 124 marks a hard phase timeout (a node
     # that never even reached its own per-output stall cutoff).
     PHASE_RC1=$(timeout "$hard_to" docker wait gs-congest-node1 2>/dev/null || echo 124)
-    PHASE_RC2=$(timeout 60 docker wait gs-congest-node2 2>/dev/null || echo 124)
+    PHASE_RC2=$(timeout "$hard_to" docker wait gs-congest-node2 2>/dev/null || echo 124)
 
     say "--- node1 output lines ---"
     docker logs gs-congest-node1 2>&1 | grep -aE "gs-congest|OUTPUT|RESULT|STALL" | tail -12
