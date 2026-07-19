@@ -112,6 +112,25 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   PoolId pool_id = task_raw->pool_id_;
   u32 method_id = task_raw->method_;
 
+  // Producer-only reuse fix: for a kPinnedHost / kManagedUvm task the POD is the
+  // CLIENT-OWNED slot itself (not the per-pop D2H scratch), and every device
+  // Send re-submits that SAME slot as a fresh top-level execution. But the slot
+  // still carries run_ctx_ from its PRIOR submission — the runtime never
+  // destructs it (we WrapNonOwning below) and the device Send only clears fut_,
+  // not run_ctx_. BeginRunContext/EnsureRunCtx deliberately REUSE a non-null
+  // run_ctx_, so without this the second submission inherits the first's
+  // IsStarted()/IsCoroCompleted() state: the worker drives it as a RESUME of an
+  // already-finished coroutine, PutBlob never re-executes, SendOut never fires,
+  // and the kernel's WriteWait spins forever (the historical "dataset REUSE
+  // hangs / one-round-trip-per-dataset" symptom). Freeing the stale context here
+  // makes EnsureRunCtx allocate a clean one — IsStarted() false → StartCoroutine.
+  // Fresh slots (run_ctx_ null) reset to a no-op, so single-fire paths are
+  // unchanged. The D2H-scratch (kDeviceMem) path already gets a fresh copy per
+  // pop, so it is left untouched.
+  if (!task_on_device) {
+    task_raw->ResetRunCtx();
+  }
+
   // task_raw points into a reused worker scratch buffer (or device memory), not
   // a make_shared block — wrap it NON-OWNING so the Future frees nothing.
   Future<Task> future(pool_id, method_id,
