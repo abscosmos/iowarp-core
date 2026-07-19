@@ -73,6 +73,24 @@ run_phase() {
 MODE="${1:-both}"
 small_ok=-1; large_verdict="not-run"
 
+# --- tiny: HARD regression gate for cross-node SHM clients (#774) -----------
+# 4 x 64KB blobs, 2 outputs. Before the client_net_key_ echo fix, ANY blob
+# whose name hash-routed to the other node's container left the SHM client's
+# future incomplete forever (run2run repurposes task_id_.net_key_; the
+# response came back bearing the daemon's key and the client demux parked
+# it). This phase must PASS on both nodes; it is wired into cluster-tests.yml
+# so the cross-node SHM client path can never silently regress again.
+if [ "$MODE" = "tiny" ]; then
+    GS_BLOBS=4 GS_OUTPUTS=2 run_phase "tiny cross-node SHM gate" 64 420
+    if [ "$PHASE_RC1" = "0" ] && [ "$PHASE_RC2" = "0" ]; then
+        ok "Cross-node SHM client gate PASSED (issue #774)"
+        exit 0
+    fi
+    err "Cross-node SHM client gate FAILED (node1=$PHASE_RC1 node2=$PHASE_RC2)"
+    err "  A cross-node-routed SHM-client task did not complete — see #774."
+    exit 1
+fi
+
 if [ "$MODE" = "small" ] || [ "$MODE" = "both" ]; then
     run_phase "L=256 analog (small)" 512 600
     if [ "$PHASE_RC1" = "0" ] && [ "$PHASE_RC2" = "0" ]; then
