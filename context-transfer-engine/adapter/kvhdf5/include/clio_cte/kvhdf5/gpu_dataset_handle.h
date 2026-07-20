@@ -223,6 +223,30 @@ struct GpuDatasetHandle {
         __syncthreads();
     }
 
+    // ---- Device self-addressing: in-kernel per-snapshot key stamp -----------
+    //
+    // Re-target chunk c's Put/Get to a new destination `tag` from INSIDE the
+    // kernel, before firing — the tag-table addressing model (DESIGN §3.3) that
+    // lets a persistent kernel serve many snapshots out of a fixed set of reused
+    // buffer groups: the host pre-builds a device-visible TagId[num_snaps] table
+    // off the hot path, and the kernel stamps chunk c's tag = table[snapshot]
+    // just before WriteAsync(c). The blob name (chunk coordinate) is unchanged,
+    // so snapshot s lands as its OWN dataset (tag) under the same coordinate key.
+    //
+    // The runtime reads task->tag_id_ at store time (core_runtime.cc:1085), so a
+    // device-set tag routes EXACTLY like a host-set one (same field, same path;
+    // gpu_vector already sets task fields in-kernel this way). Thread-0 only
+    // (iowarp's producer guard) — the write is published system-wide by the
+    // __threadfence_system that WriteAsync issues before the task is enqueued, so
+    // the CPU worker reads the fresh tag. Call SetTag(c, ...) then WriteAsync(c)
+    // from the SAME thread-0 with no barrier between; do NOT let a non-zero thread
+    // fire before the stamp lands.
+    __device__ void SetTag(uint32_t c, cte::TagId tag) const {
+        if (clio::run::gpu::IpcManager::GetGpuThreadId() != 0) return;
+        chunks_[c].put_fp.ptr_->tag_id_ = tag;
+        chunks_[c].get_fp.ptr_->tag_id_ = tag;
+    }
+
     // Single-chunk convenience: target chunk 0.
     __device__ byte_t* Data() const { return chunks_[0].data; }
     __device__ uint64_t Size() const { return chunks_[0].size; }

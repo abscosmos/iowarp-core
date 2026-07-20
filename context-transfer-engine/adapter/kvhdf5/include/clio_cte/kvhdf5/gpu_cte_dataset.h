@@ -67,6 +67,7 @@ class GpuCteDataset {
     uint32_t count_ = 0;
     uint32_t pool_ = 0;                    // resident data buffers M (M==count_ if unpooled)
     uint32_t grid_ = 0;                    // producer grid G (blocks); G divides M
+    uint64_t data_bytes_ = 0;              // registered DATA backend size (device payload)
     // Set once any I/O-status accessor is called. Purely for the destructor's
     // "you never checked" warning; mutable so the accessors stay const.
     mutable bool io_checked_ = false;
@@ -226,6 +227,11 @@ public:
     [[nodiscard]] uint32_t ChunkCount() const { return count_; }
     // Resident data-buffer count M (== ChunkCount() when unpooled).
     [[nodiscard]] uint32_t PoolSize() const { return pool_; }
+    // Bytes of DEVICE payload this dataset holds resident: the registered data
+    // backend size (M * chunk_bytes when pooled, else the sum of chunk sizes).
+    // This is the figure that must stay bounded when buffer groups are reused
+    // across snapshots — measure THIS, not a dataset count.
+    [[nodiscard]] uint64_t DeviceDataBytes() const { return data_bytes_; }
 
     // ---- The producer-launch contract (was "grid == M"; now generalized) ----
     // The producer kernel MUST launch grid == GridSize(), and G == GridSize()
@@ -313,6 +319,48 @@ public:
             " (rc=" + std::to_string(PutStatus(static_cast<uint32_t>(c))) +
             "; 13 == bdev out of capacity). The data did NOT land. Size the bdev "
             "to at least the total bytes written.");
+    }
+
+    // ---- Host key re-arm: reuse this dataset for another snapshot ------------
+    //
+    // Re-target every chunk's Put/Get task slot to a NEW destination tag, reusing
+    // the SAME task slots + data buffers + geometry. This is the host "key re-arm"
+    // that lets a fixed set of buffer groups serve many snapshots with device
+    // memory CONSTANT in the snapshot count (DESIGN §3.3): snapshot s and s+2 share
+    // one dataset/buffer group but persist under distinct tags.
+    //
+    // Only tag_id_ changes. blob_name_ (the chunk coordinate), blob_data_ (the
+    // device buffer), size_ and all geometry are IDENTICAL across snapshots, so a
+    // re-arm is a handful of POD writes with nothing to re-allocate and nothing to
+    // re-copy to the device — the device ChunkDesc array still points at the same
+    // task slots + buffers (only the slot CONTENTS change), so Handle() stays valid.
+    //
+    // Completion state resets automatically and needs no help here: the device Send
+    // clears fut_.is_complete_ on every submit, and the runtime resets the task's
+    // run_ctx_ on reuse (the producer-only reuse fix in ipc_gpu2cpu.cc — without it
+    // reuse deadlocks at the 2nd fire). We only clear return_code_ so a fresh
+    // ThrowIfIoFailed()/PutStatus() reflects THIS snapshot's writes, and reset the
+    // "never checked" guard so the destructor still nags if the caller stops
+    // checking.
+    //
+    // ORDERING (caller's responsibility): the prior snapshot's Puts on these slots
+    // MUST have drained (WriteWait / WriteDrainAll, i.e. the buffer-reuse barrier
+    // the pool already enforces) BEFORE re-arming — otherwise the host would rewrite
+    // tag_id_ while the CPU worker is still reading it for the in-flight Put. The
+    // DEVICE never reads tag_id_ (only the worker does, at execute time), so no
+    // device fence is needed; the drain barrier supplies the host-visible ordering.
+    void Rearm(cte::TagId new_tag) {
+        for (uint32_t c = 0; c < count_; ++c) {
+            byte_t* put_slot = task_base_ + static_cast<uint64_t>(c) * kSlotPair;
+            byte_t* get_slot = put_slot + kPutSlot;
+            auto* put = reinterpret_cast<cte::PodPutBlobTask*>(put_slot);
+            auto* get = reinterpret_cast<cte::PodGetBlobTask*>(get_slot);
+            put->tag_id_ = new_tag;
+            get->tag_id_ = new_tag;
+            put->return_code_.store(0);
+            get->return_code_.store(0);
+        }
+        io_checked_ = false;
     }
 
 private:
@@ -405,6 +453,7 @@ private:
         }
         const uint64_t data_bytes =
             pooling ? static_cast<uint64_t>(pool_) * slot_bytes : total_data;
+        data_bytes_ = data_bytes;
 
         // (a) Task backend: count_ * (put-slot + get-slot), + pad.
         // MUST be kPinnedHost, matching the gpu_vector adapter reference.
@@ -567,6 +616,7 @@ private:
         count_ = o.count_;
         pool_ = o.pool_;
         grid_ = o.grid_;
+        data_bytes_ = o.data_bytes_;
         handle_ = o.handle_;
         io_checked_ = o.io_checked_;
         o.io_checked_ = true;  // moved-from shell owns nothing; never warn for it

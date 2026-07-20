@@ -25,6 +25,8 @@ kvhdf5_add_gpu_test_target(kvhdf5_e2e_tests WITH_KVHDF5_HEADERS
         backend_ceiling_test.cu
         occupancy_bench.cu
         pooled_double_buffer_test.cu
+        snapshot_reuse_test.cu
+        snapshot_read_test.cu
 )
 
 # The pooled double-buffer test is the reference user of the fused
@@ -97,3 +99,10 @@ add_custom_target(threeway_bench
     USES_TERMINAL
     COMMENT "Running three-way Gray-Scott I/O benchmark (raw / sync / async)"
 )
+
+# The C++ self-supervising driver (gsbench_run) replaces the two shell orchestrators above
+# (this file's threeway_bench target and scaling_campaign/run_campaign.sh) with one typed
+# binary over a shared arm/study registry. It fork/execs kvhdf5_e2e_tests per arm, so it needs
+# that target to exist; gated the same way this whole directory is (CUDA-only) since it is
+# useless without the CUDA bench binary it drives. See gsbench_driver/SPEC.md.
+add_subdirectory(gsbench_driver)
