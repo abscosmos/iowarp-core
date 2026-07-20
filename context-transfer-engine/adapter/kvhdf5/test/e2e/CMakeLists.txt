@@ -26,6 +26,7 @@ kvhdf5_add_gpu_test_target(kvhdf5_e2e_tests WITH_KVHDF5_HEADERS
         occupancy_bench.cu
         pooled_double_buffer_test.cu
         snapshot_reuse_test.cu
+        snapshot_read_test.cu
 )
 
 # The pooled double-buffer test is the reference user of the fused
