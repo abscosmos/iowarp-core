@@ -77,11 +77,6 @@
       "Bash(pkill -9 -f chi_rss)",
       "Read(//home/iowarp/.clio/**)",
       "Bash(pkill -9 -f 'clio_run runtime\\\\|clio_run runtime')",
-      "Read(//home/joshua/.claude/**)",
-      "Read(//home/joshua/.claude/projects/**)",
-      "Read(//home/joshua/.claude-grc/**)",
-      "Read(//home/joshua/.claude-grc/projects/**)",
-      "Read(//home/joshua/**)",
       "WebFetch(domain:www.pdsw.org)",
       "Bash(docker exec *)",
       "Bash(docker start *)"
