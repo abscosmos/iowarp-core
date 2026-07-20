@@ -88,6 +88,12 @@ set(CLIENT_RETRY_TEST_SOURCES
   test_client_retry.cc
 )
 
+# Bdev AllocPolicy test executable (pure host: no server, no IPC, no GPU)
+set(BDEV_ALLOC_POLICY_TEST_TARGET clio_run_bdev_alloc_policy_tests)
+set(BDEV_ALLOC_POLICY_TEST_SOURCES
+  test_bdev_alloc_policy.cc
+)
+
 
 # GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET test_ipc_allocate_buffer_gpu)
@@ -465,6 +471,36 @@ set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
 )
 endif()
 
+# Create Bdev AllocPolicy test executable.
+# Exercises CreateParams (serialization + YAML `alloc:` parsing) and drives
+# MemBdevTransport directly, so it needs no runtime server and no GPU.
+add_executable(${BDEV_ALLOC_POLICY_TEST_TARGET} ${BDEV_ALLOC_POLICY_TEST_SOURCES})
+
+target_include_directories(${BDEV_ALLOC_POLICY_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include
+  ${CLIO_RUN_ROOT}/modules/bdev/include
+)
+
+target_link_libraries(${BDEV_ALLOC_POLICY_TEST_TARGET}
+  clio_bdev_runtime           # MemBdevTransport lives here
+  clio_bdev_client            # Bdev module client
+  clio_admin_client           # Admin module client
+  clio_run_cxx                # Main CLIO Runtime library
+  ctp::cxx                    # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}   # Threading support
+)
+
+set_target_properties(${BDEV_ALLOC_POLICY_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${BDEV_ALLOC_POLICY_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 
 # GPU runtime tests removed — kernels now submit tasks to the CPU
 # runtime via gpu2cpu_queue (see test/unit/gpu/test_sycl_*.cc).
@@ -527,6 +563,39 @@ if(CLIO_CORE_ENABLE_CUDA)
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 120
     LABELS "gpu;cuda;stress"
+  )
+endif()
+
+# gpu2cpu ring backpressure: a producer-only kernel that submits far more tasks
+# than `queue_depth` parks inside ring_buffer::Emplace()'s wait-for-space spin.
+# Asserts the CPU consumer still drains every one of them. See the file header
+# for how this relates to the gsbench chunks*snaps > queue_depth deadlock.
+if(CLIO_CORE_ENABLE_CUDA)
+  add_cuda_executable(test_gpu2cpu_backpressure FALSE
+    gpu/test_gpu2cpu_backpressure_gpu.cc
+    INCLUDE_DIRS
+      ${CLIO_RUN_ROOT}/include
+      ${CLIO_RUN_ROOT}/test
+      ${CLIO_RUN_ROOT}/modules/MOD_NAME/include
+      ${CLIO_RUN_ROOT}/modules/admin/include
+    LINK_LIBS
+      clio_run_cxx
+      clio_run_cxx_gpu
+      clio_admin_client
+      clio_MOD_NAME_client
+      ctp::cuda_cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(test_gpu2cpu_backpressure PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME cr_gpu2cpu_backpressure_cuda COMMAND test_gpu2cpu_backpressure
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_gpu2cpu_backpressure_cuda PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10501"
+    TIMEOUT 180
+    LABELS "gpu;cuda;backpressure"
   )
 endif()
 
@@ -839,6 +908,17 @@ if(CLIO_CORE_ENABLE_TESTS)
   set_tests_properties(cr_runtime_cleanup_tests PROPERTIES
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 120
+  )
+
+  # Bdev AllocPolicy Tests (no server, no GPU — safe to run anywhere)
+  add_test(
+    NAME cr_bdev_alloc_policy_tests
+    COMMAND ${BDEV_ALLOC_POLICY_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_bdev_alloc_policy_tests PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
   )
 
   # IPC Errors Tests

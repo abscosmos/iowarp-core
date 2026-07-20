@@ -855,6 +855,12 @@ class RunContext {
   ctp::abitfield32_t gpu_flags_;   /**< GPU device-completion bit (gpu2gpu) */
   uintptr_t gpu_task_device_ptr_;  /**< Device addr of the task POD (kDeviceMem) */
   u32 gpu_task_size_;              /**< sizeof(TaskT) for the H2D writeback */
+  /** Submit-probe record for this task (gpu::SubmitProbeHostRec*), opened by
+   *  IpcGpu2Cpu::RecvIn at the Pop. Carried here so the later hops stamp through
+   *  a plain pointer instead of hashing the task address on the dispatch path.
+   *  0 for every task the probe did not open — which is every CPU-origin task,
+   *  and all tasks when the probe is off. */
+  uintptr_t probe_rec_;
 
  private:
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
@@ -896,6 +902,7 @@ class RunContext {
         response_fd_(-1),
         gpu_task_device_ptr_(0),
         gpu_task_size_(0),
+        probe_rec_(0),
         is_notified_(false),
         coro_completed_(false),
         flags_() {

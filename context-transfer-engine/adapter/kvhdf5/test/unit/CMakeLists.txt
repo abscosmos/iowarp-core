@@ -8,6 +8,7 @@ find_package(CUDAToolkit REQUIRED)
 add_executable(kvhdf5_unit_tests
     chunking_test.cpp
     tag_path_test.cpp
+    meta_blob_test.cpp
 )
 
 set_target_properties(kvhdf5_unit_tests PROPERTIES

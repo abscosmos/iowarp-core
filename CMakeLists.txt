@@ -177,6 +177,18 @@ option(CLIO_CTE_ENABLE_ADIOS2_ADAPTER "Enable ADIOS2 adapter" OFF)
 option(CLIO_CTE_ENABLE_FUSE_ADAPTER "Enable FUSE3 adapter" OFF)
 option(CLIO_CTE_ENABLE_HDF5_VOL "Enable HDF5 VOL connector (requires HDF5 >= 1.14)" OFF)
 
+# Link libhdf5 into components that READ or WRITE real .h5 files but are not the
+# VOL connector -- today that is CAE (the HDF5 assimilator, and ExportData, which
+# exports a CTE tag as an .h5).
+#
+# This option is what context-assimilation-engine/CMakeLists.txt has always
+# derived CLIO_CAE_ENABLE_HDF5 from, but it was never actually DECLARED anywhere,
+# so it silently evaluated as empty/false and CAE's entire HDF5 path -- including
+# the pre-existing ExportData -- compiled out to "HDF5 support not compiled in".
+# Declaring it makes that code reachable. It stays OFF by default: HDF5 is an
+# optional system dependency and nothing in the default build needs it.
+option(CLIO_CORE_ENABLE_HDF5 "Enable HDF5 support in CAE (assimilator + .h5 export)" OFF)
+
 #------------------------------------------------------------------------------
 # CAE (context-assimilation-engine) Options
 #------------------------------------------------------------------------------
@@ -792,7 +804,7 @@ if(CLIO_CORE_ENABLE_LIBFABRIC)
 endif()
 
 # HDF5 (optional - for CAE HDF5 assimilator and CTE HDF5 VOL connector)
-if(CLIO_CTE_ENABLE_HDF5_VOL)
+if(CLIO_CTE_ENABLE_HDF5_VOL OR CLIO_CORE_ENABLE_HDF5)
     # Try CONFIG mode first (for HDF5 installed to non-standard cmake/ directory)
     find_package(HDF5 COMPONENTS C QUIET CONFIG)
     if(NOT HDF5_FOUND)
