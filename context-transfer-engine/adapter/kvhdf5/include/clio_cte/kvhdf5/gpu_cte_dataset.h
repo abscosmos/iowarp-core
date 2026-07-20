@@ -26,6 +26,7 @@
 #include "dataset_meta.h"  // Layout, DatasetMeta
 #include "gpu_dataset_handle.h"
 #include "tag_resolve.h"  // ResolveTagId (path->TagId)
+#include "meta_write.h"   // WriteDatasetMeta (publish Layout as the __meta blob)
 
 #include <clio_runtime/ipc_manager.h>
 #include <clio_runtime/types.h>
@@ -175,6 +176,27 @@ public:
     // so chunks address as (path-tag, chunk-coord). Throws if the path has no valid
     // segment or on any iowarp failure. pool_size / grid_size forward to the
     // Phase 3 pool + pipeline-depth contract (see the multi-chunk ctor).
+    //
+    // SELF-DESCRIBING: this also publishes `layout` into the tag as the reserved
+    // __meta blob (meta_blob.h), once, on the host, off the timed path. That is
+    // what makes an exported .h5 possible -- the chunks alone do not encode dims,
+    // chunk geometry, or element type, so without __meta the dataset is not
+    // reconstructible from the store.
+    //
+    // The publish is BEST-EFFORT and happens AFTER construction: a failed __meta
+    // write costs only exportability, not the producer's data, so it is reported
+    // and not thrown (matching this class's REPORT-don't-throw I/O philosophy --
+    // see the dtor). And publishing only once the backends are allocated means a
+    // construction failure never strands an orphan __meta describing chunks that
+    // will never be written. Chunks are not written until the caller runs a
+    // kernel, so publishing here vs. before construction is equivalent to any
+    // reader.
+    //
+    // This is why FromPath (and FromDataset) is the blessed surface: the raw
+    // (TagId, Layout) constructor below takes no cte::Client and therefore
+    // CANNOT publish __meta. A dataset built through it stores chunks that no
+    // exporter can interpret. Prefer FromPath unless you specifically want the
+    // bare, unexportable form.
     static GpuCteDataset FromPath(clio::run::IpcManager* ipc,
                                   clio::run::IpcManagerGpuInfo info, uint32_t gpu_id,
                                   cte::Client* cte_client, std::string_view path,
@@ -185,8 +207,13 @@ public:
         if (tag_name.empty())
             throw std::runtime_error("GpuCteDataset::FromPath: empty/invalid tag path");
         cte::TagId tag = ResolveTagId(cte_client, tag_name);
-        return GpuCteDataset(ipc, info, gpu_id, tag, layout, pool_size, data_kind,
-                             grid_size);
+        GpuCteDataset ds(ipc, info, gpu_id, tag, layout, pool_size, data_kind,
+                         grid_size);
+        // Best-effort by design: WriteDatasetMeta logs its own error and the
+        // dataset stays fully usable for chunk writes even if __meta is lost
+        // (only .h5 exportability is), so the producer is not aborted here.
+        (void)WriteDatasetMeta(cte_client, tag, layout);
+        return ds;
     }
 
     // Convenience over FromPath for callers that already hold a DatasetMeta (the
