@@ -33,6 +33,24 @@
 
 #include <cstdint>
 
+// Whether an out-of-range chunk coordinate additionally TRAPS the kernel (on top of
+// the always-on host-visible report). Defaults to on in debug, off in release, so a
+// developer hits it immediately but a shipped kernel degrades to the reported no-op.
+//
+// A trap destroys the CUDA context, which is unrecoverable in a shared-server,
+// single-process test binary — so that binary defines this to 0 (see the e2e
+// CMakeLists) to exercise the graceful path in-process. Define it uniformly for a
+// whole binary (a target compile definition), never per-TU: InRange/ReportOutOfRange
+// are inline __device__ members, so mismatched values across TUs would be an ODR
+// violation.
+#ifndef KVHDF5_GPU_OOR_TRAP
+#  ifdef NDEBUG
+#    define KVHDF5_GPU_OOR_TRAP 0
+#  else
+#    define KVHDF5_GPU_OOR_TRAP 1
+#  endif
+#endif
+
 namespace kvhdf5 {
 
 namespace cte = clio::cte::core;
@@ -63,14 +81,37 @@ struct GpuDatasetHandle {
     // unpooled dataset, which is exactly depth D == 1 over N buffers.
     uint32_t pool_ = 0;             // M resident data buffers (host maps c -> c % M)
     uint32_t grid_ = 0;             // G producer blocks; G divides M; D = M / G
+    // ---- Out-of-range chunk-coordinate report --------------------------------
+    //
+    // Sticky, one word per dataset, holding (first offending c) + 1 so that 0 means
+    // "no violation" without burning a sentinel coordinate. Points INTO the task
+    // backend's tail pad (GpuCteDataset::Init), which is kPinnedHost — deliberately:
+    //
+    //  * device-writable through UVA, so the kernel needs no extra allocation and
+    //    no cudaMemcpy to report;
+    //  * host-readable with ZERO device operations, which is the binding constraint.
+    //    The persistent-kernel arm keeps one cooperative grid resident for the whole
+    //    run and completes its writes with no device-side op; a report channel that
+    //    needed a D2H (or any device call) on the completion path could not schedule
+    //    under that resident grid and would deadlock it. A mapped pinned word cannot.
+    //
+    // Null only for a default-constructed handle, in which case reporting is skipped
+    // and the guard still degrades to a safe no-op.
+    uint32_t* oob_ = nullptr;
 
 #if CTP_IS_GPU_COMPILER
     __device__ uint32_t Count() const { return count_; }
     __device__ uint32_t PoolSize() const { return pool_; }
     __device__ uint32_t GridSize() const { return grid_; }
     __device__ uint32_t Depth() const { return pool_ / grid_; }
-    __device__ byte_t* Data(uint32_t c) const { return chunks_[c].data; }
-    __device__ uint64_t Size(uint32_t c) const { return chunks_[c].size; }
+    __device__ byte_t* Data(uint32_t c) const {
+        if (!InRange(c)) return nullptr;
+        return chunks_[c].data;
+    }
+    __device__ uint64_t Size(uint32_t c) const {
+        if (!InRange(c)) return 0;
+        return chunks_[c].size;
+    }
 
     // Submit chunk c's pre-built Put/Get task and wait. Thread-0 of the block
     // enqueues; all other threads no-op (iowarp's threadIdx==0 producer guard).
@@ -78,8 +119,14 @@ struct GpuDatasetHandle {
     // prior codegen; the bench opts into Write<false>/WriteAsync<false> to shed
     // the SendIn submit-probe registers on its hot non-probing runs.
     template<bool Probing = true>
-    __device__ void Write(uint32_t c) const { Submit<Probing>(c, chunks_[c].put_fp); }
-    __device__ void Read(uint32_t c) const { Submit(c, chunks_[c].get_fp); }
+    __device__ void Write(uint32_t c) const {
+        if (!InRange(c)) return;
+        Submit<Probing>(c, chunks_[c].put_fp);
+    }
+    __device__ void Read(uint32_t c) const {
+        if (!InRange(c)) return;
+        Submit(c, chunks_[c].get_fp);
+    }
 
     // Async split of Write/Read (the "Phase 2" overlap path): *Async fires the
     // chunk's pre-built task WITHOUT waiting; *Wait drains it later. Firing many
@@ -90,10 +137,22 @@ struct GpuDatasetHandle {
     // only; pair every *Async(c) with exactly one *Wait(c) before the kernel
     // exits (the host Synchronize waits the kernel, not the server's puts).
     template<bool Probing = true>
-    __device__ void WriteAsync(uint32_t c) const { SubmitAsync<Probing>(c, chunks_[c].put_fp); }
-    __device__ void ReadAsync(uint32_t c) const { SubmitAsync(c, chunks_[c].get_fp); }
-    __device__ void WriteWait(uint32_t c) const { SubmitWait(c, chunks_[c].put_fp); }
-    __device__ void ReadWait(uint32_t c) const { SubmitWait(c, chunks_[c].get_fp); }
+    __device__ void WriteAsync(uint32_t c) const {
+        if (!InRange(c)) return;
+        SubmitAsync<Probing>(c, chunks_[c].put_fp);
+    }
+    __device__ void ReadAsync(uint32_t c) const {
+        if (!InRange(c)) return;
+        SubmitAsync(c, chunks_[c].get_fp);
+    }
+    __device__ void WriteWait(uint32_t c) const {
+        if (!InRange(c)) return;
+        SubmitWait(c, chunks_[c].put_fp);
+    }
+    __device__ void ReadWait(uint32_t c) const {
+        if (!InRange(c)) return;
+        SubmitWait(c, chunks_[c].get_fp);
+    }
 
     // ---- Bounded-pool double buffering: fill + fire, one fused kernel --------
     //
@@ -194,6 +253,16 @@ struct GpuDatasetHandle {
         for (uint32_t c = b; c < n; c += g) {
             // Reclaim this chunk's buffer from the chunk that used it M ago. THIS is
             // the invariant; it stays put regardless of TailDrain.
+            //
+            // c and m are uint32_t, so `c - m` would WRAP (not go negative) on
+            // underflow and index chunks_ astronomically out of range. The `c >= m`
+            // test is what makes that unreachable: it is evaluated on the same two
+            // values in the same expression, so the subtraction is only ever taken
+            // when it cannot wrap, and the result obeys c - m < c < n == count_ —
+            // in range by construction. WriteWait's own guard is therefore
+            // belt-and-braces here, and it costs nothing: it is thread-0-only and
+            // contains no barrier, so a guarded skip can never desynchronize the
+            // __syncthreads() below.
             if (c >= m) WriteWait(c - m);   // thread-0 only
             __syncthreads();                // <-- ALL threads wait for that drain
             fill(c, chunks_[c].data, chunks_[c].size);
@@ -243,21 +312,76 @@ struct GpuDatasetHandle {
     // fire before the stamp lands.
     __device__ void SetTag(uint32_t c, cte::TagId tag) const {
         if (clio::run::gpu::IpcManager::GetGpuThreadId() != 0) return;
+        if (!InRange(c)) return;   // inside the thread-0 guard: one report, not 256
         chunks_[c].put_fp.ptr_->tag_id_ = tag;
         chunks_[c].get_fp.ptr_->tag_id_ = tag;
     }
 
-    // Single-chunk convenience: target chunk 0.
-    __device__ byte_t* Data() const { return chunks_[0].data; }
-    __device__ uint64_t Size() const { return chunks_[0].size; }
-    __device__ void Write() const { Submit(0, chunks_[0].put_fp); }
-    __device__ void Read() const { Submit(0, chunks_[0].get_fp); }
-    __device__ void WriteAsync() const { SubmitAsync(0, chunks_[0].put_fp); }
-    __device__ void WriteWait() const { SubmitWait(0, chunks_[0].put_fp); }
-    __device__ void ReadAsync() const { SubmitAsync(0, chunks_[0].get_fp); }
-    __device__ void ReadWait() const { SubmitWait(0, chunks_[0].get_fp); }
+    // Single-chunk convenience: target chunk 0. Routed through the indexed forms so
+    // they inherit the same bounds guard — chunk 0 is in range for every dataset
+    // Init() will build (it rejects zero chunks), so this is identical codegen for a
+    // live handle; it only catches a default-constructed / moved-from one, where
+    // chunks_ is null and the old form dereferenced it.
+    __device__ byte_t* Data() const { return Data(0); }
+    __device__ uint64_t Size() const { return Size(0); }
+    __device__ void Write() const { Write(0); }
+    __device__ void Read() const { Read(0); }
+    __device__ void WriteAsync() const { WriteAsync(0); }
+    __device__ void WriteWait() const { WriteWait(0); }
+    __device__ void ReadAsync() const { ReadAsync(0); }
+    __device__ void ReadWait() const { ReadWait(0); }
 
 private:
+    // ---- Chunk-coordinate bounds guard --------------------------------------
+    //
+    // Every device accessor funnels its coordinate through here BEFORE it can
+    // subscript chunks_. Out of range used to read past the end of the device
+    // ChunkDesc array and then dereference whatever pointer/FullPtr it found —
+    // undefined behaviour that could silently corrupt unrelated device memory.
+    // Now it is a no-op that the host can see.
+    //
+    // Cost, on the in-range path: ONE compare of c against count_, a field the
+    // handle already carries by value in the kernel parameter bank. No load, no
+    // memory traffic, no divergence that was not already there. The report side
+    // is entirely off the fall-through path.
+    //
+    // Uniformity: c is block-uniform at every call site in this header, so the
+    // branch is warp- and block-uniform where the caller is whole-block (Data,
+    // Size) and sits under the existing thread-0 producer guard where one exists
+    // (SetTag). CRITICALLY, no guarded early-return here skips a __syncthreads()
+    // or a grid.sync(): the submit/drain paths this guards contain no barrier at
+    // all, and WritePipelined's barriers sit outside the guarded calls. A resident
+    // cooperative grid therefore cannot desynchronize on a rejected coordinate.
+    __device__ bool InRange(uint32_t c) const {
+        if (c < count_) return true;
+        ReportOutOfRange(c);
+        return false;
+    }
+
+    // Record the FIRST offending coordinate and keep it: atomicCAS from 0 means a
+    // later, less interesting violation cannot overwrite the one that started it.
+    // Stored as c+1 so 0 stays a clean "never happened" for the host.
+    //
+    // *oob_ is a mapped pinned-host word, so the store lands system-visible with no
+    // device operation and no D2H — see the oob_ member comment for why that
+    // matters to the persistent arm. _system scope matches how the gpu2cpu ring
+    // already does its cross-PCIe atomics on pinned memory.
+    //
+    // Debug builds additionally trap, so a bad coordinate fails loudly in
+    // development instead of being discovered later in the host status. Release
+    // builds never trap: the guard degrades to the silent-but-reported no-op.
+    //
+    // __noinline__ so the cold report body (a system-scope atomic, and the trap
+    // in debug) is NOT copied into every accessor's call site — it keeps InRange's
+    // fall-through to a single compare and holds the per-kernel register delta at
+    // the hot path to ~zero, which §eval publishes.
+    __device__ __noinline__ void ReportOutOfRange(uint32_t c) const {
+        if (oob_) atomicCAS_system(oob_, 0u, c + 1u);
+#if KVHDF5_GPU_OOR_TRAP
+        __trap();
+#endif
+    }
+
     template<bool Probing = true, typename TaskT>
     __device__ void Submit(uint32_t c, const ctp::ipc::FullPtr<TaskT>& fp) const {
         SubmitAsync<Probing>(c, fp);

@@ -72,6 +72,11 @@ class GpuCteDataset {
     // Set once any I/O-status accessor is called. Purely for the destructor's
     // "you never checked" warning; mutable so the accessors stay const.
     mutable bool io_checked_ = false;
+    // Device's out-of-range chunk-coordinate report: points into the task backend's
+    // tail pad (kPinnedHost, so this is a plain host load). Holds first offending
+    // coordinate + 1, or 0 for "never happened". Owned by task_alloc_, so there is
+    // nothing extra to free.
+    uint32_t* oob_ = nullptr;
 
     GpuDatasetHandle handle_{};
 
@@ -326,8 +331,36 @@ public:
         return -1;
     }
 
-    /** True if ANY chunk's Put failed (its data did not land). Marks as checked. */
-    [[nodiscard]] bool IoFailed() const { return FirstFailedPut() >= 0; }
+    /**
+     * Chunk coordinate the kernel passed to a device accessor that was NOT in
+     * [0, ChunkCount()), or -1 if every coordinate was in range. Only the FIRST
+     * such coordinate is kept (the device CASes from 0), because the first one is
+     * the one that localizes the bug.
+     *
+     * This is a REJECTED ACCESS, not a failed write: the guard turned it into a
+     * no-op before it could touch the descriptor array, so nothing was read, nothing
+     * was submitted, and no memory was corrupted. It is surfaced through the I/O
+     * status API rather than a channel of its own because the observable
+     * consequence is the same as a failed Put — the caller believes a chunk was
+     * written and it was not.
+     *
+     * Reading the word is a plain host load (the task backend is kPinnedHost), so
+     * this is safe to call even while a kernel is resident. Marks as checked.
+     */
+    [[nodiscard]] int OutOfRangeChunk() const {
+        io_checked_ = true;
+        if (oob_ == nullptr) return -1;
+        const uint32_t v = *oob_;
+        return v == 0 ? -1 : static_cast<int>(v - 1);
+    }
+
+    /**
+     * True if ANY chunk's Put failed (its data did not land) OR the kernel submitted
+     * an out-of-range chunk coordinate. Marks as checked.
+     */
+    [[nodiscard]] bool IoFailed() const {
+        return FirstFailedPut() >= 0 || OutOfRangeChunk() >= 0;
+    }
 
     /**
      * Throwing form, for callers whose output is worthless if a write was lost —
@@ -339,6 +372,18 @@ public:
      * make, not ours). This is the opt-in way to say "a lost write is fatal".
      */
     void ThrowIfIoFailed(const char* what = "GpuCteDataset") const {
+        // Check the coordinate guard FIRST: an out-of-range access means the kernel
+        // is indexing wrong, which is a more fundamental defect than a Put that was
+        // correctly addressed and merely didn't fit.
+        int oob = OutOfRangeChunk();
+        if (oob >= 0)
+            throw std::runtime_error(
+                std::string(what) + ": kernel submitted OUT-OF-RANGE chunk "
+                "coordinate " + std::to_string(oob) + " (dataset has " +
+                std::to_string(count_) + " chunks, valid range [0, " +
+                std::to_string(count_) + ")). The access was REJECTED — no memory "
+                "was read or written for it, and any data that coordinate was "
+                "meant to carry did NOT land. Fix the kernel's chunk indexing.");
         int c = FirstFailedPut();
         if (c < 0) return;
         throw std::runtime_error(
@@ -387,6 +432,12 @@ public:
             put->return_code_.store(0);
             get->return_code_.store(0);
         }
+        // NOT cleared: the out-of-range report. A return_code_ is a per-snapshot I/O
+        // outcome and belongs to the writes being re-armed; an out-of-range
+        // coordinate is a kernel indexing DEFECT, and the geometry it violated
+        // (count_) is identical across every snapshot this dataset serves. Keeping
+        // it sticky for the dataset's lifetime means one bad snapshot cannot be
+        // papered over by the next re-arm.
         io_checked_ = false;
     }
 
@@ -497,14 +548,29 @@ private:
         // slot. (The old note here — "kPinnedHost didn't help, race is
         // upstream" — was against the pre-9266bd19 co-located-FutureShm model,
         // which no longer exists.)
+        // The tail pad also houses the device's out-of-range report word (see
+        // GpuDatasetHandle::oob_): it needs to be device-writable AND host-readable
+        // with no device operation, which is exactly what this kPinnedHost backend
+        // already is. 128 bytes of pad rather than 64 so the word can sit on a
+        // 64-byte boundary past the last slot without running off the end —
+        // kSlotPair is a sum of two task sizeofs and is not guaranteed to leave the
+        // slot array 64-aligned.
         char* task_base = nullptr;
         const uint64_t task_bytes =
-            static_cast<uint64_t>(count_) * kSlotPair + 64;
+            static_cast<uint64_t>(count_) * kSlotPair + 128;
         task_alloc_ = ipc_->AllocateAndRegisterGpuBackend(
             gpu_id_, MemKind::kPinnedHost, task_bytes, &task_base);
         task_base_ = reinterpret_cast<byte_t*>(task_base);
         if (task_alloc_.IsNull() || task_base_ == nullptr)
             throw std::runtime_error("GpuCteDataset: task backend alloc failed");
+
+        // Out-of-range report word, 64-aligned inside the tail pad. Zero it here:
+        // the backend's contents are not guaranteed clean, and a stale nonzero word
+        // would report a violation that never happened.
+        const uint64_t oob_off =
+            ((static_cast<uint64_t>(count_) * kSlotPair + 63) / 64) * 64;
+        oob_ = reinterpret_cast<uint32_t*>(task_base_ + oob_off);
+        *oob_ = 0;
 
         // (b) Data backend: one buffer partitioned into M distinct regions
         // (M == N when not pooling; M == pool_ < N when pooling, chunks share).
@@ -557,7 +623,7 @@ private:
         ctp::GpuApi::Memcpy(desc_base_, host_descs_.data(),
                             count_ * sizeof(ChunkDesc));
 
-        handle_ = {info, desc_base_, count_, pool_, grid_};
+        handle_ = {info, desc_base_, count_, pool_, grid_, oob_};
     }
 
     // Placement-new this chunk's Pod Put/Get prototypes on the host and copy
@@ -611,6 +677,17 @@ private:
      */
     void WarnIfIoFailureUnchecked() const {
         if (io_checked_ || task_base_ == nullptr || count_ == 0) return;
+        if (oob_ != nullptr && *oob_ != 0) {
+            HLOG(kError,
+                 "GpuCteDataset: kernel submitted OUT-OF-RANGE chunk coordinate {} "
+                 "(dataset has {} chunks) and its status was NEVER CHECKED. The "
+                 "access was rejected, so nothing was corrupted -- but whatever that "
+                 "coordinate was meant to write DID NOT LAND. Call "
+                 "ThrowIfIoFailed()/IoFailed()/OutOfRangeChunk() after submitting, "
+                 "and fix the kernel's chunk indexing.",
+                 *oob_ - 1, count_);
+            return;
+        }
         for (uint32_t c = 0; c < count_; ++c) {
             int rc = PutStatus(c);
             if (rc == 0) continue;
@@ -644,6 +721,7 @@ private:
         pool_ = o.pool_;
         grid_ = o.grid_;
         data_bytes_ = o.data_bytes_;
+        oob_ = o.oob_;
         handle_ = o.handle_;
         io_checked_ = o.io_checked_;
         o.io_checked_ = true;  // moved-from shell owns nothing; never warn for it
@@ -653,6 +731,7 @@ private:
         o.task_base_ = nullptr;
         o.data_base_ = nullptr;
         o.desc_base_ = nullptr;
+        o.oob_ = nullptr;
         o.count_ = 0;
         o.pool_ = 0;
         o.grid_ = 0;

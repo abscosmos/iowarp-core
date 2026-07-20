@@ -27,7 +27,18 @@ kvhdf5_add_gpu_test_target(kvhdf5_e2e_tests WITH_KVHDF5_HEADERS
         pooled_double_buffer_test.cu
         snapshot_reuse_test.cu
         snapshot_read_test.cu
+        oob_guard_test.cu
 )
+
+# The device-side chunk-coordinate guard traps by default in a debug build (its
+# tripwire for development). A trap destroys the CUDA context, which is
+# unrecoverable in this shared-server, single-process test binary — and it would
+# make the guard's graceful-no-op path impossible to assert in-process. Force the
+# trap OFF for the whole test binary so oob_guard_test can verify the reported
+# no-op directly; production / eval builds keep the debug trap. Defined on the
+# TARGET (not per-source) so every TU sees one value — the guard's __device__
+# members are inline, so a per-TU mismatch would be an ODR violation.
+target_compile_definitions(kvhdf5_e2e_tests PRIVATE KVHDF5_GPU_OOR_TRAP=0)
 
 # The pooled double-buffer test is the reference user of the fused
 # WritePipelined producer, so it is also where that kernel's register/spill cost
