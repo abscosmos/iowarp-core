@@ -27,18 +27,22 @@ std::vector<Arm> BuildRegistry() {
         // hdf5_async: needs the async-VOL LD_LIBRARY_PATH/HDF5_PLUGIN_PATH/HDF5_VOL_CONNECTOR
         // env, applied specially by the runner (see runner.cpp ApplyArmEnv), plus
         // GSBENCH_HDF5_ASYNC_FWAIT=0 to avoid the H5VL_async_file_wait busy-spin livelock.
-        {"hdf5_async",    "[gsbench_hdf5_async]", {{"GSBENCH_HDF5_ASYNC_FWAIT", "0"}}, true, false},
+        {"async_VOL",     "[gsbench_hdf5_async]", {{"GSBENCH_HDF5_ASYNC_FWAIT", "0"}}, true, false},
 
         {"hostclio",      "[gsbench_hostclio]",   {}, false, false},
 
-        // GPUH5 arms. gpuh5 (reuse) is the canonical/default design: GPU-initiated, bounded
-        // (2 reused groups) memory. gpuh5_noreuse is the old one-dataset-per-snapshot async
-        // path (memory linear in snaps); gpuh5_sync is the fused submit-AND-wait variant.
-        // gpuh5_sync: fused submit-AND-wait (no double buffering). Two data backends as
-        // separate arms so the sync-vs-sync comparison against persistent_sync (which is
-        // FORCED pinned) can isolate the data-backend cost from the cooperative-kernel cost.
-        {"gpuh5_sync",           "[gsbench_gpuh5_sync]",    {{"GSBENCH_DATA_PINNED", "0"}}, false, false},
-        {"gpuh5_sync_pinned",    "[gsbench_gpuh5_sync]",    {{"GSBENCH_DATA_PINNED", "1"}}, false, false},
+        // GPUH5 arms. NAMING: `gpuh5` / `gpuh5_sync` are the PERSISTENT (resident cooperative)
+        // arms -- the canonical design (see the bottom of this list). The RELAUNCHED variants
+        // carry the _relaunch suffix. Both are GPU-initiated and bounded (2 reused groups for
+        // the overlapped arms, 1 for the synchronous ones); gpuh5_noreuse is the old
+        // one-dataset-per-snapshot async path, whose memory is linear in snaps.
+        //
+        // gpuh5_sync_relaunch: relaunched fused submit-AND-wait (1 buffer, no double
+        // buffering). Two data backends as separate arms so the sync-vs-sync comparison
+        // against gpuh5_sync (which is FORCED pinned) isolates the data-backend cost from the
+        // cooperative-kernel cost.
+        {"gpuh5_sync_relaunch",  "[gsbench_gpuh5_sync]",    {{"GSBENCH_DATA_PINNED", "0"}}, false, false},
+        {"gpuh5_sync_relaunch_pinned", "[gsbench_gpuh5_sync]",    {{"GSBENCH_DATA_PINNED", "1"}}, false, false},
         {"gpuh5_noreuse",        "[gsbench_gpuh5_noreuse]", {{"GSBENCH_DATA_PINNED", "0"}}, false, false},
         {"gpuh5_noreuse_pinned", "[gsbench_gpuh5_noreuse]", {{"GSBENCH_DATA_PINNED", "1"}}, false, false},
 
@@ -46,21 +50,23 @@ std::vector<Arm> BuildRegistry() {
         // fixed override here -- the runner sets it per work-unit when is_pooled is true.
         {"pooled",        "[gsbench_pooled]",     {}, false, true},
 
-        // gpuh5 (reuse): the DEFAULT GPUH5 design -- async's shape but memory constant in
+        // gpuh5_relaunch: the RELAUNCHED design -- async's shape but memory constant in
         // snapshots (2 reused buffer groups, snap % 2, drain-before-refill + device tag-stamp;
-        // DESIGN §7 "Option B", relaunched). Checksum must equal the other GPUH5 arms.
-        // _pinned = the same arm with kPinnedHost data (the backend the persistent arm is forced
-        // onto), so persistent-vs-gpuh5 can be compared on an equal data backend.
-        {"gpuh5",         "[gsbench_gpuh5]",      {{"GSBENCH_DATA_PINNED", "0"}}, false, false},
-        {"gpuh5_pinned",  "[gsbench_gpuh5]",      {{"GSBENCH_DATA_PINNED", "1"}}, false, false},
+        // DESIGN §7 "Option B"). Checksum must equal the other GPUH5 arms. _pinned = the same
+        // arm with kPinnedHost data (the backend gpuh5/gpuh5_sync are forced onto), so the
+        // persistent-vs-relaunch comparison can be made on an equal data backend.
+        {"gpuh5_relaunch", "[gsbench_gpuh5]",      {{"GSBENCH_DATA_PINNED", "0"}}, false, false},
+        {"gpuh5_relaunch_pinned", "[gsbench_gpuh5]",      {{"GSBENCH_DATA_PINNED", "1"}}, false, false},
 
-        // persistent: the WHOLE snapshot loop in ONE resident cooperative kernel (grid.sync()
-        // between steps) -- DESIGN §7 "Option A", measured head-to-head vs the relaunched reuse
-        // arm. Same bounded 2-group memory; forces kPinnedHost data (deadlock safety).
-        // persistent_sync: same resident kernel but fire-AND-wait each snapshot (no overlap) --
-        // the persistent analog of gpuh5_sync.
-        {"persistent",      "[gsbench_persistent]",      {}, false, false},
-        {"persistent_sync", "[gsbench_persistent_sync]", {}, false, false},
+        // gpuh5 / gpuh5_sync: THE canonical design -- the WHOLE snapshot loop in ONE resident
+        // cooperative kernel (grid.sync() between steps), DESIGN §7 "Option A", measured
+        // head-to-head against the _relaunch variants. Bounded memory: gpuh5 keeps 2 groups
+        // (overlap 1 snapshot ahead), gpuh5_sync keeps 1 (it submits-AND-waits, so only one
+        // snapshot is ever in flight). Both FORCE kPinnedHost data for deadlock safety -- a
+        // resident cooperative grid would starve the server's D2H -- which is why they report
+        // pinned=1 regardless of GSBENCH_DATA_PINNED.
+        {"gpuh5",            "[gsbench_persistent]",      {}, false, false},
+        {"gpuh5_sync",       "[gsbench_persistent_sync]", {}, false, false},
     };
 }
 
