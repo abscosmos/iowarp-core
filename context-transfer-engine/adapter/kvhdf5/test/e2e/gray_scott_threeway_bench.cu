@@ -407,6 +407,54 @@ template __global__ void GsPersistentKernel<false>(
     float*, float*, float*, float*, const kvhdf5::GpuDatasetHandle*, unsigned,
     const clio::cte::core::TagId*, const uint32_t*, GsParams, unsigned, unsigned, unsigned);
 
+// ---- COMPUTE-ONLY variant of the persistent kernel (register-decomposition probe) ------
+//
+// Splits GsPersistentKernel<true>'s +14 registers over GsStepKernel (40 vs 26) into two
+// deltas for the paper: "cost of going resident/cooperative" vs "cost of the I/O path".
+// This kernel is GsPersistentKernel with EVERY CLIO call stripped — no CLIO_GPU_INIT, no
+// per-chunk submit loop (WriteWait/fill/SetTag/Write/WriteAsync), no tail drain — keeping
+// ONLY the resident cooperative compute: the snapshot/step loop, grid.sync() between
+// steps, the identical Gray-Scott stencil math, and the ping-pong pointer swap. It keeps
+// GsPersistentKernel's full parameter list (the I/O-only params go unused) so the two
+// kernels are argument-for-argument comparable. It is never launched; it exists solely to
+// be measured by cudaFuncGetAttributes / cudaOccupancyMaxActiveBlocksPerMultiprocessor in
+// the register-report TEST_CASE below.
+__global__ void GsPersistentComputeOnlyKernel(
+    float* u0, float* v0, float* u1, float* v1,
+    const kvhdf5::GpuDatasetHandle* groups, unsigned ngroups,
+    const clio::cte::core::TagId* tag_table, const uint32_t* mask,
+    GsParams p, unsigned N, unsigned num_snaps, unsigned steps_per) {
+    (void)groups; (void)ngroups; (void)tag_table; (void)mask;
+    cg::grid_group grid = cg::this_grid();
+    const unsigned cells = N * N;
+    const unsigned gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned gstride = gridDim.x * blockDim.x;
+
+    float* uc = u0; float* vc = v0; float* un = u1; float* vn = v1;
+    for (unsigned s = 0; s < num_snaps; ++s) {
+        // COMPUTE steps_per Gray-Scott steps in-kernel; identical to GsPersistentKernel's
+        // compute phase. No SUBMIT section here — that is the whole point of this probe.
+        for (unsigned t = 0; t < steps_per; ++t) {
+            for (unsigned gid = gtid; gid < cells; gid += gstride) {
+                unsigned x = gid % N, y = gid / N;
+                unsigned xm = (x == 0) ? (N - 1) : (x - 1);
+                unsigned xp = (x == N - 1) ? 0u : (x + 1);
+                unsigned ym = (y == 0) ? (N - 1) : (y - 1);
+                unsigned yp = (y == N - 1) ? 0u : (y + 1);
+                float ucv = uc[gid], vcv = vc[gid];
+                float lap_u = uc[y*N+xm] + uc[y*N+xp] + uc[ym*N+x] + uc[yp*N+x] - 4.f*ucv;
+                float lap_v = vc[y*N+xm] + vc[y*N+xp] + vc[ym*N+x] + vc[yp*N+x] - 4.f*vcv;
+                float uvv = ucv * vcv * vcv;
+                un[gid] = ucv + p.dt * (p.Du * lap_u - uvv + p.F * (1.f - ucv));
+                vn[gid] = vcv + p.dt * (p.Dv * lap_v + uvv - (p.F + p.k) * vcv);
+            }
+            grid.sync();
+            float* tu = uc; uc = un; un = tu;
+            float* tv = vc; vc = vn; vn = tv;
+        }
+    }
+}
+
 // ---- POOLED arm: fill + fire fused into ONE kernel --------------------------
 //
 // The sync/async arms are a THREE-kernel shape: TwCopyKernel stages every chunk's bytes
@@ -440,16 +488,16 @@ struct TwPooledFill {
     }
 };
 
-// NOTE (2026-07-18, persistent-kernel redesign): the planned long-running/persistent snapshot
-// kernel (loops over snapshots in-kernel, double-buffers across them, WriteWait to reclaim a
-// group) measured ~55 registers -> 66.7% occupancy on sm_89 @ blockDim=256 (static ptxas), two
-// tiers below the 100% that separate relaunched compute+submit kernels reach. We ACCEPT the worse
-// occupancy (going persistent on purpose). The register pressure is the Submit/SubmitWait machinery
-// (Future<TaskT>, IpcManager pointer-chasing, probe timestamps) + loop-carried state held resident
-// together, not the stencil. TODO: test whether `__launch_bounds__(256, 6)` is a net win — it
-// forces <=40 regs / 100% occupancy but spills ~24 B/thread (16 store + 8 load) into the inner loop;
-// for a memory-bound stencil that may cost more than the extra 2 resident blocks buy, so measure at
-// runtime before adopting.
+// NOTE (2026-07-20, measured via cudaFuncGetAttributes + cudaOccupancyMaxActiveBlocksPerMultiprocessor,
+// RTX 4090 / sm_89): the persistent snapshot kernel (GsPersistentKernel; loops over snapshots
+// in-kernel, double-buffers across them, WriteWait to reclaim a group) measures 40 registers (Async)
+// / 42 (fire-and-wait) with a 136 B/thread local-memory spill, yet reaches 6 blocks/SM = 100%
+// occupancy at blockDim=256 -- the SAME tier as the stock stencil (26 regs), because the thread-count
+// ceiling (1536/256=6) binds before the 64K register file. The register pressure is the Submit/
+// SubmitWait machinery (Future<TaskT>, IpcManager pointer-chasing) + loop-carried state held resident,
+// not the stencil. __launch_bounds__(256,6) recovers nothing (occupancy is already 100%) and only
+// grows the spill, so it is NOT used. (An earlier "~55 regs -> 66.7%" estimate here was static-ptxas
+// on a prototype and is superseded by the numbers above.)
 template <bool kProbing>
 __global__ __launch_bounds__(256) void TwSnapPooledKernel(kvhdf5::GpuDatasetHandle h,
                                                           const byte_t* src) {
@@ -3268,9 +3316,20 @@ TEST_CASE("GSBENCH kernel register report",
          reinterpret_cast<const void*>(TwSnapFireKernel<false>)},
         {"TwDrainKernel", "clio-async",
          reinterpret_cast<const void*>(TwDrainKernel)},
+        {"GsPersistentKernel<true>", "gpuh5",
+         reinterpret_cast<const void*>(GsPersistentKernel<true>)},
+        {"GsPersistentKernel<false>", "gpuh5_sync",
+         reinterpret_cast<const void*>(GsPersistentKernel<false>)},
+        {"GsPersistentComputeOnlyKernel", "gpuh5-decomposition-probe (never launched)",
+         reinterpret_cast<const void*>(GsPersistentComputeOnlyKernel)},
+        {"ReuseFireKernel", "reuse",
+         reinterpret_cast<const void*>(ReuseFireKernel)},
+        {"TwSnapPooledKernel<false>", "pooled",
+         reinterpret_cast<const void*>(TwSnapPooledKernel<false>)},
     };
-    int regs[6];
-    for (unsigned i = 0; i < 6; ++i) {
+    const unsigned kNumKernels = sizeof(kernels) / sizeof(kernels[0]);
+    int regs[kNumKernels];
+    for (unsigned i = 0; i < kNumKernels; ++i) {
         cudaFuncAttributes attr{};
         REQUIRE(cudaFuncGetAttributes(&attr, kernels[i].fn) == cudaSuccess);
         regs[i] = attr.numRegs;
@@ -3279,6 +3338,34 @@ TEST_CASE("GSBENCH kernel register report",
             "maxThreadsPerBlock=%d\n",
             kernels[i].name, kernels[i].arm, attr.numRegs, attr.sharedSizeBytes,
             attr.localSizeBytes, attr.maxThreadsPerBlock);
+    }
+
+    // ---- theoretical occupancy: persistent kernel vs the stock stencil, @256 threads/block,
+    // sm_89 (max 1536 threads/SM -> occupancy% = blocks_per_sm * 256 / 1536). ----
+    {
+        int blocks = 0;
+        REQUIRE(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks, GsStepKernel, 256, 0) == cudaSuccess);
+        std::fprintf(stderr,
+            "GSBENCH_KERNEL_OCCUPANCY kernel=GsStepKernel blockDim=256 blocks_per_sm=%d "
+            "theoretical_occupancy_pct=%.1f\n",
+            blocks, 100.0 * double(blocks) * 256.0 / 1536.0);
+
+        blocks = 0;
+        REQUIRE(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks, GsPersistentKernel<true>, 256, 0) == cudaSuccess);
+        std::fprintf(stderr,
+            "GSBENCH_KERNEL_OCCUPANCY kernel=GsPersistentKernel<true> blockDim=256 "
+            "blocks_per_sm=%d theoretical_occupancy_pct=%.1f\n",
+            blocks, 100.0 * double(blocks) * 256.0 / 1536.0);
+
+        blocks = 0;
+        REQUIRE(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &blocks, GsPersistentComputeOnlyKernel, 256, 0) == cudaSuccess);
+        std::fprintf(stderr,
+            "GSBENCH_KERNEL_OCCUPANCY kernel=GsPersistentComputeOnlyKernel blockDim=256 "
+            "blocks_per_sm=%d theoretical_occupancy_pct=%.1f\n",
+            blocks, 100.0 * double(blocks) * 256.0 / 1536.0);
     }
     // indices into `kernels`/`regs`: 0=GsStepKernel 1=MaskKernel(excluded, shared test
     // artifact) 2=TwCopyKernel 3=TwSnapSyncKernel 4=TwSnapFireKernel 5=TwDrainKernel
