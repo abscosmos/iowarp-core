@@ -34,7 +34,11 @@ std::vector<Arm> BuildRegistry() {
         // GPUH5 arms. gpuh5 (reuse) is the canonical/default design: GPU-initiated, bounded
         // (2 reused groups) memory. gpuh5_noreuse is the old one-dataset-per-snapshot async
         // path (memory linear in snaps); gpuh5_sync is the fused submit-AND-wait variant.
-        {"gpuh5_sync",           "[gsbench_gpuh5_sync]",    {}, false, false},
+        // gpuh5_sync: fused submit-AND-wait (no double buffering). Two data backends as
+        // separate arms so the sync-vs-sync comparison against persistent_sync (which is
+        // FORCED pinned) can isolate the data-backend cost from the cooperative-kernel cost.
+        {"gpuh5_sync",           "[gsbench_gpuh5_sync]",    {{"GSBENCH_DATA_PINNED", "0"}}, false, false},
+        {"gpuh5_sync_pinned",    "[gsbench_gpuh5_sync]",    {{"GSBENCH_DATA_PINNED", "1"}}, false, false},
         {"gpuh5_noreuse",        "[gsbench_gpuh5_noreuse]", {{"GSBENCH_DATA_PINNED", "0"}}, false, false},
         {"gpuh5_noreuse_pinned", "[gsbench_gpuh5_noreuse]", {{"GSBENCH_DATA_PINNED", "1"}}, false, false},
 
