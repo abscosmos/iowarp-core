@@ -39,8 +39,23 @@ Plus a sixth category that is not merely stranded but **invisible**: a task susp
 (`IsYielded() && YieldTimeUs() == 0`) is placed in **no queue at all** — `ExecTask`
 (`worker.cc:720-733`) deliberately skips `AddToBlockedQueue` for it. Its only owner is the subtask
 future's `parent_task_` handle (`future.h:138`, set in `ipc_cpu2self.cc:60`). The runtime cannot
-enumerate its own suspended tasks. **Migration must therefore also give these tasks a home**, or
-they remain unreachable by any migrator (see D4).
+enumerate its own suspended tasks. **D4 fixes this by parking them in the blocked queue**, which
+folds category 6 into category 2 and makes the whole set enumerable by one mechanism.
+
+### 2.2 `blocked_queues_` is currently vestigial
+
+Worth stating plainly, because D4 depends on it. `AddToBlockedQueue`'s `YieldTimeUs() == 0` branch
+(`worker.cc:1151`) is the one that feeds `blocked_queues_`, and essentially nothing reaches it:
+
+* `ExecTask` (`worker.cc:725`) only calls it when `YieldTimeUs() > 0` — i.e. always the *periodic*
+  branch.
+* `ProcessBlockedQueue`'s own re-add (`worker.cc:951`) is **dead code**, unreachable behind a
+  `continue` at line 947.
+* `ReschedulePeriodicTask` (`worker.cc:1268`) reaches it only for a periodic task whose period is 0.
+
+So `blocked_queues_[4]`, its four-bucket backoff, and `WorkerStats::num_blocked_tasks_` are
+scaffolding for a case that never populates them. D4 puts them to their intended use rather than
+adding a parallel registry.
 
 ### 2.1 Why they are pinned
 
@@ -173,24 +188,55 @@ The `Emplace` deliberately happens **outside** the lock. `mpsc_ring_buffer::Empl
 (`ring_buffer.h:509-521`) — holding `sig_mtx_` across that would let a full orphaned queue
 deadlock the migrator, converting a one-thread stall into a two-thread stall. See §7.2.
 
-### D4 — Giving `co_await`-suspended tasks a home
+### D4 — Park `co_await`-suspended tasks in the blocked queue
 
-Category 6 (§2) is not in any queue, so "migrate all blocked tasks" cannot reach it. Two ways:
+**Decision:** the `YieldTimeUs() == 0` yield path in `ExecTask` (`worker.cc:720-733`) now calls
+`AddToBlockedQueue`, so an event-waiting task is parked in `blocked_queues_[]` instead of vanishing
+into the subtask future's `parent_task_` handle. The blocked queue becomes the enumerable set of
+suspended tasks — for migration (D-b), for `WorkerStats`, and for diagnostics. No parallel registry.
 
-* **(i) Suspended registry.** An intrusive list on the worker, under `park_mtx_`, that
-  `ExecTask`'s `YieldTimeUs() == 0` path adds to and every resume path removes from. The migrator
-  walks it and re-points each task. Also gives us the observability we currently lack
-  (`WorkerStats::num_blocked_tasks_`, `worker.h:77`, badly undercounts today).
-* **(ii) Do nothing.** Argue that a suspended task needs no migration: it is not consuming the
-  wedged worker, and its wakeup arrives via the event queue — which D3 has already re-pointed…
-  except D3 re-points *tasks the migrator can enumerate*, and this one it cannot. **So (ii) does
-  not actually work under D-c.** A suspended task the migrator never sees keeps its stale
-  `EventQueue()` pointer forever, and its completion signal goes to the wedged worker's queue.
+The one-line version of this is wrong, though. `ProcessBlockedQueue` (`worker.cc:902-953`) today is
+a *resume-once-and-forget* scan, and both halves of that are hostile to event-waiting tasks:
 
-**Recommendation: (i) is required, not optional, given D-c.** This is the main place where
-"rewrite the address" costs more than "make the address unnecessary" — it forces the runtime to
-maintain an enumerable set of suspended tasks that it does not have today. Worth knowing the
-price, but it is a bounded, mechanical change and the observability is independently valuable.
+1. **It resumes unconditionally.** It pops a task and calls `ExecTask(task, is_started)` with no
+   check that what the task is waiting on has actually happened (`worker.cc:944`). An event-waiting
+   task resumed mid-`co_await` returns from the await while the subtask is still running and reads
+   its outputs early — precisely the #705 failure (short reads/writes, freed buffers).
+2. **It never re-queues.** The re-add at `worker.cc:951` is dead code behind the `continue` at 947,
+   so a popped task leaves the queue permanently. Tracking would be lost on first scan.
+
+So `ProcessBlockedQueue` is rewritten as a **readiness scan**:
+
+```
+for each parked task (bounded batch):
+  if (task->IsCoroCompleted())            -> erase        // already finished elsewhere
+  else if (awaited future is complete)    -> erase, resume, LOG(kWarning)
+  else                                    -> leave parked, bump miss count / backoff bucket
+```
+
+The middle branch is a genuine bonus: it is a **self-healing net for lost wakeups**. Normally
+`ProcessEventQueue` resumes the parent long before the scan sees it, so reaching that branch means
+an event was dropped — which is exactly the #680 class, and it should be loud rather than silent.
+The existing four buckets (`% 2/4/8/16`) become the backoff for how often a long-waiter is
+re-checked, which is what they were shaped for.
+
+Supporting changes:
+
+* **`std::queue` → `std::list` + an iterator stored on the task**, so `ProcessEventQueue` can erase
+  a task in O(1) before resuming it. Without O(1) erase, a resumed task lingers as a stale entry
+  and can be double-parked when it suspends again.
+* **`AddToBlockedQueue`'s `wait_for_task` parameter is deleted.** It currently means "do not add"
+  (`worker.cc:1145`) — the exact behaviour being reversed — and no caller passes `true`.
+* **Delete the dead `continue` + unreachable re-add** at `worker.cc:946-951`.
+* **Awaited-future lifetime.** The scan needs to test completeness of what the task awaits.
+  `RunContext::awaited_fshm_` is a raw `const void*` (`task.h:885`). Dereferencing it is safe *while
+  the parent is suspended* (the parent's coroutine frame holds the owning `Future`, which holds the
+  `shared_ptr<FutureShm>`), but that is an invariant worth making explicit — consider storing an
+  owning `Future` instead of the raw pointer. See open decision §8.1.
+* **Ownership.** Parking adds a second owning `shared_ptr<Task>` reference. A task that completes
+  through a path which never erases its entry is retained forever by the queue. The
+  `IsCoroCompleted()` branch above makes this self-correcting, but given #620/#680 were both
+  reference-lifetime bugs, the leak-detection tests should be run against this specifically.
 
 ### D5 — The lane: transfer it, do not lock its pop path
 
@@ -249,10 +295,21 @@ one, the stalled worker looks permanently loaded (harmless) and the replacement 
 
 ### P2 — Migration of parked + suspended state (D1–D4, D6)
 
-* `event_queue_` → `mpmc_ring_buffer`; `park_mtx_`; suspended registry; `sig_mtx_`/`sig_gen_`
-  and the D3 producer handshake; `LoadBalance::MigrateAllFrom(stalled, fresh)`.
-* **Clears stranded categories 2–6.** This is the phase that stops one bad task from stalling an
-  unbounded dependency tree.
+Split into two mergeable steps, because D4 is independently testable and carries the #705 risk:
+
+**P2a — park event-waiting tasks (D4), no migration yet.** `ExecTask` parks them;
+`blocked_queues_` → `std::list` + task-held iterator; `ProcessBlockedQueue` becomes the readiness
+scan; `ProcessEventQueue` erases before resuming; delete `wait_for_task` and the dead re-add.
+Behaviour-preserving by design — nothing should resume differently — so any change in the FUSE /
+stress suites here is a real regression and is easy to attribute. Lands the lost-wakeup safety net
+and fixes `WorkerStats::num_blocked_tasks_` on its own.
+
+**P2b — migration.** `event_queue_` → `mpmc_ring_buffer`; `park_mtx_`; `sig_mtx_`/`sig_gen_` and
+the D3 producer handshake; `LoadBalance::MigrateAllFrom(stalled, fresh)` + re-drain of quarantined
+queues (§7.2); load accounting moves (D6).
+
+* **Clears stranded categories 2–6.** This is what stops one bad task from stalling an unbounded
+  dependency tree.
 * Requires §7.1 closed, since started fibers now move deliberately.
 
 ### P3 — Observability + quarantine policy
@@ -335,15 +392,19 @@ cache**; a stack allocated on worker A and freed on worker B lands in B's cache.
 
 The C++20 stackless backend heap-allocates frames and is thread-agnostic; only Boost needs this.
 
-### 7.2 Full event queue is a spin-forever, not a failure
+### 7.2 Full event queue — accepted, keep blocking `Emplace` *(closed)*
 
 `Emplace` under `WAIT_FOR_SPACE` claims a tail slot then busy-loops until the consumer advances
-(`ring_buffer.h:509-521`). Today the queue is sized `2 × GetQueueDepth()` under a #620 assumption
-("a parent fills at most ~queue_depth subtask slots in its own lane", `worker.h:499-508`). After
-migration a single replacement worker may receive the events of *several* workers' worth of tasks,
-so that bound no longer holds. Options: size the replacement's queue larger, use
-`ErrorOnNoSpace` + a spill list, or migrate to at most one worker's worth of tasks per rescue.
-**Must be settled during P2 design, not discovered at runtime.**
+(`ring_buffer.h:509-521`). Decision: **leave it as is.** The argument that makes it safe:
+
+* The push is **outside** `sig_mtx_` (D3), so a spinning producer can never block the migrator.
+  This is the constraint that must not be relaxed; if the push is ever moved inside the lock, a full
+  orphaned queue converts a one-thread stall into a two-thread stall.
+* The migrator drains the old queue as part of the re-point sequence, so a producer that arrives
+  with a stale pointer finds space and completes, then catches the generation bump and re-pushes.
+* Residual window: enough producers to refill a just-drained queue before any of them re-checks the
+  generation. Closed cheaply by having `LoadBalance` **re-drain a quarantined worker's event queue
+  on every subsequent tick**, not just at rescue time. No protocol change, ~10 lines.
 
 ### 7.3 TLS captured across a suspend point
 
@@ -367,20 +428,26 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
 
 ## 8. Open decisions
 
-1. **Suspended registry (D4).** Confirm it is in scope — under D-c it is *required*, not
-   optional, because a task the migrator cannot enumerate keeps a stale event-queue pointer
-   forever. This is the one real cost of "rewrite the address" over "remove the address".
-2. **Event-queue overflow (§7.2).** Grow the replacement's queue, make `Emplace` fallible with a
-   spill list, or cap tasks migrated per rescue?
+*Closed:* suspended-task tracking → D4 (park in the blocked queue). Event-queue overflow → §7.2
+(keep blocking `Emplace`, re-drain quarantined queues).
+
+1. **Awaited-future handle (D4).** Keep `awaited_fshm_` as a raw `const void*` (`task.h:885`) and
+   document the "safe while suspended" invariant, or promote it to an owning `Future`? The raw
+   pointer is sound today only because the suspended parent's frame keeps the `FutureShm` alive —
+   an invariant the readiness scan now depends on, where before it only did a pointer comparison.
+   Recommendation: promote it; it is a small change and removes a lifetime argument from the
+   critical path.
+2. **Readiness-scan backoff.** Reuse the existing `% 2/4/8/16` buckets keyed on yield count, or
+   re-key them on *time* parked? Yield count no longer means much for a task that suspends once and
+   waits a long time.
 3. **Wedged-worker fate.** When the bad task finally returns, does the worker rejoin the pool or
    retire? Rejoining risks re-wedging on the same task class; retiring leaks a thread per bad task
    until exit. Recommendation: rejoin with exponential-backoff quarantine.
 4. **All-workers-stalled.** `LoadBalance` already detects it (`default_sched.cc:383`). With an
    unbounded elastic pool the answer is "spawn as many replacements as needed" — confirm there is
    no cap, and that the loud warning stays.
-5. **Do the blocked/periodic buckets stay four-deep?** The `% 2/4/8/16` scheme is a hand-rolled
-   timer wheel; migration would be simpler over one parked list plus a deadline-ordered structure.
-   Bigger diff, entirely optional.
+5. **Do the periodic buckets stay four-deep?** The `% 2/4/8/16` scheme is a hand-rolled timer wheel.
+   Optional cleanup, unrelated to correctness.
 
 ---
 
@@ -394,6 +461,15 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
   * rescue: lane transfer republished the tid, backlog drained, blocked queues emptied;
   * migration racing a completion → no lost wakeup, no double-execute (per-task exec counter);
   * duplicate-event tolerance (§6.3) as an explicit case.
+* **P2a-specific** (the #705 risk surface):
+  * **no spurious resume** — a task parked awaiting a slow subtask must not be resumed by the
+    readiness scan before that subtask completes. Assert with a counter on the await return path;
+    this is the regression that would silently corrupt reads/writes rather than hang.
+  * parked task is resumed exactly once when its event arrives, and its blocked-queue entry is
+    gone afterwards (no stale entry, no double-park on re-suspend);
+  * the lost-wakeup branch fires and logs when an event is deliberately dropped;
+  * `num_blocked_tasks_` now tracks the real suspended count;
+  * leak-detection suite against the new owning reference (D4, ownership note).
 * **TSan** on the P2 diff (§6.5).
 * **Benchmark:** `sched_variety` chained-class p50/p99/max per phase.
 * **Regression:** the embedded-FUSE xfstests named in `SuspendMe`'s comment
