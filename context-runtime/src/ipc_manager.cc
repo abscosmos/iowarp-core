@@ -2951,6 +2951,35 @@ void IpcManager::RecvZmqClientThread() {
   }
 }
 
+namespace {
+/**
+ * Idle backoff for the two SHM ring drain loops.
+ *
+ * Both rings are polled, not pollable — there is no fd to block on — so an
+ * idle drainer has to choose between burning a core and adding latency. A flat
+ * sleep adds its full duration to the round-trip whenever the ring was empty at
+ * the moment the peer wrote to it, and the SHM path crosses TWO of these loops
+ * per request (client -> in-ring -> worker -> out-ring -> client). Sleeping
+ * 20us unconditionally therefore cost up to ~40us per op, which measured as SHM
+ * being SLOWER than the ZMQ unix-socket path even though it does strictly less
+ * work.
+ *
+ * Spin first (the request we are waiting for is usually microseconds away),
+ * then decay to the sleep so a genuinely idle runtime does not pin a core.
+ * `spins` is the caller's per-loop counter, reset on every unit of work.
+ */
+inline void ShmDrainBackoff(size_t &spins) {
+  // ~4k yields ≈ tens of microseconds of spinning on this class of machine,
+  // covering the common case where a peer is actively driving the ring.
+  constexpr size_t kSpinBudget = 4096;
+  if (++spins < kSpinBudget) {
+    CTP_THREAD_MODEL->Yield();
+  } else {
+    CTP_THREAD_MODEL->SleepForUs(20);
+  }
+}
+}  // namespace
+
 void IpcManager::RecvShmClientThread() {
 #if CTP_IS_HOST
   // Client-side SHM analogue of RecvZmqClientThread. Drains the single
@@ -2962,6 +2991,7 @@ void IpcManager::RecvShmClientThread() {
   // polled its own per-thread ring in RecvOut.
   size_t recv_count = 0;
   size_t miss_count = 0;
+  size_t idle_spins = 0;
   while (shm_recv_running_.load()) {
     bool drained_any = false;
     // Drain everything currently available before backing off.
@@ -3002,10 +3032,10 @@ void IpcManager::RecvShmClientThread() {
       pending_zmq_futures_.erase(it);
       ++recv_count;
     }
-    if (!drained_any) {
-      // Idle: cede the CPU. 20us matches the RecvOut backoff floor and keeps
-      // response latency low without pinning a core.
-      CTP_THREAD_MODEL->SleepForUs(20);
+    if (drained_any) {
+      idle_spins = 0;
+    } else {
+      ShmDrainBackoff(idle_spins);
     }
   }
 #endif
@@ -3019,19 +3049,19 @@ void IpcManager::RecvShmServerThread() {
   // and Worker need no knowledge of it: there is no "which worker drains it"
   // question to answer. IpcCpu2Cpu::RecvIn deserializes one task per call and
   // pushes it onto a scheduler-chosen lane.
+  size_t idle_spins = 0;
   while (shm_in_recv_running_.load(std::memory_order_acquire)) {
     bool drained_any = false;
     // Drain everything currently queued before backing off, so a burst is
-    // ingested in one pass rather than one task per sleep.
+    // ingested in one pass rather than one task per backoff.
     while (shm_in_recv_running_.load(std::memory_order_acquire) &&
            IpcCpu2Cpu::RecvIn(this)) {
       drained_any = true;
     }
-    if (!drained_any) {
-      // Idle backoff. The ring has no pollable fd, so this is a sleep rather
-      // than a blocking wait; 20us matches the client recv thread and keeps
-      // task-ingest latency well under a scheduling quantum.
-      CTP_THREAD_MODEL->SleepForUs(20);
+    if (drained_any) {
+      idle_spins = 0;
+    } else {
+      ShmDrainBackoff(idle_spins);
     }
   }
   HLOG(kInfo, "[ShmServerRecvThread] shutting down");
