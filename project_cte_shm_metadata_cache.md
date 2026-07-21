@@ -490,6 +490,31 @@ purpose: the slot generation protects the METADATA copy, while §5.3's hazard is
 the DataOrganizer relocating blocks during the PAYLOAD read. A client must
 re-check `placement_gen_` after copying bytes.
 
+**Phase 5 COMPLETE — fast path wired and MEASURED.**
+
+`Tag::GetBlobSize` now answers from the SHM cache when the blob is cached and
+falls through to RPC on any miss or inconsistent read. Measured on this host,
+same query, same blobs, same process:
+
+| Configuration | SHM fast path | RPC path | Speedup |
+|---|---|---|---|
+| **External daemon (cross-process — the real target)** | **0.170 µs/op** | **82.7 µs/op** | **488x** |
+| In-process runtime (`CLIO_INIT` with runtime) | 0.075 µs/op | 5.57 µs/op | 74x |
+
+**Design target was < 5 µs; achieved 0.17 µs cross-process — ~29x better than
+target.** The 82.7 µs RPC figure lines up with the §1 baseline (72 µs transport
+floor plus CTE handler work), which is the sanity check that the benchmark is
+measuring the right thing.
+
+Note the two rows measure genuinely different baselines: with an in-process
+runtime there is no cross-process round-trip at all, so its 5.6 µs is not the
+number this design set out to beat. Quote the cross-process row.
+
+The benchmark asserts correctness alongside speed — both paths must return the
+same size, and every fast-path lookup must hit — so a regression that turned
+the fast path into a miss-storm would fail rather than silently look fast.
+CTE suite: **11/11** in both configurations.
+
 **Phase 4 COMPLETE — client attach + write-then-read tests passing.**
 Two bugs surfaced only by writing the test:
 

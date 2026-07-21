@@ -2614,5 +2614,118 @@ TEST_CASE("CTE SHM cache write-then-read",
   }
 }
 
+/**
+ * issue #783: BEFORE/AFTER benchmark for metadata reads.
+ *
+ * Compares the shared-memory fast path against the authoritative RPC path for
+ * the same query, on the same blobs, in the same process. This is the number
+ * the whole design exists to move: the RPC floor measured on this host is
+ * ~72 us single-threaded, and the target is < 5 us.
+ *
+ * Correctness is asserted alongside speed -- a fast answer that disagrees with
+ * the RPC answer would make the benchmark meaningless.
+ */
+TEST_CASE("CTE SHM cache metadata read benchmark",
+          "[cte][core][shm_cache][bench]") {
+  auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
+  clio::cte::core::CreateParams params;
+
+  REQUIRE_NOTHROW(fixture->CreateAsync(
+      pool_query, CTECoreFunctionalTestFixture::kCTECorePoolName,
+      CTECoreFunctionalTestFixture::kCTECorePoolId, params));
+
+  const std::string target_name = fixture->test_storage_path_;
+  clio::run::u32 reg_result = fixture->RegisterTargetAsync(
+      target_name, clio::run::bdev::BdevType::kFile,
+      CTECoreFunctionalTestFixture::kTestTargetSize,
+      clio::run::PoolQuery::Local(), clio::run::PoolId(661, 0));
+  REQUIRE(reg_result == 0);
+
+  if (!fixture->core_client_->HasShmCache()) {
+    HLOG(kWarning,
+         "[#783] SHM metadata cache unavailable -- benchmark SKIPPED (this "
+         "measures nothing on this host)");
+    return;
+  }
+
+  clio::cte::core::TagId tag_id = fixture->GetOrCreateTagAsync("shm_bench_tag");
+  REQUIRE(!tag_id.IsNull());
+
+  // Populate a working set.
+  const int kBlobs = 32;
+  const clio::run::u64 kBlobSize = 1024;
+  std::vector<std::string> names;
+  for (int i = 0; i < kBlobs; ++i) {
+    std::string bn = "bench_blob_" + std::to_string(i);
+    names.push_back(bn);
+    auto data = fixture->CreateTestData(kBlobSize, 'K');
+    auto fp = CLIO_IPC->AllocateBuffer(kBlobSize);
+    REQUIRE(!fp.IsNull());
+    REQUIRE(fixture->CopyToSharedMemory(fp, data));
+    auto t = fixture->core_client_->AsyncPutBlob(
+        tag_id, bn, 0, kBlobSize, fp.shm_.template Cast<void>(), 0.5f,
+        clio::cte::core::Context(), 0);
+    REQUIRE(!t.IsNull());
+    REQUIRE(fixture->WaitForTaskCompletion(t, 10000));
+    REQUIRE(t->return_code_ == 0);
+    CLIO_IPC->FreeBuffer(fp);
+  }
+
+  const int kIters = 2000;
+
+  // ---- AFTER: shared-memory fast path (zero IPC) ----
+  clio::run::u64 shm_checksum = 0;
+  int shm_hits = 0;
+  auto shm_t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIters; ++i) {
+    clio::cte::core::ShmBlobRecord rec;
+    if (fixture->core_client_->TryGetBlobRecordShm(
+            tag_id, names[i % kBlobs], &rec)) {
+      shm_checksum += rec.total_size_;
+      ++shm_hits;
+    }
+  }
+  auto shm_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - shm_t0)
+                    .count();
+
+  // Every lookup must hit; a benchmark dominated by misses would be measuring
+  // the wrong thing entirely.
+  REQUIRE(shm_hits == kIters);
+
+  // ---- BEFORE: authoritative RPC path ----
+  // Fewer iterations because each is ~70us; scaled per-op below.
+  const int kRpcIters = 200;
+  clio::run::u64 rpc_checksum = 0;
+  auto rpc_t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kRpcIters; ++i) {
+    auto t = fixture->core_client_->AsyncGetBlobSize(tag_id,
+                                                     names[i % kBlobs]);
+    t.Wait();
+    rpc_checksum += t->size_;
+  }
+  auto rpc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - rpc_t0)
+                    .count();
+
+  double shm_us = static_cast<double>(shm_ns) / 1000.0 / kIters;
+  double rpc_us = static_cast<double>(rpc_ns) / 1000.0 / kRpcIters;
+
+  // The two paths must agree, normalized for iteration count.
+  REQUIRE(shm_checksum / kIters == rpc_checksum / kRpcIters);
+
+  HLOG(kWarning,
+       "[#783 BENCH] metadata read: SHM {} us/op vs RPC {} us/op -- speedup {}x "
+       "({} shm iters, {} rpc iters, {} byte blobs)",
+       shm_us, rpc_us, (rpc_us > 0 ? rpc_us / shm_us : 0.0), kIters, kRpcIters,
+       kBlobSize);
+
+  // The design target is < 5 us. Assert something far looser so the test is a
+  // regression guard rather than a flaky performance gate: if the fast path is
+  // not at least 5x faster than RPC, it is not doing its job.
+  REQUIRE(shm_us < rpc_us / 5.0);
+}
+
 // Main function using simple_test.h framework
 SIMPLE_TEST_MAIN()

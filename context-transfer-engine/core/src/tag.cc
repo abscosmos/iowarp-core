@@ -239,6 +239,18 @@ float Tag::GetBlobScore(const std::string &blob_name) {
 
 clio::run::u64 Tag::GetBlobSize(const std::string &blob_name) {
   auto *cte_client = CLIO_CTE_CLIENT;
+
+  // issue #783 fast path: answer from the shared-memory metadata cache with
+  // ZERO IPC when the blob is cached. A miss (or an inconsistent read) simply
+  // falls through to the RPC below -- the cache is never treated as
+  // authoritative, and "not cached" must never be reported as "size 0".
+  if (cte_client->HasShmCache()) {
+    ShmBlobRecord rec;
+    if (cte_client->TryGetBlobRecordShm(tag_id_, blob_name, &rec)) {
+      return rec.total_size_;
+    }
+  }
+
   auto task = cte_client->AsyncGetBlobSize(tag_id_, blob_name);
   task.Wait();
 
