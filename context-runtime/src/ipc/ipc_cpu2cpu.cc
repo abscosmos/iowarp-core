@@ -65,11 +65,11 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc) {
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   f.GetTaskPtr()->BeginRunContext();
-  // Pick a worker lane and enqueue, exactly as the ZMQ client recv thread does
-  // (IpcCpu2CpuZmq::RecvIn). We are not a worker, so there is no "own lane" to
-  // push to — the scheduler decides. Always signal: see ipc_cpu2cpu_impl.h for
-  // the enqueue/sleep race this closes.
-  LaneId lane_id = ipc->GetScheduler()->ClientMapTask(ipc, f);
+  // issue #781: ClientMapTask removed. Like the ZMQ client recv thread
+  // (IpcCpu2CpuZmq::RecvIn), this SHM recv path deposits on the shared ingress
+  // lane (0); the runtime maps the task to a worker via RuntimeMapTask. Always
+  // signal: see ipc_cpu2cpu_impl.h for the enqueue/sleep race this closes.
+  LaneId lane_id = 0;
   auto &lane_ref = ipc->GetTaskQueue()->GetLane(lane_id, 0);
   lane_ref.Push(f);
   ipc->AwakenWorker(&lane_ref);
