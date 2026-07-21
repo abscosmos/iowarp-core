@@ -302,12 +302,26 @@ class IpcManager {
     return main_allocator_;
   }
 
+  /**
+   * Returns the runtime-wide metadata allocator (issue #783), or nullptr if
+   * the metadata segment is not attached. Callers MUST null-check: the segment
+   * is optional, and a client that failed to attach it simply falls back to
+   * the RPC path rather than failing.
+   */
+  CLIO_TASK_ALLOC_T *GetMetadataAllocator() { return metadata_allocator_; }
+
+  /** True if the metadata segment is available for shared-memory caching. */
+  bool HasMetadataSegment() const { return metadata_allocator_ != nullptr; }
+
   /** Pid-based allocator ids of this runtime's SHM segments (pid.1 main,
-   *  pid.2 queue). Reported to clients via ClientConnect so they attach the
-   *  right allocators instead of assuming (1,0)/(2,0). */
+   *  pid.2 queue, pid.3 metadata). Reported to clients via ClientConnect so
+   *  they attach the right allocators instead of assuming (1,0)/(2,0). */
   ctp::ipc::AllocatorId GetMainAllocatorId() const { return main_allocator_id_; }
   ctp::ipc::AllocatorId GetQueueAllocatorId() const {
     return queue_allocator_id_;
+  }
+  ctp::ipc::AllocatorId GetMetadataAllocatorId() const {
+    return metadata_allocator_id_;
   }
 
   /**
@@ -1366,6 +1380,20 @@ class IpcManager {
 
   // Queue allocator pointer — ArenaAllocator for all TaskQueue structures
   CLIO_QUEUE_ALLOC_T *queue_allocator_ = nullptr;
+
+  // issue #783: runtime-wide metadata segment. Large (default 8 GB), sparse,
+  // never pre-faulted. Owned by the runtime; the CTE shared-memory metadata
+  // cache is its first consumer. Clients attach it read-write but by
+  // convention write only lock words -- metadata itself is runtime-owned.
+  ctp::ipc::PosixShmMmap metadata_backend_;
+
+  // Allocator ID for metadata segment
+  ctp::ipc::AllocatorId metadata_allocator_id_;
+
+  // Metadata allocator. BuddyAllocator (same as main) because the CTE cache
+  // does variable-size allocation with frees, which an ArenaAllocator cannot
+  // service.
+  CLIO_TASK_ALLOC_T *metadata_allocator_ = nullptr;
 
   // Number of workers for which queues are allocated
   u32 num_workers_ = 0;

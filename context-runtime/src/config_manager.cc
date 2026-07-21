@@ -211,6 +211,9 @@ ConfigManager::GetSharedMemorySegmentName(MemorySegment segment,
   case kQueueSegment:
     segment_name = queue_segment_name_;
     break;
+  case kMetadataSegment:
+    segment_name = metadata_segment_name_;
+    break;
   default:
     return "";
   }
@@ -250,6 +253,8 @@ void ConfigManager::LoadDefault() {
   // Set default shared memory segment names with environment variables
   main_segment_name_ = "chi_main_segment_${USER}";
   client_data_segment_name_ = "chi_client_data_segment_${USER}";
+  metadata_segment_name_ = "chi_metadata_segment_${USER}";
+  metadata_segment_size_ = 0;  // 0 means auto-calculate
 
   // Set default hostfile path (empty means no networking/distributed mode)
   hostfile_path_ = "";
@@ -457,6 +462,20 @@ size_t ConfigManager::CalculateMainSegmentSize() const {
   // Main segment holds task data (FutureShm, BuddyAllocator metadata) — no queues
   // Use 1 GB default for task/data allocations
   return ctp::Unit<size_t>::Gigabytes(1);
+}
+
+size_t ConfigManager::CalculateMetadataSegmentSize() const {
+  // If metadata_segment_size is explicitly set (non-zero), use it
+  if (metadata_segment_size_ > 0) {
+    return metadata_segment_size_;
+  }
+
+  // Default 8 GB. This is an address-space reservation, not an allocation: the
+  // segment is never pre-faulted, so only pages the runtime actually writes
+  // consume RAM. Sized generously because the CTE metadata cache (issue #783)
+  // holds one entry per live tag and blob, and growing the segment later would
+  // invalidate every client's mapping.
+  return ctp::Unit<size_t>::Gigabytes(8);
 }
 
 size_t ConfigManager::CalculateQueueSegmentSize() const {

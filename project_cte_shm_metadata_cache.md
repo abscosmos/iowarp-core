@@ -178,7 +178,7 @@ the existing code:
    few stuck blobs wedge the runtime. **The reorganizer must `try_lock` and skip** —
    it is background work and is free to reorganize a different blob.
 4. **Timeout-and-steal is probabilistic, not correct.** If the timeout fires on a
-   *live but slow* client — page fault against an undersized `/dev/shm` (§5.7),
+   *live but slow* client — page fault under memory pressure (§5.7),
    descheduled, swapped — the reorganizer moves data under an active reader, which is
    exactly the corruption being prevented. 500 ms makes that rare; rare **plus
    silent** is the worst failure mode to ship.
@@ -341,12 +341,37 @@ to the isolation model. Options: accept it (single-tenant assumption), or partit
 segments per tenant/pool. This should be decided deliberately and recorded, not
 inherited by accident.
 
-### 5.7 `/dev/shm` sizing
+### 5.7 Segment sizing — it is RAM, not `/dev/shm`
 
-`/dev/shm` is **64 MB** on this dev host. An 8 GB sparse segment maps fine, but
-touching past the tmpfs limit raises **`SIGBUS`**, not `ENOMEM` — a crash, not a
-clean failure. We need (a) a graceful "cache full → fall back to RPC" path, and
-(b) documented tmpfs sizing for realistic benchmarking.
+**Corrected during Phase 1 implementation.** The original text here assumed these
+segments are `/dev/shm` files and that this host's 64 MB `/dev/shm` was the binding
+constraint. That is wrong.
+
+On Linux the runtime creates segments with **`memfd_create()`**
+(`SystemInfo::CreateNewSharedMemory`, `system_info.cc:519`), then publishes a symlink
+under a per-user directory (`/tmp/clio_<user>/`) pointing at `/proc/<pid>/fd/<n>` so
+other processes can find and open them. memfd objects live in the kernel's internal
+shmem pool — bounded by **RAM + swap and the memory cgroup** — and are *not* subject
+to the `/dev/shm` mount size at all. Verified: `/proc/<pid>/maps` shows
+`/memfd:chi_metadata_segment_...`, and `/dev/shm` stays 0% used with a 1 GB main
+segment live.
+
+This also explains an older observation that a 1 GB main segment and a 128 MB ring
+"work anyway" on a host with a 64 MB `/dev/shm` — not sparseness, just the wrong
+filesystem.
+
+Consequences:
+- **Do not clamp against `std::filesystem::space("/dev/shm")`.** It measures an
+  unrelated filesystem and needlessly shrinks the cache (an early Phase 1 draft cut
+  8 GB to 57 MB this way).
+- The reservation is close to free — sparse and never pre-faulted, so cost is only
+  pages actually written. Verified: with a ~6 GB metadata segment mapped, runtime RSS
+  is ~35 MB.
+- The real limit is the **live set** against RAM/cgroup. Exhausting shmem surfaces as
+  `SIGBUS` or the OOM killer rather than a clean allocation failure, so Phase 1 clamps
+  the reservation to **half of physical RAM** as a sanity bound.
+- A "cache full → fall back to RPC" path is still required, since allocator exhaustion
+  inside the segment must degrade rather than fail.
 
 ## 6. Phasing
 
@@ -382,6 +407,38 @@ the legacy path.
 Phases 0-2 are self-contained and carry essentially no risk to existing behavior.
 Phase 3 is where the blast radius starts. Phase 5 before Phase 6 deliberately: proving
 the read path on metadata-only ops is far cheaper to debug than on payload reads.
+
+## 6b. Implementation status
+
+**Phase 1 (metadata segment) — done.**
+- `kMetadataSegment` added to `MemorySegment` (`types.h`).
+- `ConfigManager`: `metadata_segment_name_`, `metadata_segment_size_`,
+  `CalculateMetadataSegmentSize()`, plus the name switch case.
+- `IpcManager`: `metadata_backend_` / `metadata_allocator_id_` /
+  `metadata_allocator_`, `GetMetadataAllocator()`, `HasMetadataSegment()`.
+- Server creates it at `pid.3` (allocator index reservation bumped 3 -> 4);
+  client attaches best-effort. **Both paths are non-fatal**: if the segment is
+  missing the runtime still boots and clients silently use the RPC path.
+- Reservation sanity-clamped to half of RAM (see §5.7).
+- Verified live: segment mapped as `/memfd:chi_metadata_segment_<user>_<port>`,
+  runtime RSS ~35 MB with ~6 GB reserved (confirming it is not pre-faulted), and a
+  client logs a successful attach.
+
+**Phase 2 (primitives) — `TimedMutex` done, rest pending.**
+- `clio_ctp/thread/lock/timed_mutex.h`: unfair CAS lock with PID +
+  process-start-time reclamation, `TryLock`/`Lock`/`Unlock`, ABA-safe release,
+  `ScopedTimedLock` RAII guard, `steal_count_` diagnostics.
+- Standalone smoke test passes (unique ids, reentrant `TryLock` correctly fails,
+  clean release, no spurious steals).
+- Still to build: `ipc::string`, `ipc::unordered_map`, `Lease`, and the
+  kill-clients-at-random torture test.
+
+**Known blocker (not caused by this work):** `clio_run_thrpt_bench` aborts shortly
+after client init with `Fatal glibc error: tpp.c:83 (__pthread_tpp_change_priority)`,
+in every transport mode including TCP (which maps no SHM at all). Needs isolating
+before Phase 0 baselines can be taken — note that a partial rebuild after an
+`IpcManager` layout change produces ABI skew between the core library and the module
+`.so`s, which can present as spurious crashes, so always rebuild modules together.
 
 ## 7. Decisions
 

@@ -715,6 +715,8 @@ void IpcManager::ServerFinalize() {
 
   // Clear main allocator pointer
   main_allocator_ = nullptr;
+  // issue #783: metadata segment is runtime-owned; clients only detach.
+  metadata_allocator_ = nullptr;
 
   // Leak scan while the SHM segments are still mapped (alloc_vector_ is not
   // cleared here). This is the reliable trigger for the IpcManager leak scan:
@@ -878,12 +880,69 @@ bool IpcManager::ServerInitShm() {
       return false;
     }
 
-    // Reserve segment indices 0-2 of this pid's allocator-id space: index 1 is
-    // the main segment and index 2 is the queue segment (see above). Runtime
-    // data segments created on demand by IncreaseClientShm (for AllocateBuffer
-    // / FutureShm) start at index 3 so their AllocatorId never collides with
-    // main/queue. Clients use a different pid, so they keep starting at 0.
-    shm_count_.store(3, std::memory_order_relaxed);
+    // issue #783: runtime-wide metadata segment (pid.3). Backs the CTE
+    // shared-memory metadata cache. Deliberately NON-FATAL: if it cannot be
+    // created the runtime still starts and every client simply falls back to
+    // the RPC path. That matters because the reservation is huge (8 GB by
+    // default) and a host with a small /dev/shm can legitimately refuse it --
+    // losing an optimization is acceptable, failing to boot is not.
+    metadata_allocator_id_ = ctp::ipc::AllocatorId::Get(pid, 3);
+    std::string metadata_segment_name =
+        config->GetSharedMemorySegmentName(kMetadataSegment);
+    size_t metadata_segment_size = config->CalculateMetadataSegmentSize();
+
+    // Sanity-clamp the reservation against physical RAM.
+    //
+    // NOTE ON WHAT BACKS THIS: on Linux these segments are memfd_create()
+    // objects (SystemInfo::CreateNewSharedMemory), NOT files under /dev/shm.
+    // memfd lives in the kernel's internal shmem pool, bounded by RAM+swap and
+    // the memory cgroup -- the /dev/shm mount size is irrelevant here, which is
+    // why a 1 GB main segment works fine on a host whose /dev/shm is 64 MB.
+    // Do not "fix" this by measuring std::filesystem::space("/dev/shm"); that
+    // reads an unrelated filesystem and needlessly shrinks the cache.
+    //
+    // The reservation itself is nearly free because the segment is sparse and
+    // never pre-faulted. The hazard is only the LIVE SET: pages actually
+    // written come out of RAM, and exhausting shmem surfaces as SIGBUS or the
+    // OOM killer rather than a clean allocation failure. Clamping to half of
+    // RAM keeps the default a no-op on real nodes while protecting small
+    // dev boxes and constrained containers.
+    {
+      size_t ram = ctp::SystemInfo::GetRamCapacity();
+      if (ram > 0 && metadata_segment_size > ram / 2) {
+        size_t clamped = ram / 2;
+        HLOG(kWarning,
+             "Metadata segment: requested {} bytes exceeds half of RAM ({} "
+             "bytes total); clamping to {} bytes",
+             metadata_segment_size, ram, clamped);
+        metadata_segment_size = clamped;
+      }
+    }
+
+    HLOG(kInfo,
+         "Initializing metadata shared memory segment: {} bytes ({} MB), "
+         "sparse/not pre-faulted",
+         metadata_segment_size, metadata_segment_size / (1024 * 1024));
+    if (metadata_backend_.shm_init(
+            metadata_allocator_id_,
+            ctp::Unit<size_t>::Bytes(metadata_segment_size),
+            metadata_segment_name)) {
+      metadata_allocator_ = metadata_backend_.MakeAlloc<CLIO_TASK_ALLOC_T>();
+    }
+    if (!metadata_allocator_) {
+      HLOG(kWarning,
+           "ServerInitShm: metadata segment '{}' unavailable ({} bytes) -- "
+           "SHM metadata caching disabled, clients will use the RPC path",
+           metadata_segment_name, metadata_segment_size);
+    }
+
+    // Reserve segment indices 0-3 of this pid's allocator-id space: index 1 is
+    // the main segment, index 2 the queue segment, index 3 the metadata
+    // segment (see above). Runtime data segments created on demand by
+    // IncreaseClientShm (for AllocateBuffer / FutureShm) start at index 4 so
+    // their AllocatorId never collides. Clients use a different pid, so they
+    // keep starting at 0.
+    shm_count_.store(4, std::memory_order_relaxed);
 
 #if CTP_IS_HOST
     // Single inbound MPSC ring shared by every SHM client (replaces the old
@@ -957,6 +1016,35 @@ bool IpcManager::ClientInitShm() {
       return false;
     }
     queue_allocator_id_ = queue_allocator_->GetId();
+
+    // issue #783: attach the runtime-wide metadata segment for SHM metadata
+    // caching. BEST-EFFORT -- unlike main/queue, a failure here is not fatal.
+    // The segment is an optimization; a client that cannot attach it just uses
+    // the RPC path. It is also legitimately absent when the runtime chose not
+    // to create it (small /dev/shm), so this must not log at error level.
+    //
+    // Mapped read-write, not PROT_READ: acquiring a lease is a store. Clients
+    // are trusted by convention to write ONLY lock words, never metadata --
+    // the runtime never treats this segment as authoritative, so a
+    // misbehaving client can degrade other clients but cannot corrupt the
+    // runtime's own state.
+    {
+      std::string metadata_segment_name =
+          config->GetSharedMemorySegmentName(kMetadataSegment);
+      if (metadata_backend_.shm_attach(metadata_segment_name)) {
+        metadata_allocator_ = metadata_backend_.AttachAlloc<CLIO_TASK_ALLOC_T>();
+      }
+      if (metadata_allocator_) {
+        metadata_allocator_id_ = metadata_allocator_->GetId();
+        HLOG(kInfo, "ClientInitShm: attached metadata segment '{}'",
+             metadata_segment_name);
+      } else {
+        HLOG(kInfo,
+             "ClientInitShm: metadata segment '{}' unavailable -- SHM metadata "
+             "caching disabled for this client (RPC path still works)",
+             metadata_segment_name);
+      }
+    }
 
 #if CTP_IS_HOST
     // Single per-process response ring (replaces the old per-thread
@@ -2625,6 +2713,11 @@ bool IpcManager::ReconnectToOriginalHost() {
     main_allocator_ = nullptr;
     worker_queues_ = ctp::ipc::FullPtr<TaskQueue>();
     main_backend_ = ctp::ipc::PosixShmMmap();
+    // issue #783: the metadata mapping points into the OLD server's segment;
+    // drop it so ClientInitShm re-attaches the restarted server's one instead
+    // of leaving a dangling pointer into an unmapped region.
+    metadata_allocator_ = nullptr;
+    metadata_backend_ = ctp::ipc::PosixShmMmap();
 
     // Re-attach to new shared memory
     if (!ClientInitShm()) return false;
@@ -2732,6 +2825,9 @@ bool IpcManager::ReconnectToNewHost(const std::string &new_addr) {
   shm_send_transport_.reset();
   shm_recv_transport_.reset();
   main_allocator_ = nullptr;
+  // issue #783: remote host -> no shared memory at all, so the metadata cache
+  // is unavailable and every read must take the RPC path.
+  metadata_allocator_ = nullptr;
   runtime_pid_ = 0;
 
   // Create new ZMQ DEALER transport

@@ -596,7 +596,13 @@ CTP_GPU_FUN ctp::ipc::RoundRobinAllocator *GetSharedAllocGpu();
 enum MemorySegment {
   kMainSegment = 0,
   kClientDataSegment = 1,
-  kQueueSegment = 2
+  kQueueSegment = 2,
+  // issue #783: runtime-wide metadata segment. Large (default 8 GB) and
+  // sparsely populated -- it is never pre-faulted, so only touched pages cost
+  // RAM. Owned by the runtime as a whole (not by any one ChiMod); the CTE
+  // shared-memory metadata cache is its first consumer. Clients map it
+  // read-write, but by convention only ever write lock words.
+  kMetadataSegment = 3
 };
 
 // Input/Output parameter macros
