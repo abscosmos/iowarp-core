@@ -392,6 +392,13 @@ bool IpcManager::ClientInit() {
         "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
     shm_recv_transport_ = ctp::lbm::TransportFactory::Get(
         "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kServer);
+
+    // Start the dedicated SHM response recv thread: it drains shm_out_server_
+    // and wakes waiters (the SHM analogue of zmq_recv_thread_). App threads now
+    // block on their EventManager in RecvOut instead of polling a per-thread
+    // ring, so this thread MUST be running before any response can land.
+    shm_recv_running_.store(true);
+    shm_recv_thread_ = std::thread([this]() { RecvShmClientThread(); });
   }
 
   // Default host until identified
@@ -605,6 +612,21 @@ void IpcManager::ClientFinalize() {
     }
   }
 
+  // Stop the SHM response recv thread and tear down the response ring. Join
+  // BEFORE Shutdown so the thread cannot touch a detached segment.
+#if CTP_IS_HOST
+  if (shm_recv_running_.load()) {
+    shm_recv_running_.store(false);
+    if (shm_recv_thread_.joinable()) {
+      shm_recv_thread_.join();
+    }
+  }
+  if (shm_out_server_ok_) {
+    shm_out_server_.Shutdown();  // unmap + unlink "clio-<pid>-shm-out"
+    shm_out_server_ok_ = false;
+  }
+#endif
+
   // Clean up lightbeam transport objects. The recv thread that reads the
   // response listener is already stopped above, so closing it here is safe.
   // NOTE (Windows): the listener is a ROUTER on the shared ZMQ context; at
@@ -676,6 +698,15 @@ void IpcManager::ServerFinalize() {
   // earlier in the shutdown sequence before workers are freed); these are
   // no-ops in that case.
   ClearTransports();
+
+  // Tear down the single inbound SHM ring. Workers are already stopped by this
+  // point (StopWorkers runs before ServerFinalize), so nothing is draining it.
+#if CTP_IS_HOST
+  if (shm_in_server_ok_) {
+    shm_in_server_.Shutdown();  // unmap + unlink "clio-<pid>-shm-in"
+    shm_in_server_ok_ = false;
+  }
+#endif
 
   // Clear main allocator pointer
   main_allocator_ = nullptr;
@@ -849,6 +880,28 @@ bool IpcManager::ServerInitShm() {
     // main/queue. Clients use a different pid, so they keep starting at 0.
     shm_count_.store(3, std::memory_order_relaxed);
 
+#if CTP_IS_HOST
+    // Single inbound MPSC ring shared by every SHM client (replaces the old
+    // per-worker "clio-<pid>-<tid>" servers). Clients SendBytes serialized tasks
+    // here; only the net_recv worker drains it (Worker::Run ->
+    // IpcCpu2Cpu::RecvIn) and fans tasks out to worker lanes, mirroring how the
+    // ZMQ path funnels all inbound client traffic through one recv owner. Sized
+    // large (~128MB) so bursty async fan-out from many clients rarely blocks a
+    // producer in SendBytes. The name is derived from the runtime pid so a
+    // client can form it from the server_pid_ it learns via ClientConnect.
+    {
+      std::string in_name = "clio-" + std::to_string(pid) + "-shm-in";
+      shm_in_server_ok_ =
+          shm_in_server_.ServerInit(in_name, ctp::Unit<size_t>::Megabytes(128));
+      if (!shm_in_server_ok_) {
+        HLOG(kError, "ServerInitShm: failed to create inbound SHM ring '{}'",
+             in_name);
+        return false;
+      }
+      HLOG(kInfo, "ServerInitShm: inbound SHM ring '{}' (128MB)", in_name);
+    }
+#endif
+
     return true;
   } catch (const std::exception &e) {
     return false;
@@ -899,6 +952,26 @@ bool IpcManager::ClientInitShm() {
       return false;
     }
     queue_allocator_id_ = queue_allocator_->GetId();
+
+#if CTP_IS_HOST
+    // Single per-process response ring (replaces the old per-thread
+    // "clio-<pid>-<tid>" servers). The runtime routes every response for this
+    // process here (IpcCpu2Cpu::SendOut -> "clio-<client_pid>-shm-out"); the
+    // dedicated RecvShmClientThread drains it and wakes waiters. ~1MB is ample
+    // for the response stream from one runtime, continuously drained.
+    {
+      std::string out_name =
+          "clio-" + std::to_string(ctp::SystemInfo::GetPid()) + "-shm-out";
+      shm_out_server_ok_ =
+          shm_out_server_.ServerInit(out_name, ctp::Unit<size_t>::Megabytes(1));
+      if (!shm_out_server_ok_) {
+        HLOG(kError, "ClientInitShm: failed to create response SHM ring '{}'",
+             out_name);
+        return false;
+      }
+      HLOG(kInfo, "ClientInitShm: response SHM ring '{}' (1MB)", out_name);
+    }
+#endif
 
     return true;
   } catch (const std::exception &e) {
@@ -2875,6 +2948,66 @@ void IpcManager::RecvZmqClientThread() {
   }
 }
 
+void IpcManager::RecvShmClientThread() {
+#if CTP_IS_HOST
+  // Client-side SHM analogue of RecvZmqClientThread. Drains the single
+  // per-process response ring (shm_out_server_). For each response: match it to
+  // the waiting Future by net_key (stamped in SendIn, echoed by SendOut), park
+  // the archive for RecvOut to deserialize (RecvOut owns the concrete task
+  // type), mark the client task complete, and wake its waiter via
+  // EventManager::Signal. This replaces the old model where every client thread
+  // polled its own per-thread ring in RecvOut.
+  size_t recv_count = 0;
+  size_t miss_count = 0;
+  while (shm_recv_running_.load()) {
+    bool drained_any = false;
+    // Drain everything currently available before backing off.
+    while (shm_recv_running_.load()) {
+      auto archive = std::make_unique<LoadTaskArchive>();
+      ctp::lbm::ClientInfo info =
+          shm_out_server_.Recv(*archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+      if (info.rc != 0) break;  // EAGAIN: nothing more in flight right now
+      drained_any = true;
+
+      if (archive->GetTaskInfos().empty()) {
+        HLOG(kError, "RecvShmClientThread: response with no task_infos");
+        continue;
+      }
+      size_t net_key = archive->GetTaskInfos()[0].task_id_.net_key_;
+
+      std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+      auto it = pending_zmq_futures_.find(net_key);
+      if (it == pending_zmq_futures_.end()) {
+        ++miss_count;
+        HLOG(kError,
+             "RecvShmClientThread: no pending future for net_key {} "
+             "(received={}, misses={})",
+             net_key, recv_count, miss_count);
+        continue;
+      }
+      Task *task = it->second.task;
+      // Park the archive; RecvOut moves it out and deserializes into the task.
+      pending_response_archives_[net_key] = std::move(archive);
+      // Publish the parked archive before the waiter observes completion.
+      std::atomic_thread_fence(std::memory_order_release);
+      task->SetNewData();
+      task->SetComplete();
+      if (task->WaiterPid() != 0) {
+        ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
+                                       static_cast<int>(task->WaiterTid()));
+      }
+      pending_zmq_futures_.erase(it);
+      ++recv_count;
+    }
+    if (!drained_any) {
+      // Idle: cede the CPU. 20us matches the RecvOut backoff floor and keeps
+      // response latency low without pinning a core.
+      CTP_THREAD_MODEL->SleepForUs(20);
+    }
+  }
+#endif
+}
+
 void IpcManager::HeartbeatThread() {
   while (heartbeat_running_.load()) {
     bool alive = IsServerAlive();
@@ -2887,6 +3020,14 @@ void IpcManager::CleanupResponseArchive(size_t net_key) {
   std::lock_guard<std::mutex> lock(pending_futures_mutex_);
   auto it = pending_response_archives_.find(net_key);
   if (it != pending_response_archives_.end()) {
+    // Frees ZMQ zero-copy recv handles (bulk.desc); a no-op for a SHM archive
+    // (its recv bulks carry no desc). Reaching here means the future was dropped
+    // WITHOUT a Recv — the consumed path erases the entry in RecvOut. NOTE: a
+    // SHM archive's malloc'd recv payloads (bulk.data.ptr_) are intentionally
+    // NOT freed here: bulk.data.ptr_ on the TCP/IPC path can be a CHI-allocated
+    // (non-malloc) buffer, so a blanket free corrupts the heap. The consumed
+    // path adopts SHM payloads into the task (TASK_DATA_OWNER); only a truly
+    // dropped-before-Recv SHM future leaks its payload, which is rare and bounded.
     zmq_transport_->ClearRecvHandles(*(it->second));
     pending_response_archives_.erase(it);
   }

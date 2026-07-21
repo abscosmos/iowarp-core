@@ -53,7 +53,18 @@ static constexpr size_t kShmMpscDefaultSegmentSize = 1024 * 1024;
 // Per-chunk cap: SendBytes/RecvBytes move at most this many bytes per xfer slot.
 static constexpr size_t kShmMpscChunkSize = 32 * 1024;
 // Number of in-flight transfer slots the ring tracks (bounds concurrency).
-static constexpr size_t kShmMpscMaxXfers = 256;
+//
+// This is the fixed descriptor-array size in ShmTransportHeader and the upper
+// bound on max_inflight_ (= min(kShmMpscMaxXfers, num_slots_)). It MUST be >=
+// the ring's slot count for the segment to be fully usable: the runtime's
+// inbound ring is now a single 128MB segment (128MB / 32KB = 4096 slots), so a
+// smaller cap here would pin in-flight capacity far below the ring size (256
+// slots = only 8MB) and waste the rest. 4096 covers the 128MB inbound ring;
+// smaller rings (e.g. the 1MB client response ring, 32 slots) just leave the
+// tail of the descriptor array unused. The array costs ~40 bytes/slot, so the
+// header is ~160KB — carved out of the segment ahead of the ring (see
+// ServerInit), negligible against a 128MB segment and acceptable against 1MB.
+static constexpr size_t kShmMpscMaxXfers = 4096;
 
 // --- Per-chunk transfer descriptor (lives in the SHM header) ----------------
 // One producer fills this in, sets ready_, and the consumer drains it. conn_id_

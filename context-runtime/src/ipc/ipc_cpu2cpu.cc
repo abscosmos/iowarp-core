@@ -18,13 +18,15 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
   // that used to funnel through one worker); routing/execution then follow the
   // standard ProcessNewTask flow. Keeping this off the worker means the worker
   // never touches serialized task/future bytes.
-  IpcManagerTls *tls = ipc->GetTls();
-  if (!tls->shm_server_ok_) {
+  // Drain the runtime's SINGLE inbound ring (shm_in_server_), not a per-thread
+  // server. Only the net_recv worker calls this (see Worker::Run's gate), so
+  // there is exactly one consumer — the MPSC ring's single-consumer contract.
+  if (!ipc->shm_in_server_ok_) {
     return false;
   }
   LoadTaskArchive archive;
   ctp::lbm::ClientInfo info =
-      tls->shm_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+      ipc->shm_in_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
   if (info.rc != 0) {
     return false;
   }
@@ -91,12 +93,15 @@ void IpcCpu2Cpu::SendOut(
       CLIO_POOL_MANAGER->GetStaticContainer(task_ptr->pool_id_).get();
   auto future_shm = task_ptr->RunFuture().GetFutureShm();
 
-  // #642: serialize the result and high-level Send it to the originating client
-  // thread's MPSC server ("clio-<client_pid>-<client_tid>"). send_transport is
+  // Serialize the result and high-level Send it to the originating client's
+  // SINGLE per-process response ring ("clio-<client_pid>-shm-out"), drained by
+  // that client's RecvShmClientThread. The waiter tid is no longer part of the
+  // ring name (one ring per process); it is still carried on the task so the
+  // client recv thread can Signal the exact waiting thread. send_transport is
   // used only to Expose bulk descriptors while building the archive; conn->Send
   // performs the actual MPSC transfer (metadata + data).
-  std::string name = "clio-" + std::to_string(task_ptr->WaiterPid()) + "-" +
-                     std::to_string(task_ptr->WaiterTid());
+  std::string name =
+      "clio-" + std::to_string(task_ptr->WaiterPid()) + "-shm-out";
   ctp::lbm::ShmMpscTransport *conn = ipc->GetOrCreateShmConn(name);
   if (conn != nullptr) {
     // Restore the CLIENT's response-matching key before serializing: a
