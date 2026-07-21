@@ -31,7 +31,7 @@ Five worker structures are reachable only from that worker's own thread:
 |---|---|---|---|
 | 1 | Lane backlog | `assigned_lane_` (`worker.h:475`), SHM MPSC ring | Wedged worker is the ring's only consumer |
 | 2 | Blocked queues | `blocked_queues_[4]` (`worker.h:490`), `std::queue` | No lock; owner thread only |
-| 3 | Periodic queues | `periodic_queues_[4]` (`worker.h:524`), `std::queue` | Same |
+| 3 | Periodic queues | `periodic_queues_[4]` (`worker.h:524`), `std::queue` | Same — **and this is the most severe row**, see §2.3 |
 | 4 | Retry queue | `retry_queue_` (`worker.h:497`), `std::queue` | Same |
 | 5 | Completion events | `event_queue_` (`worker.h:508`), process-local MPSC ring | Producers push from anywhere, but only the wedged worker pops (`ProcessEventQueue`, `worker.cc:1017`) |
 
@@ -41,21 +41,6 @@ Plus a sixth category that is not merely stranded but **invisible**: a task susp
 future's `parent_task_` handle (`future.h:138`, set in `ipc_cpu2self.cc:60`). The runtime cannot
 enumerate its own suspended tasks. **D4 fixes this by parking them in the blocked queue**, which
 folds category 6 into category 2 and makes the whole set enumerable by one mechanism.
-
-### 2.2 `blocked_queues_` is currently vestigial
-
-Worth stating plainly, because D4 depends on it. `AddToBlockedQueue`'s `YieldTimeUs() == 0` branch
-(`worker.cc:1151`) is the one that feeds `blocked_queues_`, and essentially nothing reaches it:
-
-* `ExecTask` (`worker.cc:725`) only calls it when `YieldTimeUs() > 0` — i.e. always the *periodic*
-  branch.
-* `ProcessBlockedQueue`'s own re-add (`worker.cc:951`) is **dead code**, unreachable behind a
-  `continue` at line 947.
-* `ReschedulePeriodicTask` (`worker.cc:1268`) reaches it only for a periodic task whose period is 0.
-
-So `blocked_queues_[4]`, its four-bucket backoff, and `WorkerStats::num_blocked_tasks_` are
-scaffolding for a case that never populates them. D4 puts them to their intended use rather than
-adding a parallel registry.
 
 ### 2.1 Why they are pinned
 
@@ -74,6 +59,48 @@ it was popped off a lane (`worker.cc:429-432`) and never revisited. A completed 
 cannot wake its parent when that worker is wedged, even though the subtask ran to completion on a
 healthy worker. Same design already produced the #680 lost-wakeup class — hence the two
 `AwakenAllWorkers()` fallbacks in `IpcManager::AwakenWorker` (`ipc_manager.cc:750-793`).
+
+### 2.2 `blocked_queues_` is currently vestigial
+
+Worth stating plainly, because D4 depends on it. `AddToBlockedQueue`'s `YieldTimeUs() == 0` branch
+(`worker.cc:1151`) is the one that feeds `blocked_queues_`, and essentially nothing reaches it:
+
+* `ExecTask` (`worker.cc:725`) only calls it when `YieldTimeUs() > 0` — i.e. always the *periodic*
+  branch.
+* `ProcessBlockedQueue`'s own re-add (`worker.cc:951`) is **dead code**, unreachable behind a
+  `continue` at line 947.
+* `ReschedulePeriodicTask` (`worker.cc:1268`) reaches it only for a periodic task whose period is 0.
+
+So `blocked_queues_[4]`, its four-bucket backoff, and `WorkerStats::num_blocked_tasks_` are
+scaffolding for a case that never populates them. D4 puts them to their intended use rather than
+adding a parallel registry.
+
+`periodic_queues_[4]`, by contrast, is very much alive — and is where the runtime's own
+infrastructure lives.
+
+### 2.3 Periodic tasks are the highest-stakes stranded state
+
+The periodic queue holds the runtime's **network and client-IPC pollers**. Both schedulers
+hard-route admin periodic methods to specific worker roles (`default_sched.cc:167-195`,
+`local_sched.cc:126-136`):
+
+```
+14 = kSend       peer DEALER pool          -> net_send_worker_
+15 = kRecv       peer ROUTER (9413)        -> net_recv_worker_
+20 = kClientRecv client-facing ROUTER      -> net_recv_worker_
+21 = kClientSend same client-facing ROUTER -> net_recv_worker_
+```
+
+Consequences the plan has to answer for:
+
+* **Severity.** If `net_recv_worker_` stalls, its stranded pollers mean the node stops receiving
+  peer traffic *and* stops servicing client IPC. One bad task becomes a whole-node outage. This is
+  worse than a stalled compute worker, and the plan previously treated periodic as a lesser sibling
+  of blocked.
+* **They cannot simply be moved.** The comment above that routing table is explicit: *"ZeroMQ
+  sockets are not safe to share across threads, so each socket has exactly one owner thread."*
+  Migrating a net poller to a replacement worker would touch a ZMQ socket from a foreign thread —
+  undefined behaviour, not just misplacement. See D7.
 
 ---
 
@@ -238,6 +265,44 @@ Supporting changes:
   `IsCoroCompleted()` branch above makes this self-correcting, but given #620/#680 were both
   reference-lifetime bugs, the leak-detection tests should be run against this specifically.
 
+### D4b — Periodic tasks: the migration silently undoes itself unless the role moves too
+
+`ProcessPeriodicQueue` (`worker.cc:955-1015`) does not merely resume a due task — it **re-routes**
+it every period: `CLIO_IPC->RouteTask(task->RunFuture())`, executing only on `ExecHere`. That has a
+consequence the rest of the plan has to respect:
+
+> Migrate a role-pinned periodic task to a replacement worker, and on its very next period
+> `RouteTask` → `RuntimeMapTask` sends it **straight back to the stalled worker's lane**, because
+> the routing table keys on role, not on health. The rescue reverts itself within one period, and
+> the symptom is a rescue that appears to succeed and then quietly stops working.
+
+This splits periodic tasks in two, and they need opposite treatment:
+
+**Non-pinned periodic tasks — migrate the queue, placement self-heals.** `RuntimeMapTask` routes
+these by measured `RealtimeLoad`, so they will naturally avoid the stalled worker. All they need is
+*somebody to scan them*. Moving `periodic_queues_[]` to a worker that runs `ProcessPeriodicQueue` is
+sufficient; the existing per-period re-route does the placement. This is the cheapest correct fix in
+the whole plan.
+
+**Role-pinned periodic tasks (admin 14/15/20/21) — do not migrate; re-point the role, or neither.**
+Moving the task without moving the role reverts (above); moving the role without moving the socket
+is UB (§2.3). So a stalled net worker is *not* rescuable by task migration at all — see D7.
+
+Periodic-specific mechanics for whichever tasks do move:
+
+* **`Lane()` must stay valid.** `ReschedulePeriodicTask` (`worker.cc:1247-1251`) **silently drops**
+  a periodic task whose `Lane()` is null — `if (!lane) return;`, no log, task gone. Lane transfer
+  (D5) keeps the lane object alive and valid, which is another argument for it over lane draining.
+* **Reset `BlockStart()` on migration.** A periodic task stranded 10 s behind a wedged worker has
+  `elapsed >> yield_time`, so it fires the instant it is scanned — and a whole migrated queue fires
+  simultaneously. `AddToBlockedQueue` already has staleness handling for this
+  (`worker.cc:1179-1185`, the >10 ms reset); migration should reuse it rather than invent a rule.
+* **`ProcessPeriodicQueue` is the model for D4's readiness scan.** It already does exactly the right
+  shape — check whether the task is due, resume if so, **re-queue if not** (`worker.cc:1010-1013`).
+  D4's rewrite of `ProcessBlockedQueue` is that same loop with "awaited future is complete"
+  substituted for "deadline reached". Framing it as *make blocked look like periodic* keeps the
+  change small and well-precedented.
+
 ### D5 — The lane: transfer it, do not lock its pop path
 
 Symmetry would suggest making the lane `mpmc` too. Recommend **not**:
@@ -265,6 +330,30 @@ Migrated tasks carry `sched_reserved_us_` reservations counted in the stalled wo
 `queued_load_us_` (#781). If they are not released from the old worker and re-reserved on the new
 one, the stalled worker looks permanently loaded (harmless) and the replacement looks idle
 (harmful — the mapper will pile new work onto it). Also update `SetRunWorkerId`.
+
+### D7 — Migratability is a property of the worker's role
+
+Not every worker can be rescued by moving its tasks. This has to be explicit or the rescue path
+will do something unsafe.
+
+| Role | Migratable? | Why | Rescue strategy |
+|---|---|---|---|
+| `scheduler_worker_` | Yes | General purpose | Lane transfer + task migration |
+| `io_workers_` | Yes | General purpose | Lane transfer + task migration |
+| `net_send_worker_` | **No** | Owns the peer DEALER ZMQ socket; sockets are single-thread-owned | Prevention + alarm (§8.2) |
+| `net_recv_worker_` | **No** | Owns the peer + client ROUTER sockets | Prevention + alarm (§8.2) |
+| GPU worker | **No** (probably) | Bound to `gpu_lanes_`; `SuspendMe` early-returns because "GPU workers must never sleep" (`worker.cc:483-486`) | Spike §7.7 |
+| Worker 0 | Special | Hardcoded `worker_id_ == 0` drives `BatchManager::FlushDue` (`worker.cc:288`) | Make it a role pointer so the duty can move |
+
+`LoadBalance` must therefore branch on role before rescuing, and the migratable set is exactly
+"general-purpose compute workers". For the rest, the correct engineering answer is that **they must
+never run a task that can stall** — which is a placement invariant, not a migration mechanism.
+
+That invariant is not obviously held today: `DefaultScheduler::PickAltWorker`
+(`default_sched.cc:302-319`) deliberately falls back to `net_recv_worker_` / `net_send_worker_`
+("any worker whose Run loop drains its own lane breaks the self-block"). So an arbitrary — possibly
+blocking — task can legitimately be placed on a net worker. **Confirm and close this before relying
+on prevention** (§8.2).
 
 ---
 
@@ -304,9 +393,15 @@ Behaviour-preserving by design — nothing should resume differently — so any 
 stress suites here is a real regression and is easy to attribute. Lands the lost-wakeup safety net
 and fixes `WorkerStats::num_blocked_tasks_` on its own.
 
-**P2b — migration.** `event_queue_` → `mpmc_ring_buffer`; `park_mtx_`; `sig_mtx_`/`sig_gen_` and
-the D3 producer handshake; `LoadBalance::MigrateAllFrom(stalled, fresh)` + re-drain of quarantined
-queues (§7.2); load accounting moves (D6).
+**P2b — periodic queue migration (D4b).** Migrate `periodic_queues_[]` under `park_mtx_`; reset
+`BlockStart()`; role gating from D7 so only migratable workers are rescued and role-pinned admin
+pollers are left alone. Deliberately **before** P2c: it needs no event-queue changes at all (the
+per-period `RouteTask` self-heals placement), so it is the cheapest large win available and it
+clears the most severe stranded category (§2.3).
+
+**P2c — blocked/suspended migration.** `event_queue_` → `mpmc_ring_buffer`; `sig_mtx_`/`sig_gen_`
+and the D3 producer handshake; `LoadBalance::MigrateAllFrom(stalled, fresh)` + re-drain of
+quarantined queues (§7.2); retry queue; load accounting moves (D6).
 
 * **Clears stranded categories 2–6.** This is what stops one bad task from stalling an unbounded
   dependency tree.
@@ -418,7 +513,22 @@ Each worker `ServerInit`s a named segment `clio-<pid>-<tid>` on its own thread
 (`worker.cc:242-247`). If any response path is keyed to the *worker's* tid rather than the
 *client's*, migration breaks it. Read `IpcManager::GetTls()` / `SendRuntime` before P2.
 
-### 7.5 CI noise
+### 7.5 ZMQ socket thread-ownership (gates any net-worker rescue)
+
+*"ZeroMQ sockets are not safe to share across threads, so each socket has exactly one owner
+thread"* (`default_sched.cc:170-171`). Any design that moves a net poller — or re-points
+`net_recv_worker_` / `net_send_worker_` at a replacement — must also move socket ownership, which
+means tearing down and re-creating the socket on the new thread mid-flight. That is a much larger
+change than this issue, and it is why D7 marks net workers non-migratable.
+
+### 7.6 GPU worker rescue (spike)
+
+`gpu_lanes_` are polled by their owning worker, and `SuspendMe` (`worker.cc:483-486`) early-returns
+for GPU workers because they must never sleep. Determine whether `SetGpuLanes` can transfer lanes to
+a replacement thread, or whether device-context affinity makes GPU workers non-migratable like net
+workers. Only needed if we intend to rescue them at all.
+
+### 7.7 CI noise
 
 `force_net` / stress tests were already flaky on `dev` at the #782 merge (different test each run,
 clear on retry). Do not read one red run as a regression; re-run and compare against a same-day
@@ -437,16 +547,21 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
    an invariant the readiness scan now depends on, where before it only did a pointer comparison.
    Recommendation: promote it; it is a small change and removes a lifetime argument from the
    critical path.
-2. **Readiness-scan backoff.** Reuse the existing `% 2/4/8/16` buckets keyed on yield count, or
+2. **Net-worker stall policy (D7).** Net workers cannot be rescued by migration (§7.5), so the
+   answer has to be prevention: they must never run a task that can stall. But `PickAltWorker`
+   (`default_sched.cc:302-319`) deliberately places arbitrary tasks on them today. Options: exclude
+   net workers from `PickAltWorker`, or accept the risk and settle for a loud alarm. Recommendation:
+   exclude, and alarm as well — a stalled net worker is a node outage and should never be silent.
+3. **Readiness-scan backoff.** Reuse the existing `% 2/4/8/16` buckets keyed on yield count, or
    re-key them on *time* parked? Yield count no longer means much for a task that suspends once and
    waits a long time.
-3. **Wedged-worker fate.** When the bad task finally returns, does the worker rejoin the pool or
+4. **Wedged-worker fate.** When the bad task finally returns, does the worker rejoin the pool or
    retire? Rejoining risks re-wedging on the same task class; retiring leaks a thread per bad task
    until exit. Recommendation: rejoin with exponential-backoff quarantine.
-4. **All-workers-stalled.** `LoadBalance` already detects it (`default_sched.cc:383`). With an
+5. **All-workers-stalled.** `LoadBalance` already detects it (`default_sched.cc:383`). With an
    unbounded elastic pool the answer is "spawn as many replacements as needed" — confirm there is
    no cap, and that the loud warning stays.
-5. **Do the periodic buckets stay four-deep?** The `% 2/4/8/16` scheme is a hand-rolled timer wheel.
+6. **Do the periodic buckets stay four-deep?** The `% 2/4/8/16` scheme is a hand-rolled timer wheel.
    Optional cleanup, unrelated to correctness.
 
 ---
@@ -470,6 +585,18 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
   * the lost-wakeup branch fires and logs when an event is deliberately dropped;
   * `num_blocked_tasks_` now tracks the real suspended count;
   * leak-detection suite against the new owning reference (D4, ownership note).
+* **P2b-specific** (periodic, D4b):
+  * **the self-undo test** — migrate a periodic task, let one full period elapse, assert it did
+    *not* route back onto the stalled worker's lane. This is the failure that looks like a working
+    rescue for 500 ms and then silently stops.
+  * a role-pinned admin poller (14/15/20/21) is **not** migrated, and the rescue path says so;
+  * a queue of long-stranded periodic tasks does not all fire in the same tick after migration
+    (`BlockStart()` reset);
+  * a migrated periodic task whose `Lane()` went null is never silently dropped
+    (`worker.cc:1247-1251`) — add the missing log there regardless.
+* **Node-level:** stall a compute worker under network load and assert peer traffic and client IPC
+  keep flowing — i.e. the §2.3 outage does not occur. Worth having even though compute workers are
+  not where that risk lives, because it is the regression test for D7's role gating.
 * **TSan** on the P2 diff (§6.5).
 * **Benchmark:** `sched_variety` chained-class p50/p99/max per phase.
 * **Regression:** the embedded-FUSE xfstests named in `SuspendMe`'s comment
