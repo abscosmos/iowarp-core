@@ -490,6 +490,33 @@ purpose: the slot generation protects the METADATA copy, while §5.3's hazard is
 the DataOrganizer relocating blocks during the PAYLOAD read. A client must
 re-check `placement_gen_` after copying bytes.
 
+**Phase 4 COMPLETE — client attach + write-then-read tests passing.**
+Two bugs surfaced only by writing the test:
+
+1. **CreateTask propagation alone does not work.** The OUT offset is written
+   only by the process that actually causes pool creation, and compose creates
+   the CTE pool at startup — so every real client called GetOrCreatePool, hit
+   the existing pool, never ran the ChiMod's `Create`, and got offset 0.
+   Discovery must not depend on being the first caller. Added a
+   `MetadataDirectory` as the first object in the metadata segment, published
+   to every client in the **ClientConnect handshake** beside the allocator ids.
+   The CreateTask path is kept and tried first, then falls back to the
+   directory.
+2. **The blob mirror was published too early.** `BlobInfo` is inserted into the
+   map empty and only gains blocks/`total_size_cache_` later in `ExtendBlob`,
+   so mirroring at insert time published size 0 — a client reading its own
+   write got the wrong answer. The mirror now runs at the successful end of
+   `PutBlobImpl`.
+
+The write-then-read test asserts what makes the cache *safe*, not merely fast:
+a miss is reported as not-cached and never as absent; the cached size AGREES
+with the authoritative RPC answer; an overwrite is reflected rather than served
+stale; payload reads stay refused while blobs live on file targets. It also
+fails loudly rather than passing vacuously when the cache is unavailable — the
+first version silently skipped every assertion and "passed".
+
+CTE functional suite: **10/10**.
+
 **Phase 3 COMPLETE — dual-write wired and verified end-to-end.**
 `ShmMetadataCache` (runtime-side owner) is created in `Runtime::Create` and
 mirrored at every blob insert (3 sites: PutBlob, WAL replay, metadata restore),
