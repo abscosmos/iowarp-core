@@ -11,20 +11,18 @@
 
 namespace clio::run {
 
-bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
-  // #642: drain this worker's MPSC SHM server (DONTWAIT) and enqueue any
-  // received external-client task onto the normal dispatch path. The client
-  // already addressed this worker, so the deserialize happens here (the work
-  // that used to funnel through one worker); routing/execution then follow the
-  // standard ProcessNewTask flow. Keeping this off the worker means the worker
-  // never touches serialized task/future bytes.
-  IpcManagerTls *tls = ipc->GetTls();
-  if (!tls->shm_server_ok_) {
+bool IpcCpu2Cpu::RecvIn(IpcManager *ipc) {
+  // Drain the runtime's SINGLE inbound ring (shm_in_server_, DONTWAIT) and
+  // enqueue any received external-client task onto the normal dispatch path.
+  // The only caller is IpcManager::RecvShmServerThread, a dedicated non-worker
+  // thread — that satisfies the ring's single-consumer contract on its own and
+  // keeps every byte of task/future deserialization off the workers.
+  if (!ipc->shm_in_server_ok_) {
     return false;
   }
   LoadTaskArchive archive;
   ctp::lbm::ClientInfo info =
-      tls->shm_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+      ipc->shm_in_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
   if (info.rc != 0) {
     return false;
   }
@@ -67,7 +65,14 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   f.GetTaskPtr()->BeginRunContext();
-  lane->Push(f);
+  // Pick a worker lane and enqueue, exactly as the ZMQ client recv thread does
+  // (IpcCpu2CpuZmq::RecvIn). We are not a worker, so there is no "own lane" to
+  // push to — the scheduler decides. Always signal: see ipc_cpu2cpu_impl.h for
+  // the enqueue/sleep race this closes.
+  LaneId lane_id = ipc->GetScheduler()->ClientMapTask(ipc, f);
+  auto &lane_ref = ipc->GetTaskQueue()->GetLane(lane_id, 0);
+  lane_ref.Push(f);
+  ipc->AwakenWorker(&lane_ref);
   return true;
 }
 
@@ -91,12 +96,15 @@ void IpcCpu2Cpu::SendOut(
       CLIO_POOL_MANAGER->GetStaticContainer(task_ptr->pool_id_).get();
   auto future_shm = task_ptr->RunFuture().GetFutureShm();
 
-  // #642: serialize the result and high-level Send it to the originating client
-  // thread's MPSC server ("clio-<client_pid>-<client_tid>"). send_transport is
+  // Serialize the result and high-level Send it to the originating client's
+  // SINGLE per-process response ring ("clio-<client_pid>-shm-out"), drained by
+  // that client's RecvShmClientThread. The waiter tid is no longer part of the
+  // ring name (one ring per process); it is still carried on the task so the
+  // client recv thread can Signal the exact waiting thread. send_transport is
   // used only to Expose bulk descriptors while building the archive; conn->Send
   // performs the actual MPSC transfer (metadata + data).
-  std::string name = "clio-" + std::to_string(task_ptr->WaiterPid()) + "-" +
-                     std::to_string(task_ptr->WaiterTid());
+  std::string name =
+      "clio-" + std::to_string(task_ptr->WaiterPid()) + "-shm-out";
   ctp::lbm::ShmMpscTransport *conn = ipc->GetOrCreateShmConn(name);
   if (conn != nullptr) {
     // Restore the CLIENT's response-matching key before serializing: a

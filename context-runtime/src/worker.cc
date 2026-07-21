@@ -264,12 +264,10 @@ void Worker::Run() {
     did_work_ = false;  // Reset work tracker at start of each loop iteration
     task_did_work_ = false;  // Reset task-level work tracker
 
-    // Drain this worker's MPSC SHM server for inbound client tasks. All
-    // deserialization lives in IpcCpu2Cpu::RecvIn — the worker never touches
-    // serialized task/future bytes.
-    if (assigned_lane_ && IpcCpu2Cpu::RecvIn(CLIO_IPC, assigned_lane_)) {
-      did_work_ = true;
-    }
+    // NOTE: the inbound SHM ring is NOT drained here. A dedicated thread
+    // (IpcManager::RecvShmServerThread) owns it and pushes tasks onto worker
+    // lanes, mirroring the ZMQ path's ClientRecvThread. Workers therefore never
+    // touch serialized task bytes and need no knowledge of the transport.
 
     // Process tasks from assigned lane
     if (assigned_lane_) {
