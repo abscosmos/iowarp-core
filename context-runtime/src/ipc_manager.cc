@@ -617,6 +617,8 @@ void IpcManager::ClientFinalize() {
 #if CTP_IS_HOST
   if (shm_recv_running_.load()) {
     shm_recv_running_.store(false);
+    // Wake it if parked so the join is prompt (see StopShmServerRecvThread).
+    shm_out_server_.SignalConsumerIfParked();
     if (shm_recv_thread_.joinable()) {
       shm_recv_thread_.join();
     }
@@ -2953,30 +2955,72 @@ void IpcManager::RecvZmqClientThread() {
 
 namespace {
 /**
- * Idle backoff for the two SHM ring drain loops.
+ * Lost-wakeup safety net for the parked SHM drain loops.
  *
- * Both rings are polled, not pollable — there is no fd to block on — so an
- * idle drainer has to choose between burning a core and adding latency. A flat
- * sleep adds its full duration to the round-trip whenever the ring was empty at
- * the moment the peer wrote to it, and the SHM path crosses TWO of these loops
- * per request (client -> in-ring -> worker -> out-ring -> client). Sleeping
- * 20us unconditionally therefore cost up to ~40us per op, which measured as SHM
- * being SLOWER than the ZMQ unix-socket path even though it does strictly less
- * work.
+ * The park/signal handshake (ShmMpscTransport::SignalConsumerIfParked) is
+ * designed so a wake can never be missed, so in principle these threads could
+ * block forever. They don't: a bounded wait means a bug in that handshake — or
+ * a producer killed between reserving its slot and signalling — degrades to a
+ * few milliseconds of extra latency instead of a permanently wedged runtime.
+ * This codebase has shipped that exact failure mode more than once (#768,
+ * #774), and 20 idle wakeups/sec/thread is not a measurable cost.
  *
- * Spin first (the request we are waiting for is usually microseconds away),
- * then decay to the sleep so a genuinely idle runtime does not pin a core.
- * `spins` is the caller's per-loop counter, reset on every unit of work.
+ * This is NOT the polling interval: under load the drainer is woken by the
+ * producer's signal and never reaches the timeout.
  */
-inline void ShmDrainBackoff(size_t &spins) {
-  // ~4k yields ≈ tens of microseconds of spinning on this class of machine,
-  // covering the common case where a peer is actively driving the ring.
-  constexpr size_t kSpinBudget = 4096;
-  if (++spins < kSpinBudget) {
-    CTP_THREAD_MODEL->Yield();
-  } else {
-    CTP_THREAD_MODEL->SleepForUs(20);
+constexpr int kShmParkTimeoutUs = 50'000;  // 50ms
+
+/**
+ * How long a drainer stays hot before parking, in failed drain attempts.
+ *
+ * Parking is not free: the wake costs the producer a tgkill and the consumer a
+ * signalfd read plus an epoll wakeup. Measured on the task round-trip, parking
+ * on EVERY message is worse than either alternative — the drain thread ends up
+ * asleep whenever a request arrives, so the signal round-trip lands on the
+ * critical path:
+ *
+ *   bdev_allocation, 4 threads    park always   spin always   spin-then-park
+ *   SHM throughput                  5,303/s      14,227/s        (below)
+ *
+ * So spin while there is any reason to believe more work is imminent, and park
+ * only once the ring has been quiet for a while. Under load the drainer never
+ * reaches the budget, stays unparked, and producers skip the signal entirely
+ * (SignalConsumerIfParked checks parked_ first) — the fast path costs nothing.
+ * When traffic genuinely stops, the drainer parks once and the machine goes
+ * fully idle: no polling, no periodic wakeups beyond the safety-net timeout.
+ */
+constexpr size_t kShmSpinBudget = 4096;
+
+/**
+ * Block until this ring has work, using the park/signal handshake.
+ *
+ * Publishing `parked` BEFORE the final IsEmpty() re-check is what makes this
+ * race-free: a producer that reserves its slot after our re-check must observe
+ * parked_ and signal us, and one that reserved before it is seen by the
+ * re-check so we never block on a non-empty ring.
+ */
+void ShmParkUntilWork(ctp::lbm::ShmMpscTransport &ring,
+                      ctp::lbm::EventManager *em) {
+  ring.SetConsumerParked(true);
+  if (ring.IsEmpty()) {
+    em->Wait(kShmParkTimeoutUs);
   }
+  ring.SetConsumerParked(false);
+}
+
+/**
+ * One idle iteration of a drain loop: spin while warm, then park.
+ * `spins` is the caller's counter; it is reset by the caller on any work, and
+ * here after a park so a woken drainer gets a fresh hot window.
+ */
+void ShmDrainIdle(ctp::lbm::ShmMpscTransport &ring, ctp::lbm::EventManager *em,
+                  size_t &spins) {
+  if (++spins < kShmSpinBudget) {
+    CTP_THREAD_MODEL->Yield();
+    return;
+  }
+  ShmParkUntilWork(ring, em);
+  spins = 0;
 }
 }  // namespace
 
@@ -2991,10 +3035,16 @@ void IpcManager::RecvShmClientThread() {
   // polled its own per-thread ring in RecvOut.
   size_t recv_count = 0;
   size_t miss_count = 0;
+  // GetTls() registers this thread's signalfd-backed EventManager (its ctor
+  // calls AddSignalEvent, which also BLOCKS SIGUSR1 here — mandatory before
+  // publishing ourselves as the drainer, or a producer's wake would kill the
+  // process via SIGUSR1's default disposition).
+  ctp::lbm::EventManager *em = &GetTls()->event_manager_;
+  shm_out_server_.RegisterConsumer();
   size_t idle_spins = 0;
   while (shm_recv_running_.load()) {
     bool drained_any = false;
-    // Drain everything currently available before backing off.
+    // Drain everything currently available before parking.
     while (shm_recv_running_.load()) {
       auto archive = std::make_unique<LoadTaskArchive>();
       ctp::lbm::ClientInfo info =
@@ -3035,9 +3085,10 @@ void IpcManager::RecvShmClientThread() {
     if (drained_any) {
       idle_spins = 0;
     } else {
-      ShmDrainBackoff(idle_spins);
+      ShmDrainIdle(shm_out_server_, em, idle_spins);
     }
   }
+  shm_out_server_.UnregisterConsumer();
 #endif
 }
 
@@ -3049,11 +3100,16 @@ void IpcManager::RecvShmServerThread() {
   // and Worker need no knowledge of it: there is no "which worker drains it"
   // question to answer. IpcCpu2Cpu::RecvIn deserializes one task per call and
   // pushes it onto a scheduler-chosen lane.
+  // Same rendezvous as the client drainer: our signalfd EventManager (which
+  // blocks SIGUSR1 on this thread) plus publishing our tid in the ring header
+  // so producing clients know whom to wake.
+  ctp::lbm::EventManager *em = &GetTls()->event_manager_;
+  shm_in_server_.RegisterConsumer();
   size_t idle_spins = 0;
   while (shm_in_recv_running_.load(std::memory_order_acquire)) {
     bool drained_any = false;
-    // Drain everything currently queued before backing off, so a burst is
-    // ingested in one pass rather than one task per backoff.
+    // Drain everything currently queued before parking, so a burst is ingested
+    // in one pass rather than one task per wakeup.
     while (shm_in_recv_running_.load(std::memory_order_acquire) &&
            IpcCpu2Cpu::RecvIn(this)) {
       drained_any = true;
@@ -3061,9 +3117,10 @@ void IpcManager::RecvShmServerThread() {
     if (drained_any) {
       idle_spins = 0;
     } else {
-      ShmDrainBackoff(idle_spins);
+      ShmDrainIdle(shm_in_server_, em, idle_spins);
     }
   }
+  shm_in_server_.UnregisterConsumer();
   HLOG(kInfo, "[ShmServerRecvThread] shutting down");
 #endif
 }
@@ -3084,6 +3141,10 @@ void IpcManager::StartShmServerRecvThread() {
 void IpcManager::StopShmServerRecvThread() {
 #if CTP_IS_HOST
   shm_in_recv_running_.store(false, std::memory_order_release);
+  // Kick the drainer in case it is parked, so the join doesn't wait out the
+  // park timeout. Harmless if it is awake, and the bounded wait bounds the
+  // worst case anyway if this signal races the park.
+  shm_in_server_.SignalConsumerIfParked();
   if (shm_in_recv_thread_.joinable()) {
     shm_in_recv_thread_.join();
   }
