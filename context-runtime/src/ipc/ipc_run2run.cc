@@ -457,8 +457,9 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   task_ptr->SetRouted();
 
   if (ipc_manager->GetScheduler() != nullptr) {
-    clio::run::u32 lane_id =
-        ipc_manager->GetScheduler()->ClientMapTask(ipc_manager, future);
+    // issue #781: ClientMapTask removed. Deposit on the shared ingress lane (0);
+    // the runtime maps to a worker via RuntimeMapTask.
+    clio::run::u32 lane_id = 0;
     auto *worker_queues = ipc_manager->GetTaskQueue();
     if (worker_queues) {
       auto &dest_lane = worker_queues->GetLane(lane_id, 0);
