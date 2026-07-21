@@ -464,7 +464,34 @@ are rare and short, but reader retry rate under realistic write load is a
 number worth measuring rather than assuming — a hot blob under sustained
 rewrite could starve readers into the RPC fallback.
 
-- Still to build: nothing in Phase 2. Next is Phase 3.
+- Still to build: nothing in Phase 2.
+
+**Phase 3 (SHM records) — data model done; dual-write wiring pending.**
+`clio_cte/core/shm_metadata_cache.h` defines `ShmBlockDesc`, `ShmBlobRecord`,
+`ShmTagRecord`, the three maps, and `ShmMetadataCacheRoot`. 7 tests pass,
+including a **forked child** that attaches the segment independently and reads
+back 200 entries plus a spilled long key — the property that validates the
+whole offset-based design.
+
+Two shape decisions forced by the primitives:
+
+- **Map values are strictly POD.** The map's reader copies the value out
+  between two generation reads, so a value containing an `ipc::string` (which
+  is non-copyable by design) would defeat the seqlock. The blob NAME is
+  therefore the map key, not a field of the record.
+- **Block lists are fixed-size inline (`kMaxInlineBlocks = 8`), not vectors.**
+  The fast path only serves small blobs, and a small blob has few blocks.
+  Capping keeps the record POD with no nested allocation and no second pointer
+  chase for a lock-free reader; a blob with more blocks is flagged
+  `kShmBlobTruncated` and is never payload-read from the cache.
+
+`ShmBlobRecord::placement_gen_` is separate from the map's slot seqlock on
+purpose: the slot generation protects the METADATA copy, while §5.3's hazard is
+the DataOrganizer relocating blocks during the PAYLOAD read. A client must
+re-check `placement_gen_` after copying bytes.
+
+Still to build in Phase 3: runtime dual-write into the cache from
+`core_runtime.cc`, gated so the legacy path stays authoritative.
 
 **Design refinement made during implementation: the map never rehashes.** Growth
 is the one operation that cannot be made safe for untracked cross-process
