@@ -490,6 +490,33 @@ purpose: the slot generation protects the METADATA copy, while §5.3's hazard is
 the DataOrganizer relocating blocks during the PAYLOAD read. A client must
 re-check `placement_gen_` after copying bytes.
 
+**Phase 6a DONE — RAM bdev is shared-memory backed.** (6b/6c pending: the
+direct-readable flag and the client payload read.)
+
+A `kRam` device's bytes now live in a dedicated SHM segment, mapped as ONE
+contiguous sparse region rather than a page table. Since these are memfd
+segments an untouched reservation costs nothing, so a flat mapping is both
+simpler and faster to index than the old 1 GiB page vector — `EnsureRamPage`
+now allocates nothing and is pure arithmetic. The paged API is retained only so
+existing call sites are unchanged.
+
+Segment name derives purely from **(runtime pid, pool id)**, so a client can
+reconstruct it from what it already has — server pid from ClientConnect, target
+pool id from each cached block descriptor. No name or page table needs
+publishing through a side channel.
+
+`kPinned` stays on the private heap (`cudaMallocHost` memory cannot be
+SHM-backed). Backing is best-effort: failure costs only the client fast path.
+`Destroy` clears `ready_` before unmapping so a client mid-attach refuses
+rather than reading a dying segment.
+
+Verified: bdev chimod suite **21/21** with three devices reporting themselves
+SHM-backed.
+
+*Unrelated pre-existing bug found while testing:* `clio_run_thrpt_bench
+--test-case bdev_allocation` segfaults against an external daemon on BOTH the
+ram and file paths, so it predates this work. Worth its own issue.
+
 **Phase 5 COMPLETE — fast path wired and MEASURED.**
 
 `Tag::GetBlobSize` now answers from the SHM cache when the blob is cached and
