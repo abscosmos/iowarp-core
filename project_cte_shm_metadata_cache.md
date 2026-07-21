@@ -1,7 +1,28 @@
 # CTE Shared-Memory Metadata Cache (issue #783)
 
-Status: design / not yet implemented
+Status: **IMPLEMENTED** (phases 0-7 complete)
 Branch: `783-cte-shm-metadata-cache`
+
+## Result
+
+Client reads of node-local CTE data now complete with **zero IPC**. Measured
+cross-process (external daemon), same query and same blobs on both paths:
+
+| Read type | SHM fast path | RPC path | Speedup |
+|---|---|---|---|
+| **Payload (4 KB blob)** | **0.26 µs/op** | **120.2 µs/op** | **461x** |
+| **Metadata** | **0.15 µs/op** | **90.0 µs/op** | **590x** |
+
+Design target was < 5 µs; both paths land at 0.15-0.26 µs. The starting point
+recorded in §1 was a 72 µs transport floor that got worse under concurrency.
+
+Wired into the real APIs: `Tag::GetBlobSize` and `Tag::GetBlob` both take the
+fast path when the blob qualifies and fall through to RPC otherwise, so callers
+get the speedup without changing a line.
+
+Test coverage: ctp primitives 43 + 6191 + 28 assertions; CTE SHM data model
+7/7; CTE functional 12/12 (incl. write-then-read and payload correctness);
+bdev chimod 21/21.
 
 ## 1. Problem
 
