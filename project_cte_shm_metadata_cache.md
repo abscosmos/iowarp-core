@@ -379,7 +379,7 @@ Dual-write is what keeps a 127-call-site refactor from becoming a flag-day.
 
 | Phase | Work | Exit criterion |
 |---|---|---|
-| 0 | CTE metadata benchmark harness | Baseline recorded |
+| 0 | CTE metadata benchmark harness | DONE -- baseline SHM 72.1 µs (see §6b) |
 | 1 | `kMetadataSegment` + `IpcManager` plumbing | Runtime creates it; client attaches RO |
 | 2 | `ipc::string`, `ipc::unordered_map`, `TimedMutex`, `Lease` | Standalone torture test, incl. random reader kills mid-lease |
 | 3 | `ShmTagInfo`/`ShmBlobInfo`; runtime **dual-writes** | Old path still authoritative; all CTE tests green |
@@ -433,12 +433,27 @@ the read path on metadata-only ops is far cheaper to debug than on payload reads
 - Still to build: `ipc::string`, `ipc::unordered_map`, `Lease`, and the
   kill-clients-at-random torture test.
 
-**Known blocker (not caused by this work):** `clio_run_thrpt_bench` aborts shortly
-after client init with `Fatal glibc error: tpp.c:83 (__pthread_tpp_change_priority)`,
-in every transport mode including TCP (which maps no SHM at all). Needs isolating
-before Phase 0 baselines can be taken — note that a partial rebuild after an
-`IpcManager` layout change produces ABI skew between the core library and the module
-`.so`s, which can present as spurious crashes, so always rebuild modules together.
+**Phase 0 (baseline) — done.** Measured on this branch after a consistent full
+rebuild, single thread, `--test-case latency`: **SHM 72.1 µs**, IPC 109.7 µs, TCP
+517.5 µs. Matches the pre-merge numbers (70.6 / 124.5 / 471.7), so merging `dev`
+introduced no latency regression. **SHM 72 µs is the number the cache must beat**;
+the target is < 5 µs.
+
+**Resolved false alarm — ABI skew, not a `dev` bug.** During Phase 1,
+`clio_run_thrpt_bench` aborted just after client init with `Fatal glibc error:
+tpp.c:83 (__pthread_tpp_change_priority)`, in every transport mode including TCP. It
+looked like a pre-existing `dev` regression. It was not: adding members to
+`IpcManager` changes its layout, and rebuilding only `clio_run` left the module
+`.so`s (`clio_*_runtime`) compiled against the old layout. The resulting ABI skew
+presented as unrelated crashes — including a startup segfault when the skew ran the
+other way. A consistent rebuild of runtime + all modules + bench made it vanish.
+
+**Rule for this work:** after touching the layout of any widely-included type, rebuild
+the modules in the same command, e.g.
+`cmake --build build-cpu --target clio_run clio_admin_runtime clio_bdev_runtime
+clio_MOD_NAME_runtime clio_cte_core_runtime clio_cae_core_runtime
+clio_run_thrpt_bench -j 6`. A partial rebuild will produce crashes that look like
+someone else's bug.
 
 ## 7. Decisions
 
