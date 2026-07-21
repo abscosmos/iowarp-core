@@ -424,14 +424,33 @@ the read path on metadata-only ops is far cheaper to debug than on payload reads
   runtime RSS ~35 MB with ~6 GB reserved (confirming it is not pre-faulted), and a
   client logs a successful attach.
 
-**Phase 2 (primitives) — `TimedMutex` done, rest pending.**
-- `clio_ctp/thread/lock/timed_mutex.h`: unfair CAS lock with PID +
-  process-start-time reclamation, `TryLock`/`Lock`/`Unlock`, ABA-safe release,
-  `ScopedTimedLock` RAII guard, `steal_count_` diagnostics.
-- Standalone smoke test passes (unique ids, reentrant `TryLock` correctly fails,
-  clean release, no spurious steals).
-- Still to build: `ipc::string`, `ipc::unordered_map`, `Lease`, and the
-  kill-clients-at-random torture test.
+**Phase 2 (primitives) — 3 of 4 done.**
+- `thread/lock/timed_mutex.h`: unfair CAS lock with PID + process-start-time
+  reclamation, ABA-safe release, `ScopedTimedLock`, `steal_count_`. Verified by
+  fork/SIGKILL: a killed holder is reclaimed at the threshold; a live-but-slow
+  holder is never stolen from.
+- `data_structures/ipc/string.h`: offset-based, SSO (23 bytes inline), one-way
+  growth, deleted implicit copy, FNV-1a `hash()` (NOT `std::hash`, which is not
+  stable across processes), `EqualsBytes` for allocation-free probing.
+  10 cases / 43 assertions.
+- `data_structures/ipc/unordered_map.h`: open addressing, **fixed capacity**,
+  per-slot seqlock, tombstones, `TryGetBytes` so clients never allocate.
+  11 cases / 6191 assertions.
+- Still to build: `Lease` (over `TimedMutex`), and the multi-process
+  kill-readers-at-random torture test.
+
+**Design refinement made during implementation: the map never rehashes.** Growth
+is the one operation that cannot be made safe for untracked cross-process
+readers — a rehash must free the old table, and knowing when the last reader has
+left it requires exactly the epoch machinery §5.3b rejected. So the table is
+sized up front and a full table is an insert failure, which routes into the
+"cache full -> fall back to RPC" path that already had to exist. This removes an
+entire class of use-after-free rather than trying to synchronize it.
+
+**Also found: `AllocateOffset` THROWS `OUT_OF_MEMORY`** (`arena_allocator.h:143`)
+rather than returning null. Both containers now catch it, because the whole
+fallback strategy depends on exhaustion being a recoverable condition rather
+than an exception escaping into a client read path.
 
 **Phase 0 (baseline) — done.** Measured on this branch after a consistent full
 rebuild, single thread, `--test-case latency`: **SHM 72.1 µs**, IPC 109.7 µs, TCP

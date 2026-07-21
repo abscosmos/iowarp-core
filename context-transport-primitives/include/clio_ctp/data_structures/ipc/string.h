@@ -327,6 +327,17 @@ class string : public ShmContainer<AllocT> {
     return h;
   }
 
+  /**
+   * Compare against raw bytes without constructing a string.
+   *
+   * Required by the SHM hash map's client-side lookup: clients must never
+   * allocate inside the metadata segment (they are readers, and allocating
+   * would mutate runtime-owned structures), so probing the table with a
+   * temporary ipc::string key is not an option.
+   */
+  CTP_INLINE_CROSS_FUN
+  bool EqualsBytes(const char *p, size_t n) const { return Equals(p, n); }
+
   CTP_INLINE_CROSS_FUN
   static size_t StrLen(const char *s) {
     size_t n = 0;
