@@ -251,6 +251,27 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
           best_load = rl;
         }
       }
+      // issue #781: reserve the incoming task's PREDICTED cost on the chosen
+      // worker so the NEXT mapping sees it as queued load — the quick-behind-
+      // heavy fix. The prediction comes from the learned per-method model via
+      // the populated PredictedStat (MOD_NAME::GetTaskStats reports the compute
+      // counter); it converges to ~the real cost after a few runs. Released in
+      // Worker::ExecTask when the task actually starts.
+      if (selected != nullptr && task_ptr != nullptr && container != nullptr) {
+        // Read the compute counter FRESH here: RunContext::predicted_stat_ is
+        // only populated at EXECUTION time (BeginTask on the destination worker),
+        // so it is still empty during routing. GetTaskStats is cheap + const.
+        clio::run::TaskStat stat = container->GetTaskStats(task_ptr);
+        double predicted = container->InferCpuTime(task_ptr->method_, stat);
+        if (predicted > 0.0) {
+          // Set PredictedLoad too so ExecTask/EndTask account the SAME value
+          // (its own PredictedStat() lookup would still read 0 during the window
+          // before BeginTask). sched_reserved_us_ marks it as map-accounted.
+          task_ptr->SetPredictedLoad(static_cast<float>(predicted));
+          task_ptr->SetSchedReservedUs(static_cast<float>(predicted));
+          selected->ReserveLoad(predicted);
+        }
+      }
     }
   }
 

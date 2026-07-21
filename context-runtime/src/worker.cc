@@ -670,12 +670,27 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     // BeginTask via container->GetTaskStats(task), so derive the model
     // inferences from the already-cached stat instead of re-calling
     // GetTaskStats here.
+    // issue #781: if RuntimeMapTask already predicted this task's cost at map
+    // time (sched_reserved_us_ != 0), that value is AUTHORITATIVE — it was
+    // computed from a fresh GetTaskStats, whereas PredictedStat() here can still
+    // be 0 (BeginTask populates it just now). So only (re)compute PredictedLoad
+    // when the task was NOT map-accounted.
+    float reserved = task_ptr->SchedReservedUs();
     if (exec) {
-      task_ptr->SetPredictedLoad(
-          exec->InferCpuTime(task_ptr->method_, task_ptr->PredictedStat()));
+      if (reserved == 0.0f) {
+        task_ptr->SetPredictedLoad(
+            exec->InferCpuTime(task_ptr->method_, task_ptr->PredictedStat()));
+      }
       task_ptr->SetPredictedWallUs(exec->InferWallClockTime(
           task_ptr->method_, task_ptr->PredictedStat()));
-      load_ += task_ptr->PredictedLoad();
+    }
+    // The task is now EXECUTING: count its predicted cost in load_ (whether the
+    // value came from the map or from here), and release the queued reservation
+    // so it is not double-counted. EndTask subtracts the same PredictedLoad.
+    load_ += task_ptr->PredictedLoad();
+    if (reserved != 0.0f) {
+      ReleaseReservation(reserved);
+      task_ptr->SetSchedReservedUs(0);
     }
   }
 
@@ -748,6 +763,16 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
 
   // Subtract predicted load from worker
   load_ -= task_ptr->PredictedLoad();
+
+  // issue #781: defensively release any still-held queued reservation for tasks
+  // that reach EndTask WITHOUT executing (e.g. the early-error EACCES path), so a
+  // reservation can never leak onto queued_load_. Normal tasks already released
+  // it in ExecTask (sched_reserved_us_ == 0 here), so this is a no-op for them.
+  float reserved = task_ptr->SchedReservedUs();
+  if (reserved != 0.0f) {
+    ReleaseReservation(reserved);
+    task_ptr->SetSchedReservedUs(0);
+  }
 
   // Reinforce model with actual CPU and wall time
   float actual_cpu_us = static_cast<float>(task_ptr->RunCpuTimer().GetUsec());

@@ -196,16 +196,34 @@ class Worker {
   }
 
   /**
-   * Measured real-time load used for routing (issue #781): estimated queued
-   * cost plus how long the currently-executing task has already been running.
-   * An overrunning task inflates its own worker's load in real time, so the
-   * mapper steers new work away from it — no cost prediction required.
+   * Measured real-time load used for routing (issue #781):
+   *   load_             predicted cost of the task currently EXECUTING
+   *   queued_load_us_   predicted cost of tasks assigned/queued but not started
+   *   elapsed           how long the executing task has OVERRUN wall-clock
+   * The predicted terms come from the learned per-method model (converges after
+   * a few runs); the elapsed term is the pure-measured signal that catches a
+   * task overrunning its prediction (or a mislabeled non-yielding spin). Together
+   * they steer new work off both busy AND backlogged workers.
    * @param now_us current steady-clock time in microseconds.
    */
   double RealtimeLoad(double now_us) const {
     double start = last_exec_start_us_.load(std::memory_order_relaxed);
     double elapsed = (start != 0.0) ? (now_us - start) : 0.0;
-    return static_cast<double>(load_) + elapsed;
+    return static_cast<double>(load_) +
+           queued_load_us_.load(std::memory_order_relaxed) + elapsed;
+  }
+
+  /** #781: reserve predicted cost on this worker when a task is mapped to it. */
+  void ReserveLoad(double us) {
+    if (us > 0.0) queued_load_us_.fetch_add(us, std::memory_order_relaxed);
+  }
+  /** #781: release the reservation when the task starts executing (or is
+   *  cancelled) — the executing cost is then tracked by load_ instead. */
+  void ReleaseReservation(double us) {
+    if (us > 0.0) {
+      double prev = queued_load_us_.fetch_sub(us, std::memory_order_relaxed);
+      if (prev - us < 0.0) queued_load_us_.store(0.0, std::memory_order_relaxed);
+    }
   }
 
   /**
@@ -433,6 +451,11 @@ class Worker {
   // runtime can spawn a replacement and steal the backlog. std::atomic so the
   // monitor thread can read it without a lock.
   std::atomic<double> last_exec_start_us_{0.0};  // 0 == not executing
+  // issue #781: sum of predicted costs of tasks mapped to this worker but not
+  // yet started (the queue). Added in RuntimeMapTask, released in ExecTask when
+  // the task begins. Lets the mapper avoid a worker with a heavy task queued
+  // even before it starts running — the queued-behind-heavy fix.
+  std::atomic<double> queued_load_us_{0.0};
   bool did_work_;       // Tracks if any work was done in current loop iteration
   bool task_did_work_;  // Tracks if current task did actual work (set by tasks
                         // via CLIO_CUR_WORKER)
