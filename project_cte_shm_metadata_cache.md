@@ -490,8 +490,30 @@ purpose: the slot generation protects the METADATA copy, while §5.3's hazard is
 the DataOrganizer relocating blocks during the PAYLOAD read. A client must
 re-check `placement_gen_` after copying bytes.
 
-**Phase 6a DONE — RAM bdev is shared-memory backed.** (6b/6c pending: the
-direct-readable flag and the client payload read.)
+**PHASE 6 COMPLETE — zero-IPC payload reads working and measured.**
+
+| Read type | SHM fast path | RPC path | Speedup |
+|---|---|---|---|
+| **Payload (4 KB blob)** | **0.207 µs/op** | **94.3 µs/op** | **455x** |
+| Metadata (cross-process) | 0.170 µs/op | 82.7 µs/op | 488x |
+
+`BuildShmBlobRecord` sets `kShmBlobDirectReadable` only when EVERY block is
+node-local and `kRam`; the flag starts true and is cleared by the first block
+that fails, so the default is *refuse* and an unknown target can never be
+mistaken for readable. `Client::TryReadBlobShm` attaches the bdev segment
+lazily (cached per pool, negative results cached too) and validates
+`placement_gen_` **before and after** the copy — the metadata seqlock protects
+only the record, while the real hazard is the DataOrganizer relocating blocks
+mid-`memcpy`.
+
+**Test isolation was the hard part, not the code.** The first version
+registered a RAM target on the *shared* fixture pool, where file targets had
+accumulated from earlier tests and the DPE placed the blob on one. The blob was
+therefore correctly not direct-readable and the payload path was never
+exercised — the test warned loudly instead of passing vacuously. Giving it its
+own CTE pool with a RAM target as the ONLY target is what made it a real test.
+
+**Phase 6a — RAM bdev is shared-memory backed.**
 
 A `kRam` device's bytes now live in a dedicated SHM segment, mapped as ONE
 contiguous sparse region rather than a page table. Since these are memfd
