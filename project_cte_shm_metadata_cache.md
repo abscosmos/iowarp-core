@@ -221,13 +221,21 @@ generation catches the payload being moved under a reader.
 
 Four constraints on the implementation:
 
-**1. Lock words must live in a separate read-write region.** Acquiring a lease is a
-store, and clients map the data `PROT_READ` (§5.5). A `TimedMutex` therefore cannot be
-embedded inline in an `ShmBlobInfo` that lives in the read-only region. Layout: a
-lock array in a small **RW-mapped** region, indexed parallel to the objects, with
-metadata and payload staying **RO**. This yields a useful safety property — since
-correctness rests on the generation counter, a client that corrupts a lock word can
-only damage *liveness*, never silently corrupt another reader's data.
+**1. Mapping is `PROT_READ|PROT_WRITE`; read-only is enforced by discipline.**
+DECIDED: clients map the segment read-write, because acquiring a lease is a store and
+splitting lock words into a separate region is not worth the layout complexity. **The
+only bytes a client may write are lock words. Metadata is never client-writable.**
+
+This trades a hardware guarantee for a convention, so two invariants become
+load-bearing:
+- The runtime **must never read the SHM cache as authoritative**. It keeps its own
+  structures; the cache is derived state, and a client that scribbles on it can only
+  harm other clients, never the runtime. (This is why Phase 7 keeps it a pure cache.)
+- A corrupted cache must be **droppable and rebuildable** wholesale, since we can no
+  longer rely on `PROT_READ` to prevent corruption from happening at all.
+
+Acceptable because §7.1 already accepts a single-tenant trust model. Under
+multi-tenancy this decision would have to be revisited along with §5.6.
 
 **2. Default to a lock-free read; take a lease only when you need a stable view.**
 An exclusive `TimedMutex` serializes concurrent readers of the same hot blob, and the
@@ -239,6 +247,24 @@ leases *rare* is also what keeps reclamation simple: an exclusive lock has a sin
 owner, so a dead holder is identifiable, which a shared/reader-counted lease would
 not be (that would need per-holder tracking, i.e. epochs again by another name).
 
+**What if a client dies mid-seqlock-read?** Nothing happens, and this is the whole
+reason to prefer a seqlock for the default path. A seqlock *reader* acquires nothing
+and stores nothing — it reads the sequence, copies, and re-reads the sequence. A dead
+reader therefore leaves **no state to release, reclaim, or unwind**; there is no
+counter to decrement and no lock to steal. It has copied garbage into its own address
+space, but it is dead, so nobody consumes it. No cross-process effect whatsoever.
+
+The seqlock's one death hazard is on the **writer** side: a writer that dies between
+its two sequence bumps leaves the sequence odd forever, and readers retry forever. But
+the writer is always the **runtime** — the single trusted owner — and if the runtime
+dies the whole session is being torn down anyway. The asymmetry is exactly the one we
+want: the untrusted-liveness side (clients) is stateless, and the stateful side is the
+one process whose death is already fatal.
+
+This is precisely why the seqlock is the *default* and `Lease` is the *exception*: a
+lease is the only client-side construct whose abandonment needs servicing, so the
+design minimizes how often one is held.
+
 **3. Reclamation needs PID + process start time, not a bare timeout.** A timeout alone
 cannot distinguish a dead holder from a live-but-slow one (§5.3, point 4). The lock
 word carries `{owner_pid, process_start_time, acquire_timestamp}`; a waiter past the
@@ -246,11 +272,36 @@ threshold checks liveness and steals **only if the owner is genuinely gone**. St
 time is required because PIDs are recycled — on Linux, field 22 of `/proc/<pid>/stat`.
 A steal must bump a steal counter so a resurrected holder can detect it lost the lock.
 
-**4. The runtime must never block on a lease.** Per §5.3 the reorganizer `try_lock`s
-and skips. Writes cannot "skip" as such, but they do not need to block either: the
-runtime updates its own authoritative structure and **defers the SHM mirror update**
-if the lease is contended. This is only sound because the SHM copy is a *cache*, never
-the source of truth — see the revised Phase 7.
+**4. The runtime may wait on a lease — but the *task* waits, never the *worker
+thread*.** DECIDED: waiting is unavoidable, since a lease that the runtime could
+ignore would not protect anything. The constraint is not *whether* to wait but *how*.
+
+A thread-blocking wait is not available here. `ReorganizeBlobInternal` /
+`DynamicReorganize` are coroutines on workers, and `core_tasks.h:820-831` already
+documents why: a thread-blocking lock "CANNOT be used here — it would deadlock the
+single worker the instant the holder suspends at a `co_await`." With 4 workers, a few
+contended blobs would wedge the runtime — the exact failure class issue #781 exists to
+prevent.
+
+The codebase already has the right pattern, in that same comment: the `write_owner_`
+contender "busy-polls via `co_await yield()` ... which is lost-wakeup-proof because it
+re-checks every worker iteration." So:
+
+- `Lease` acquisition on the runtime side is a **`co_await` retry loop**, not a
+  blocking acquire. The task suspends; the worker goes and runs other tasks.
+- The reorganizer, being pure background work, still prefers `try_lock`-and-skip — it
+  has no obligation to reorganize any particular blob right now.
+- Metadata writes wait via `co_await`, bounded by the `TimedMutex` threshold.
+
+Two consequences to keep in view:
+- The `TimedMutex` timeout now **bounds runtime write latency**, not just reclamation
+  lag. A 500 ms threshold means a metadata write can stall that long behind a wedged
+  client. This is the strongest argument for the §5.3 size cap: bounding legitimate
+  lease hold time lets the threshold come down proportionally.
+- A client holding a lease can now delay runtime progress, which is a denial-of-service
+  vector even under a single-tenant model — a merely *buggy* client that leaks a lease
+  is enough. The timeout is the backstop, and clients must never hold a lease across a
+  syscall, an I/O, or anything else unbounded.
 
 ### 5.4 Read-your-own-writes
 
@@ -305,13 +356,20 @@ Dual-write is what keeps a 127-call-site refactor from becoming a flag-day.
 | 7 | Retire the *scaffolding*, keep SHM as a pure cache | Steady state (see below) |
 
 **Phase 7 revised.** The original plan was to retire the legacy structures and make SHM
-the single source of truth. That is now rejected: if SHM were authoritative, a runtime
-write would have to *land* there, so the runtime would have to block on a client-held
-lease — violating §5.3b constraint 4. Instead the runtime keeps its own authoritative
-structures permanently and the SHM segment stays a **pure read cache** the runtime may
-always defer updating or invalidate wholesale. This also means a corrupted or wedged
-cache is recoverable by dropping it, never a data-loss event. Phase 7 therefore only
-removes benchmarking scaffolding and any redundant bookkeeping, not the legacy path.
+the single source of truth. That is now rejected, primarily because of §5.3b constraint
+1: clients map the segment **read-write**, so a buggy client can corrupt it. Derived
+state that can be dropped and rebuilt is a recoverable annoyance; *authoritative* state
+that a client can corrupt is data loss. The runtime therefore keeps its own structures
+permanently, and the SHM segment stays a **pure read cache** it may defer updating or
+invalidate wholesale at any time.
+
+(A secondary argument also applies: an authoritative cache would put client-held leases
+on the critical path of every metadata write, rather than merely on cache freshness.
+The runtime is willing to wait on leases — §5.3b constraint 4 — but there is no reason
+to make correctness, rather than staleness, depend on that wait.)
+
+Phase 7 therefore only removes benchmarking scaffolding and redundant bookkeeping, not
+the legacy path.
 
 Phases 0-2 are self-contained and carry essentially no risk to existing behavior.
 Phase 3 is where the blast radius starts. Phase 5 before Phase 6 deliberately: proving
@@ -347,8 +405,17 @@ the read path on metadata-only ops is far cheaper to debug than on payload reads
 8. **Smart pointer — DECIDED: new `Lease`** in `clio_ctp/memory/smart_ptr/lease.h`,
    alongside `shared_ptr.h` / `unique_ptr.h`. See §5.3b for its four constraints.
 
+9. **Mapping — DECIDED: `PROT_READ|PROT_WRITE`.** Clients map read-write; only lock
+   words are client-writable, enforced by convention rather than by the MMU. See
+   §5.3b constraint 1 for the two invariants this makes load-bearing.
+10. **Runtime waiting — DECIDED: the runtime may wait on leases.** Unavoidable, since
+    an ignorable lease protects nothing. But it waits by `co_await` retry, never by
+    blocking a worker thread (§5.3b constraint 4).
+
 ### Still open
 
 - The exact fast-path size cap (item 6) — needs measurement, not a decision.
 - Whether the `TimedMutex` threshold stays at 500 ms or drops once the size cap bounds
-  legitimate hold time (§5.3).
+  legitimate hold time. This now matters more than it did: with the runtime waiting on
+  leases (item 10), the threshold bounds **runtime metadata-write latency**, not just
+  reclamation lag.
