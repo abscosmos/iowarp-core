@@ -34,6 +34,7 @@
 #ifndef CLIO_RUNTIME_INCLUDE_WORKERS_WORKER_H_
 #define CLIO_RUNTIME_INCLUDE_WORKERS_WORKER_H_
 
+#include <atomic>
 #include <chrono>
 // <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
 // (task.h, included below, derives CLIO_ENABLE_BOOST_COROUTINES from this.)
@@ -183,6 +184,39 @@ class Worker {
    * @return true if worker is active, false otherwise
    */
   bool IsRunning() const;
+
+  // --- issue #781: measured-load + stall-detection accessors ---
+
+  /** Estimated queued CPU time (us), bumped/decremented around ExecTask. */
+  float Load() const { return load_; }
+
+  /** True while a task is actively executing on this worker. */
+  bool IsExecuting() const {
+    return last_exec_start_us_.load(std::memory_order_relaxed) != 0.0;
+  }
+
+  /**
+   * Measured real-time load used for routing (issue #781): estimated queued
+   * cost plus how long the currently-executing task has already been running.
+   * An overrunning task inflates its own worker's load in real time, so the
+   * mapper steers new work away from it — no cost prediction required.
+   * @param now_us current steady-clock time in microseconds.
+   */
+  double RealtimeLoad(double now_us) const {
+    double start = last_exec_start_us_.load(std::memory_order_relaxed);
+    double elapsed = (start != 0.0) ? (now_us - start) : 0.0;
+    return static_cast<double>(load_) + elapsed;
+  }
+
+  /**
+   * True if this worker has been executing one task longer than \a threshold_sec
+   * — i.e. a non-yielding/mislabeled task is stalling it (issue #781).
+   * @param now_us current steady-clock time in microseconds.
+   */
+  bool IsStalled(double now_us, double threshold_sec) const {
+    double start = last_exec_start_us_.load(std::memory_order_relaxed);
+    return start != 0.0 && (now_us - start) > threshold_sec * 1e6;
+  }
 
   /**
    * Set the task currently executing on this worker thread (the worker sets
@@ -392,6 +426,13 @@ class Worker {
   bool is_running_;
   bool is_initialized_;
   float load_;          // Estimated total CPU time (us) of active tasks
+  // issue #781: wall-clock timestamp stamped at the top of ExecTask and cleared
+  // when the task returns/yields. While executing, (now() - last_exec_start_) is
+  // the current task's elapsed time; the monitor thread uses this to detect a
+  // worker stalled on a non-yielding task ( > kStallThresholdSec ) so the
+  // runtime can spawn a replacement and steal the backlog. std::atomic so the
+  // monitor thread can read it without a lock.
+  std::atomic<double> last_exec_start_us_{0.0};  // 0 == not executing
   bool did_work_;       // Tracks if any work was done in current loop iteration
   bool task_did_work_;  // Tracks if current task did actual work (set by tasks
                         // via CLIO_CUR_WORKER)

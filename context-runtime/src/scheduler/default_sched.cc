@@ -47,6 +47,7 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
   if (!work_orch) {
     return;
   }
+  work_orch_ = work_orch;  // #781: retained for elastic SpawnAdditionalWorker
 
   u32 total_workers = work_orch->GetTotalWorkerCount();
 
@@ -127,26 +128,10 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
        gpu_worker_ ? (int)gpu_worker_->GetId() : -1);
 }
 
-u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
-                                    const Future<Task> &task) {
-  u32 num_lanes = ipc_manager->GetNumSchedQueues();
-  if (num_lanes == 0) {
-    return 0;
-  }
-
-  Task *task_ptr = task.get();
-
-  // Network tasks (Send/Recv from admin pool) → last lane
-  if (task_ptr != nullptr && task_ptr->pool_id_ == clio::run::kAdminPoolId) {
-    u32 method_id = task_ptr->method_;
-    if (method_id == 14 || method_id == 15 || method_id == 20 || method_id == 21) {
-      return num_lanes - 1;
-    }
-  }
-
-  // Default: scheduler worker (lane 0)
-  return 0;
-}
+// NOTE (issue #781): ClientMapTask has been removed. Client/recv-thread ingress
+// no longer picks a worker lane directly — tasks are mapped to workers ONLY in
+// the runtime (RuntimeMapTask via RouteTask). The recv threads now deposit onto
+// the shared ingress lane and the runtime places the task.
 
 u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
                                       ContainerHold container) {
@@ -257,7 +242,27 @@ Worker *DefaultScheduler::PickAltWorker(u32 avoid_id) const {
   return nullptr;
 }
 
-void DefaultScheduler::RebalanceWorker(Worker *worker) { (void)worker; }
+// issue #781 — SCAFFOLD ONLY (not yet wired). Called by the WorkOrchestrator
+// monitor thread every ~500ms. Real implementation will:
+//   1. detect a worker stuck > kStallThresholdSec inside one ExecTask
+//      (worker->IsStalled()) and, if so, work_orch_->SpawnAdditionalWorker()
+//      + StealAll(from stalled lane -> new worker) so the pathological task
+//      strands one thread, never the runtime;
+//   2. update perf_pdf_ from recently-completed exec times (telemetry);
+//   3. retire elastic workers idle > kRetireCooldownSec (hysteresis);
+//   4. emit sched.threads.* metrics; WARN when live threads are abnormal.
+void DefaultScheduler::LoadBalance() {
+  // TODO(#781): stall detection + elastic spawn + steal + retire + telemetry.
+}
+
+// issue #781 — SCAFFOLD ONLY (not yet wired). Move up to kStealBatch tasks from
+// each ring neighbour (then the most-loaded worker) onto thief's lane using a
+// steal-safe lane pop, keeping the pool work-conserving.
+bool DefaultScheduler::StealWork(Worker *thief) {
+  (void)thief;
+  // TODO(#781): neighbour + most-loaded steal.
+  return false;
+}
 
 void DefaultScheduler::AdjustPolling(const clio::run::shared_ptr<Task> &task) {
   if (task.IsNull()) {
