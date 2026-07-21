@@ -147,16 +147,78 @@ blobs. Sequence that corrupts data:
 2. Runtime reorganizes the blob; blocks are freed and reused by another blob.
 3. Client `memcpy`s from those offsets → **silently returns another blob's bytes.**
 
-No error surfaces. Mitigation: a per-blob generation counter validated *before and
-after* the payload copy (extending the seqlock across the data read, not just the
-metadata read), plus epoch-deferred reuse of RAM-bdev blocks so recycling cannot
-outrun an in-flight reader.
+No error surfaces.
+
+**Scope note:** locking only the *metadata copy-out* does not fix this. The hazard is
+the **payload** read. Whatever mechanism we use must span the `memcpy` from the RAM
+bdev, not just the `BlobInfo` field read.
+
+#### Chosen design: generation for correctness, lease for progress
+
+A per-blob **timed lease** (proposed: 500 ms) that the reorganizer respects is the
+right shape, but it cannot be the *correctness* mechanism, for four reasons found in
+the existing code:
+
+1. **A lock requires the client to write.** Clients map `PROT_READ` (§5.5). Acquiring
+   any mutex is a store. This forces the lock words into a **separate small
+   read-write mapped region**, with the payload staying read-only. Consequence: a
+   buggy or hostile client can corrupt lock state, and corrupting it to *unlocked*
+   breaks safety rather than merely liveness. So the lock cannot be load-bearing.
+2. **`ctp::Mutex` is a ticket lock and cannot be reclaimed.**
+   `thread/lock/mutex.h:47` — `Lock()` does `lock_.fetch_add(1)` and spins until
+   `head_ == tkt`. If a client dies holding it, `head_` never advances and *every*
+   later waiter blocks forever. Forcibly advancing `head_` releases multiple waiters
+   at once, destroying mutual exclusion. A reclaimable lease needs a different
+   primitive: a CAS word carrying **owner PID + acquire timestamp**.
+3. **The reorganizer is a coroutine on a runtime worker.**
+   `ReorganizeBlobInternal` / `DynamicReorganize` return `TaskResume`, and
+   `core_tasks.h:820-831` already warns that a thread-blocking lock "CANNOT be used
+   here — it would deadlock the single worker the instant the holder suspends at a
+   `co_await`." A 500 ms blocking wait would stall a whole worker; with 4 workers, a
+   few stuck blobs wedge the runtime. **The reorganizer must `try_lock` and skip** —
+   it is background work and is free to reorganize a different blob.
+4. **Timeout-and-steal is probabilistic, not correct.** If the timeout fires on a
+   *live but slow* client — page fault against an undersized `/dev/shm` (§5.7),
+   descheduled, swapped — the reorganizer moves data under an active reader, which is
+   exactly the corruption being prevented. 500 ms makes that rare; rare **plus
+   silent** is the worst failure mode to ship.
+
+Therefore:
+
+- **Correctness** = a per-blob **generation counter**, validated before *and* after
+  the payload copy. Requires no client writes, costs nothing on the read path, and
+  stays correct even if the lease is stolen, corrupted, or skipped.
+- **The lease** = a *progress* optimization, so readers do not livelock retrying while
+  the organizer churns a hot blob.
+- **Neither side ever blocks on the other.** Client: `try_lock` with a tiny budget,
+  else fall back to RPC. Runtime: `try_lock`, else skip this blob this pass.
+- **500 ms becomes the stale-lease janitor threshold, not a wait.** If a lease has
+  been held longer than that, check the owner PID for liveness and reclaim only if it
+  is gone — never as a blind timeout.
+
+**Size cap.** The motivation is *small* I/O; for a 1 GB blob a 71 µs round-trip is
+already noise. Restricting the fast path to blobs under ~1 MB bounds a client's
+legitimate lease hold to well under 100 µs, which lets the janitor threshold be far
+tighter than 500 ms and shrinks the damage a dead client can do. 500 ms is ~100,000x
+the 5 µs target — it is sized for large-blob copies that should not use this path at
+all. **Exact cap is TBD from measurement (open question 6).**
+
+**Lock ordering:** `TagInfo` before `BlobInfo`, enforced identically on both sides.
 
 ### 5.4 Read-your-own-writes
 
 Fully-async write-through means a client that does `PutBlob` then `GetBlob` can miss
-its own write — which breaks the filesystem adapter's expectations. Mitigation: a
-per-client pending-write key set; those keys take the slow path until acknowledged.
+its own write — which breaks the filesystem adapter's expectations.
+
+Mitigation: a client-local `std::unordered_map` of **pending writes**, consulted
+before every fast-path read; a hit forces the slow path until the write is
+acknowledged. This is client-local plain heap — no SHM, no cross-process concern.
+
+Two requirements that are easy to miss:
+- It must track **deletes, truncates and renames**, not just puts. Otherwise a client
+  reads a blob it just deleted straight out of the stale SHM cache.
+- It must be consulted by **metadata-only** fast paths (`GetBlobSize`, `GetBlobScore`)
+  too, not only payload reads — a stale size is just as wrong as stale bytes.
 
 ### 5.5 `PROT_READ` discipline
 
@@ -188,7 +250,7 @@ Dual-write is what keeps a 127-call-site refactor from becoming a flag-day.
 |---|---|---|
 | 0 | CTE metadata benchmark harness | Baseline recorded |
 | 1 | `kMetadataSegment` + `IpcManager` plumbing | Runtime creates it; client attaches RO |
-| 2 | `ipc::string`, `ipc::unordered_map` + epoch reclamation | Standalone torture test, incl. random reader kills |
+| 2 | `ipc::string`, `ipc::unordered_map`, reclaimable lease primitive + epoch reclamation | Standalone torture test, incl. random reader kills mid-lease |
 | 3 | `ShmTagInfo`/`ShmBlobInfo`; runtime **dual-writes** | Old path still authoritative; all CTE tests green |
 | 4 | Propagate map locations via `CreateTask` | Client holds valid handles |
 | 5 | Client fast path for **metadata-only** ops (`GetBlobSize`, `GetBlobScore`) | Correctness parity; latency win measured |
@@ -210,3 +272,9 @@ the read path on metadata-only ops is far cheaper to debug than on payload reads
    variant need a slimmed block descriptor?
 5. Does `kPinned` (GPU page-locked) RAM bdev stay on the old private-heap path?
    `cudaMallocHost` memory cannot trivially be SHM-backed.
+6. **Fast-path blob size cap** (§5.3) — measure where the SHM path stops beating the
+   RPC path and set the cap there. Expected to land near 256 KB - 1 MB.
+7. The reclaimable lease needs a **new lock primitive** (CAS word + owner PID +
+   timestamp); `ctp::Mutex` cannot be reclaimed. Does it belong in
+   `clio_ctp/thread/lock/` next to `Mutex`, or in the SHM-cache layer as a
+   special-purpose type?
