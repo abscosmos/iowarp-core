@@ -97,10 +97,10 @@ Consequences the plan has to answer for:
   peer traffic *and* stops servicing client IPC. One bad task becomes a whole-node outage. This is
   worse than a stalled compute worker, and the plan previously treated periodic as a lesser sibling
   of blocked.
-* **They cannot simply be moved.** The comment above that routing table is explicit: *"ZeroMQ
-  sockets are not safe to share across threads, so each socket has exactly one owner thread."*
-  Migrating a net poller to a replacement worker would touch a ZMQ socket from a foreign thread —
-  undefined behaviour, not just misplacement. See D7.
+* **The routing table itself is being deleted.** D8 replaces these roles with dedicated-worker
+  periodic tasks placed by load, so the pollers become migratable like anything else. The
+  socket-ownership constraint the table encodes does *not* go away — it has to be re-expressed, and
+  that is most of what D8 is about.
 
 ---
 
@@ -340,20 +340,86 @@ will do something unsafe.
 |---|---|---|---|
 | `scheduler_worker_` | Yes | General purpose | Lane transfer + task migration |
 | `io_workers_` | Yes | General purpose | Lane transfer + task migration |
-| `net_send_worker_` | **No** | Owns the peer DEALER ZMQ socket; sockets are single-thread-owned | Prevention + alarm (§8.2) |
-| `net_recv_worker_` | **No** | Owns the peer + client ROUTER sockets | Prevention + alarm (§8.2) |
-| GPU worker | **No** (probably) | Bound to `gpu_lanes_`; `SuspendMe` early-returns because "GPU workers must never sleep" (`worker.cc:483-486`) | Spike §7.7 |
+| `net_send_worker_` | **Deleted** | Becomes a dedicated-worker task — D8 | Migratable once D8 lands |
+| `net_recv_worker_` | **Deleted** | Same | Migratable once D8 lands |
+| GPU worker | **No** (probably) | Bound to `gpu_lanes_`; `SuspendMe` early-returns because "GPU workers must never sleep" (`worker.cc:483-486`) | Spike §7.6 |
 | Worker 0 | Special | Hardcoded `worker_id_ == 0` drives `BatchManager::FlushDue` (`worker.cc:288`) | Make it a role pointer so the duty can move |
 
-`LoadBalance` must therefore branch on role before rescuing, and the migratable set is exactly
-"general-purpose compute workers". For the rest, the correct engineering answer is that **they must
-never run a task that can stall** — which is a placement invariant, not a migration mechanism.
+`LoadBalance` branches on this before rescuing. After D8 the non-migratable set shrinks to the GPU
+worker (pending §7.6) and worker 0's batch duty, which is the point: **role gating is a temporary
+scaffold, not the destination.**
 
-That invariant is not obviously held today: `DefaultScheduler::PickAltWorker`
-(`default_sched.cc:302-319`) deliberately falls back to `net_recv_worker_` / `net_send_worker_`
-("any worker whose Run loop drains its own lane breaks the self-block"). So an arbitrary — possibly
-blocking — task can legitimately be placed on a net worker. **Confirm and close this before relying
-on prevention** (§8.2).
+Note this also dissolves what was open decision §8.2 — `DefaultScheduler::PickAltWorker`
+(`default_sched.cc:302-319`) deliberately falls back to the net workers, which made "protect them by
+prevention" unworkable. With no net worker to protect, the hole closes by construction.
+
+### D8 — Delete the net-worker roles; make them expensive dedicated-worker tasks
+
+**Decision:** remove `net_send_worker_` / `net_recv_worker_` as scheduler roles. The net pollers
+become ordinary periodic tasks, placed by load-based routing, declared costly enough that
+`RuntimeMapTask` + `LoadBalance` give each its own worker and spawn one when needed.
+
+The hook already exists and is already used for exactly this purpose. `Runtime::GetTaskStats`
+(`admin_runtime.cc:1870-1886`) already reports these four methods with `io_size_ = 1 MiB` and
+`compute_ = ` the net-queue backlog, commented *"io_size_ here is just a stand-in so the scheduler
+doesn't route them as zero-cost metadata."* And #781 already **reserves** predicted cost on the
+target worker (`ReserveLoad` / `queued_load_us_`), so a task declared expensive repels other work
+from its worker automatically. Exclusivity becomes an emergent property of the load model rather
+than a hardcoded table. Three things have to be true or it breaks:
+
+**(a) The learned model will erase an inflated constant.** `Container::InferCpuTime =
+coef * (compute + 1)`, with `coef` driven by SGD from *measured* CPU time in `ReinforceCpuModel`
+(`EndTask`, `worker.cc:778`). A poller that returns `EAGAIN` on most ticks measures near-zero CPU,
+so `coef` converges toward zero and the inflated cost stops repelling anything — quietly, over
+minutes, after appearing to work. Setting `compute_` high is self-defeating against a subsystem
+built to learn true costs.
+
+Two ways out, and the second is the honest one:
+
+* Exempt these methods from reinforcement — a per-method "declared cost, do not learn" flag.
+* Say what we actually mean. The requirement is **exclusivity**, not expense. A
+  `TASK_DEDICATED_WORKER` property that `RuntimeMapTask` honours (place alone) and `LoadBalance`
+  services (spawn one if none is free, keep others off it) expresses it directly, survives the
+  learner, and is self-documenting. Cost inflation stays as a secondary placement hint but stops
+  being load-bearing. **Recommended.**
+
+**(b) Socket-ownership groups must survive the roles.** The routing comment is explicit:
+*"The split is by SOCKET OWNERSHIP, not by verb — ZeroMQ sockets are not safe to share across
+threads, so each socket has exactly one owner thread"* (`default_sched.cc:169-171`). The roles
+encode three groups:
+
+```
+{kSend}                    peer DEALER pool
+{kRecv}                    peer ROUTER (9413)
+{kClientRecv, kClientSend} SHARE the client-facing ROUTER  <-- must not run concurrently
+```
+
+Delete the roles without replacing this and methods 20/21 can be placed on two different workers,
+concurrently driving the same ZMQ socket. Options: a co-location/affinity group in the mapper, or
+**merge `kClientRecv` + `kClientSend` into a single periodic task** — one socket, one task, one
+thread by construction, no new scheduler concept. Recommend the merge; add a general affinity-group
+mechanism only when a second resource needs it.
+
+**(c) "Exactly one live instance" becomes a load-bearing invariant.** ØMQ permits moving a socket
+between threads given a full barrier and no concurrent use. A periodic task supplies both: it exists
+in exactly one periodic queue, and `ProcessPeriodicQueue` re-routes it *between* executions, so
+period N finishes on worker A before period N+1 starts on worker B, with the lane push/pop providing
+the barrier. **So dynamic reassignment is safe iff a method never has two live instances.** That is
+currently true but unasserted, and at least two pieces of code silently depend on it — both of which
+were safe only because of the pinning being deleted:
+
+* `Runtime::Recv`: *"No socket lock needed - single net worker processes all Recv tasks."*
+* `Runtime::ClientSend` (`admin_runtime.cc:652`) keeps a function-local
+  `static std::vector<shared_ptr<Task>> deferred_deletes`, mutated with no lock. Two concurrent
+  instances would be a data race on a `shared_ptr` vector — i.e. a double-free, the #680 shape.
+
+Assert the invariant (one live instance per net periodic method) rather than assuming it, and audit
+these two sites as part of the change.
+
+**What this buys.** Deletes the hardcoded method-id routing from *both* schedulers; removes the
+non-migratable role class; and converts the §2.3 failure — a stalled net worker taking the node's
+networking down with no rescue possible — into an ordinary migratable stall. That is the real win:
+not that the poller moves, but that when its worker wedges, it *can* move.
 
 ---
 
@@ -393,13 +459,19 @@ Behaviour-preserving by design — nothing should resume differently — so any 
 stress suites here is a real regression and is easy to attribute. Lands the lost-wakeup safety net
 and fixes `WorkerStats::num_blocked_tasks_` on its own.
 
-**P2b — periodic queue migration (D4b).** Migrate `periodic_queues_[]` under `park_mtx_`; reset
-`BlockStart()`; role gating from D7 so only migratable workers are rescued and role-pinned admin
-pollers are left alone. Deliberately **before** P2c: it needs no event-queue changes at all (the
-per-period `RouteTask` self-heals placement), so it is the cheapest large win available and it
-clears the most severe stranded category (§2.3).
+**P2b — dissolve the net-worker roles (D8).** `TASK_DEDICATED_WORKER` (or the reinforcement-exempt
+declared cost); merge `kClientRecv`+`kClientSend`; delete the method-id routing tables from
+`default_sched.cc` and `local_sched.cc`, and `net_send_worker_`/`net_recv_worker_` with them; assert
+one-live-instance per net periodic; drop the net fallbacks from `PickAltWorker`. Standalone and
+independently valuable — it is a simplification of #781's routing that happens to unblock the
+rescue. Land it before P2c so periodic migration never has to special-case a role.
 
-**P2c — blocked/suspended migration.** `event_queue_` → `mpmc_ring_buffer`; `sig_mtx_`/`sig_gen_`
+**P2c — periodic queue migration (D4b).** Migrate `periodic_queues_[]` under `park_mtx_`; reset
+`BlockStart()`; D7 gating for whatever remains non-migratable (GPU, worker 0). Needs no event-queue
+changes at all — the per-period `RouteTask` self-heals placement — so it is the cheapest large win
+available and it clears the most severe stranded category (§2.3).
+
+**P2d — blocked/suspended migration.** `event_queue_` → `mpmc_ring_buffer`; `sig_mtx_`/`sig_gen_`
 and the D3 producer handshake; `LoadBalance::MigrateAllFrom(stalled, fresh)` + re-drain of
 quarantined queues (§7.2); retry queue; load accounting moves (D6).
 
@@ -513,13 +585,18 @@ Each worker `ServerInit`s a named segment `clio-<pid>-<tid>` on its own thread
 (`worker.cc:242-247`). If any response path is keyed to the *worker's* tid rather than the
 *client's*, migration breaks it. Read `IpcManager::GetTls()` / `SendRuntime` before P2.
 
-### 7.5 ZMQ socket thread-ownership (gates any net-worker rescue)
+### 7.5 ZMQ socket thread-ownership (gates D8)
 
 *"ZeroMQ sockets are not safe to share across threads, so each socket has exactly one owner
-thread"* (`default_sched.cc:170-171`). Any design that moves a net poller — or re-points
-`net_recv_worker_` / `net_send_worker_` at a replacement — must also move socket ownership, which
-means tearing down and re-creating the socket on the new thread mid-flight. That is a much larger
-change than this issue, and it is why D7 marks net workers non-migratable.
+thread"* (`default_sched.cc:170-171`). D8 relies on the weaker, documented ØMQ property — a socket
+*may* migrate between threads given a full memory barrier and no concurrent use — rather than on
+socket recreation. **Verify that reading of ØMQ against the version in use before building on it**;
+if it does not hold, D8 needs socket teardown/recreate on handoff, which is a much larger change and
+would push the net pollers back to non-migratable.
+
+Second-order: `IpcCpu2CpuZmq` and the admin recv threads cache `GetMainTransport()`
+(`ipc_manager.h:280`) on their own background threads. Those are unaffected by worker placement, but
+confirm none of them shares a socket with the periodic pollers.
 
 ### 7.6 GPU worker rescue (spike)
 
@@ -547,21 +624,21 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
    an invariant the readiness scan now depends on, where before it only did a pointer comparison.
    Recommendation: promote it; it is a small change and removes a lifetime argument from the
    critical path.
-2. **Net-worker stall policy (D7).** Net workers cannot be rescued by migration (§7.5), so the
-   answer has to be prevention: they must never run a task that can stall. But `PickAltWorker`
-   (`default_sched.cc:302-319`) deliberately places arbitrary tasks on them today. Options: exclude
-   net workers from `PickAltWorker`, or accept the risk and settle for a loud alarm. Recommendation:
-   exclude, and alarm as well — a stalled net worker is a node outage and should never be silent.
-3. **Readiness-scan backoff.** Reuse the existing `% 2/4/8/16` buckets keyed on yield count, or
+2. **How exclusivity is expressed (D8a).** An explicit `TASK_DEDICATED_WORKER` property, or a
+   declared cost that is exempt from SGD reinforcement? Recommendation: the explicit property — an
+   inflated `compute_` alone gets learned away within minutes and fails silently.
+3. **Client socket group (D8b).** Merge `kClientRecv`+`kClientSend` into one periodic task, or add a
+   co-location group to the mapper? Recommendation: merge — no new scheduler concept.
+4. **Readiness-scan backoff.** Reuse the existing `% 2/4/8/16` buckets keyed on yield count, or
    re-key them on *time* parked? Yield count no longer means much for a task that suspends once and
    waits a long time.
-4. **Wedged-worker fate.** When the bad task finally returns, does the worker rejoin the pool or
+5. **Wedged-worker fate.** When the bad task finally returns, does the worker rejoin the pool or
    retire? Rejoining risks re-wedging on the same task class; retiring leaks a thread per bad task
    until exit. Recommendation: rejoin with exponential-backoff quarantine.
-5. **All-workers-stalled.** `LoadBalance` already detects it (`default_sched.cc:383`). With an
+6. **All-workers-stalled.** `LoadBalance` already detects it (`default_sched.cc:383`). With an
    unbounded elastic pool the answer is "spawn as many replacements as needed" — confirm there is
    no cap, and that the loud warning stays.
-6. **Do the periodic buckets stay four-deep?** The `% 2/4/8/16` scheme is a hand-rolled timer wheel.
+7. **Do the periodic buckets stay four-deep?** The `% 2/4/8/16` scheme is a hand-rolled timer wheel.
    Optional cleanup, unrelated to correctness.
 
 ---
@@ -585,7 +662,15 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
   * the lost-wakeup branch fires and logs when an event is deliberately dropped;
   * `num_blocked_tasks_` now tracks the real suspended count;
   * leak-detection suite against the new owning reference (D4, ownership note).
-* **P2b-specific** (periodic, D4b):
+* **P2b-specific** (D8, net roles):
+  * **the learner test** — run a net poller for long enough that SGD converges, then assert it still
+    holds a worker to itself. This is the failure mode that passes on day one and regresses quietly.
+  * `kClientRecv`/`kClientSend` work never runs on two workers at once (assert one live instance);
+  * kill the worker hosting a poller mid-flight → the poller migrates and networking recovers, which
+    is the §2.3 outage becoming survivable and is the headline result for this phase;
+  * throughput/latency A/B vs. the static net workers — dedicated-by-load must not be worse than
+    dedicated-by-role.
+* **P2c-specific** (periodic, D4b):
   * **the self-undo test** — migrate a periodic task, let one full period elapse, assert it did
     *not* route back onto the stalled worker's lane. This is the failure that looks like a working
     rescue for 500 ms and then silently stops.
