@@ -28,6 +28,12 @@ add_dependencies(test_vector_exec clio_ctp_host)
 target_link_libraries(test_vector_exec
         clio_ctp_host)
 
+add_executable(test_string_exec
+        test_string.cc)
+add_dependencies(test_string_exec clio_ctp_host)
+target_link_libraries(test_string_exec
+        clio_ctp_host Catch2::Catch2WithMain)
+
 add_executable(test_ring_buffer_exec
         test_ring_buffer.cc)
 add_dependencies(test_ring_buffer_exec clio_ctp_host)
@@ -90,6 +96,9 @@ add_test(NAME ctp_vector_edge COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_vector_exec)
 add_test(NAME ctp_vector_stress COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_vector_exec)
+
+add_test(NAME ctp_ipc_string COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_string_exec)
 
 add_test(NAME ctp_ring_buffer COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_exec)
@@ -156,6 +165,7 @@ install(TARGETS
         test_rb_tree_pre_exec
         test_rb_tree_pre_ext_exec
         test_vector_exec
+        test_string_exec
         test_ring_buffer_exec
         test_ring_buffer_spsc_exec
         test_ring_buffer_ext_exec
