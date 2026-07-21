@@ -102,6 +102,27 @@ avg + **p99 latency segmented by task class**. Quick-task p99 under expensive-ta
 pressure is the starvation metric. Old (fixed pool, lane-0 funnel) vs new (elastic +
 steal + stall-rescue).
 
+## Measured results (first implementation)
+
+`clio_run_thrpt_bench --test-case sched_variety --threads 12 --duration 12`, runtime
+`num_threads: 8` (→ 4 I/O workers), mixed 1µs..1s workload (90% quick / 9% medium /
+1% heavy), Release. `CLIO_SCHED_FUNNEL=1` forces the legacy funnel for A/B:
+
+| metric | funnel (old) | measured-load (new) |
+|---|---|---|
+| **quick-task p99** | **519 ms** | **62 ms** (8.4× better) |
+| quick-task avg | 29 ms | 19 ms |
+| throughput | 375 ops/s | 560 ops/s (+50%) |
+
+Measured-load routing (Layer 1) alone cuts quick-task p99 by **8.4×** by steering quick
+tasks onto the least-loaded I/O worker and off any worker running a heavy/non-yielding
+task. The residual 62 ms comes from two not-yet-wired pieces: (a) `RealtimeLoad` counts
+only the *executing* task (`load_` bumps at exec-start), not tasks *queued* behind a
+heavy one on the same lane — a prediction-free fix is to add a per-worker
+assigned-but-not-done counter (or lane depth) to the load signal; (b) the backlog-steal
+(LoadBalance stall→spawn/steal) that rescues tasks already queued on a stalled worker,
+which needs the steal-safe MPSC pop. Both are the next PRs.
+
 ## Open questions
 - Steal-safe pop on a single-consumer MPSC lane (or a dedicated steal channel).
 - `WAIT_FOR_SPACE` blocking `Push` must not block a worker during steal/migration.
