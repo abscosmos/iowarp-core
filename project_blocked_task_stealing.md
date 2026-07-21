@@ -115,8 +115,9 @@ Recorded because they shape everything below:
 * **D-c — Migrated tasks get their event-queue pointer updated.** Signal redirection is done by
   rewriting the address in the task, not by making the address unnecessary.
 * **D-d — The event queue gets a consumer mutex**, so a foreign thread can drain it.
-* **D-e — Net-worker roles are deleted in favour of a `TASK_DEDICATED` flag.** Exclusivity is
-  declared by the task, not inferred from an inflated cost that the learner would erase. See D8/D8a.
+* **D-e — Net-worker roles are deleted in favour of `TaskGroup` affinity.** Tasks sharing a ZMQ
+  socket share a group; the group binds to one worker, and that worker is dedicated to the group.
+  Reuses the existing group machinery rather than adding a task flag. See D8.
 
 This is a deliberately smaller design than a lock-free late-binding scheduler, and the
 single-migrator constraint is what makes it tractable: **there is exactly one writer**, so no
@@ -355,117 +356,137 @@ Note this also dissolves what was open decision §8.2 — `DefaultScheduler::Pic
 (`default_sched.cc:302-319`) deliberately falls back to the net workers, which made "protect them by
 prevention" unworkable. With no net worker to protect, the hole closes by construction.
 
-### D8 — Delete the net-worker roles; make them expensive dedicated-worker tasks
+### D8 — Delete the net-worker roles; express socket ownership as a TaskGroup
 
-**Decision:** remove `net_send_worker_` / `net_recv_worker_` as scheduler roles. The net pollers
-become ordinary periodic tasks, placed by load-based routing, declared costly enough that
-`RuntimeMapTask` + `LoadBalance` give each its own worker and spawn one when needed.
+**Decision:** remove `net_send_worker_` / `net_recv_worker_` as scheduler roles. The pollers declare
+a **TaskGroup**; the existing group-affinity machinery pins the group to one worker, and that worker
+is dedicated to the group.
 
-The hook already exists and is already used for exactly this purpose. `Runtime::GetTaskStats`
-(`admin_runtime.cc:1870-1886`) already reports these four methods with `io_size_ = 1 MiB` and
-`compute_ = ` the net-queue backlog, commented *"io_size_ here is just a stand-in so the scheduler
-doesn't route them as zero-cost metadata."* And #781 already **reserves** predicted cost on the
-target worker (`ReserveLoad` / `queued_load_us_`), so a task declared expensive repels other work
-from its worker automatically. Exclusivity becomes an emergent property of the load model rather
-than a hardcoded table. Three things have to be true or it breaks:
+This mechanism already exists and is already half-wired for exactly this purpose:
 
-**(a) The learned model will erase an inflated constant.** `Container::InferCpuTime =
-coef * (compute + 1)`, with `coef` driven by SGD from *measured* CPU time in `ReinforceCpuModel`
-(`EndTask`, `worker.cc:778`). A poller that returns `EAGAIN` on most ticks measures near-zero CPU,
-so `coef` converges toward zero and the inflated cost stops repelling anything — quietly, over
-minutes, after appearing to work. Setting `compute_` high is self-defeating against a subsystem
-built to learn true costs.
+* `TaskGroup { int64_t id_ }` on every task (`task.h:205`), documented as *"Tasks in the same group
+  are pinned to the same worker once routed."*
+* `Container::task_group_map_ : unordered_map<int64_t, Worker*>` + `task_group_lock_`
+  (`container.h:107-109`).
+* `RuntimeMapTask` checks it **first** and returns the bound worker early (`default_sched.cc:152-165`,
+  `local_sched.cc:117-122`), then inserts the binding after routing (`default_sched.cc:284-291`).
+* `SendTask` and `RecvTask` **already set** `task_group_ = TaskGroup(0)` — *"Network tasks in
+  affinity group 0"* (`admin_tasks.h:660,729`).
 
-**Decided:** declare exclusivity directly with a `TASK_DEDICATED` flag rather than encoding it as a
-fake cost. It survives the learner, it is self-documenting, and it is what we actually mean — the
-requirement is *exclusivity*, not expense. Cost inflation stays as a secondary placement hint but
-stops being load-bearing. Semantics in D8a.
+So most of what the previous `TASK_DEDICATED` draft proposed is already in the tree. Groups give us
+sticky binding and socket co-location for free, which were the two hard parts. What is missing is
+exclusivity, rebinding, and pointer hygiene.
 
-**(b) Socket-ownership groups must survive the roles.** The routing comment is explicit:
-*"The split is by SOCKET OWNERSHIP, not by verb — ZeroMQ sockets are not safe to share across
-threads, so each socket has exactly one owner thread"* (`default_sched.cc:169-171`). The roles
-encode three groups:
+#### D8-1 — The group map already silently defeats the role table *(bug, present on dev)*
 
+Worth fixing regardless of this issue. `RuntimeMapTask` consults the group map **before** the
+periodic role table, and the insert is first-writer-wins (`if (it == end || it->second == nullptr)`).
+`SendTask` and `RecvTask` are both in group 0. Therefore:
+
+> Whichever of `kSend` / `kRecv` is routed first binds group 0 to *its* role worker. The other one
+> then hits the group early-return and follows it there — **bypassing its own role assignment**.
+
+The documented send/recv split — *"keeping [outbound sends] off the recv worker means inbound SWIM
+probe responses can still be polled"* (`default_sched.cc:176-181`) — is therefore already not
+happening. That makes deleting the role table much less risky than it looks: we are removing a
+mechanism that the group map has already overridden. It also means any "regression" measured against
+today's behaviour is a comparison against an accident, not against the design.
+
+#### D8-2 — Which groups (decision needed)
+
+Your instruction was one group for all networking tasks. One consideration before locking it in:
+
+| | Groups | Workers | Effect |
+|---|---|---|---|
+| **A** (as instructed) | `{kSend, kRecv, kClientRecv, kClientSend}` | 1 | Simplest. But one wedge takes down peer *and* client traffic — the §2.3 outage, just concentrated. Also strictly less isolation than today, where client polling sits on a different worker from group 0. |
+| **B** (recommended) | `{kSend}`, `{kRecv}`, `{kClientRecv, kClientSend}` | 3 | Groups follow **socket ownership**, which is the actual constraint (`default_sched.cc:169-171`). Restores the send/recv split that D8-1 shows is currently broken. A wedged peer poller leaves client IPC alive. |
+
+B costs one more thread than today and is the same shape as the role table it replaces — except
+expressed in a general mechanism instead of a hardcoded method-id switch. Under core pressure both
+degrade the same way (D8-5). Recommend B; A is defensible if thread count on 2-core CI is the
+binding constraint.
+
+Either way `kClientRecv` / `kClientSend` must **join a group** — they set none today, so they are
+pinned only by the role table we are deleting. Losing that without replacement is how they end up on
+two workers concurrently driving one ROUTER socket.
+
+#### D8-3 — Exclusivity: the group binding needs a dedicated worker
+
+Groups pin tasks *to* a worker; they do not keep other work *off* it. Add exclusivity to the binding
+rather than to the task:
+
+```cpp
+struct GroupBinding { Worker *worker_; bool exclusive_; };
+std::unordered_map<int64_t, GroupBinding> task_group_map_;
 ```
-{kSend}                    peer DEALER pool
-{kRecv}                    peer ROUTER (9413)
-{kClientRecv, kClientSend} SHARE the client-facing ROUTER  <-- must not run concurrently
-```
 
-Delete the roles without replacing this and methods 20/21 can be placed on two different workers,
-concurrently driving the same ZMQ socket. Options: a co-location/affinity group in the mapper, or
-**merge `kClientRecv` + `kClientSend` into a single periodic task** — one socket, one task, one
-thread by construction, no new scheduler concept. Recommend the merge; add a general affinity-group
-mechanism only when a second resource needs it.
+`RuntimeMapTask` skips exclusive-bound workers in its least-loaded scan; `LoadBalance` spawns a
+worker when an exclusive group has none of its own. Decide `exclusive_` **once, at first binding**,
+from the group's declared `TaskStat` — which is precisely what `TaskStat`'s own doc comment says it
+is for: *"when a task belongs to a TaskGroup, these stats describe the characteristics of the entire
+group"* (`task.h:228-231`), and `Runtime::GetTaskStats` already reports the net methods with
+`io_size_ = 1 MiB` and an inflated `compute_` (`admin_runtime.cc:1870-1886`).
 
-**(c) "Exactly one live instance" becomes a load-bearing invariant.** ØMQ permits moving a socket
-between threads given a full barrier and no concurrent use. A periodic task supplies both: it exists
-in exactly one periodic queue, and `ProcessPeriodicQueue` re-routes it *between* executions, so
-period N finishes on worker A before period N+1 starts on worker B, with the lane push/pop providing
-the barrier. **So dynamic reassignment is safe iff a method never has two live instances.** That is
-currently true but unasserted, and at least two pieces of code silently depend on it — both of which
-were safe only because of the pinning being deleted:
+Note this also **retires my earlier objection to cost-driven exclusivity**. That objection was to
+*continuous* repulsion via `RealtimeLoad`, which the SGD-fit `coef` in `InferCpuTime` erases within
+minutes as an `EAGAIN`-returning poller measures ~0 CPU. A **one-time bind-time** decision reading
+the declared `TaskStat` is immune — the learner never gets a vote. So "set the compute high enough
+and let it get its own worker" works, exactly as you framed it, provided the decision is made once
+at bind time and recorded in the binding.
+
+#### D8-4 — The binding must become mutable (this is the trap)
+
+`task_group_map_` is **insert-if-absent and never updated**. Nothing anywhere rebinds a group. That
+collides head-on with migration, and in the worst way:
+
+> The group early-return is the **first** thing `RuntimeMapTask` does. Migrate a group's periodic
+> tasks off a stalled worker and, on the very next period, `RouteTask` → `RuntimeMapTask` reads the
+> stale binding and sends them **straight back to the stalled worker** — before any load, role or
+> health check runs.
+
+Same self-undoing failure as D4b, but harder to spot because the early return precedes everything.
+`LoadBalance` must therefore own the binding: rebind on stall, rebind on retire, and take
+`task_group_lock_` in write mode to do it. This is now a first-class part of the migration design,
+not a detail.
+
+**Also: `Worker*` in that map is raw.** With an elastic pool that retires workers (P1), a retired
+worker leaves a dangling pointer in every container's group map. `RetireWorker` must sweep the group
+maps of all containers, or bindings must hold a worker id rather than a pointer. Worker id is safer
+and is the recommendation.
+
+#### D8-5 — Degradation and limits
+
+* **Core pressure.** N exclusive groups means N threads. Let `LoadBalance` collapse exclusive groups
+  onto a shared worker when workers exceed cores. Safe by inspection: it is today's behaviour, where
+  `net_recv_worker_` hosts several pollers — provided a *group* is never split across workers, which
+  is exactly the invariant the group map already enforces.
+* **Group ids are container-scoped.** The map lives on the `Container`, so ids only need to be unique
+  within a pool. Give them named constants rather than the bare `TaskGroup(0)` in use today.
+* **Honest limitation — this contains a stall, it does not cure one.** If a task wedges *inside its
+  own handler* (say `Recv` blocking on a socket), it cannot be migrated: migration moves only
+  *parked* tasks, and starting a second instance is forbidden by D8-6. What is gained is that no
+  other work queues behind it, and other groups survive. Curing a wedged poller needs handler-level
+  timeout with provably sane socket state — out of scope. Nobody should read "LoadBalance gives it a
+  worker" as "networking always recovers".
+
+#### D8-6 — "Exactly one live instance" becomes load-bearing
+
+ØMQ permits moving a socket between threads given a full barrier and no concurrent use. Groups give
+us the "no concurrent use" half — one group, one worker — and rebinding happens between periods, so
+period N finishes before period N+1 starts elsewhere. **But this now rests on an invariant that is
+currently true and unasserted**, and two pieces of code depend on it silently, both justified by the
+pinning we are deleting:
 
 * `Runtime::Recv`: *"No socket lock needed - single net worker processes all Recv tasks."*
 * `Runtime::ClientSend` (`admin_runtime.cc:652`) keeps a function-local
   `static std::vector<shared_ptr<Task>> deferred_deletes`, mutated with no lock. Two concurrent
-  instances would be a data race on a `shared_ptr` vector — i.e. a double-free, the #680 shape.
+  instances would be a data race on a `shared_ptr` vector — a double-free, the #680 shape.
 
-Assert the invariant (one live instance per net periodic method) rather than assuming it, and audit
-these two sites as part of the change.
+Assert one live instance per net periodic method, and audit both sites as part of the change.
 
 **What this buys.** Deletes the hardcoded method-id routing from *both* schedulers; removes the
-non-migratable role class; and converts the §2.3 failure — a stalled net worker taking the node's
-networking down with no rescue possible — into an ordinary migratable stall. That is the real win:
-not that the poller moves, but that when its worker wedges, it *can* move.
-
-### D8a — `TASK_DEDICATED` semantics
-
-```c
-#define TASK_DEDICATED BIT_OPT(clio::run::u32, 10)   // next free bit; 1/4/5/6 are retired
-```
-
-Set alongside `TASK_PERIODIC` where the pollers are spawned (`admin_client.h:128` and friends), and
-**cleared on remote receive** next to the existing `ClearFlags(TASK_PERIODIC)`
-(`ipc_run2run.cc:424`) — it is a local scheduling property, not a wire property.
-
-**1. Sticky binding, not per-period re-selection.** The scheduler holds a `{dedicated task → worker}`
-binding and `RuntimeMapTask` returns the bound worker every period. This is deliberate:
-`ProcessPeriodicQueue` re-routes on *every* tick, so without stickiness a poller would hand its ZMQ
-socket to a different thread several times a second — legal under §7.5, but constant churn and
-constant opportunity to get the barrier wrong. With stickiness the socket moves only at a rebinding
-point chosen by `LoadBalance`. This is precisely "pin to any worker, then adjust dynamically": the
-*binding* is dynamic, the per-period placement is not.
-
-**2. Repulsion by exclusion, not by load.** A worker hosting a dedicated task is skipped in
-`RuntimeMapTask`'s least-loaded scan over `io_workers_`. Exclusion rather than inflated
-`RealtimeLoad` because it is O(1) and cannot be learned away (§D8a). If every worker is dedicated,
-spawn a new one — the elastic pool is unbounded by #781's decision — rather than overflowing onto a
-dedicated worker.
-
-**3. Provisioning is a `LoadBalance` responsibility.** Each tick: every `TASK_DEDICATED` task has a
-live, unstalled worker; spawn if short; rebind if its worker stalled *and the task itself is parked*;
-retire the worker when the task goes away.
-
-**Degradation under core pressure.** One worker per dedicated task means three threads for
-{peer-send, peer-recv, client-combined}, where today there are two role workers — worse on a 2-core
-CI runner (§7.7). Let `LoadBalance` collapse several dedicated tasks onto one shared worker when
-workers exceed cores. That is safe by inspection because it *is* today's behaviour —
-`net_recv_worker_` already hosts three pollers — provided the D8b socket groups stay intact.
-
-**Honest limitation: this contains a stall, it does not cure one.** If a dedicated task wedges
-*inside its own handler* (say `Recv` blocking on a socket) it cannot be migrated: migration moves
-only *parked* tasks, and starting a second instance is forbidden by the one-live-instance invariant
-(D8c). What is actually gained:
-
-* no other work ever queues behind it (repulsion);
-* the *other* pollers survive — today a wedged `kRecv` also takes down `kClientRecv` and
-  `kClientSend`, because all three share `net_recv_worker_`;
-* a poller merely *parked* on a worker wedged by something else does migrate.
-
-Curing a wedged poller needs handler-level timeout/abandon with provably sane socket state, which is
-out of scope for this issue. Worth being explicit so nobody reads "LoadBalance spawns it a worker"
-as "networking always recovers".
+non-migratable role class from D7; fixes D8-1; and converts the §2.3 failure — a stalled net worker
+taking the node's networking down with no rescue possible — into an ordinary migratable stall.
 
 ---
 
@@ -505,12 +526,14 @@ Behaviour-preserving by design — nothing should resume differently — so any 
 stress suites here is a real regression and is easy to attribute. Lands the lost-wakeup safety net
 and fixes `WorkerStats::num_blocked_tasks_` on its own.
 
-**P2b — dissolve the net-worker roles (D8).** `TASK_DEDICATED_WORKER` (or the reinforcement-exempt
-declared cost); merge `kClientRecv`+`kClientSend`; delete the method-id routing tables from
-`default_sched.cc` and `local_sched.cc`, and `net_send_worker_`/`net_recv_worker_` with them; assert
-one-live-instance per net periodic; drop the net fallbacks from `PickAltWorker`. Standalone and
-independently valuable — it is a simplification of #781's routing that happens to unblock the
-rescue. Land it before P2c so periodic migration never has to special-case a role.
+**P2b — dissolve the net-worker roles into TaskGroups (D8).** Give `kClientRecv`/`kClientSend` a
+group (they have none today); add `exclusive_` to the group binding and key it off the declared
+`TaskStat` at bind time; make the binding **mutable** and hold a worker *id* not a pointer (D8-4);
+delete the method-id routing tables from `default_sched.cc` and `local_sched.cc` along with
+`net_send_worker_`/`net_recv_worker_`; drop the net fallbacks from `PickAltWorker`; assert
+one-live-instance per net periodic. Standalone and independently valuable — it fixes the live D8-1
+bug and simplifies #781's routing, and it happens to unblock the rescue. Land it before P2c so
+periodic migration never has to special-case a role or fight a stale binding.
 
 **P2c — periodic queue migration (D4b).** Migrate `periodic_queues_[]` under `park_mtx_`; reset
 `BlockStart()`; D7 gating for whatever remains non-migratable (GPU, worker 0). Needs no event-queue
@@ -662,8 +685,8 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
 ## 8. Open decisions
 
 *Closed:* suspended-task tracking → D4 (park in the blocked queue). Event-queue overflow → §7.2
-(keep blocking `Emplace`, re-drain quarantined queues). How exclusivity is expressed → D8a
-(`TASK_DEDICATED` flag, bit 10).
+(keep blocking `Emplace`, re-drain quarantined queues). How exclusivity is expressed → D8-3
+(a property of the group binding, decided once at bind time from the declared `TaskStat`).
 
 1. **Awaited-future handle (D4).** Keep `awaited_fshm_` as a raw `const void*` (`task.h:885`) and
    document the "safe while suspended" invariant, or promote it to an owning `Future`? The raw
@@ -671,8 +694,10 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
    an invariant the readiness scan now depends on, where before it only did a pointer comparison.
    Recommendation: promote it; it is a small change and removes a lifetime argument from the
    critical path.
-2. **Client socket group (D8b).** Merge `kClientRecv`+`kClientSend` into one periodic task, or add a
-   co-location group to the mapper? Recommendation: merge — no new scheduler concept.
+2. **How many networking groups (D8-2).** One group for all four pollers as instructed, or three
+   groups following socket ownership? Recommendation: three — a wedged peer poller then leaves client
+   IPC alive, and it restores the send/recv split that D8-1 shows is currently broken anyway. One
+   group is defensible if thread count on 2-core CI is the binding constraint.
 3. **Readiness-scan backoff.** Reuse the existing `% 2/4/8/16` buckets keyed on yield count, or
    re-key them on *time* parked? Yield count no longer means much for a task that suspends once and
    waits a long time.
@@ -707,16 +732,19 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
   * `num_blocked_tasks_` now tracks the real suspended count;
   * leak-detection suite against the new owning reference (D4, ownership note).
 * **P2b-specific** (D8, net roles):
-  * **the learner test** — run a net poller for long enough that SGD converges, then assert it still
-    holds a worker to itself. This is the failure mode that passes on day one and regresses quietly.
-    With `TASK_DEDICATED` this should be structurally impossible; the test is there to prove nobody
-    reintroduced cost-based exclusivity.
-  * a `TASK_DEDICATED` task keeps the **same** worker across many periods (sticky binding, D8a-1) —
-    its socket must not hop threads every tick;
-  * no non-dedicated task is ever routed onto a dedicated worker (D8a-2);
-  * with all workers dedicated, a new ordinary task causes a spawn rather than landing on one;
-  * degraded mode: with workers > cores, dedicated tasks collapse onto shared workers **without**
-    splitting a socket group;
+  * **the stale-binding test** — stall a group's worker, let `LoadBalance` rebind, then run a full
+    period and assert the group did **not** return to the stalled worker (D8-4). This is the trap:
+    the group early-return precedes every health check in `RuntimeMapTask`.
+  * **the learner test** — run a poller long enough for SGD to converge and assert its group still
+    holds a worker to itself. Bind-time exclusivity (D8-3) should make this structurally impossible;
+    the test exists to prove nobody reintroduced continuous cost-based repulsion.
+  * a group keeps the **same** worker across many periods — its socket must not hop threads per tick;
+  * every member of a group lands on the same worker, `kClientRecv`/`kClientSend` especially;
+  * no non-group task is ever routed onto an exclusive worker; if all workers are exclusive, an
+    ordinary task causes a spawn rather than landing on one;
+  * `RetireWorker` leaves no dangling binding in any container's `task_group_map_` (D8-4);
+  * degraded mode: with workers > cores, exclusive groups collapse onto shared workers **without**
+    splitting a group across workers;
   * `kClientRecv`/`kClientSend` work never runs on two workers at once (assert one live instance);
   * kill the worker hosting a poller mid-flight → the poller migrates and networking recovers, which
     is the §2.3 outage becoming survivable and is the headline result for this phase;
