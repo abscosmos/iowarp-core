@@ -117,7 +117,8 @@ Recorded because they shape everything below:
 * **D-d — The event queue gets a consumer mutex**, so a foreign thread can drain it.
 * **D-e — Net-worker roles are deleted in favour of `TaskGroup` affinity.** Tasks sharing a ZMQ
   socket share a group; the group binds to one worker, and that worker is dedicated to the group.
-  Reuses the existing group machinery rather than adding a task flag. See D8.
+  Three groups — peer-send, peer-recv, client — following socket ownership. Reuses the existing group
+  machinery rather than adding a task flag. See D8.
 
 This is a deliberately smaller design than a lock-free late-binding scheduler, and the
 single-migrator constraint is what makes it tractable: **there is exactly one writer**, so no
@@ -392,23 +393,35 @@ happening. That makes deleting the role table much less risky than it looks: we 
 mechanism that the group map has already overridden. It also means any "regression" measured against
 today's behaviour is a comparison against an accident, not against the design.
 
-#### D8-2 — Which groups (decision needed)
+#### D8-2 — Three groups, following socket ownership *(decided)*
 
-Your instruction was one group for all networking tasks. One consideration before locking it in:
+```c
+// admin: group ids are Container-scoped, so these only need to be unique
+// within the admin pool. Named constants, not the bare TaskGroup(0) in use today.
+kGroupNetPeerSend = 0   // kSend        — peer DEALER pool
+kGroupNetPeerRecv = 1   // kRecv        — peer ROUTER (9413)
+kGroupNetClient   = 2   // kClientRecv + kClientSend — client-facing ROUTER
+```
 
-| | Groups | Workers | Effect |
-|---|---|---|---|
-| **A** (as instructed) | `{kSend, kRecv, kClientRecv, kClientSend}` | 1 | Simplest. But one wedge takes down peer *and* client traffic — the §2.3 outage, just concentrated. Also strictly less isolation than today, where client polling sits on a different worker from group 0. |
-| **B** (recommended) | `{kSend}`, `{kRecv}`, `{kClientRecv, kClientSend}` | 3 | Groups follow **socket ownership**, which is the actual constraint (`default_sched.cc:169-171`). Restores the send/recv split that D8-1 shows is currently broken. A wedged peer poller leaves client IPC alive. |
+Groups follow **socket ownership**, which is the actual constraint
+(`default_sched.cc:169-171`). Three groups, not four: `kClientRecv` and `kClientSend` share the
+client-facing ROUTER, so they must stay in one group — that is a correctness requirement, not a
+packing preference.
 
-B costs one more thread than today and is the same shape as the role table it replaces — except
-expressed in a general mechanism instead of a hardcoded method-id switch. Under core pressure both
-degrade the same way (D8-5). Recommend B; A is defensible if thread count on 2-core CI is the
-binding constraint.
+Consequences:
 
-Either way `kClientRecv` / `kClientSend` must **join a group** — they set none today, so they are
-pinned only by the role table we are deleting. Losing that without replacement is how they end up on
-two workers concurrently driving one ROUTER socket.
+* A wedged peer poller leaves client IPC alive, and vice versa. Under a single shared group, one
+  wedge would have been the §2.3 whole-node outage in concentrated form.
+* Restores the send/recv split that D8-1 shows is currently broken — outbound DEALER sends can
+  back-pressure on ZMQ HWM without starving inbound SWIM probe polling.
+* Costs one thread more than today (3 vs 2), same shape as the role table it replaces. Degrades
+  under core pressure via D8-5.
+
+**`ClientConnect` stays ungrouped.** It is spawned as a periodic alongside the four pollers
+(`admin_runtime.cc:156`) but it is a request *handler*, not a socket poller — it fills response
+fields (`GetServerGeneration`, allocator ids, worker tids) and touches no transport. It routes
+normally and needs no affinity. Verified rather than assumed, because a fifth periodic quietly
+sharing a socket would be a latent race under any grouping.
 
 #### D8-3 — Exclusivity: the group binding needs a dedicated worker
 
@@ -674,7 +687,26 @@ for GPU workers because they must never sleep. Determine whether `SetGpuLanes` c
 a replacement thread, or whether device-context affinity makes GPU workers non-migratable like net
 workers. Only needed if we intend to rescue them at all.
 
-### 7.7 CI noise
+### 7.7 Published worker tids go stale under an elastic pool *(gates P1)*
+
+`Runtime::ClientConnect` publishes the runtime's worker OS thread ids to every connecting client
+(`admin_runtime.cc`, #642) so SHM clients can address each worker's `clio-<server_pid>-<worker_tid>`
+mailbox directly. That list is a **snapshot taken at connect time**, and P1 makes the worker set
+mutable for the first time:
+
+* A client that connected before a spawn never learns the new worker's tid — benign, it just never
+  uses it.
+* A client holding a **retired** worker's tid addresses a dead mailbox, and tasks sent there are
+  never consumed. Not benign.
+* `ClientConnectTask::kMaxWorkerTids` is a fixed cap; an unbounded elastic pool can exceed it.
+
+So `RetireWorker` cannot simply join and drop a worker whose tid has been published. Options: never
+retire a published worker (simplest — retirement is an optimisation, not a correctness requirement);
+bump `GetServerGeneration()` and make clients re-fetch; or have the replacement keep draining the
+retired worker's mailbox. Recommendation: **do not retire published workers** in this issue. Note
+this constrains P1 independently of any migration work.
+
+### 7.8 CI noise
 
 `force_net` / stress tests were already flaky on `dev` at the #782 merge (different test each run,
 clear on retry). Do not read one red run as a regression; re-run and compare against a same-day
@@ -686,7 +718,8 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
 
 *Closed:* suspended-task tracking → D4 (park in the blocked queue). Event-queue overflow → §7.2
 (keep blocking `Emplace`, re-drain quarantined queues). How exclusivity is expressed → D8-3
-(a property of the group binding, decided once at bind time from the declared `TaskStat`).
+(a property of the group binding, decided once at bind time from the declared `TaskStat`). How many
+networking groups → D8-2 (three, by socket ownership).
 
 1. **Awaited-future handle (D4).** Keep `awaited_fshm_` as a raw `const void*` (`task.h:885`) and
    document the "safe while suspended" invariant, or promote it to an owning `Future`? The raw
@@ -694,20 +727,16 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
    an invariant the readiness scan now depends on, where before it only did a pointer comparison.
    Recommendation: promote it; it is a small change and removes a lifetime argument from the
    critical path.
-2. **How many networking groups (D8-2).** One group for all four pollers as instructed, or three
-   groups following socket ownership? Recommendation: three — a wedged peer poller then leaves client
-   IPC alive, and it restores the send/recv split that D8-1 shows is currently broken anyway. One
-   group is defensible if thread count on 2-core CI is the binding constraint.
-3. **Readiness-scan backoff.** Reuse the existing `% 2/4/8/16` buckets keyed on yield count, or
+2. **Readiness-scan backoff.** Reuse the existing `% 2/4/8/16` buckets keyed on yield count, or
    re-key them on *time* parked? Yield count no longer means much for a task that suspends once and
    waits a long time.
-4. **Wedged-worker fate.** When the bad task finally returns, does the worker rejoin the pool or
+3. **Wedged-worker fate.** When the bad task finally returns, does the worker rejoin the pool or
    retire? Rejoining risks re-wedging on the same task class; retiring leaks a thread per bad task
    until exit. Recommendation: rejoin with exponential-backoff quarantine.
-5. **All-workers-stalled.** `LoadBalance` already detects it (`default_sched.cc:383`). With an
+4. **All-workers-stalled.** `LoadBalance` already detects it (`default_sched.cc:383`). With an
    unbounded elastic pool the answer is "spawn as many replacements as needed" — confirm there is
    no cap, and that the loud warning stays.
-6. **Do the periodic buckets stay four-deep?** The `% 2/4/8/16` scheme is a hand-rolled timer wheel.
+5. **Do the periodic buckets stay four-deep?** The `% 2/4/8/16` scheme is a hand-rolled timer wheel.
    Optional cleanup, unrelated to correctness.
 
 ---
@@ -739,7 +768,10 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
     holds a worker to itself. Bind-time exclusivity (D8-3) should make this structurally impossible;
     the test exists to prove nobody reintroduced continuous cost-based repulsion.
   * a group keeps the **same** worker across many periods — its socket must not hop threads per tick;
-  * every member of a group lands on the same worker, `kClientRecv`/`kClientSend` especially;
+  * every member of a group lands on the same worker — `kClientRecv`/`kClientSend` especially, since
+    they share the ROUTER socket;
+  * the three groups land on three **different** workers (D8-2), so a wedge in one leaves the others
+    polling;
   * no non-group task is ever routed onto an exclusive worker; if all workers are exclusive, an
     ordinary task causes a spawn rather than landing on one;
   * `RetireWorker` leaves no dangling binding in any container's `task_group_map_` (D8-4);
