@@ -758,6 +758,12 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   container->ReinforceWallModel(
       task_ptr->method_, task_ptr->PredictedWallUs(), actual_wall_us,
       task_ptr->PredictedStat());
+  // issue #781: fold the measured cost into the scheduler's perf-bin PDF so the
+  // monitor thread can report the live workload distribution (telemetry).
+  if (scheduler_ != nullptr) {
+    scheduler_->RecordCompletion(task_ptr->method_, actual_cpu_us,
+                                 actual_wall_us);
+  }
 
   // Break the RunContext self-cycle for a task that is about to be released.
   // ProcessNewTask binds RunFuture (run_ctx_->future_) with a copied task_ptr_

@@ -317,8 +317,23 @@ void DefaultScheduler::LoadBalance() {
   // even while a worker is wedged. The backlog-rescue (spawn a replacement +
   // steal the stalled lane) needs a steal-safe MPSC pop and lands in a
   // follow-up — see project_scheduler_antideadlock.md.
-  load_balance_ticks_.fetch_add(1, std::memory_order_relaxed);
+  u64 tick = load_balance_ticks_.fetch_add(1, std::memory_order_relaxed) + 1;
   double now_us = NowUs();
+
+  // Telemetry dump every ~5s: the perf-bin PDF is the runtime's OBSERVED live
+  // workload distribution (how many quick vs 1-second tasks it actually ran).
+  // It adapts continuously as RecordCompletion folds in each finished task.
+  if (tick % 10 == 0) {
+    HLOG(kWarning,
+         "[#781 PDF] observed exec-time bins (cumulative): "
+         "<10us={} <50us={} <500us={} <10ms={} <50ms={} <500ms={} <1s={} "
+         ">=1s={} | stalls_detected={}",
+         perf_pdf_[kLt10us].load(), perf_pdf_[kLt50us].load(),
+         perf_pdf_[kLt500us].load(), perf_pdf_[kLt10ms].load(),
+         perf_pdf_[kLt50ms].load(), perf_pdf_[kLt500ms].load(),
+         perf_pdf_[kLt1s].load(), perf_pdf_[kGe1s].load(),
+         stalls_detected_.load());
+  }
 
   auto check = [&](Worker *w) -> bool {
     if (w == nullptr || !w->IsExecuting()) return false;
@@ -351,6 +366,15 @@ void DefaultScheduler::LoadBalance() {
          compute_workers);
     // TODO(#781): work_orch_->SpawnAdditionalWorker() + steal a stalled lane.
   }
+}
+
+void DefaultScheduler::RecordCompletion(u32 method, double cpu_us,
+                                        double wall_us) {
+  // Telemetry only (issue #781): bin the measured wall time. This is the
+  // runtime OBSERVING what it actually ran — it is not used for routing.
+  (void)method;
+  (void)cpu_us;
+  perf_pdf_[BinFor(wall_us)].fetch_add(1, std::memory_order_relaxed);
 }
 
 // issue #781 — SCAFFOLD ONLY (not yet wired). Move up to kStealBatch tasks from

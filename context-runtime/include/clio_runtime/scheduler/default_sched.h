@@ -67,6 +67,7 @@ class DefaultScheduler : public Scheduler {
                      ContainerHold container) override;
   void LoadBalance() override;         // issue #781 — safety net, every 500ms
   bool StealWork(Worker *thief) override;  // issue #781 — work-conserving steal
+  void RecordCompletion(u32 method, double cpu_us, double wall_us) override;
   void AdjustPolling(const clio::run::shared_ptr<Task> &task) override;
   Worker *GetGpuWorker() const override { return gpu_worker_; }
   // Legacy alias — admin_runtime.cc:Create registers transport FDs with the

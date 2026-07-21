@@ -92,6 +92,20 @@ class Scheduler {
   virtual void LoadBalance() = 0;
 
   /**
+   * Telemetry hook (issue #781): called from Worker::EndTask with a completed
+   * task's ACTUAL measured cpu/wall time (us). Implementations fold it into the
+   * perf-bin PDF so the runtime can characterize its live workload (how many
+   * quick vs 1-second tasks it actually ran). Observation, not prediction —
+   * default no-op.
+   * @param method   the task's method id
+   * @param cpu_us   measured CPU time (us)
+   * @param wall_us  measured wall-clock time (us)
+   */
+  virtual void RecordCompletion(u32 method, double cpu_us, double wall_us) {
+    (void)method; (void)cpu_us; (void)wall_us;
+  }
+
+  /**
    * Work-stealing hook (issue #781). Invoked when \a thief has drained its own
    * lane. Implementations move a bounded number of tasks from neighbouring /
    * overloaded workers' lanes onto the thief's lane so the pool stays

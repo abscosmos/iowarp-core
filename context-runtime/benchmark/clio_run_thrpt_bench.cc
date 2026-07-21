@@ -493,7 +493,8 @@ static double Pctl(const std::vector<double> &v, double p) {
 static clio::run::u32 DrawSpinUs(std::mt19937 &rng) {
   std::uniform_real_distribution<double> u(0.0, 1.0);
   double r = u(rng), lo, hi;
-  if (r < 0.01) { lo = 10000; hi = 1000000; }        // heavy  10ms..1s
+  if (r < 0.01) { lo = 10000; hi = 2000000; }        // heavy  10ms..2s (some >1s
+                                                      // to exercise stall detect)
   else if (r < 0.10) { lo = 100; hi = 10000; }       // medium 100us..10ms
   else { lo = 1; hi = 100; }                          // quick  1us..100us
   double e = std::log(lo) + u(rng) * (std::log(hi) - std::log(lo));
