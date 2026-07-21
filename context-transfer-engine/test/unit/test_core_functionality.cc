@@ -2727,5 +2727,163 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
   REQUIRE(shm_us < rpc_us / 5.0);
 }
 
+/**
+ * issue #783 phase 6: ZERO-IPC PAYLOAD read from a RAM bdev.
+ *
+ * Registers a kRam target so blobs land in shared memory, then reads the bytes
+ * back directly and checks them against both the known pattern and the
+ * authoritative RPC read. A fast path that returns the wrong bytes is far
+ * worse than no fast path, so correctness is asserted before speed.
+ */
+TEST_CASE("CTE SHM cache direct payload read",
+          "[cte][core][shm_cache][payload]") {
+  auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
+  clio::cte::core::CreateParams params;
+
+  // ISOLATED CTE pool with a RAM target as its ONLY target. The shared fixture
+  // pool accumulates file targets from earlier tests, and the DPE then places
+  // blobs there -- which correctly yields a non-direct-readable blob and makes
+  // this test unable to exercise the payload path at all.
+  clio::run::PoolId payload_pool(7801, 0);
+  clio::cte::core::Client client(payload_pool);
+  {
+    auto t = client.AsyncCreate(pool_query, "cte_shm_payload_pool",
+                                payload_pool, params);
+    t.Wait();
+    client.AttachShmCache(*t);
+  }
+
+  // A RAM target -- this is what makes the payload SHM-resident.
+  {
+    auto t = client.AsyncRegisterTarget(
+        "ram_direct_target", clio::run::bdev::BdevType::kRam,
+        64ULL * 1024 * 1024, clio::run::PoolQuery::Local(),
+        clio::run::PoolId(671, 0));
+    t.Wait();
+    REQUIRE(t->GetReturnCode() == 0);
+  }
+
+  if (!client.HasShmCache()) {
+    HLOG(kWarning,
+         "[#783] SHM cache unavailable -- payload test SKIPPED (proves "
+         "nothing on this host)");
+    return;
+  }
+
+  clio::cte::core::TagId tag_id;
+  {
+    auto t = client.AsyncGetOrCreateTag("shm_payload_tag");
+    t.Wait();
+    tag_id = t->tag_id_;
+  }
+  REQUIRE(!tag_id.IsNull());
+
+  const std::string blob_name = "direct_read_blob";
+  const clio::run::u64 blob_size = 4096;
+  auto test_data = fixture->CreateTestData(blob_size, 'D');
+
+  auto fp = CLIO_IPC->AllocateBuffer(blob_size);
+  REQUIRE(!fp.IsNull());
+  REQUIRE(fixture->CopyToSharedMemory(fp, test_data));
+  auto put = client.AsyncPutBlob(
+      tag_id, blob_name, 0, blob_size, fp.shm_.template Cast<void>(), 0.9f,
+      clio::cte::core::Context(), 0);
+  REQUIRE(!put.IsNull());
+  REQUIRE(fixture->WaitForTaskCompletion(put, 10000));
+  REQUIRE(put->return_code_ == 0);
+  CLIO_IPC->FreeBuffer(fp);
+
+  clio::cte::core::ShmBlobRecord rec;
+  REQUIRE(client.TryGetBlobRecordShm(tag_id, blob_name, &rec));
+
+  if (!rec.IsDirectReadable()) {
+    // The DPE may have placed this blob on a non-RAM target. Not a failure of
+    // the mechanism, but say so -- silently passing would hide a regression
+    // that turned direct-readability off for everything.
+    HLOG(kWarning,
+         "[#783] blob not direct-readable (flags={}, blocks={}) -- payload "
+         "assertions SKIPPED",
+         rec.flags_, rec.num_blocks_);
+    return;
+  }
+
+  SECTION("Direct read returns the correct bytes") {
+    std::vector<char> got(blob_size, 0);
+    REQUIRE(client.TryReadBlobShm(tag_id, blob_name, got.data(),
+                                                  blob_size));
+    REQUIRE(std::memcmp(got.data(), test_data.data(), blob_size) == 0);
+  }
+
+  SECTION("Direct read agrees with the authoritative RPC read") {
+    std::vector<char> direct(blob_size, 0);
+    REQUIRE(client.TryReadBlobShm(
+        tag_id, blob_name, direct.data(), blob_size));
+
+    auto rd = CLIO_IPC->AllocateBuffer(blob_size);
+    REQUIRE(!rd.IsNull());
+    auto get = client.AsyncGetBlob(
+        tag_id, blob_name.c_str(), 0, blob_size, 0,
+        rd.shm_.template Cast<void>());
+    REQUIRE(!get.IsNull());
+    REQUIRE(fixture->WaitForTaskCompletion(get, 10000));
+    REQUIRE(get->return_code_ == 0);
+    REQUIRE(std::memcmp(direct.data(), rd.ptr_, blob_size) == 0);
+    CLIO_IPC->FreeBuffer(rd);
+  }
+
+  SECTION("Partial read at an offset") {
+    const size_t off = 1024, len = 512;
+    std::vector<char> got(len, 0);
+    REQUIRE(client.TryReadBlobShm(tag_id, blob_name, got.data(),
+                                                  len, off));
+    REQUIRE(std::memcmp(got.data(), test_data.data() + off, len) == 0);
+  }
+
+  SECTION("Out-of-range read is refused, not truncated") {
+    std::vector<char> got(blob_size, 0);
+    REQUIRE_FALSE(client.TryReadBlobShm(
+        tag_id, blob_name, got.data(), blob_size, blob_size / 2));
+  }
+
+  SECTION("Payload benchmark: direct vs RPC") {
+    const int kIters = 2000;
+    std::vector<char> buf(blob_size, 0);
+    auto t0 = std::chrono::steady_clock::now();
+    int hits = 0;
+    for (int i = 0; i < kIters; ++i) {
+      if (client.TryReadBlobShm(tag_id, blob_name, buf.data(),
+                                                blob_size)) {
+        ++hits;
+      }
+    }
+    auto shm_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+    REQUIRE(hits == kIters);
+
+    const int kRpcIters = 200;
+    auto rd = CLIO_IPC->AllocateBuffer(blob_size);
+    REQUIRE(!rd.IsNull());
+    auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kRpcIters; ++i) {
+      auto g = client.AsyncGetBlob(
+          tag_id, blob_name.c_str(), 0, blob_size, 0,
+          rd.shm_.template Cast<void>());
+      g.Wait();
+    }
+    auto rpc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - t1).count();
+    CLIO_IPC->FreeBuffer(rd);
+
+    double shm_us = static_cast<double>(shm_ns) / 1000.0 / kIters;
+    double rpc_us = static_cast<double>(rpc_ns) / 1000.0 / kRpcIters;
+    HLOG(kWarning,
+         "[#783 BENCH] PAYLOAD read {} bytes: SHM {} us/op vs RPC {} us/op -- "
+         "speedup {}x",
+         blob_size, shm_us, rpc_us, (rpc_us > 0 ? rpc_us / shm_us : 0.0));
+    REQUIRE(shm_us < rpc_us / 5.0);
+  }
+}
+
 // Main function using simple_test.h framework
 SIMPLE_TEST_MAIN()

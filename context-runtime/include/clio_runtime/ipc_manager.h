@@ -337,6 +337,17 @@ class IpcManager {
   /** Client-side: record the directory offset learned from ClientConnect. */
   void SetMetadataDirOffset(u64 off) { metadata_dir_off_ = off; }
 
+  /**
+   * PID of the runtime this process talks to (its own pid when this IS the
+   * runtime). Clients use it to reconstruct per-pool SHM segment names, e.g.
+   * a RAM bdev's data segment (issue #783), without those names having to be
+   * published anywhere.
+   */
+  int GetRuntimePid() const {
+    return runtime_pid_ != 0 ? runtime_pid_
+                             : static_cast<int>(ctp::SystemInfo::GetPid());
+  }
+
   /** Pid-based allocator ids of this runtime's SHM segments (pid.1 main,
    *  pid.2 queue, pid.3 metadata). Reported to clients via ClientConnect so
    *  they attach the right allocators instead of assuming (1,0)/(2,0). */

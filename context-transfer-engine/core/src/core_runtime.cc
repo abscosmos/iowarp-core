@@ -319,6 +319,13 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
     n = kMaxInlineBlocks;
   }
   out->num_blocks_ = static_cast<clio::run::u32>(n);
+
+  // A payload may only be read directly out of shared memory when EVERY block
+  // is node-local and RAM-backed. This starts true and is cleared by the first
+  // block that fails to qualify -- the default must be "refuse", so an
+  // unknown target can never be mistaken for a readable one.
+  bool all_direct = (n > 0) && ((out->flags_ & kShmBlobTruncated) == 0);
+
   for (size_t i = 0; i < n; ++i) {
     const BlobBlock &b = info.blocks_[i];
     ShmBlockDesc &d = out->blocks_[i];
@@ -329,13 +336,28 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
     d.size_ = b.size_;
     d.bdev_type_ = 0;
     d.node_id_ = 0;
+
+    TargetInfo *tinfo = registered_targets_.find(d.target_pool_);
+    if (tinfo == nullptr) {
+      // Unknown target: record nothing and refuse direct reads.
+      all_direct = false;
+      continue;
+    }
+    d.bdev_type_ = static_cast<clio::run::u32>(tinfo->bdev_type_);
+    const bool is_ram = (tinfo->bdev_type_ == clio::run::bdev::BdevType::kRam);
+    const bool is_local = tinfo->target_query_.IsLocalMode();
+    if (!is_ram || !is_local) {
+      // kPinned/kHbm are excluded deliberately: their pages come from GPU
+      // allocators and are not SHM-backed, so their offsets are meaningless
+      // to a client. Remote targets are excluded because the bytes are not on
+      // this node at all.
+      all_direct = false;
+    }
   }
 
-  // NOTE: kShmBlobDirectReadable is intentionally NOT set yet. Proving a block
-  // is node-local AND RAM-backed requires the target registry, and the RAM
-  // bdev is not SHM-backed until Phase 6. Until then the cache serves METADATA
-  // only and every payload read still goes through RPC -- which is the safe
-  // direction to be wrong in.
+  if (all_direct) {
+    out->flags_ |= kShmBlobDirectReadable;
+  }
   return true;
 }
 

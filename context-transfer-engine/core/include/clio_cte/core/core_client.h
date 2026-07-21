@@ -39,6 +39,9 @@
 #include <clio_cte/api.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/shm_metadata_cache.h>
+#include <clio_runtime/bdev/transports/mem_bdev_transport.h>
+#include <cstring>
+#include <unordered_map>
 
 namespace clio::cte::core {
 
@@ -150,6 +153,74 @@ class Client : public clio::run::ContainerClient {
       return false;  // name too long for the fast path
     }
     return shm_root_->blob_key_to_info_.TryGetBytes(key, n, out);
+  }
+
+  /**
+   * Zero-IPC PAYLOAD read (issue #783 phase 6).
+   *
+   * Copies blob bytes straight out of the RAM bdev's shared-memory segment,
+   * with no round-trip at all.
+   *
+   * COHERENCE (design §5.3): the metadata seqlock protects the record copy,
+   * but the hazard is the DataOrganizer relocating blocks WHILE we memcpy.
+   * So `placement_gen_` is validated before and AFTER the copy, and a change
+   * discards the bytes and reports failure. Without the post-check this
+   * function would silently return another blob's data.
+   *
+   * @return true only if `size` bytes were copied AND placement did not move.
+   *         Any false -- not cached, not direct-readable, segment missing,
+   *         placement changed -- means "fall back to RPC", never "no data".
+   */
+  bool TryReadBlobShm(const TagId &tag_id, const std::string &blob_name,
+                      char *out, size_t size, size_t offset = 0) {
+    if (shm_root_ == nullptr || out == nullptr || size == 0) {
+      return false;
+    }
+    ShmBlobRecord rec;
+    if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
+      return false;
+    }
+    if (!rec.IsDirectReadable()) {
+      return false;  // file/remote/GPU-tier blob, or truncated block list
+    }
+    if (offset + size > rec.total_size_) {
+      return false;
+    }
+    const clio::run::u64 gen_before = rec.placement_gen_;
+
+    size_t copied = 0;
+    clio::run::u64 want_from = offset;
+    for (clio::run::u32 i = 0; i < rec.num_blocks_ && copied < size; ++i) {
+      const ShmBlockDesc &b = rec.blocks_[i];
+      if (b.size_ <= want_from) {
+        want_from -= b.size_;  // this block is entirely before `offset`
+        continue;
+      }
+      char *base = MapRamBdev(b.target_pool_);
+      if (base == nullptr) {
+        return false;  // cannot reach this device -> RPC
+      }
+      clio::run::u64 intra = want_from;
+      size_t avail = static_cast<size_t>(b.size_ - intra);
+      size_t chunk = std::min(avail, size - copied);
+      std::memcpy(out + copied, base + b.target_offset_ + intra, chunk);
+      copied += chunk;
+      want_from = 0;
+    }
+    if (copied != size) {
+      return false;
+    }
+
+    // Re-validate placement. If the blob moved while we were copying, the
+    // bytes may be a mix of two blobs -- discard and let the caller use RPC.
+    ShmBlobRecord after;
+    if (!TryGetBlobRecordShm(tag_id, blob_name, &after)) {
+      return false;
+    }
+    if (after.placement_gen_ != gen_before) {
+      return false;
+    }
+    return true;
   }
 
   /** Zero-IPC tag-name lookup. */
@@ -968,6 +1039,61 @@ class Client : public clio::run::ContainerClient {
   // owns the segment and may drop the cache at any time, which is why every
   // read is validated rather than trusted.
   ShmMetadataCacheRoot *shm_root_ = nullptr;
+
+  /** One attached RAM-bdev segment, cached so a hot read does not re-attach. */
+  struct RamBdevMap {
+    ctp::ipc::PosixShmMmap backend;
+    char *base = nullptr;  /**< byte 0 of device space */
+  };
+  // Keyed by target pool. Attaching is not free, and the fast path is meant to
+  // be a few hundred nanoseconds, so a miss here would dominate the cost.
+  std::unordered_map<clio::run::u64, RamBdevMap> ram_bdevs_;
+
+  /**
+   * Resolve (attaching on first use) the base address of a RAM bdev's shared
+   * memory in THIS process, or nullptr when unavailable.
+   *
+   * The segment name is reconstructed from the runtime pid plus the target
+   * pool id, both of which the client already holds -- no name is published
+   * anywhere. A negative result is cached as a null base so a device that
+   * cannot be mapped is not retried on every single read.
+   */
+  char *MapRamBdev(const clio::run::PoolId &pool_id) {
+    clio::run::u64 key = pool_id.ToU64();
+    auto it = ram_bdevs_.find(key);
+    if (it != ram_bdevs_.end()) {
+      return it->second.base;
+    }
+    auto *ipc = CLIO_CPU_IPC;
+    RamBdevMap &slot = ram_bdevs_[key];  // caches the negative result too
+    if (ipc == nullptr) {
+      return nullptr;
+    }
+    clio::run::u32 server_pid = static_cast<clio::run::u32>(ipc->GetRuntimePid());
+    if (server_pid == 0) {
+      return nullptr;
+    }
+    std::string name =
+        clio::run::bdev::MemBdevTransport::ShmSegmentName(server_pid, pool_id);
+    if (!slot.backend.shm_attach(name)) {
+      return nullptr;
+    }
+    char *raw = reinterpret_cast<char *>(slot.backend.data_);
+    if (raw == nullptr) {
+      return nullptr;
+    }
+    auto *hdr =
+        reinterpret_cast<clio::run::bdev::MemBdevTransport::ShmRamHeader *>(raw);
+    // Refuse a segment we do not recognize or that is being torn down --
+    // Destroy() clears ready_ before unmapping precisely so this check works.
+    if (hdr->version_ !=
+            clio::run::bdev::MemBdevTransport::ShmRamHeader::kVersion ||
+        hdr->ready_ != 1) {
+      return nullptr;
+    }
+    slot.base = raw + hdr->data_off_;
+    return slot.base;
+  }
 #endif
 };
 
