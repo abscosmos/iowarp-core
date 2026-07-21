@@ -934,6 +934,28 @@ bool IpcManager::ServerInitShm() {
            "ServerInitShm: metadata segment '{}' unavailable ({} bytes) -- "
            "SHM metadata caching disabled, clients will use the RPC path",
            metadata_segment_name, metadata_segment_size);
+    } else {
+      // Publish the directory of well-known roots as the FIRST object in the
+      // segment. Clients learn its offset from ClientConnect, which is what
+      // makes discovery independent of who created a pool first.
+      try {
+        auto dir_fp =
+            metadata_allocator_->template Allocate<MetadataDirectory>(
+                sizeof(MetadataDirectory));
+        if (!dir_fp.IsNull()) {
+          auto *dir = dir_fp.ptr_;
+          std::memset(dir, 0, sizeof(MetadataDirectory));
+          dir->version_ = MetadataDirectory::kVersion;
+          metadata_dir_off_ = static_cast<u64>(
+              reinterpret_cast<char *>(dir) -
+              reinterpret_cast<char *>(metadata_allocator_));
+          HLOG(kInfo, "ServerInitShm: metadata directory at offset {}",
+               metadata_dir_off_);
+        }
+      } catch (const std::exception &e) {
+        HLOG(kWarning, "ServerInitShm: metadata directory alloc failed: {}",
+             e.what());
+      }
     }
 
     // Reserve segment indices 0-3 of this pid's allocator-id space: index 1 is
@@ -1316,6 +1338,10 @@ retry_attempt:
     // assuming (1,0)/(2,0).
     main_allocator_id_ = task->main_alloc_id_;
     queue_allocator_id_ = task->queue_alloc_id_;
+    // issue #783: learn where the metadata-segment directory lives so this
+    // client can find module cache roots without depending on having been the
+    // process that created the pool.
+    metadata_dir_off_ = task->metadata_dir_off_;
     if (task->server_pid_ > 0) {
       runtime_pid_ = static_cast<int>(task->server_pid_);
     }

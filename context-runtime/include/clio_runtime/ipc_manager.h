@@ -313,6 +313,30 @@ class IpcManager {
   /** True if the metadata segment is available for shared-memory caching. */
   bool HasMetadataSegment() const { return metadata_allocator_ != nullptr; }
 
+  /**
+   * Directory of well-known roots in the metadata segment (issue #783), or
+   * nullptr when unavailable. Resolved in THIS process from the offset the
+   * server published, so it is valid for clients too.
+   */
+  MetadataDirectory *GetMetadataDirectory() {
+    if (metadata_allocator_ == nullptr || metadata_dir_off_ == 0) {
+      return nullptr;
+    }
+    auto *dir = reinterpret_cast<MetadataDirectory *>(
+        reinterpret_cast<char *>(metadata_allocator_) + metadata_dir_off_);
+    if (dir->version_ != MetadataDirectory::kVersion) {
+      return nullptr;  // unknown layout -> decline rather than guess
+    }
+    return dir;
+  }
+
+  /** Offset of the metadata directory; 0 when unavailable. Sent to clients in
+   *  the ClientConnect handshake. */
+  u64 GetMetadataDirOffset() const { return metadata_dir_off_; }
+
+  /** Client-side: record the directory offset learned from ClientConnect. */
+  void SetMetadataDirOffset(u64 off) { metadata_dir_off_ = off; }
+
   /** Pid-based allocator ids of this runtime's SHM segments (pid.1 main,
    *  pid.2 queue, pid.3 metadata). Reported to clients via ClientConnect so
    *  they attach the right allocators instead of assuming (1,0)/(2,0). */
@@ -1394,6 +1418,10 @@ class IpcManager {
   // does variable-size allocation with frees, which an ArenaAllocator cannot
   // service.
   CLIO_TASK_ALLOC_T *metadata_allocator_ = nullptr;
+
+  // Offset of the MetadataDirectory within metadata_allocator_. Set by the
+  // server when it builds the segment, and by clients from ClientConnect.
+  u64 metadata_dir_off_ = 0;
 
   // Number of workers for which queues are allocated
   u32 num_workers_ = 0;

@@ -605,6 +605,36 @@ enum MemorySegment {
   kMetadataSegment = 3
 };
 
+/**
+ * Directory of well-known roots inside the metadata segment (issue #783).
+ *
+ * WHY THIS EXISTS: the CTE cache root offset was originally handed to clients
+ * on the CreateTask OUT path, which only works for the process that actually
+ * causes the pool to be created. Any later client -- and in practice EVERY
+ * client, because compose creates the CTE pool at startup -- calls
+ * GetOrCreatePool, hits the existing pool, never runs the ChiMod's Create, and
+ * so receives a zero offset. A discovery path must not depend on being the
+ * first caller.
+ *
+ * The directory is allocated once by IpcManager as the FIRST object in the
+ * metadata segment, and its offset is handed to every client in the
+ * ClientConnect handshake alongside the allocator ids. Modules publish their
+ * roots here by offset (never by pointer -- clients map the segment at a
+ * different base address).
+ *
+ * POD and fixed-layout: no virtuals, no pointers.
+ */
+struct MetadataDirectory {
+  static constexpr u32 kVersion = 1;
+
+  u32 version_;
+  u32 reserved_;
+  /** Offset of the CTE ShmMetadataCacheRoot, or 0 when CTE is not caching. */
+  u64 cte_cache_root_off_;
+  /** Spare slots so a new consumer does not change the layout. */
+  u64 reserved_slots_[6];
+};
+
 // Input/Output parameter macros
 #define IN
 #define OUT

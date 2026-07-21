@@ -293,6 +293,12 @@ class ShmMetadataCache {
       // ready_ LAST: a client that observes ready_ == 1 must be guaranteed the
       // maps behind it are fully constructed.
       root_->ready_ = 1;
+      // Publish in the segment directory so ANY client can find the cache,
+      // not just one that happened to trigger pool creation. Registered after
+      // ready_ for the same ordering reason.
+      if (auto *dir = ipc->GetMetadataDirectory()) {
+        dir->cte_cache_root_off_ = static_cast<clio::run::u64>(RootOffset());
+      }
       return true;
     } catch (...) {
       root_ = nullptr;

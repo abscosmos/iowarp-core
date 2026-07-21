@@ -633,6 +633,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   out_params.gpu_cache_ptr_ =
       GpuCacheCreate() ? reinterpret_cast<clio::run::u64>(gpu_cache_)
                        : static_cast<clio::run::u64>(0);
+  // issue #783: hand the client the offset of the SHM metadata cache root.
+  // An OFFSET, not a pointer -- the client maps the same segment at a
+  // different base address, so only a segment-relative value survives the
+  // trip. 0 means caching is off and the client stays on the RPC path.
+  out_params.shm_cache_root_off_ =
+      shm_cache_.IsEnabled()
+          ? static_cast<clio::run::u64>(shm_cache_.RootOffset())
+          : static_cast<clio::run::u64>(0);
   clio::run::Task::Serialize(CLIO_PRIV_ALLOC, task->chimod_params_, out_params);
 
   CLIO_CO_RETURN;
@@ -1620,6 +1628,17 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     LogTelemetry(CteOp::kPutBlob, offset, size, tag_id, now,
                  blob_info_ptr->last_read_);
     GpuCacheOnPutBlob(tag_id, blob_name, *blob_info_ptr);
+    // issue #783: mirror into the SHM cache HERE, at the successful end of the
+    // put -- not when the BlobInfo is first inserted into the map. At insert
+    // time the blob is still empty (blocks and total_size_cache_ are filled in
+    // later by ExtendBlob), so mirroring there published size 0 and a client
+    // reading its own write got the wrong answer. Caught by the
+    // write-then-read test.
+    {
+      std::string shm_key = std::to_string(tag_id.major_) + "." +
+                            std::to_string(tag_id.minor_) + "." + blob_name;
+      MirrorBlobToShm(shm_key, *blob_info_ptr);
+    }
     task->return_code_ = 0;
   } catch (const std::exception &e) {
     HLOG(kError, "PutBlob failed with exception: {}", e.what());
@@ -3962,7 +3981,10 @@ std::shared_ptr<BlobInfo> Runtime::CreateNewBlob(const std::string &blob_name,
   }  // Release lock immediately after insertion
   // issue #783: mirror into the SHM cache. Best-effort and AFTER the
   // authoritative insert, so the cache can only ever lag, never lead.
-  MirrorBlobToShm(composite_key, *new_blob_info);
+  // NOTE: deliberately NOT mirrored here. The blob has no blocks and no size
+  // yet; publishing it now would let a client read a zero-sized record for a
+  // blob that is mid-write. The mirror happens at the end of PutBlobImpl,
+  // once the content is actually there.
 
   // WAL: log blob creation
   if (!blob_txn_logs_.empty()) {

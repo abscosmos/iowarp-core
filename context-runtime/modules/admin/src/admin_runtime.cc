@@ -591,6 +591,8 @@ clio::run::TaskResume Runtime::ClientConnect(clio::run::shared_ptr<ClientConnect
   // correct allocators (segments are no longer the hardcoded (1,0)/(2,0)).
   task->main_alloc_id_ = CLIO_IPC->GetMainAllocatorId();
   task->queue_alloc_id_ = CLIO_IPC->GetQueueAllocatorId();
+  // issue #783: tell the client where the metadata-segment directory lives.
+  task->metadata_dir_off_ = CLIO_IPC->GetMetadataDirOffset();
 
   // #642: publish worker OS thread ids so SHM clients can address each worker's
   // "clio-<server_pid>-<worker_tid>" MPSC receive server.

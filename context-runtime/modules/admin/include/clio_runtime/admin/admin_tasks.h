@@ -798,6 +798,11 @@ struct ClientConnectTask : public clio::run::Task {
   // rather than assuming (1,0)/(2,0).
   OUT ctp::ipc::AllocatorId main_alloc_id_;
   OUT ctp::ipc::AllocatorId queue_alloc_id_;
+  // issue #783: offset of the MetadataDirectory inside the metadata segment,
+  // or 0 when the runtime has no metadata segment. Sent here rather than on a
+  // per-module Create path so discovery does not depend on which client
+  // happened to create a pool first.
+  OUT clio::run::u64 metadata_dir_off_;
 
   // GPU queue info (populated by server if GPUs are present)
   OUT clio::run::u32 num_gpus_;  ///< Number of GPU devices
@@ -863,7 +868,8 @@ struct ClientConnectTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     ar(response_, server_generation_, server_pid_, worker_queues_off_,
-       main_alloc_id_, queue_alloc_id_, num_gpus_, gpu_queue_depth_);
+       main_alloc_id_, queue_alloc_id_, num_gpus_, gpu_queue_depth_,
+       metadata_dir_off_);
     ar(num_worker_tids_);
     for (clio::run::u32 i = 0; i < kMaxWorkerTids; ++i) {
       ar(worker_tids_[i]);
@@ -889,6 +895,7 @@ struct ClientConnectTask : public clio::run::Task {
     worker_queues_off_ = other->worker_queues_off_;
     main_alloc_id_ = other->main_alloc_id_;
     queue_alloc_id_ = other->queue_alloc_id_;
+    metadata_dir_off_ = other->metadata_dir_off_;
     num_gpus_ = other->num_gpus_;
     gpu_queue_depth_ = other->gpu_queue_depth_;
     memcpy(cpu2gpu_queue_off_, other->cpu2gpu_queue_off_,

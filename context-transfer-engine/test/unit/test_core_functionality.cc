@@ -356,6 +356,10 @@ class CTECoreFunctionalTestFixture {
                    clio::run::PoolId pool_id, clio::cte::core::CreateParams& params) {
     auto task = core_client_->AsyncCreate(pool_query, pool_name, pool_id, params);
     task.Wait();
+    // issue #783: pick up the SHM metadata cache location returned by Create.
+    // Failure is fine and expected on hosts without a metadata segment -- the
+    // client simply keeps using RPC.
+    core_client_->AttachShmCache(*task);
   }
 
   /**
@@ -2486,5 +2490,129 @@ TEST_CASE("FUNCTIONAL - Distributed Execution Validation",
 
   INFO("Distributed execution validation test completed successfully");
 }
+/**
+ * issue #783: WRITE-THEN-READ against the shared-memory metadata cache.
+ *
+ * This is the read-your-own-writes property the design has to hold: a client
+ * that writes a blob and then reads it back must never observe the pre-write
+ * state through the cache. Because the cache is populated by the runtime while
+ * it handles PutBlob, a WAITED put is ordered before the client's next read.
+ *
+ * The test also pins the two failure modes that would make the cache unsafe:
+ *   - a miss must be reported as "not cached", never as "blob does not exist";
+ *   - cached metadata must AGREE with the authoritative RPC answer.
+ */
+TEST_CASE("CTE SHM cache write-then-read",
+          "[cte][core][shm_cache][functional]") {
+  auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
+  clio::cte::core::CreateParams params;
+
+  REQUIRE_NOTHROW(fixture->CreateAsync(
+      pool_query, CTECoreFunctionalTestFixture::kCTECorePoolName,
+      CTECoreFunctionalTestFixture::kCTECorePoolId, params));
+
+  const std::string target_name = fixture->test_storage_path_;
+  clio::run::u32 reg_result = fixture->RegisterTargetAsync(
+      target_name, clio::run::bdev::BdevType::kFile,
+      CTECoreFunctionalTestFixture::kTestTargetSize,
+      clio::run::PoolQuery::Local(), clio::run::PoolId(651, 0));
+  REQUIRE(reg_result == 0);
+
+  if (!fixture->core_client_->HasShmCache()) {
+    // Not a failure: the host may have no metadata segment. But say so loudly
+    // rather than passing silently, because a quietly-disabled cache would
+    // make every assertion below vacuous.
+    HLOG(kWarning,
+         "[#783] SHM metadata cache unavailable -- write-then-read assertions "
+         "SKIPPED (this test proves nothing on this host)");
+    return;
+  }
+
+  const std::string tag_name = "shm_rw_tag";
+  clio::cte::core::TagId tag_id = fixture->GetOrCreateTagAsync(tag_name);
+  REQUIRE(!tag_id.IsNull());
+
+  SECTION("A miss is reported as not-cached, never as absent") {
+    clio::cte::core::ShmBlobRecord rec;
+    // Never written -> must be a clean miss.
+    REQUIRE_FALSE(fixture->core_client_->TryGetBlobRecordShm(
+        tag_id, "definitely_never_written", &rec));
+  }
+
+  SECTION("Tag id is readable with zero IPC") {
+    clio::cte::core::TagId cached;
+    REQUIRE(fixture->core_client_->TryGetTagIdShm(tag_name, &cached));
+    REQUIRE(cached.major_ == tag_id.major_);
+    REQUIRE(cached.minor_ == tag_id.minor_);
+  }
+
+  SECTION("Write then read: the cache reflects the write") {
+    const std::string blob_name = "shm_rw_blob";
+    const clio::run::u64 blob_size = 2048;
+    auto test_data = fixture->CreateTestData(blob_size, 'S');
+
+    auto blob_data_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
+    REQUIRE(!blob_data_fullptr.IsNull());
+    auto blob_data_ptr = blob_data_fullptr.shm_.template Cast<void>();
+    REQUIRE(fixture->CopyToSharedMemory(blob_data_fullptr, test_data));
+
+    auto put_task = fixture->core_client_->AsyncPutBlob(
+        tag_id, blob_name, 0, blob_size, blob_data_ptr, 0.5f,
+        clio::cte::core::Context(), 0);
+    REQUIRE(!put_task.IsNull());
+    REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));
+    REQUIRE(put_task->return_code_ == 0);
+
+    // READ-YOUR-OWN-WRITE: immediately after the waited put, the cache must
+    // already carry this blob.
+    clio::cte::core::ShmBlobRecord rec;
+    REQUIRE(fixture->core_client_->TryGetBlobRecordShm(tag_id, blob_name,
+                                                       &rec));
+    REQUIRE(rec.total_size_ == blob_size);
+
+    // The cached answer must AGREE with the authoritative RPC answer. A cache
+    // that is fast but disagrees is worse than no cache at all.
+    auto size_task = fixture->core_client_->AsyncGetBlobSize(tag_id, blob_name);
+    REQUIRE(fixture->WaitForTaskCompletion(size_task, 10000));
+    REQUIRE(rec.total_size_ == size_task->size_);
+
+    // Payload reads must still be refused until the RAM bdev is SHM-backed
+    // (phase 6): this blob lives on a FILE target, so direct read is invalid.
+    REQUIRE_FALSE(rec.IsDirectReadable());
+
+    CLIO_IPC->FreeBuffer(blob_data_fullptr);
+  }
+
+  SECTION("Overwrite then read: the cache reflects the NEW size") {
+    const std::string blob_name = "shm_rw_overwrite";
+    const clio::run::u64 first_size = 1024;
+    const clio::run::u64 second_size = 4096;
+
+    for (clio::run::u64 sz : {first_size, second_size}) {
+      auto data = fixture->CreateTestData(sz, 'O');
+      auto fp = CLIO_IPC->AllocateBuffer(sz);
+      REQUIRE(!fp.IsNull());
+      REQUIRE(fixture->CopyToSharedMemory(fp, data));
+      auto t = fixture->core_client_->AsyncPutBlob(
+          tag_id, blob_name, 0, sz, fp.shm_.template Cast<void>(), 0.5f,
+          clio::cte::core::Context(), 0);
+      REQUIRE(!t.IsNull());
+      REQUIRE(fixture->WaitForTaskCompletion(t, 10000));
+      REQUIRE(t->return_code_ == 0);
+      CLIO_IPC->FreeBuffer(fp);
+    }
+
+    // A stale cache would still report first_size here -- the exact bug this
+    // whole mechanism has to avoid.
+    clio::cte::core::ShmBlobRecord rec;
+    REQUIRE(fixture->core_client_->TryGetBlobRecordShm(tag_id, blob_name,
+                                                       &rec));
+    auto size_task = fixture->core_client_->AsyncGetBlobSize(tag_id, blob_name);
+    REQUIRE(fixture->WaitForTaskCompletion(size_task, 10000));
+    REQUIRE(rec.total_size_ == size_task->size_);
+  }
+}
+
 // Main function using simple_test.h framework
 SIMPLE_TEST_MAIN()

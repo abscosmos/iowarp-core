@@ -38,6 +38,7 @@
 #include <clio_ctp/util/singleton.h>
 #include <clio_cte/api.h>
 #include <clio_cte/core/core_tasks.h>
+#include <clio_cte/core/shm_metadata_cache.h>
 
 namespace clio::cte::core {
 
@@ -45,6 +46,121 @@ class Client : public clio::run::ContainerClient {
  public:
   CTP_CROSS_FUN Client() = default;
   CTP_CROSS_FUN explicit Client(const clio::run::PoolId &pool_id) { Init(pool_id); }
+
+#if CTP_IS_HOST
+  // =========================================================================
+  // issue #783: shared-memory metadata cache (client side).
+  //
+  // Strictly an OPTIMIZATION. Every accessor reports failure rather than
+  // guessing, and a caller that gets `false` must fall back to the normal RPC
+  // path. The cache can be absent (no metadata segment), stale (writes are
+  // asynchronous), or full -- none of which are errors.
+  // =========================================================================
+
+  /**
+   * Attach the cache using the root offset returned by Create.
+   *
+   * @param root_off offset from CreateParams::shm_cache_root_off_. 0 means the
+   *        runtime is not caching, and this simply leaves the cache disabled.
+   * @return true if the cache is now usable.
+   */
+  bool AttachShmCache(clio::run::u64 root_off) {
+    shm_root_ = nullptr;
+    if (root_off == 0) {
+      HLOG(kDebug, "[#783] AttachShmCache: root_off=0 (runtime not caching)");
+      return false;  // runtime is not caching -- not an error
+    }
+    auto *ipc = CLIO_CPU_IPC;
+    if (ipc == nullptr) {
+      return false;
+    }
+    auto *alloc = ipc->GetMetadataAllocator();
+    if (alloc == nullptr) {
+      HLOG(kDebug, "[#783] AttachShmCache: no metadata allocator attached");
+      return false;  // segment not attached (e.g. TCP client, or remote node)
+    }
+    auto *root = reinterpret_cast<ShmMetadataCacheRoot *>(
+        reinterpret_cast<char *>(alloc) + root_off);
+    // Refuse anything we do not recognize. The cache is derived state, so
+    // declining to use it is always safe; guessing at a layout is not.
+    if (root->ready_ != 1 ||
+        root->version_ != ShmMetadataCacheRoot::kLayoutVersion) {
+      HLOG(kDebug,
+           "[#783] AttachShmCache: rejected root (ready={}, version={}, "
+           "expected version={})",
+           root->ready_, root->version_,
+           ShmMetadataCacheRoot::kLayoutVersion);
+      return false;
+    }
+    shm_root_ = root;
+    return true;
+  }
+
+  /**
+   * Attach by discovering the cache through the metadata-segment directory.
+   *
+   * This is the RELIABLE path. The CreateTask overload below only carries a
+   * non-zero offset for the process that actually caused the pool to be
+   * created; in practice compose creates the CTE pool at startup, so every
+   * later client sees zero there. Discovery must not depend on being first.
+   */
+  bool AttachShmCache() {
+    auto *ipc = CLIO_CPU_IPC;
+    if (ipc == nullptr) {
+      return false;
+    }
+    auto *dir = ipc->GetMetadataDirectory();
+    if (dir == nullptr) {
+      return false;
+    }
+    return AttachShmCache(dir->cte_cache_root_off_);
+  }
+
+  /** Convenience: attach from a completed CreateTask, falling back to the
+   *  directory when the task carries no offset (i.e. the pool already
+   *  existed, which is the common case). */
+  bool AttachShmCache(CreateTask &task) {
+    clio::run::u64 off = task.GetParams().shm_cache_root_off_;
+    if (off != 0 && AttachShmCache(off)) {
+      return true;
+    }
+    return AttachShmCache();
+  }
+
+  bool HasShmCache() const { return shm_root_ != nullptr; }
+
+  /**
+   * Zero-IPC metadata read.
+   *
+   * @return true if a consistent record was found in shared memory. false
+   *         means "not cached / could not read consistently" -- ALWAYS fall
+   *         back to the RPC path, never treat it as "blob does not exist".
+   */
+  bool TryGetBlobRecordShm(const TagId &tag_id, const std::string &blob_name,
+                           ShmBlobRecord *out) const {
+    if (shm_root_ == nullptr || out == nullptr) {
+      return false;
+    }
+    // Key is built into a stack buffer: a client must never allocate inside
+    // the runtime-owned segment, and this is the hot path.
+    char key[512];
+    size_t n = MakeShmBlobKey(tag_id, blob_name.data(), blob_name.size(), key,
+                              sizeof(key));
+    if (n == 0) {
+      return false;  // name too long for the fast path
+    }
+    return shm_root_->blob_key_to_info_.TryGetBytes(key, n, out);
+  }
+
+  /** Zero-IPC tag-name lookup. */
+  bool TryGetTagIdShm(const std::string &tag_name, TagId *out) const {
+    if (shm_root_ == nullptr || out == nullptr) {
+      return false;
+    }
+    return shm_root_->tag_name_to_id_.TryGetBytes(tag_name.data(),
+                                                  tag_name.size(), out);
+  }
+#endif
 
 #if CTP_IS_HOST
   /**
@@ -844,6 +960,15 @@ class Client : public clio::run::ContainerClient {
     return ipc_manager->Send(task);
   }
 #endif  // CTP_IS_HOST
+
+#if CTP_IS_HOST
+ private:
+  // issue #783: resolved address of the SHM metadata cache root in THIS
+  // process, or nullptr when caching is unavailable. Not owned -- the runtime
+  // owns the segment and may drop the cache at any time, which is why every
+  // read is validated rather than trusted.
+  ShmMetadataCacheRoot *shm_root_ = nullptr;
+#endif
 };
 
 // Global pointer-based singleton for CTE client with lazy initialization
