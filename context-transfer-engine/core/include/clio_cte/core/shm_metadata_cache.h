@@ -180,7 +180,13 @@ struct ShmMetadataCacheRoot {
 };
 
 /**
- * Build the "<tag_major>.<tag_minor>/<blob_name>" key used by the blob map.
+ * Build the blob-map key.
+ *
+ * Format is "<tag_major>.<tag_minor>.<blob_name>", matching the composite key
+ * the CTE runtime already builds for tag_blob_name_to_info_ EXACTLY. Using one
+ * convention rather than two is what makes the dual-write trivially
+ * consistent -- a second format would let the cache and the authoritative map
+ * disagree about which blob a key names.
  *
  * Written into a caller-provided buffer so the CLIENT never allocates: clients
  * are readers, and allocating inside the runtime-owned segment is exactly what
@@ -222,7 +228,7 @@ inline size_t MakeShmBlobKey(const clio::run::UniqueId &tag_id,
   if (pos + 1 >= out_cap) {
     return 0;
   }
-  out[pos++] = '/';
+  out[pos++] = '.';
   if (pos + blob_name_len >= out_cap) {
     return 0;
   }
@@ -232,6 +238,163 @@ inline size_t MakeShmBlobKey(const clio::run::UniqueId &tag_id,
   out[pos] = '\0';
   return pos;
 }
+
+/**
+ * Runtime-side owner of the shared-memory metadata cache (issue #783).
+ *
+ * ENTIRELY BEST-EFFORT. Every method is a no-op when the cache is disabled, and
+ * every failure is swallowed. That is deliberate: the cache is derived state,
+ * so the correct response to any problem is to stop caching, not to fail the
+ * operation the caller was actually performing. A metadata write must never be
+ * rejected because a cache mirror could not be updated.
+ *
+ * Not thread-safe on its own -- callers mirror under whatever synchronization
+ * already guards the authoritative structure.
+ */
+class ShmMetadataCache {
+ public:
+  ShmMetadataCache() = default;
+
+  /**
+   * Construct the cache in the runtime's metadata segment.
+   *
+   * @return true if the cache is live. false simply means caching is off:
+   *         no metadata segment (small host, attach failure), or the
+   *         allocation did not fit. Callers must not treat this as an error.
+   */
+  bool Create(size_t tag_capacity, size_t blob_capacity) {
+    auto *ipc = CLIO_IPC;
+    if (ipc == nullptr) {
+      return false;
+    }
+    alloc_ = ipc->GetMetadataAllocator();
+    if (alloc_ == nullptr) {
+      return false;  // segment unavailable -> caching disabled, not an error
+    }
+    try {
+      auto fp = alloc_->template Allocate<ShmMetadataCacheRoot>(
+          sizeof(ShmMetadataCacheRoot));
+      if (fp.IsNull()) {
+        alloc_ = nullptr;
+        return false;
+      }
+      root_ = fp.ptr_;
+      new (root_) ShmMetadataCacheRoot();
+      new (&root_->tag_name_to_id_) ShmTagIdMap(alloc_, tag_capacity);
+      new (&root_->tag_id_to_info_) ShmTagInfoMap(alloc_, tag_capacity);
+      new (&root_->blob_key_to_info_) ShmBlobInfoMap(alloc_, blob_capacity);
+      if (!root_->tag_name_to_id_.valid() || !root_->tag_id_to_info_.valid() ||
+          !root_->blob_key_to_info_.valid()) {
+        root_ = nullptr;
+        alloc_ = nullptr;
+        return false;
+      }
+      root_->version_ = ShmMetadataCacheRoot::kLayoutVersion;
+      // ready_ LAST: a client that observes ready_ == 1 must be guaranteed the
+      // maps behind it are fully constructed.
+      root_->ready_ = 1;
+      return true;
+    } catch (...) {
+      root_ = nullptr;
+      alloc_ = nullptr;
+      return false;
+    }
+  }
+
+  bool IsEnabled() const { return root_ != nullptr && alloc_ != nullptr; }
+
+  /** Byte offset of the root within the metadata allocator, which is what a
+   *  client needs in order to find the cache. Propagated via CreateTask in
+   *  Phase 4. */
+  size_t RootOffset() const {
+    if (!IsEnabled()) {
+      return 0;
+    }
+    return static_cast<size_t>(reinterpret_cast<const char *>(root_) -
+                               reinterpret_cast<const char *>(alloc_));
+  }
+
+  /** Mirror one blob. `composite_key` MUST be the same key the authoritative
+   *  map uses, so the two cannot disagree about identity. */
+  void PutBlob(const std::string &composite_key, const ShmBlobRecord &rec) {
+    if (!IsEnabled()) {
+      return;
+    }
+    try {
+      ShmBlobInfoMap::BytesProbe p{composite_key.data(), composite_key.size()};
+      root_->blob_key_to_info_.InsertOrAssign(
+          p,
+          ShmCacheString::HashBytes(composite_key.data(), composite_key.size()),
+          rec);
+      // A false return means the table is full. Nothing to do: the blob is
+      // simply not cached and clients take the RPC path for it.
+    } catch (...) {
+    }
+  }
+
+  void EraseBlob(const std::string &composite_key) {
+    if (!IsEnabled()) {
+      return;
+    }
+    try {
+      ShmBlobInfoMap::BytesProbe p{composite_key.data(), composite_key.size()};
+      root_->blob_key_to_info_.Erase(
+          p, ShmCacheString::HashBytes(composite_key.data(),
+                                       composite_key.size()));
+    } catch (...) {
+    }
+  }
+
+  void PutTagId(const std::string &tag_name, const clio::run::UniqueId &id) {
+    if (!IsEnabled()) {
+      return;
+    }
+    try {
+      ShmTagIdMap::BytesProbe p{tag_name.data(), tag_name.size()};
+      root_->tag_name_to_id_.InsertOrAssign(
+          p, ShmCacheString::HashBytes(tag_name.data(), tag_name.size()), id);
+    } catch (...) {
+    }
+  }
+
+  void EraseTagId(const std::string &tag_name) {
+    if (!IsEnabled()) {
+      return;
+    }
+    try {
+      ShmTagIdMap::BytesProbe p{tag_name.data(), tag_name.size()};
+      root_->tag_name_to_id_.Erase(
+          p, ShmCacheString::HashBytes(tag_name.data(), tag_name.size()));
+    } catch (...) {
+    }
+  }
+
+  void PutTagInfo(const clio::run::UniqueId &id, const ShmTagRecord &rec) {
+    if (!IsEnabled()) {
+      return;
+    }
+    try {
+      root_->tag_id_to_info_.InsertOrAssign(id, ShmTagInfoMap::Hash(id), rec);
+    } catch (...) {
+    }
+  }
+
+  void EraseTagInfo(const clio::run::UniqueId &id) {
+    if (!IsEnabled()) {
+      return;
+    }
+    try {
+      root_->tag_id_to_info_.Erase(id, ShmTagInfoMap::Hash(id));
+    } catch (...) {
+    }
+  }
+
+  ShmMetadataCacheRoot *root() { return root_; }
+
+ private:
+  ShmCacheAlloc *alloc_ = nullptr;
+  ShmMetadataCacheRoot *root_ = nullptr;
+};
 
 }  // namespace clio::cte::core
 

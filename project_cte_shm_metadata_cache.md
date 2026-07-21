@@ -490,8 +490,38 @@ purpose: the slot generation protects the METADATA copy, while §5.3's hazard is
 the DataOrganizer relocating blocks during the PAYLOAD read. A client must
 re-check `placement_gen_` after copying bytes.
 
-Still to build in Phase 3: runtime dual-write into the cache from
-`core_runtime.cc`, gated so the legacy path stays authoritative.
+**Phase 3 COMPLETE — dual-write wired and verified end-to-end.**
+`ShmMetadataCache` (runtime-side owner) is created in `Runtime::Create` and
+mirrored at every blob insert (3 sites: PutBlob, WAL replay, metadata restore),
+every blob erase (3 sites), and tag creation. Every mirror call is best-effort
+and swallows failure: the cache is derived state, so the right response to any
+problem is to stop caching, never to reject the metadata write the caller was
+actually performing. Mirrors run AFTER the authoritative insert, so the cache
+can only lag, never lead.
+
+Verified against a live daemon by attaching the metadata segment from an
+UNRELATED process and reading the maps:
+
+```
+ready=1 version=1
+tag_name_to_id  : size=11  cap=65536
+tag_id_to_info  : size=11  cap=65536
+blob_key_to_info: size=87  cap=262144
+```
+
+CTE functional suite stays 9/9 with the mirror active.
+
+**Method note worth keeping.** The first "green" run proved nothing: the suite
+that passed (`cte_core_functionality_simple_tests`) never creates a CTE pool, so
+`Runtime::Create` — and therefore the whole dual-write path — never executed.
+Confirming the cache was actually *enabled* (`root_off=68072` in the log) and
+then reading the populated maps from another process is what made the result
+mean something. A green suite that does not reach the new code is not evidence.
+
+`kShmBlobDirectReadable` is deliberately NOT set yet: proving a block is
+node-local AND RAM-backed needs the target registry, and the RAM bdev is not
+SHM-backed until Phase 6. Until then the cache serves METADATA only and every
+payload read still goes through RPC — the safe direction to be wrong in.
 
 **Design refinement made during implementation: the map never rehashes.** Growth
 is the one operation that cannot be made safe for untracked cross-process

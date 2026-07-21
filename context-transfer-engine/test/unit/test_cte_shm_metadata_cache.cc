@@ -131,7 +131,7 @@ TEST_CASE("ShmCache: blob key construction", "[shm_cache]") {
   clio::run::UniqueId tag(12, 34);
   size_t n = MakeShmBlobKey(tag, "myblob", 6, buf, sizeof(buf));
   REQUIRE(n > 0);
-  REQUIRE(std::string(buf, n) == "12.34/myblob");
+  REQUIRE(std::string(buf, n) == "12.34.myblob");
 
   // Too-small buffer must refuse rather than truncate: a truncated key would
   // alias a different blob.
@@ -152,10 +152,10 @@ TEST_CASE("ShmCache: insert and read back in-process", "[shm_cache]") {
   rec.blocks_[0].size_ = 4096;
   rec.blocks_[0].bdev_type_ =
       static_cast<clio::run::u32>(clio::run::bdev::BdevType::kRam);
-  REQUIRE(PutBlob(f, "1.0/blob_a", rec));
+  REQUIRE(PutBlob(f, "1.0.blob_a", rec));
 
   ShmBlobRecord out;
-  REQUIRE(f.root->blob_key_to_info_.TryGetBytes("1.0/blob_a", 10, &out));
+  REQUIRE(f.root->blob_key_to_info_.TryGetBytes("1.0.blob_a", 10, &out));
   REQUIRE(out.total_size_ == 4096);
   REQUIRE(out.num_blocks_ == 1);
   REQUIRE(out.blocks_[0].target_offset_ == 512);
@@ -220,10 +220,10 @@ TEST_CASE("ShmCache: readable from another process at a different address", "[sh
     rec.flags_ = kShmBlobDirectReadable;
     rec.blocks_[0].target_offset_ = static_cast<clio::run::u64>(i) * 4096;
     rec.blocks_[0].size_ = 100;
-    REQUIRE(PutBlob(f, "1.0/blob_" + std::to_string(i), rec));
+    REQUIRE(PutBlob(f, "1.0.blob_" + std::to_string(i), rec));
   }
   // Long key crossing the SSO boundary, to prove spilled keys resolve too.
-  std::string longkey = "1.0/" + std::string(120, 'L');
+  std::string longkey = "1.0." + std::string(120, 'L');
   ShmBlobRecord big;
   big.total_size_ = 999999;
   REQUIRE(PutBlob(f, longkey, big));
@@ -251,7 +251,7 @@ TEST_CASE("ShmCache: readable from another process at a different address", "[sh
       _exit(23);
     }
     for (int i = 0; i < kEntries; ++i) {
-      std::string k = "1.0/blob_" + std::to_string(i);
+      std::string k = "1.0.blob_" + std::to_string(i);
       ShmBlobRecord out;
       if (!child_root->blob_key_to_info_.TryGetBytes(k.data(), k.size(),
                                                      &out)) {
@@ -277,7 +277,7 @@ TEST_CASE("ShmCache: readable from another process at a different address", "[sh
     // A key that was never inserted must miss, not alias something else.
     if (rc == 0) {
       ShmBlobRecord out;
-      if (child_root->blob_key_to_info_.TryGetBytes("1.0/nope", 8, &out)) {
+      if (child_root->blob_key_to_info_.TryGetBytes("1.0.nope", 8, &out)) {
         rc = 28;
       }
     }
