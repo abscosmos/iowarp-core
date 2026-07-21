@@ -276,22 +276,30 @@ A steal must bump a steal counter so a resurrected holder can detect it lost the
 thread*.** DECIDED: waiting is unavoidable, since a lease that the runtime could
 ignore would not protect anything. The constraint is not *whether* to wait but *how*.
 
-A thread-blocking wait is not available here. `ReorganizeBlobInternal` /
-`DynamicReorganize` are coroutines on workers, and `core_tasks.h:820-831` already
-documents why: a thread-blocking lock "CANNOT be used here — it would deadlock the
-single worker the instant the holder suspends at a `co_await`." With 4 workers, a few
-contended blobs would wedge the runtime — the exact failure class issue #781 exists to
-prevent.
+**Thread-blocking waits are ACCEPTED for the initial implementation**, on the strength
+of the issue #781 work-orchestrator mechanisms (elastic pool + stall detection + worker
+spawn/steal), which detect a wedged worker and spawn a replacement. This branch merges
+`origin/dev` at PR #782 specifically so those mechanisms are present — they landed in
+dev *after* this branch was cut, and without them a blocking lease wait would reproduce
+the exact deadlock class #781 exists to prevent.
 
-The codebase already has the right pattern, in that same comment: the `write_owner_`
-contender "busy-polls via `co_await yield()` ... which is lost-wakeup-proof because it
-re-checks every worker iteration." So:
+Historical constraint, retained because it still applies to any path that must not
+depend on stall detection: `core_tasks.h:820-831` documents that a thread-blocking lock
+"CANNOT be used here — it would deadlock the single worker the instant the holder
+suspends at a `co_await`," and demonstrates the alternative — the `write_owner_`
+contender "busy-polls via `co_await yield()` ... lost-wakeup-proof because it re-checks
+every worker iteration."
 
-- `Lease` acquisition on the runtime side is a **`co_await` retry loop**, not a
-  blocking acquire. The task suspends; the worker goes and runs other tasks.
-- The reorganizer, being pure background work, still prefers `try_lock`-and-skip — it
-  has no obligation to reorganize any particular blob right now.
-- Metadata writes wait via `co_await`, bounded by the `TimedMutex` threshold.
+So, in order of preference:
+
+- The reorganizer, being pure background work, still prefers **`try_lock`-and-skip** —
+  it has no obligation to reorganize any particular blob right now, so it should never
+  wait at all.
+- Metadata writes may **block the worker**, bounded by the `TimedMutex` threshold and
+  backstopped by #781 stall detection.
+- If stall detection proves insufficient under load, the `co_await` retry loop above is
+  the fallback — same semantics, no worker occupancy. Worth revisiting if Phase 5/6
+  benchmarks show worker starvation.
 
 Two consequences to keep in view:
 - The `TimedMutex` timeout now **bounds runtime write latency**, not just reclamation
