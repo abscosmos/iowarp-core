@@ -205,6 +205,53 @@ all. **Exact cap is TBD from measurement (open question 6).**
 
 **Lock ordering:** `TagInfo` before `BlobInfo`, enforced identically on both sides.
 
+### 5.3b `TimedMutex` and `Lease` (replaces `shared_ptr`)
+
+Decision: a reclaimable `TimedMutex` (`clio_ctp/thread/lock/timed_mutex.h`, beside
+`Mutex`) plus a SHM smart pointer `Lease` (`clio_ctp/memory/smart_ptr/lease.h`, beside
+`shared_ptr`/`unique_ptr`). A `Lease` acquires the target's `TimedMutex` on
+construction and releases on destruction; because the lock is reclaimable, a client
+that dies holding one is eventually serviced. Clients **copy metadata out and release
+immediately** rather than holding a lease across work.
+
+This replaces epochs/hazard pointers for the **lifetime** problem. It does *not*
+replace the generation counter, which remains the **coherence** mechanism (§5.3).
+They are complementary: the lease stops the object being freed under a reader; the
+generation catches the payload being moved under a reader.
+
+Four constraints on the implementation:
+
+**1. Lock words must live in a separate read-write region.** Acquiring a lease is a
+store, and clients map the data `PROT_READ` (§5.5). A `TimedMutex` therefore cannot be
+embedded inline in an `ShmBlobInfo` that lives in the read-only region. Layout: a
+lock array in a small **RW-mapped** region, indexed parallel to the objects, with
+metadata and payload staying **RO**. This yields a useful safety property — since
+correctness rests on the generation counter, a client that corrupts a lock word can
+only damage *liveness*, never silently corrupt another reader's data.
+
+**2. Default to a lock-free read; take a lease only when you need a stable view.**
+An exclusive `TimedMutex` serializes concurrent readers of the same hot blob, and the
+CAS ping-pongs that cache line across every reading core — the opposite of what a
+read-mostly cache wants. So the common path is a **seqlock read that performs zero
+stores** (read generation, copy, re-read generation, retry), and `Lease` is reserved
+for operations needing a stable view for longer than a retry loop tolerates. Keeping
+leases *rare* is also what keeps reclamation simple: an exclusive lock has a single
+owner, so a dead holder is identifiable, which a shared/reader-counted lease would
+not be (that would need per-holder tracking, i.e. epochs again by another name).
+
+**3. Reclamation needs PID + process start time, not a bare timeout.** A timeout alone
+cannot distinguish a dead holder from a live-but-slow one (§5.3, point 4). The lock
+word carries `{owner_pid, process_start_time, acquire_timestamp}`; a waiter past the
+threshold checks liveness and steals **only if the owner is genuinely gone**. Start
+time is required because PIDs are recycled — on Linux, field 22 of `/proc/<pid>/stat`.
+A steal must bump a steal counter so a resurrected holder can detect it lost the lock.
+
+**4. The runtime must never block on a lease.** Per §5.3 the reorganizer `try_lock`s
+and skips. Writes cannot "skip" as such, but they do not need to block either: the
+runtime updates its own authoritative structure and **defers the SHM mirror update**
+if the lease is contended. This is only sound because the SHM copy is a *cache*, never
+the source of truth — see the revised Phase 7.
+
 ### 5.4 Read-your-own-writes
 
 Fully-async write-through means a client that does `PutBlob` then `GetBlob` can miss
@@ -250,31 +297,58 @@ Dual-write is what keeps a 127-call-site refactor from becoming a flag-day.
 |---|---|---|
 | 0 | CTE metadata benchmark harness | Baseline recorded |
 | 1 | `kMetadataSegment` + `IpcManager` plumbing | Runtime creates it; client attaches RO |
-| 2 | `ipc::string`, `ipc::unordered_map`, reclaimable lease primitive + epoch reclamation | Standalone torture test, incl. random reader kills mid-lease |
+| 2 | `ipc::string`, `ipc::unordered_map`, `TimedMutex`, `Lease` | Standalone torture test, incl. random reader kills mid-lease |
 | 3 | `ShmTagInfo`/`ShmBlobInfo`; runtime **dual-writes** | Old path still authoritative; all CTE tests green |
 | 4 | Propagate map locations via `CreateTask` | Client holds valid handles |
 | 5 | Client fast path for **metadata-only** ops (`GetBlobSize`, `GetBlobScore`) | Correctness parity; latency win measured |
 | 6 | SHM RAM bdev + client payload fast path | `GetBlob` < 5 µs, zero IPC |
-| 7 | Retire dual-write and legacy structures | Single source of truth |
+| 7 | Retire the *scaffolding*, keep SHM as a pure cache | Steady state (see below) |
+
+**Phase 7 revised.** The original plan was to retire the legacy structures and make SHM
+the single source of truth. That is now rejected: if SHM were authoritative, a runtime
+write would have to *land* there, so the runtime would have to block on a client-held
+lease — violating §5.3b constraint 4. Instead the runtime keeps its own authoritative
+structures permanently and the SHM segment stays a **pure read cache** the runtime may
+always defer updating or invalidate wholesale. This also means a corrupted or wedged
+cache is recoverable by dropping it, never a data-loss event. Phase 7 therefore only
+removes benchmarking scaffolding and any redundant bookkeeping, not the legacy path.
 
 Phases 0-2 are self-contained and carry essentially no risk to existing behavior.
 Phase 3 is where the blast radius starts. Phase 5 before Phase 6 deliberately: proving
 the read path on metadata-only ops is far cheaper to debug than on payload reads.
 
-## 7. Open questions
+## 7. Decisions
 
-1. Trust boundary (§5.6) — accept node-wide metadata visibility, or partition?
-2. Epoch reclamation vs. hazard pointers vs. never-reclaim (bounded arena + compaction
-   at quiesce)? Never-reclaim is dramatically simpler and may be adequate at 8 GB.
-3. Do we need `TagId -> TagInfo` *and* `string -> TagId` in SHM, or can the client
-   resolve names once and cache the ID privately?
-4. `BlobBlock` embeds a `bdev::Client` — is that SHM-safe as-is, or does the SHM
-   variant need a slimmed block descriptor?
-5. Does `kPinned` (GPU page-locked) RAM bdev stay on the old private-heap path?
-   `cudaMallocHost` memory cannot trivially be SHM-backed.
-6. **Fast-path blob size cap** (§5.3) — measure where the SHM path stops beating the
-   RPC path and set the cap there. Expected to land near 256 KB - 1 MB.
-7. The reclaimable lease needs a **new lock primitive** (CAS word + owner PID +
-   timestamp); `ctp::Mutex` cannot be reclaimed. Does it belong in
-   `clio_ctp/thread/lock/` next to `Mutex`, or in the SHM-cache layer as a
-   special-purpose type?
+1. **Trust boundary — DECIDED: accept node-wide metadata visibility.** Any client may
+   read every tag/blob name and size on the node. Single-tenant assumption; revisit if
+   multi-tenancy becomes a requirement.
+2. **Reclamation — DECIDED: `Lease` + `TimedMutex` (§5.3b).** Not epochs, not hazard
+   pointers, not never-reclaim. Lifetime is handled by a reclaimable lease; coherence
+   stays with the generation counter.
+3. **Both maps in SHM — DECIDED.** `string -> TagId` *and* `TagId -> TagInfo` (and the
+   blob equivalents). No client-private ID caching scheme.
+4. **`BlobBlock` — RESOLVED BY INSPECTION: a slimmed POD descriptor is required.**
+   `BlobBlock` embeds a `bdev::Client`, which derives from `ContainerClient`
+   (`container.h:590`). Its *data* is only `PoolId pool_id_` + `u32 return_code_`, but
+   it declares `virtual void Init()` and `virtual ~ContainerClient()`, so the object
+   **carries a vtable pointer**. A vptr is a process-local address (and moves under
+   ASLR / differing .so load addresses), so it is meaningless — and dangerous — in a
+   segment mapped by another process. The SHM block descriptor must therefore be plain
+   POD: `{PoolId target_pool, PoolQuery target_query, u64 target_offset, u64 size,
+   u64 capacity}`, with the `bdev::Client` reconstructed runtime-side on demand.
+   **General rule for this work: no virtual functions in any type stored in SHM.**
+5. **`kPinned` — DECIDED: stays on the private heap.** `cudaMallocHost` memory is not
+   SHM-backed; the GPU-pinned RAM bdev keeps the existing path and simply does not
+   participate in the client fast path.
+6. **Fast-path blob size cap — measure in Phase 0/6.** Set it where the SHM path stops
+   beating RPC; expected near 256 KB - 1 MB.
+7. **Lock primitive — DECIDED: new `TimedMutex`** in `clio_ctp/thread/lock/timed_mutex.h`,
+   alongside `mutex.h` / `rwlock.h` / `spin_lock.h` / `cvrwlock.h`.
+8. **Smart pointer — DECIDED: new `Lease`** in `clio_ctp/memory/smart_ptr/lease.h`,
+   alongside `shared_ptr.h` / `unique_ptr.h`. See §5.3b for its four constraints.
+
+### Still open
+
+- The exact fast-path size cap (item 6) — needs measurement, not a decision.
+- Whether the `TimedMutex` threshold stays at 500 ms or drops once the size cap bounds
+  legitimate hold time (§5.3).
