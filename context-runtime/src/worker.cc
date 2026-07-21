@@ -264,19 +264,10 @@ void Worker::Run() {
     did_work_ = false;  // Reset work tracker at start of each loop iteration
     task_did_work_ = false;  // Reset task-level work tracker
 
-    // Drain the runtime's single inbound MPSC SHM ring for client tasks. Only
-    // the net_recv worker does this (the ring is single-consumer, mirroring the
-    // ZMQ model where one recv owner drains the client-facing socket); it then
-    // routes each task onto the right worker lane via the standard
-    // ProcessNewTasks/RouteTask flow. All deserialization lives in
-    // IpcCpu2Cpu::RecvIn — the worker never touches serialized task bytes.
-    // The drainer is identified by a flag set at DivideWorkers (Worker pointer),
-    // NOT by lane: worker lanes are assigned later (SpawnWorkerThreads), so the
-    // net lane pointer is still null when DivideWorkers runs.
-    if (drains_shm_in_ring_ && assigned_lane_ &&
-        IpcCpu2Cpu::RecvIn(CLIO_IPC, assigned_lane_)) {
-      did_work_ = true;
-    }
+    // NOTE: the inbound SHM ring is NOT drained here. A dedicated thread
+    // (IpcManager::RecvShmServerThread) owns it and pushes tasks onto worker
+    // lanes, mirroring the ZMQ path's ClientRecvThread. Workers therefore never
+    // touch serialized task bytes and need no knowledge of the transport.
 
     // Process tasks from assigned lane
     if (assigned_lane_) {

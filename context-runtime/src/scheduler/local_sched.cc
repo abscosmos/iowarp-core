@@ -92,14 +92,6 @@ void LocalScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
     }
   }
 
-  // Designate the single drainer of the inbound SHM ring by Worker pointer
-  // (lanes aren't assigned yet at DivideWorkers time). Clear all first so a
-  // re-divide never leaves two drainers on the single-consumer ring.
-  for (u32 i = 0; i < total_workers; ++i) {
-    if (Worker *w = work_orch->GetWorker(i)) w->SetDrainsShmInRing(false);
-  }
-  if (net_worker_) net_worker_->SetDrainsShmInRing(true);
-
   HLOG(kInfo,
        "LocalScheduler: {} scheduler workers, 1 network worker (worker {})"
        ", gpu_worker={}",

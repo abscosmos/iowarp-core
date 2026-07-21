@@ -273,16 +273,6 @@ class Worker {
   TaskLane *GetLane() const;
 
   /**
-   * Mark this worker as the single drainer of the runtime's inbound SHM ring
-   * (IpcManager::shm_in_server_). Set by the scheduler's DivideWorkers on the
-   * net_recv worker. Identity is by Worker pointer, NOT by lane: DivideWorkers
-   * runs before worker lanes are assigned (SpawnWorkerThreads), so the net lane
-   * pointer is still null at that point — a lane-based check would match no one.
-   */
-  void SetDrainsShmInRing(bool v) { drains_shm_in_ring_ = v; }
-  bool DrainsShmInRing() const { return drains_shm_in_ring_; }
-
-  /**
    * Set GPU lanes for this worker to process
    * @param lanes Vector of TaskLane pointers for GPU queues
    */
@@ -405,9 +395,6 @@ class Worker {
   bool did_work_;       // Tracks if any work was done in current loop iteration
   bool task_did_work_;  // Tracks if current task did actual work (set by tasks
                         // via CLIO_CUR_WORKER)
-  bool drains_shm_in_ring_ = false;  // Set on the net_recv worker: this worker
-                                     // drains IpcManager::shm_in_server_ (the
-                                     // single inbound SHM ring) each loop.
 
   // Task currently executing on this worker thread (null when idle). The
   // RunContext lives inside this Task; it is never held as a bare pointer.

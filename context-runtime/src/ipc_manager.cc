@@ -699,9 +699,12 @@ void IpcManager::ServerFinalize() {
   // no-ops in that case.
   ClearTransports();
 
-  // Tear down the single inbound SHM ring. Workers are already stopped by this
-  // point (StopWorkers runs before ServerFinalize), so nothing is draining it.
+  // Tear down the single inbound SHM ring. Join its recv thread FIRST so it
+  // cannot touch a detached segment (or push onto lanes whose workers are
+  // already stopped). The admin ChiMod also stops it via a transport-shutdown
+  // hook on the normal path; both call sites are idempotent.
 #if CTP_IS_HOST
+  StopShmServerRecvThread();
   if (shm_in_server_ok_) {
     shm_in_server_.Shutdown();  // unmap + unlink "clio-<pid>-shm-in"
     shm_in_server_ok_ = false;
@@ -883,9 +886,9 @@ bool IpcManager::ServerInitShm() {
 #if CTP_IS_HOST
     // Single inbound MPSC ring shared by every SHM client (replaces the old
     // per-worker "clio-<pid>-<tid>" servers). Clients SendBytes serialized tasks
-    // here; only the net_recv worker drains it (Worker::Run ->
-    // IpcCpu2Cpu::RecvIn) and fans tasks out to worker lanes, mirroring how the
-    // ZMQ path funnels all inbound client traffic through one recv owner. Sized
+    // here; the dedicated RecvShmServerThread drains it (-> IpcCpu2Cpu::RecvIn)
+    // and fans tasks out to worker lanes, mirroring how the ZMQ path funnels
+    // all inbound client traffic through one dedicated recv thread. Sized
     // large (~128MB) so bursty async fan-out from many clients rarely blocks a
     // producer in SendBytes. The name is derived from the runtime pid so a
     // client can form it from the server_pid_ it learns via ClientConnect.
@@ -3004,6 +3007,55 @@ void IpcManager::RecvShmClientThread() {
       // response latency low without pinning a core.
       CTP_THREAD_MODEL->SleepForUs(20);
     }
+  }
+#endif
+}
+
+void IpcManager::RecvShmServerThread() {
+#if CTP_IS_HOST
+  ctp::SystemInfo::SetCurrentThreadName("chi-shm-in-recv");
+  // Runtime-side analogue of the ZMQ ClientRecvThread. This thread is the
+  // inbound ring's single consumer, which is the whole reason the schedulers
+  // and Worker need no knowledge of it: there is no "which worker drains it"
+  // question to answer. IpcCpu2Cpu::RecvIn deserializes one task per call and
+  // pushes it onto a scheduler-chosen lane.
+  while (shm_in_recv_running_.load(std::memory_order_acquire)) {
+    bool drained_any = false;
+    // Drain everything currently queued before backing off, so a burst is
+    // ingested in one pass rather than one task per sleep.
+    while (shm_in_recv_running_.load(std::memory_order_acquire) &&
+           IpcCpu2Cpu::RecvIn(this)) {
+      drained_any = true;
+    }
+    if (!drained_any) {
+      // Idle backoff. The ring has no pollable fd, so this is a sleep rather
+      // than a blocking wait; 20us matches the client recv thread and keeps
+      // task-ingest latency well under a scheduling quantum.
+      CTP_THREAD_MODEL->SleepForUs(20);
+    }
+  }
+  HLOG(kInfo, "[ShmServerRecvThread] shutting down");
+#endif
+}
+
+void IpcManager::StartShmServerRecvThread() {
+#if CTP_IS_HOST
+  // Only a SHM-mode runtime has an inbound ring; every other configuration
+  // (client processes, ZMQ/TCP/IPC runtimes) makes this a no-op.
+  if (!shm_in_server_ok_ || shm_in_recv_running_.load()) {
+    return;
+  }
+  shm_in_recv_running_.store(true, std::memory_order_release);
+  shm_in_recv_thread_ = std::thread([this]() { RecvShmServerThread(); });
+  HLOG(kInfo, "[ShmServerRecvThread] started");
+#endif
+}
+
+void IpcManager::StopShmServerRecvThread() {
+#if CTP_IS_HOST
+  shm_in_recv_running_.store(false, std::memory_order_release);
+  if (shm_in_recv_thread_.joinable()) {
+    shm_in_recv_thread_.join();
   }
 #endif
 }

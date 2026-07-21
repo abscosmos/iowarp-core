@@ -11,16 +11,12 @@
 
 namespace clio::run {
 
-bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
-  // #642: drain this worker's MPSC SHM server (DONTWAIT) and enqueue any
-  // received external-client task onto the normal dispatch path. The client
-  // already addressed this worker, so the deserialize happens here (the work
-  // that used to funnel through one worker); routing/execution then follow the
-  // standard ProcessNewTask flow. Keeping this off the worker means the worker
-  // never touches serialized task/future bytes.
-  // Drain the runtime's SINGLE inbound ring (shm_in_server_), not a per-thread
-  // server. Only the net_recv worker calls this (see Worker::Run's gate), so
-  // there is exactly one consumer — the MPSC ring's single-consumer contract.
+bool IpcCpu2Cpu::RecvIn(IpcManager *ipc) {
+  // Drain the runtime's SINGLE inbound ring (shm_in_server_, DONTWAIT) and
+  // enqueue any received external-client task onto the normal dispatch path.
+  // The only caller is IpcManager::RecvShmServerThread, a dedicated non-worker
+  // thread — that satisfies the ring's single-consumer contract on its own and
+  // keeps every byte of task/future deserialization off the workers.
   if (!ipc->shm_in_server_ok_) {
     return false;
   }
@@ -69,7 +65,14 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   f.GetTaskPtr()->BeginRunContext();
-  lane->Push(f);
+  // Pick a worker lane and enqueue, exactly as the ZMQ client recv thread does
+  // (IpcCpu2CpuZmq::RecvIn). We are not a worker, so there is no "own lane" to
+  // push to — the scheduler decides. Always signal: see ipc_cpu2cpu_impl.h for
+  // the enqueue/sleep race this closes.
+  LaneId lane_id = ipc->GetScheduler()->ClientMapTask(ipc, f);
+  auto &lane_ref = ipc->GetTaskQueue()->GetLane(lane_id, 0);
+  lane_ref.Push(f);
+  ipc->AwakenWorker(&lane_ref);
   return true;
 }
 

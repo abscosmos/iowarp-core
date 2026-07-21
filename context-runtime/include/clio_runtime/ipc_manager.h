@@ -880,6 +880,27 @@ class IpcManager {
   void RecvShmClientThread();
 
   /**
+   * Runtime-side thread that drains the single inbound SHM ring
+   * (shm_in_server_) in SHM mode, deserializing each client task and pushing it
+   * onto a scheduler-chosen worker lane via IpcCpu2Cpu::RecvIn. The server-side
+   * analogue of the ZMQ path's ClientRecvThread, and the reason no worker or
+   * scheduler needs to know the ring exists: this thread IS the ring's single
+   * consumer.
+   */
+  void RecvShmServerThread();
+
+  /**
+   * Start RecvShmServerThread. Called once from the admin ChiMod's Create,
+   * next to IpcManagerRun2Run::StartRecvThreads — by then the pool manager,
+   * task queue and scheduler the thread pushes into all exist. No-op unless
+   * this process is a SHM-mode runtime with a live inbound ring.
+   */
+  void StartShmServerRecvThread();
+
+  /** Stop and join RecvShmServerThread. Idempotent; safe if never started. */
+  void StopShmServerRecvThread();
+
+  /**
    * Clean up a response archive and its zmq_msg_t handles
    * Called from Future::Destroy() to free zero-copy recv buffers
    * @param net_key Net key (client_task_vaddr_) used as map key
@@ -1062,13 +1083,6 @@ class IpcManager {
     net_recv_lane_ = recv_lane;
     net_lane_ = send_lane;  // back-compat for callers that haven't updated
   }
-
-  /** The lane owned by the net_recv worker (set by the scheduler's
-   *  DivideWorkers via SetNetLane). Used to gate the single inbound SHM ring's
-   *  drain to exactly one worker (mirrors the ZMQ path where only the
-   *  net_recv_worker owns the client-facing recv), instead of every worker
-   *  draining its own per-thread server. nullptr before DivideWorkers runs. */
-  TaskLane *GetNetRecvLane() const { return net_recv_lane_; }
 
   /**
    * Enqueue a Future<SendTask> to the network queue.
@@ -1387,8 +1401,8 @@ class IpcManager {
 
   // The single named MPSC receive rings that replace the old per-thread servers.
   // Runtime: shm_in_server_ ("clio-<runtime_pid>-shm-in", ~128MB) receives every
-  //   client's serialized tasks; drained by the net_recv worker only (see
-  //   Worker::Run / IpcCpu2Cpu::RecvIn), which fans them out to worker lanes.
+  //   client's serialized tasks; drained by the dedicated RecvShmServerThread
+  //   (see IpcCpu2Cpu::RecvIn), which fans them out to worker lanes.
   // Client: shm_out_server_ ("clio-<client_pid>-shm-out", ~1MB) receives this
   //   process's task responses; drained by the dedicated shm recv thread
   //   (RecvShmClientThread), which demuxes by net_key and wakes waiters. This
@@ -1470,6 +1484,13 @@ class IpcManager {
   // per-process response ring) and wakes waiters, mirroring RecvZmqClientThread.
   std::thread shm_recv_thread_;
   std::atomic<bool> shm_recv_running_{false};
+
+  // Runtime SHM recv thread (SHM mode): drains shm_in_server_ (the single
+  // inbound ring) and pushes tasks onto worker lanes, mirroring the ZMQ path's
+  // ClientRecvThread. Owning the drain here — rather than on a designated
+  // worker — is what keeps the schedulers and Worker free of transport state.
+  std::thread shm_in_recv_thread_;
+  std::atomic<bool> shm_in_recv_running_{false};
 
   // Background heartbeat thread for server liveness detection
   std::thread heartbeat_thread_;

@@ -118,16 +118,6 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
     }
   }
 
-  // Designate the single drainer of the inbound SHM ring. Do this by Worker
-  // pointer (not lane): lanes are assigned later in SpawnWorkerThreads, so
-  // net_recv_worker_->GetLane() is still null here. Clear all first so a
-  // re-divide (reconfigure) never leaves two drainers on the single-consumer
-  // ring.
-  for (u32 i = 0; i < total_workers; ++i) {
-    if (Worker *w = work_orch->GetWorker(i)) w->SetDrainsShmInRing(false);
-  }
-  if (net_recv_worker_) net_recv_worker_->SetDrainsShmInRing(true);
-
   int send_id = net_send_worker_ ? (int)net_send_worker_->GetId() : -1;
   int recv_id = net_recv_worker_ ? (int)net_recv_worker_->GetId() : -1;
   HLOG(kInfo,
