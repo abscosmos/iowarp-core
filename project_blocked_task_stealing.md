@@ -115,6 +115,8 @@ Recorded because they shape everything below:
 * **D-c — Migrated tasks get their event-queue pointer updated.** Signal redirection is done by
   rewriting the address in the task, not by making the address unnecessary.
 * **D-d — The event queue gets a consumer mutex**, so a foreign thread can drain it.
+* **D-e — Net-worker roles are deleted in favour of a `TASK_DEDICATED` flag.** Exclusivity is
+  declared by the task, not inferred from an inflated cost that the learner would erase. See D8/D8a.
 
 This is a deliberately smaller design than a lock-free late-binding scheduler, and the
 single-migrator constraint is what makes it tractable: **there is exactly one writer**, so no
@@ -374,14 +376,10 @@ so `coef` converges toward zero and the inflated cost stops repelling anything �
 minutes, after appearing to work. Setting `compute_` high is self-defeating against a subsystem
 built to learn true costs.
 
-Two ways out, and the second is the honest one:
-
-* Exempt these methods from reinforcement — a per-method "declared cost, do not learn" flag.
-* Say what we actually mean. The requirement is **exclusivity**, not expense. A
-  `TASK_DEDICATED_WORKER` property that `RuntimeMapTask` honours (place alone) and `LoadBalance`
-  services (spawn one if none is free, keep others off it) expresses it directly, survives the
-  learner, and is self-documenting. Cost inflation stays as a secondary placement hint but stops
-  being load-bearing. **Recommended.**
+**Decided:** declare exclusivity directly with a `TASK_DEDICATED` flag rather than encoding it as a
+fake cost. It survives the learner, it is self-documenting, and it is what we actually mean — the
+requirement is *exclusivity*, not expense. Cost inflation stays as a secondary placement hint but
+stops being load-bearing. Semantics in D8a.
 
 **(b) Socket-ownership groups must survive the roles.** The routing comment is explicit:
 *"The split is by SOCKET OWNERSHIP, not by verb — ZeroMQ sockets are not safe to share across
@@ -420,6 +418,54 @@ these two sites as part of the change.
 non-migratable role class; and converts the §2.3 failure — a stalled net worker taking the node's
 networking down with no rescue possible — into an ordinary migratable stall. That is the real win:
 not that the poller moves, but that when its worker wedges, it *can* move.
+
+### D8a — `TASK_DEDICATED` semantics
+
+```c
+#define TASK_DEDICATED BIT_OPT(clio::run::u32, 10)   // next free bit; 1/4/5/6 are retired
+```
+
+Set alongside `TASK_PERIODIC` where the pollers are spawned (`admin_client.h:128` and friends), and
+**cleared on remote receive** next to the existing `ClearFlags(TASK_PERIODIC)`
+(`ipc_run2run.cc:424`) — it is a local scheduling property, not a wire property.
+
+**1. Sticky binding, not per-period re-selection.** The scheduler holds a `{dedicated task → worker}`
+binding and `RuntimeMapTask` returns the bound worker every period. This is deliberate:
+`ProcessPeriodicQueue` re-routes on *every* tick, so without stickiness a poller would hand its ZMQ
+socket to a different thread several times a second — legal under §7.5, but constant churn and
+constant opportunity to get the barrier wrong. With stickiness the socket moves only at a rebinding
+point chosen by `LoadBalance`. This is precisely "pin to any worker, then adjust dynamically": the
+*binding* is dynamic, the per-period placement is not.
+
+**2. Repulsion by exclusion, not by load.** A worker hosting a dedicated task is skipped in
+`RuntimeMapTask`'s least-loaded scan over `io_workers_`. Exclusion rather than inflated
+`RealtimeLoad` because it is O(1) and cannot be learned away (§D8a). If every worker is dedicated,
+spawn a new one — the elastic pool is unbounded by #781's decision — rather than overflowing onto a
+dedicated worker.
+
+**3. Provisioning is a `LoadBalance` responsibility.** Each tick: every `TASK_DEDICATED` task has a
+live, unstalled worker; spawn if short; rebind if its worker stalled *and the task itself is parked*;
+retire the worker when the task goes away.
+
+**Degradation under core pressure.** One worker per dedicated task means three threads for
+{peer-send, peer-recv, client-combined}, where today there are two role workers — worse on a 2-core
+CI runner (§7.7). Let `LoadBalance` collapse several dedicated tasks onto one shared worker when
+workers exceed cores. That is safe by inspection because it *is* today's behaviour —
+`net_recv_worker_` already hosts three pollers — provided the D8b socket groups stay intact.
+
+**Honest limitation: this contains a stall, it does not cure one.** If a dedicated task wedges
+*inside its own handler* (say `Recv` blocking on a socket) it cannot be migrated: migration moves
+only *parked* tasks, and starting a second instance is forbidden by the one-live-instance invariant
+(D8c). What is actually gained:
+
+* no other work ever queues behind it (repulsion);
+* the *other* pollers survive — today a wedged `kRecv` also takes down `kClientRecv` and
+  `kClientSend`, because all three share `net_recv_worker_`;
+* a poller merely *parked* on a worker wedged by something else does migrate.
+
+Curing a wedged poller needs handler-level timeout/abandon with provably sane socket state, which is
+out of scope for this issue. Worth being explicit so nobody reads "LoadBalance spawns it a worker"
+as "networking always recovers".
 
 ---
 
@@ -616,7 +662,8 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
 ## 8. Open decisions
 
 *Closed:* suspended-task tracking → D4 (park in the blocked queue). Event-queue overflow → §7.2
-(keep blocking `Emplace`, re-drain quarantined queues).
+(keep blocking `Emplace`, re-drain quarantined queues). How exclusivity is expressed → D8a
+(`TASK_DEDICATED` flag, bit 10).
 
 1. **Awaited-future handle (D4).** Keep `awaited_fshm_` as a raw `const void*` (`task.h:885`) and
    document the "safe while suspended" invariant, or promote it to an owning `Future`? The raw
@@ -624,21 +671,18 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
    an invariant the readiness scan now depends on, where before it only did a pointer comparison.
    Recommendation: promote it; it is a small change and removes a lifetime argument from the
    critical path.
-2. **How exclusivity is expressed (D8a).** An explicit `TASK_DEDICATED_WORKER` property, or a
-   declared cost that is exempt from SGD reinforcement? Recommendation: the explicit property — an
-   inflated `compute_` alone gets learned away within minutes and fails silently.
-3. **Client socket group (D8b).** Merge `kClientRecv`+`kClientSend` into one periodic task, or add a
+2. **Client socket group (D8b).** Merge `kClientRecv`+`kClientSend` into one periodic task, or add a
    co-location group to the mapper? Recommendation: merge — no new scheduler concept.
-4. **Readiness-scan backoff.** Reuse the existing `% 2/4/8/16` buckets keyed on yield count, or
+3. **Readiness-scan backoff.** Reuse the existing `% 2/4/8/16` buckets keyed on yield count, or
    re-key them on *time* parked? Yield count no longer means much for a task that suspends once and
    waits a long time.
-5. **Wedged-worker fate.** When the bad task finally returns, does the worker rejoin the pool or
+4. **Wedged-worker fate.** When the bad task finally returns, does the worker rejoin the pool or
    retire? Rejoining risks re-wedging on the same task class; retiring leaks a thread per bad task
    until exit. Recommendation: rejoin with exponential-backoff quarantine.
-6. **All-workers-stalled.** `LoadBalance` already detects it (`default_sched.cc:383`). With an
+5. **All-workers-stalled.** `LoadBalance` already detects it (`default_sched.cc:383`). With an
    unbounded elastic pool the answer is "spawn as many replacements as needed" — confirm there is
    no cap, and that the loud warning stays.
-7. **Do the periodic buckets stay four-deep?** The `% 2/4/8/16` scheme is a hand-rolled timer wheel.
+6. **Do the periodic buckets stay four-deep?** The `% 2/4/8/16` scheme is a hand-rolled timer wheel.
    Optional cleanup, unrelated to correctness.
 
 ---
@@ -665,6 +709,14 @@ clear on retry). Do not read one red run as a regression; re-run and compare aga
 * **P2b-specific** (D8, net roles):
   * **the learner test** — run a net poller for long enough that SGD converges, then assert it still
     holds a worker to itself. This is the failure mode that passes on day one and regresses quietly.
+    With `TASK_DEDICATED` this should be structurally impossible; the test is there to prove nobody
+    reintroduced cost-based exclusivity.
+  * a `TASK_DEDICATED` task keeps the **same** worker across many periods (sticky binding, D8a-1) —
+    its socket must not hop threads every tick;
+  * no non-dedicated task is ever routed onto a dedicated worker (D8a-2);
+  * with all workers dedicated, a new ordinary task causes a spawn rather than landing on one;
+  * degraded mode: with workers > cores, dedicated tasks collapse onto shared workers **without**
+    splitting a socket group;
   * `kClientRecv`/`kClientSend` work never runs on two workers at once (assert one live instance);
   * kill the worker hosting a poller mid-flight → the poller migrates and networking recovers, which
     is the §2.3 outage becoming survivable and is the headline result for this phase;
