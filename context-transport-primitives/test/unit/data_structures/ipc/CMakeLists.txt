@@ -40,6 +40,12 @@ add_dependencies(test_unordered_map_exec clio_ctp_host)
 target_link_libraries(test_unordered_map_exec
         clio_ctp_host Catch2::Catch2WithMain)
 
+add_executable(test_lease_exec
+        test_lease.cc)
+add_dependencies(test_lease_exec clio_ctp_host)
+target_link_libraries(test_lease_exec
+        clio_ctp_host Catch2::Catch2WithMain)
+
 add_executable(test_ring_buffer_exec
         test_ring_buffer.cc)
 add_dependencies(test_ring_buffer_exec clio_ctp_host)
@@ -109,6 +115,10 @@ add_test(NAME ctp_ipc_string COMMAND
 add_test(NAME ctp_ipc_unordered_map COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_unordered_map_exec)
 
+add_test(NAME ctp_ipc_lease COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_lease_exec)
+set_tests_properties(ctp_ipc_lease PROPERTIES TIMEOUT 120)
+
 add_test(NAME ctp_ring_buffer COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_exec)
 add_test(NAME ctp_ring_buffer_spsc COMMAND
@@ -176,6 +186,7 @@ install(TARGETS
         test_vector_exec
         test_string_exec
         test_unordered_map_exec
+        test_lease_exec
         test_ring_buffer_exec
         test_ring_buffer_spsc_exec
         test_ring_buffer_ext_exec

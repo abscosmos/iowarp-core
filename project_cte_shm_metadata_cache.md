@@ -436,8 +436,35 @@ the read path on metadata-only ops is far cheaper to debug than on payload reads
 - `data_structures/ipc/unordered_map.h`: open addressing, **fixed capacity**,
   per-slot seqlock, tombstones, `TryGetBytes` so clients never allocate.
   11 cases / 6191 assertions.
-- Still to build: `Lease` (over `TimedMutex`), and the multi-process
-  kill-readers-at-random torture test.
+- `memory/smart_ptr/lease.h`: `Leaseable` mix-in carrying BOTH mechanisms
+  (`gen_` seqlock for correctness, `lease_mutex_` for progress/lifetime),
+  `SeqRead()` optimistic-read helper, and move-only RAII `Lease<T>` whose
+  `get()` returns nullptr unless owned, so a missed `Owns()` check fails loudly
+  instead of silently reading unprotected memory. 5 cases / 28 assertions.
+
+**Phase 2 exit criterion MET.** The torture test forks 6 seqlock readers plus 2
+lease-holding readers, SIGKILLs them at random mid-read (and the lease holders
+while they still hold the lease) against a writer that deliberately widens its
+update window. Result over a 3s run:
+
+| metric | value |
+|---|---|
+| writes | 503,400 |
+| successful cross-process reads | 25,554,659 |
+| **torn reads** | **0** |
+| reader retries | 242,412,642 |
+| leases reclaimed from dead holders | 1 |
+
+Zero tears across 25.5M reads while readers were being killed, and the writer
+never wedged behind an abandoned lease.
+
+**Caveat to carry into Phase 5:** the retry rate here is ~90%, because this
+writer holds its update window open almost continuously by design. Real writes
+are rare and short, but reader retry rate under realistic write load is a
+number worth measuring rather than assuming — a hot blob under sustained
+rewrite could starve readers into the RPC fallback.
+
+- Still to build: nothing in Phase 2. Next is Phase 3.
 
 **Design refinement made during implementation: the map never rehashes.** Growth
 is the one operation that cannot be made safe for untracked cross-process
