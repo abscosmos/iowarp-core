@@ -646,7 +646,7 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
   // co_awaits returns here (clears), so it never looks stalled; a spinning task
   // never returns, so last_exec_start_us_ stays set and IsStalled() fires.
   last_exec_start_us_.store(
-      static_cast<double>(
+      static_cast<long long>(
           std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now().time_since_epoch())
               .count()),
@@ -697,7 +697,7 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
   task_ptr->RunWallTimer().Pause();
 
   // issue #781: task returned/yielded — no longer stalling this worker.
-  last_exec_start_us_.store(0.0, std::memory_order_relaxed);
+  last_exec_start_us_.store(0, std::memory_order_relaxed);
 
   // For periodic tasks, only set task_did_work_ if the task reported
   // actual work done (e.g., received data, sent data). This prevents

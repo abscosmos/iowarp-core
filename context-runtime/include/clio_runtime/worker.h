@@ -192,7 +192,7 @@ class Worker {
 
   /** True while a task is actively executing on this worker. */
   bool IsExecuting() const {
-    return last_exec_start_us_.load(std::memory_order_relaxed) != 0.0;
+    return last_exec_start_us_.load(std::memory_order_relaxed) != 0;
   }
 
   /**
@@ -207,22 +207,28 @@ class Worker {
    * @param now_us current steady-clock time in microseconds.
    */
   double RealtimeLoad(double now_us) const {
-    double start = last_exec_start_us_.load(std::memory_order_relaxed);
-    double elapsed = (start != 0.0) ? (now_us - start) : 0.0;
+    long long start = last_exec_start_us_.load(std::memory_order_relaxed);
+    double elapsed = (start != 0) ? (now_us - static_cast<double>(start)) : 0.0;
     return static_cast<double>(load_) +
-           queued_load_us_.load(std::memory_order_relaxed) + elapsed;
+           static_cast<double>(queued_load_us_.load(std::memory_order_relaxed)) +
+           elapsed;
   }
 
-  /** #781: reserve predicted cost on this worker when a task is mapped to it. */
+  /** #781: reserve predicted cost on this worker when a task is mapped to it.
+   *  Integer atomic (µs) — atomic<double> fetch_add is not portable (icx/MSVC). */
   void ReserveLoad(double us) {
-    if (us > 0.0) queued_load_us_.fetch_add(us, std::memory_order_relaxed);
+    if (us > 0.0) {
+      queued_load_us_.fetch_add(static_cast<long long>(us),
+                                std::memory_order_relaxed);
+    }
   }
   /** #781: release the reservation when the task starts executing (or is
    *  cancelled) — the executing cost is then tracked by load_ instead. */
   void ReleaseReservation(double us) {
     if (us > 0.0) {
-      double prev = queued_load_us_.fetch_sub(us, std::memory_order_relaxed);
-      if (prev - us < 0.0) queued_load_us_.store(0.0, std::memory_order_relaxed);
+      long long amt = static_cast<long long>(us);
+      long long prev = queued_load_us_.fetch_sub(amt, std::memory_order_relaxed);
+      if (prev - amt < 0) queued_load_us_.store(0, std::memory_order_relaxed);
     }
   }
 
@@ -232,8 +238,9 @@ class Worker {
    * @param now_us current steady-clock time in microseconds.
    */
   bool IsStalled(double now_us, double threshold_sec) const {
-    double start = last_exec_start_us_.load(std::memory_order_relaxed);
-    return start != 0.0 && (now_us - start) > threshold_sec * 1e6;
+    long long start = last_exec_start_us_.load(std::memory_order_relaxed);
+    return start != 0 &&
+           (now_us - static_cast<double>(start)) > threshold_sec * 1e6;
   }
 
   /**
@@ -450,12 +457,12 @@ class Worker {
   // worker stalled on a non-yielding task ( > kStallThresholdSec ) so the
   // runtime can spawn a replacement and steal the backlog. std::atomic so the
   // monitor thread can read it without a lock.
-  std::atomic<double> last_exec_start_us_{0.0};  // 0 == not executing
+  std::atomic<long long> last_exec_start_us_{0};  // µs, 0 == not executing
   // issue #781: sum of predicted costs of tasks mapped to this worker but not
   // yet started (the queue). Added in RuntimeMapTask, released in ExecTask when
   // the task begins. Lets the mapper avoid a worker with a heavy task queued
   // even before it starts running — the queued-behind-heavy fix.
-  std::atomic<double> queued_load_us_{0.0};
+  std::atomic<long long> queued_load_us_{0};  // µs
   bool did_work_;       // Tracks if any work was done in current loop iteration
   bool task_did_work_;  // Tracks if current task did actual work (set by tasks
                         // via CLIO_CUR_WORKER)
