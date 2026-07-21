@@ -7,6 +7,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
+#include <clio_runtime/bdev/bdev_runtime.h>
 #include <clio_ctp/util/gpu_api.h>
 #include <cstdlib>
 
@@ -22,10 +23,73 @@ bool MemBdevTransport::Init(const CreateParams& params,
   size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
   allocator_.Init(num_workers, ram_capacity_, params.alignment_);
 
+  // issue #783: back a plain RAM device with shared memory so client processes
+  // can read blob payloads directly.
+  //
+  // kPinned is deliberately excluded: its pages come from cudaMallocHost and
+  // cannot be SHM-backed, so it keeps the private-heap path.
+  //
+  // BEST-EFFORT. If the segment cannot be created the device still works
+  // exactly as before on the private heap; only the client fast path is lost.
+  if (bdev_type_ == BdevType::kRam && runtime != nullptr) {
+    InitShmBacking(runtime->pool_id_);
+  }
+
   return true;
 }
 
+void MemBdevTransport::InitShmBacking(const clio::run::PoolId &pool_id) {
+  try {
+    auto pid = static_cast<clio::run::u32>(ctp::SystemInfo::GetPid());
+    shm_name_ = ShmSegmentName(pid, pool_id);
+    // Reserve header + full capacity in one sparse mapping. memfd reservations
+    // are lazily faulted, so this costs only the bytes actually written.
+    size_t total = sizeof(ShmRamHeader) + static_cast<size_t>(ram_capacity_);
+    ctp::ipc::MemoryBackendId bid(pid, pool_id.major_);
+    if (!shm_backend_.shm_init(bid, ctp::Unit<size_t>::Bytes(total),
+                               shm_name_)) {
+      HLOG(kWarning,
+           "[#783] RAM bdev '{}': shm_init failed ({} bytes) -- falling back "
+           "to private heap, client direct reads disabled",
+           shm_name_, total);
+      return;
+    }
+    char *base = reinterpret_cast<char *>(shm_backend_.data_);
+    if (base == nullptr) {
+      return;
+    }
+    shm_header_ = reinterpret_cast<ShmRamHeader *>(base);
+    std::memset(shm_header_, 0, sizeof(ShmRamHeader));
+    shm_header_->version_ = ShmRamHeader::kVersion;
+    shm_header_->capacity_ = ram_capacity_;
+    shm_header_->data_off_ = sizeof(ShmRamHeader);
+    shm_base_ = base + sizeof(ShmRamHeader);
+    // ready_ LAST, so a client that sees ready_ == 1 knows the mapping behind
+    // it is fully described.
+    shm_header_->ready_ = 1;
+    shm_backed_ = true;
+    HLOG(kInfo, "[#783] RAM bdev '{}' is shared-memory backed ({} bytes)",
+         shm_name_, ram_capacity_);
+  } catch (const std::exception &e) {
+    HLOG(kWarning, "[#783] RAM bdev shm backing failed: {}", e.what());
+    shm_backed_ = false;
+    shm_base_ = nullptr;
+    shm_header_ = nullptr;
+  }
+}
+
 void MemBdevTransport::Destroy() {
+  if (shm_backed_) {
+    // Mark unusable before tearing the mapping down so a client that is
+    // mid-attach refuses rather than reading a dying segment.
+    if (shm_header_ != nullptr) {
+      shm_header_->ready_ = 0;
+    }
+    shm_header_ = nullptr;
+    shm_base_ = nullptr;
+    shm_backed_ = false;
+    shm_backend_.shm_destroy();
+  }
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
   for (RamPage &page : ram_pages_) {
     FreeRamPage(page);
@@ -57,6 +121,11 @@ void MemBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& block
 }
 
 char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
+  // SHM-backed devices need no per-page allocation at all: the whole capacity
+  // is one sparse mapping, so a page is just an offset into it.
+  if (shm_backed_ && shm_base_ != nullptr) {
+    return shm_base_ + page_idx * kRamPageSize;
+  }
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
   if (page_idx >= ram_pages_.size()) {
     ram_pages_.resize(page_idx + 1);
@@ -85,6 +154,9 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
 }
 
 char* MemBdevTransport::GetRamPage(size_t page_idx) const {
+  if (shm_backed_ && shm_base_ != nullptr) {
+    return shm_base_ + page_idx * kRamPageSize;
+  }
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
   if (page_idx >= ram_pages_.size()) return nullptr;
   return ram_pages_[page_idx].data;
