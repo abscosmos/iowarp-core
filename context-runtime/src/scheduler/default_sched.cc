@@ -542,7 +542,11 @@ void DefaultScheduler::LoadBalance() {
   //   - Worker::TasksProcessed(): periodic pollers complete and re-arm
   //     continuously, so an all-tasks counter never stops advancing. Polling is
   //     not progress; use RealTasksProcessed().
-  {
+  // work_orch_ is null when LoadBalance is driven directly by a unit test
+  // rather than by the WorkOrchestrator's monitor thread. The stall check below
+  // already guards this; the watchdog must too, or the no-op path segfaults
+  // (caught by clio_run_autogen_coverage_tests' "LoadBalance noop" section).
+  if (work_orch_ != nullptr) {
     u64 processed = 0;
     u64 outstanding = 0;
     bool any_executing = false;
