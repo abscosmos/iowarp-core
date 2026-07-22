@@ -111,7 +111,8 @@ class DefaultScheduler : public Scheduler {
   std::vector<Worker *> elastic_workers_;
 
   /** #785 progress watchdog. Monitor-thread only, so plain members. */
-  static constexpr double kNoProgressAlarmSec = 10.0;
+  static constexpr double kNoProgressAlarmSec = 10.0;   ///< nothing executing
+  static constexpr double kAllBlockedAlarmSec = 60.0;   ///< all blocked (ambiguous)
   u64 last_progress_count_ = 0;
   double last_progress_us_ = 0.0;
   bool progress_alarm_raised_ = false;

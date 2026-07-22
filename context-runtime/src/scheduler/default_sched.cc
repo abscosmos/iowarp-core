@@ -549,31 +549,62 @@ void DefaultScheduler::LoadBalance() {
   if (work_orch_ != nullptr) {
     u64 processed = 0;
     u64 outstanding = 0;
-    bool any_executing = false;
+    u32 live = 0;       // workers executing something
+    u32 live_stalled = 0;  // ...of which are stuck past the stall threshold
     for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
       Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
       if (w == nullptr) continue;
       processed += w->RealTasksProcessed();
-      if (w->IsExecuting()) any_executing = true;
+      if (w->IsExecuting()) {
+        ++live;
+        if (w->IsStalled(now_us, kStallThresholdSec)) ++live_stalled;
+      }
       WorkerStats st = w->GetWorkerStats();
       outstanding += st.num_queued_tasks_ + st.num_blocked_tasks_ +
                      st.num_retry_tasks_;
     }
-    const bool wedged_shape = (outstanding > 0) && !any_executing;
+    // Two shapes mean "no progress is possible", and BOTH must be covered:
+    //
+    //  (a) nothing is executing at all — everything is parked waiting on
+    //      something that is not coming (dependency cycle, lost wakeup).
+    //
+    //  (b) everything that IS executing is stalled — the lock-cycle case.
+    //      CoMutex::Lock() calls ctp::Mutex::Lock(), a BLOCKING mutex rather
+    //      than a coroutine-aware park, so two tasks deadlocked on an A/B-B/A
+    //      lock order sit *inside* ExecTask with IsExecuting() true. Keying
+    //      only on (a) would have missed the commonest real deadlock entirely,
+    //      while this alarm claimed to cover it.
+    // The two shapes are NOT equally diagnostic, so they get different
+    // windows:
+    //   (a) nothing executing at all is unambiguous — no thread can make
+    //       progress, period. Alarm after the short window.
+    //   (b) everything executing is blocked is AMBIGUOUS: a worker deadlocked
+    //       on a lock is indistinguishable from one inside a slow syscall that
+    //       will return. Alarming on that quickly would fire on every long
+    //       blocking task, and an alarm operators learn to ignore is worse than
+    //       none. So it needs a much longer window, after which deadlock is far
+    //       likelier than slowness.
+    const bool nothing_running = (outstanding > 0) && (live == 0);
+    const bool all_blocked =
+        (outstanding > 0) && (live > 0) && (live_stalled == live);
+    const double window_sec =
+        nothing_running ? kNoProgressAlarmSec : kAllBlockedAlarmSec;
+    const bool wedged_shape = nothing_running || all_blocked;
     if (!wedged_shape || processed != last_progress_count_) {
       last_progress_count_ = processed;
       last_progress_us_ = now_us;
       progress_alarm_raised_ = false;
     } else if (!progress_alarm_raised_ &&
-               (now_us - last_progress_us_) > kNoProgressAlarmSec * 1e6) {
+               (now_us - last_progress_us_) > window_sec * 1e6) {
       progress_alarm_raised_ = true;  // once per stall, not once per tick
       HLOG(kError,
-           "[#785] DEADLOCK SUSPECTED: {} task(s) outstanding, NO worker "
-           "executing, and no non-periodic task completed in {}s. Migration "
-           "cannot resolve this shape — everything is parked waiting on "
-           "something that is not coming (dependency cycle, lock cycle, or a "
-           "lost wakeup). Worker state:",
-           outstanding, kNoProgressAlarmSec);
+           "[#785] DEADLOCK SUSPECTED: {} task(s) outstanding, {} worker(s) "
+           "executing ({} of them stalled), and no non-periodic task completed "
+           "in {}s. Migration cannot resolve this shape — either everything is "
+           "parked waiting on something that is not coming (dependency cycle, "
+           "lost wakeup), or every running worker is blocked (lock cycle). "
+           "Worker state:",
+           outstanding, live, live_stalled, window_sec);
       for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
         Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
         if (w == nullptr) continue;
