@@ -131,6 +131,15 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
+          # GitHub's pwsh shell runs with $ErrorActionPreference = 'Stop'. In
+          # PowerShell 7.3+ that can also apply to NATIVE commands via
+          # $PSNativeCommandUseErrorActionPreference, in which case a non-zero
+          # exit from cmake throws and terminates the script — the retry below
+          # would never run and this step would behave exactly as it does today,
+          # silently. Force both off so a failed build is an exit code we can
+          # branch on rather than a terminating error.
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
           cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::warning::BUILD-RETRY: first build attempt failed (exit $LASTEXITCODE); retrying once — see issue #800"
@@ -297,10 +306,16 @@ jobs:
           rem Retry once on a transient Windows link lock — see the Build step
           rem in build-test and issue #800. A real compile error fails the same
           rem way on the retry, so this cannot turn genuine breakage green.
+          rem The retry sleeps with ping, not `timeout /t`: the latter aborts
+          rem with "Input redirection is not supported" when stdin is
+          rem redirected, which it is under Actions. ping -n 6 waits ~5s.
+          rem Comments are kept OUTSIDE the parenthesised block below — a rem
+          rem line inside one is parsed with it, so a stray closing paren in a
+          rem comment would terminate the block early.
           cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS%
           if errorlevel 1 (
             echo ::warning::BUILD-RETRY: first icx build attempt failed; retrying once - see issue #800
-            timeout /t 5 /nobreak >nul
+            ping -n 6 127.0.0.1 >nul
             cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
           )
       - name: Run ctest
@@ -437,6 +452,10 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
+          # See the build-test Build step: pwsh 'Stop' + native-command error
+          # preference would abort before the retry could run.
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
           cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::warning::BUILD-RETRY: first boost build attempt failed (exit $LASTEXITCODE); retrying once — see issue #800"
