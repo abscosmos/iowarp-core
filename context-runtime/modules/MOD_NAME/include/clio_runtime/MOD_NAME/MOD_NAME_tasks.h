@@ -123,10 +123,18 @@ struct CustomTask : public clio::run::Task {
       clio::run::u32 operation_id,
       clio::run::u32 spin_us = 0,
       clio::run::u32 chain_depth = 0,
-      clio::run::u32 block_us = 0)
+      clio::run::u32 block_us = 0,
+      int64_t group_id = -1)
       : clio::run::Task(task_node, pool_id, pool_query, 10),
         data_(CLIO_PRIV_ALLOC, data), operation_id_(operation_id),
         spin_us_(spin_us), chain_depth_(chain_depth), block_us_(block_us) {
+    // issue #785: optional scheduling affinity group. Lets a test exercise the
+    // group machinery D8 relies on — same group pins to one worker, distinct
+    // groups bind independently — without needing the admin network periodics,
+    // which never spawn in a co-located client-mode runtime.
+    if (group_id >= 0) {
+      task_group_ = clio::run::TaskGroup(group_id);
+    }
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
