@@ -879,6 +879,63 @@ networking groups → D8-2 (three, by socket ownership).
 
 ---
 
+## 9b. Implementation status (measured, 2026-07-22)
+
+**Done and verified.** `test_stall_migration.cc` — 5 tests, 3/3 consecutive runs green at a flat
+61-63 s, TSan-clean in every changed file, no regression (wait 4/4, comutex 13/13).
+
+| Category (§2) | Mechanism | Status |
+|---|---|---|
+| 1 lane backlog | lane transfer (D5) | done |
+| 2 blocked queues | `park_mtx_` + `MigrateParkedTo` | done |
+| 3 periodic queues | same | done |
+| 4 retry queue | same | done |
+| 5 event queue | queue-object transfer, drained by adopter | done |
+| 6 `co_await`-suspended | follows category 5 | done |
+
+**The design got simpler than §4 assumed.** Transferring the event queue OBJECT rather than draining
+it redirects both queued events and every event a still-running subtask pushes later, because a
+parked task's raw queue pointer stays correct. No per-task re-pointing and no producer-side
+handshake — so D1's `mpmc` and D3's `sig_mtx_`/`sig_gen_` were never needed on this path. Same
+insight as the lane transfer.
+
+**Corrections to earlier decisions, forced by measurement:**
+
+* §2.5 stands and is the load-bearing fact: at the default `num_threads=4` there is exactly ONE
+  general-purpose worker, so migration has nowhere to go. `SpawnAdditionalWorker` is the
+  precondition for everything else.
+* #781's **unbounded** elastic pool is wrong once rescue cascades. Spawning per rescue makes the pool
+  track CUMULATIVE stalls; it reached 17 workers on a 6-core box and the suite slowed until it looked
+  like a deadlock. Fixed by reusing idle replacements (`FindIdleElasticWorker`) plus a ceiling of
+  baseline + one thread per core. Soak now shows 20 rescues from 6 spawns.
+* `RetireWorker` stays a no-op — §7.7.
+
+**Bugs found in this work, all by running repeatedly rather than once:**
+
+1. Elastic workers were invisible to stall detection, so cascades stopped at level one.
+2. `check()` rescued net workers — the exact D7 ZMQ hazard, violated in the implementation of the
+   document that describes it.
+3. `AdoptEventQueue` stored over the rescuer's queue pointer, orphaning events for tasks that still
+   pointed at it. **Task loss**, and the true cause of the intermittency previously misdiagnosed as
+   a hang, oversubscription, and rescue latency in turn.
+4. Six data races TSan found in the new code (unguarded `queue.size()`, `GetSuspendPeriod`,
+   `Finalize`, `tid_`, `load_`, `is_running_`).
+5. Pre-existing: `ReschedulePeriodicTask` silently dropped a periodic task with no lane — fixed.
+
+**Still open.** `Container::Reinforce{Cpu,Wall}Model` races on its float vectors (~30 TSan reports).
+Pre-existing #781; the fix either breaks the public const-ref getters or puts a mutex on the
+per-task-completion hot path of every worker, so it is recorded rather than changed here.
+
+**What is NOT proven.** The tests cover two stall shapes — CPU spin and blocking sleep — on one
+6-core box, single node, no CI. There is no coverage of dependency cycles (mutual `co_await`, lock
+cycles), which migration cannot fix by design and the runtime does not detect. A task wedged inside
+its own handler is still unrescuable. Net and GPU workers are never migrated (D7), so a wedge there
+remains a node-level outage until D8 lands. "Deadlock is impossible" is therefore NOT established;
+what is established is that a worker wedged by a non-yielding task no longer strands the work
+committed to it.
+
+---
+
 ## 10. Deferred / out of scope
 
 * **General work stealing by idle workers.** Explicitly deferred per D-a. `StealWork()` stays a
