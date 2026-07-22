@@ -79,6 +79,8 @@ using namespace std::chrono_literals;
 #include <clio_runtime/task.h>
 #include <clio_runtime/types.h>
 
+#include <clio_runtime/scheduler/default_sched.h>
+
 #include <clio_runtime/MOD_NAME/MOD_NAME_client.h>
 #include <clio_runtime/MOD_NAME/MOD_NAME_tasks.h>
 
@@ -665,7 +667,54 @@ TEST_CASE("progress_watchdog_does_not_cry_wolf_on_slow_work", "[stall][watchdog]
 }
 
 //==============================================================================
-// TEST 8 — no task may be DROPPED, however slow the runtime gets
+// TEST 8 — the watchdog's FIRING conditions, tested as a predicate
+//
+// Test 7 covers the false-positive direction. This covers firing, which cannot
+// be tested by building a real deadlock: the tasks would never complete,
+// teardown would never finish, and CI would HANG rather than fail — the one
+// outcome worse than an untested alarm. Testing the predicate directly gets the
+// coverage without wedging anything.
+//
+// The lock-cycle row is the one that matters. CoMutex::Lock() calls
+// ctp::Mutex::Lock(), a blocking mutex rather than a coroutine-aware park, so
+// two tasks deadlocked A/B-B/A sit INSIDE ExecTask with IsExecuting() true. An
+// earlier version of this watchdog keyed only on "nothing executing" and so
+// missed that case entirely while claiming to cover it.
+//==============================================================================
+
+TEST_CASE("watchdog_predicate_fires_on_the_right_shapes", "[stall][predicate]") {
+  using clio::run::DefaultScheduler;
+  double win = 0.0;
+
+  SECTION("idle runtime is not a deadlock") {
+    // No outstanding work: nothing to be stuck on, however few workers run.
+    REQUIRE_FALSE(DefaultScheduler::IsWedgedShape(0, 0, 0, &win));
+    REQUIRE_FALSE(DefaultScheduler::IsWedgedShape(0, 4, 4, &win));
+  }
+
+  SECTION("work outstanding with nothing executing IS a deadlock") {
+    REQUIRE(DefaultScheduler::IsWedgedShape(1, 0, 0, &win));
+    // Unambiguous, so it uses the SHORT window.
+    REQUIRE(win < 30.0);
+  }
+
+  SECTION("work outstanding with every executing worker stalled IS suspect") {
+    REQUIRE(DefaultScheduler::IsWedgedShape(5, 4, 4, &win));
+    // Ambiguous against a slow syscall, so it must use the LONG window —
+    // firing quickly here would alarm on every long blocking task.
+    REQUIRE(win > 30.0);
+  }
+
+  SECTION("a healthy worker means progress is possible") {
+    // Three of four stalled, one still running: not wedged.
+    REQUIRE_FALSE(DefaultScheduler::IsWedgedShape(5, 4, 3, &win));
+    // Nothing stalled at all.
+    REQUIRE_FALSE(DefaultScheduler::IsWedgedShape(5, 4, 0, &win));
+  }
+}
+
+//==============================================================================
+// TEST 9 — no task may be DROPPED, however slow the runtime gets
 //==============================================================================
 
 TEST_CASE("no_tasks_dropped_under_stall_pressure", "[stall][drop]") {

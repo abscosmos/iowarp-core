@@ -65,7 +65,25 @@ class DefaultScheduler : public Scheduler {
   void DivideWorkers(WorkOrchestrator *work_orch) override;
   u32 RuntimeMapTask(Worker *worker, const Future<Task> &task,
                      ContainerHold container) override;
-  void LoadBalance() override;         // issue #781 — safety net, every 500ms
+  void LoadBalance() override;
+
+  /**
+   * issue #785: the progress watchdog's decision, as a pure function so it can
+   * be unit-tested without constructing a real deadlock.
+   *
+   * A live deadlock test would wedge the runtime permanently — the tasks never
+   * complete, teardown never finishes, and CI hangs rather than fails. Testing
+   * the predicate directly gets the coverage without that risk.
+   *
+   * @param outstanding queued + blocked + retry tasks across all workers.
+   * @param live workers currently inside ExecTask.
+   * @param live_stalled how many of those are past the stall threshold.
+   * @param[out] window_sec how long to wait before believing it (the
+   *   "everything blocked" shape is ambiguous and needs far longer).
+   * @return true if this shape means no progress is possible.
+   */
+  static bool IsWedgedShape(u64 outstanding, u32 live, u32 live_stalled,
+                            double *window_sec);         // issue #781 — safety net, every 500ms
   bool StealWork(Worker *thief) override;  // issue #781 — work-conserving steal
   void RecordCompletion(u32 method, double cpu_us, double wall_us) override;
   void AdjustPolling(const clio::run::shared_ptr<Task> &task) override;

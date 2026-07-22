@@ -358,6 +358,29 @@ Worker *DefaultScheduler::PickLeastLoadedLive(double now_us, Worker *avoid_a,
   return best;
 }
 
+bool DefaultScheduler::IsWedgedShape(u64 outstanding, u32 live,
+                                     u32 live_stalled, double *window_sec) {
+  // No work outstanding is not a deadlock, it is an idle runtime.
+  if (outstanding == 0) {
+    return false;
+  }
+  // (a) Nothing executing at all: unambiguous — no thread can make progress.
+  if (live == 0) {
+    if (window_sec) *window_sec = kNoProgressAlarmSec;
+    return true;
+  }
+  // (b) Everything executing is stalled: the lock-cycle shape. CoMutex::Lock()
+  // blocks the worker rather than parking the task, so a deadlocked worker is
+  // still "executing". Ambiguous against a slow syscall, hence the much longer
+  // window.
+  if (live_stalled == live) {
+    if (window_sec) *window_sec = kAllBlockedAlarmSec;
+    return true;
+  }
+  // Something is running and not stalled: progress is possible.
+  return false;
+}
+
 void DefaultScheduler::LoadBalance() {
   // Runs on the WorkOrchestrator monitor thread every ~500ms (NOT a worker).
   // This pass implements the OBSERVABILITY half of the safety net: detect a
@@ -584,12 +607,9 @@ void DefaultScheduler::LoadBalance() {
     //       blocking task, and an alarm operators learn to ignore is worse than
     //       none. So it needs a much longer window, after which deadlock is far
     //       likelier than slowness.
-    const bool nothing_running = (outstanding > 0) && (live == 0);
-    const bool all_blocked =
-        (outstanding > 0) && (live > 0) && (live_stalled == live);
-    const double window_sec =
-        nothing_running ? kNoProgressAlarmSec : kAllBlockedAlarmSec;
-    const bool wedged_shape = nothing_running || all_blocked;
+    double window_sec = kNoProgressAlarmSec;
+    const bool wedged_shape =
+        IsWedgedShape(outstanding, live, live_stalled, &window_sec);
     if (!wedged_shape || processed != last_progress_count_) {
       last_progress_count_ = processed;
       last_progress_us_ = now_us;
