@@ -382,7 +382,12 @@ class ConfigManager : public ctp::BaseConfig {
   // costs only the pages actually touched. NOTE: on a host whose /dev/shm is
   // smaller than the live set, touching past the tmpfs limit raises SIGBUS,
   // not ENOMEM. See CalculateMetadataSegmentSize().
-  size_t metadata_segment_size_ = ctp::Unit<size_t>::Gigabytes(8);
+  // 0 means "auto-calculate" — CalculateMetadataSegmentSize() supplies the
+  // default. Initialising this to a non-zero size would make the explicit
+  // override branch there permanently true and the documented sentinel a lie;
+  // it only worked because LoadDefault() resets it to 0. Set via the
+  // `metadata_segment_size` key under `runtime` in the config file.
+  size_t metadata_segment_size_ = 0;
 
   u32 port_ = 9413;
   // If true (CLIO_EPHEMERAL / --ephemeral), skip the default compose at startup.
