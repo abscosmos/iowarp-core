@@ -93,7 +93,24 @@ class MemBdevTransport : public BdevTransport {
   /** Create the shared-memory backing for a node-local RAM device. */
   void InitShmBacking(const clio::run::PoolId &pool_id);
 
+  /**
+   * True if this page's START lies inside the shared mapping.
+   *
+   * Deliberately NOT "the whole 1 GiB page fits": a device smaller than one
+   * page has a partial page 0, and requiring the full page rejected it --
+   * which silently pushed every RAM bdev back to the private heap and broke
+   * direct payload reads. Callers clamp their access within the device
+   * capacity, and the mapping is sized to cover it (see kBackendHeaderSlack).
+   */
+  bool ShmPageInBounds(size_t page_idx) const {
+    if (kRamPageSize != 0 && page_idx > shm_usable_ / kRamPageSize) {
+      return false;  // guards the multiply below from overflowing
+    }
+    return page_idx * kRamPageSize < shm_usable_;
+  }
+
   ctp::ipc::PosixShmMmap shm_backend_;
+  size_t shm_usable_ = 0;  /**< bytes of device space actually mapped */
   char *shm_base_ = nullptr;       /**< byte 0 of device space, or nullptr */
   ShmRamHeader *shm_header_ = nullptr;
   bool shm_backed_ = false;

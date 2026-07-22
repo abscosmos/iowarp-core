@@ -44,7 +44,15 @@ void MemBdevTransport::InitShmBacking(const clio::run::PoolId &pool_id) {
     shm_name_ = ShmSegmentName(pid, pool_id);
     // Reserve header + full capacity in one sparse mapping. memfd reservations
     // are lazily faulted, so this costs only the bytes actually written.
-    size_t total = sizeof(ShmRamHeader) + static_cast<size_t>(ram_capacity_);
+    // Ask for the device capacity PLUS slack for the backend's own header.
+    // The backend carves that out of the region, so data_capacity_ comes back
+    // smaller than requested (measured: exactly 65536 less). Without the slack
+    // the last 64 KB of the device maps to nothing, and the original code
+    // indexed into it -- an out-of-bounds write that Linux tolerated and
+    // Windows turned into a SIGSEGV in cte_tiered_storage_all.
+    static constexpr size_t kBackendHeaderSlack = 1024 * 1024;
+    size_t total = sizeof(ShmRamHeader) + static_cast<size_t>(ram_capacity_) +
+                   kBackendHeaderSlack;
     ctp::ipc::MemoryBackendId bid(pid, pool_id.major_);
     if (!shm_backend_.shm_init(bid, ctp::Unit<size_t>::Bytes(total),
                                shm_name_)) {
@@ -58,18 +66,42 @@ void MemBdevTransport::InitShmBacking(const clio::run::PoolId &pool_id) {
     if (base == nullptr) {
       return;
     }
+    // Trust the backend's reported capacity, not the size we asked for. The
+    // backend carves out its own header (kBackendHeaderSize) and a platform
+    // may hand back a smaller view than requested -- on Windows the metadata
+    // segment failed outright with "MapViewOfFile: Access is denied" at a
+    // similar size. Indexing to the REQUESTED capacity in that case walks off
+    // the end of the mapping, which is what segfaulted cte_tiered_storage_all
+    // on Windows while going unnoticed on Linux.
+    // Use what the backend ACTUALLY mapped, which is less than requested: it
+    // carves out its own header, and a platform may return a shorter view.
+    // Do NOT reject a short mapping -- an all-or-nothing check disables SHM
+    // backing entirely and sends every page to the 1 GiB private-heap path,
+    // which OOM-killed the bdev suite. Pages past the end fall back
+    // individually via ShmPageInBounds().
+    size_t usable = shm_backend_.data_capacity_;
+    if (usable <= sizeof(ShmRamHeader)) {
+      HLOG(kWarning,
+           "[#783] RAM bdev '{}': mapping unusably small ({} bytes) -- "
+           "private heap",
+           shm_name_, usable);
+      shm_backend_.shm_destroy();
+      return;
+    }
     shm_header_ = reinterpret_cast<ShmRamHeader *>(base);
     std::memset(shm_header_, 0, sizeof(ShmRamHeader));
     shm_header_->version_ = ShmRamHeader::kVersion;
     shm_header_->capacity_ = ram_capacity_;
     shm_header_->data_off_ = sizeof(ShmRamHeader);
     shm_base_ = base + sizeof(ShmRamHeader);
+    shm_usable_ = usable - sizeof(ShmRamHeader);
     // ready_ LAST, so a client that sees ready_ == 1 knows the mapping behind
     // it is fully described.
     shm_header_->ready_ = 1;
     shm_backed_ = true;
-    HLOG(kInfo, "[#783] RAM bdev '{}' is shared-memory backed ({} bytes)",
-         shm_name_, ram_capacity_);
+    HLOG(kInfo,
+         "[#783] RAM bdev '{}' is shared-memory backed ({} of {} bytes mapped)",
+         shm_name_, shm_usable_, ram_capacity_);
   } catch (const std::exception &e) {
     HLOG(kWarning, "[#783] RAM bdev shm backing failed: {}", e.what());
     shm_backed_ = false;
@@ -123,8 +155,20 @@ void MemBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& block
 char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
   // SHM-backed devices need no per-page allocation at all: the whole capacity
   // is one sparse mapping, so a page is just an offset into it.
+  //
+  // The bounds check is NOT redundant: without it an offset past the mapping
+  // returns a pointer the caller happily memcpy's into. That is a silent
+  // out-of-bounds write, and it is what crashed Windows CI.
   if (shm_backed_ && shm_base_ != nullptr) {
-    return shm_base_ + page_idx * kRamPageSize;
+    if (ShmPageInBounds(page_idx)) {
+      return shm_base_ + page_idx * kRamPageSize;
+    }
+    HLOG(kWarning,
+         "[#783] RAM bdev '{}': page {} is outside the {}-byte mapping -- "
+         "using private heap for it",
+         shm_name_, page_idx, shm_usable_);
+    // Fall through to the private-heap path rather than hand back a bad
+    // pointer; correctness first, the fast path is only an optimization.
   }
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
   if (page_idx >= ram_pages_.size()) {
@@ -154,7 +198,7 @@ char* MemBdevTransport::EnsureRamPage(size_t page_idx) {
 }
 
 char* MemBdevTransport::GetRamPage(size_t page_idx) const {
-  if (shm_backed_ && shm_base_ != nullptr) {
+  if (shm_backed_ && shm_base_ != nullptr && ShmPageInBounds(page_idx)) {
     return shm_base_ + page_idx * kRamPageSize;
   }
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
