@@ -44,9 +44,16 @@
 #include <clio_ctp/memory/backend/posix_shm_mmap.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
 
+// fork()/waitpid() are POSIX-only; the cross-process case is compiled out on
+// Windows rather than replaced with a same-process imitation, which would not
+// exercise the property it exists to prove (offsets resolving at a different
+// base address).
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -58,7 +65,7 @@ namespace {
 
 /** Unique-ish segment name so parallel test runs do not collide. */
 std::string SegName() {
-  return "cte_shm_cache_test_" + std::to_string(getpid());
+  return "cte_shm_cache_test_" + std::to_string(ctp::SystemInfo::GetPid());
 }
 
 struct Fixture {
@@ -69,7 +76,8 @@ struct Fixture {
 
   bool Create() {
     name = SegName();
-    ctp::ipc::AllocatorId id = ctp::ipc::AllocatorId::Get(getpid(), 77);
+    ctp::ipc::AllocatorId id =
+        ctp::ipc::AllocatorId::Get(ctp::SystemInfo::GetPid(), 77);
     if (!backend.shm_init(id, ctp::Unit<size_t>::Megabytes(64), name)) {
       return false;
     }
@@ -204,6 +212,7 @@ TEST_CASE("ShmCache: tag maps round-trip", "[shm_cache]") {
   f.Destroy();
 }
 
+#ifndef _WIN32
 TEST_CASE("ShmCache: readable from another process at a different address", "[shm_cache]") {
   // THE test that matters: every internal reference is a segment-relative
   // offset, so a child that maps the same segment at a different base address
@@ -291,5 +300,6 @@ TEST_CASE("ShmCache: readable from another process at a different address", "[sh
 
   f.Destroy();
 }
+#endif  // !_WIN32
 
 SIMPLE_TEST_MAIN()

@@ -35,11 +35,18 @@
 
 #include "clio_ctp/memory/smart_ptr/lease.h"
 
+// The cross-process half of this suite needs fork()/mmap()/waitpid(), which
+// are POSIX-only. On Windows the single-process Lease/SeqRead cases still run;
+// the kill-readers torture test is compiled out rather than faked, because a
+// weaker stand-in would give false confidence in the one property that matters.
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <csignal>
+#endif
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -68,11 +75,20 @@ struct Shared {
 };
 
 Shared *MapShared() {
+#ifndef _WIN32
   void *m = mmap(nullptr, sizeof(Shared), PROT_READ | PROT_WRITE,
                  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   if (m == MAP_FAILED) {
     return nullptr;
   }
+#else
+  // Single-process cases only need shared-nothing memory; the cross-process
+  // cases are compiled out on Windows.
+  void *m = std::malloc(sizeof(Shared));
+  if (m == nullptr) {
+    return nullptr;
+  }
+#endif
   auto *s = new (m) Shared();
   s->rec.InitLeaseable();
   s->rec.value = 0;
@@ -87,6 +103,7 @@ Shared *MapShared() {
   return s;
 }
 
+#ifndef _WIN32
 /** Reader loop: seqlock-read the record and check the invariant. */
 void ReaderLoop(Shared *s) {
   ctp::min_u64 snap[kFields];
@@ -109,8 +126,15 @@ void ReaderLoop(Shared *s) {
     s->read_ok.fetch_add(1);
   }
 }
+#endif  // !_WIN32
 
 }  // namespace
+
+#ifdef _WIN32
+static void UnmapShared(Shared *s) { std::free(s); }
+#else
+static void UnmapShared(Shared *s) { munmap(s, sizeof(Shared)); }
+#endif
 
 TEST_CASE("Lease: basic acquire and release", "[lease]") {
   auto *s = MapShared();
@@ -131,7 +155,7 @@ TEST_CASE("Lease: basic acquire and release", "[lease]") {
   // outliving its segment unlocks through a dangling pointer -- which is
   // exactly what a client must avoid when the runtime tears the metadata
   // segment down underneath it.
-  munmap(s, sizeof(Shared));
+  UnmapShared(s);
 }
 
 TEST_CASE("Lease: TryAcquire fails while held", "[lease]") {
@@ -153,7 +177,7 @@ TEST_CASE("Lease: TryAcquire fails while held", "[lease]") {
     REQUIRE(c.Owns());
   }
 
-  munmap(s, sizeof(Shared));
+  UnmapShared(s);
 }
 
 TEST_CASE("Lease: move transfers ownership exactly once", "[lease]") {
@@ -174,7 +198,7 @@ TEST_CASE("Lease: move transfers ownership exactly once", "[lease]") {
     REQUIRE(c.Owns());
   }
 
-  munmap(s, sizeof(Shared));
+  UnmapShared(s);
 }
 
 TEST_CASE("SeqRead: rejects a write in progress", "[lease]") {
@@ -193,7 +217,7 @@ TEST_CASE("SeqRead: rejects a write in progress", "[lease]") {
   REQUIRE(ok);
   REQUIRE(ran);
 
-  munmap(s, sizeof(Shared));
+  UnmapShared(s);
 }
 
 // ===========================================================================
@@ -204,6 +228,7 @@ TEST_CASE("SeqRead: rejects a write in progress", "[lease]") {
 //   2. Killing readers -- including ones holding leases -- never wedges the
 //      writer, and abandoned leases are reclaimed.
 // ===========================================================================
+#ifndef _WIN32
 TEST_CASE("Lease torture: readers killed at random never tear or wedge",
           "[lease][torture]") {
   auto *s = MapShared();
@@ -307,5 +332,6 @@ TEST_CASE("Lease torture: readers killed at random never tear or wedge",
   REQUIRE(s->read_ok.load() > 10);
   REQUIRE(s->rec.lease_mutex_.GetStealCount() >= 1);
 
-  munmap(s, sizeof(Shared));
+  UnmapShared(s);
 }
+#endif  // !_WIN32

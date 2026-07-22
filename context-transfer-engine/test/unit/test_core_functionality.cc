@@ -2626,7 +2626,7 @@ TEST_CASE("CTE SHM cache write-then-read",
  * the RPC answer would make the benchmark meaningless.
  */
 TEST_CASE("CTE SHM cache metadata read benchmark",
-          "[cte][core][shm_cache][bench]") {
+          "[cte][core][shm_cache][bench][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
   clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   clio::cte::core::CreateParams params;
@@ -2736,7 +2736,7 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
  * worse than no fast path, so correctness is asserted before speed.
  */
 TEST_CASE("CTE SHM cache direct payload read",
-          "[cte][core][shm_cache][payload]") {
+          "[cte][core][shm_cache][payload][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
   clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   clio::cte::core::CreateParams params;
@@ -2898,7 +2898,7 @@ TEST_CASE("CTE SHM cache direct payload read",
  * the write, and the read saving is only the fraction Amdahl allows.
  */
 TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
-          "[cte][core][shm_cache][bench][wtr]") {
+          "[cte][core][shm_cache][bench][wtr][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
   clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   clio::cte::core::CreateParams params;
