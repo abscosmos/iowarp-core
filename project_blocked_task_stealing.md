@@ -577,6 +577,34 @@ taking the node's networking down with no rescue possible — into an ordinary m
 * **Clears stranded category 1.** Unstarted lane tasks have no coroutine state, so this phase
   needs no cross-thread-resume guarantee beyond what the runtime already does (§7.1).
 
+**STATUS: P1 DONE — commit 35fba7a6.** `SpawnAdditionalWorker` is real; `LoadBalance` transfers a
+stalled worker's lane to a fresh worker. Verified 5/5 runs: chained tasks 6/8 stranded → 0/8, 4
+rescues fired, no regression in `wait_functionality` (4/4) or `comutex` (13/13).
+
+Implementation notes worth carrying forward:
+
+* **No lane headroom exists.** The TaskQueue is constructed with `num_lanes = num_threads`
+  (`ipc_manager.cc:1021`) — the `+1` in `CalculateQueueSegmentSize` is sizing only. So an elastic
+  worker cannot be given a lane. It does not need one: the rescue is a *swap*. This is what makes
+  D5 the right call rather than a convenience.
+* **Append safety without a lock.** `all_workers_`/`workers_`/`worker_threads_` reserve
+  `kElasticHeadroom` at Init so a spawn is a pure append that cannot reallocate under readers on
+  other threads; `GetWorker`/`GetWorkerCount` are bounded by an atomic published count rather than
+  `size()`. Hitting the cap is a hard stop, never a reallocation.
+* **Rescue once per stalled worker**, guarded on `GetLane() != nullptr`. Without that guard the
+  500 ms monitor spawns a thread per tick for the entire life of the bad task.
+* **`RetireWorker` stays a deliberate no-op**, per §7.7 — retiring a worker whose tid
+  `ClientConnect` published leaves clients addressing a dead mailbox, which is task loss strictly
+  worse than the thread it reclaims.
+
+**Scope check — what P1 did NOT fix.** The passing test exercises the **lane backlog** category
+only: the chained tasks' subtasks were queued behind spinners, and moving the lane freed them. The
+event-queue, blocked, periodic and retry categories are untouched, and no test isolates them yet.
+The next test must suspend a parent on a worker and wedge that worker *afterwards*, so the stall
+lands on the completion path rather than the lane. That needs a subtask slow enough to keep the
+parent suspended — `CustomTask` needs a `chain_depth_` so a Custom can self-send a spinning Custom
+child and `co_await` it.
+
 ### P2 — Migration of parked + suspended state (D1–D4, D6)
 
 Split into two mergeable steps, because D4 is independently testable and carries the #705 risk:
