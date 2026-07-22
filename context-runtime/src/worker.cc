@@ -186,7 +186,7 @@ WorkerStats Worker::GetWorkerStats() const {
       (suspend_period < 0) ? 0 : static_cast<u32>(suspend_period);
 
   stats.num_tasks_processed_ = num_tasks_processed_;
-  stats.load_ = load_;
+  stats.load_ = load_.load(std::memory_order_relaxed);
 
   return stats;
 }
@@ -203,6 +203,8 @@ void Worker::Finalize() {
   // Note: Context cache cleanup removed - RunContext is now embedded in Task
 
   // Clean up all blocked queues
+  {
+  std::lock_guard<std::mutex> lk(park_mtx_);  // #785: monitor may splice these
   for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
     while (!blocked_queues_[i].empty()) {
       // Each entry is an owning shared_ptr<Task>; popping drops the worker's
@@ -233,6 +235,7 @@ void Worker::Finalize() {
 
   is_initialized_ = false;
 }
+  }
 
 void Worker::Run() {
   if (!is_initialized_) {
@@ -256,7 +259,7 @@ void Worker::Run() {
   // (issue #520). On Windows the same order matters for liveness: Signal()
   // on a tid without a registered event is a lost wakeup.
   int tid = ctp::SystemInfo::GetTid();
-  tid_ = static_cast<u32>(tid);  // publish for ClientConnect worker-tid list (#642)
+  tid_.store(static_cast<u32>(tid), std::memory_order_release);  // #642
   event_manager_.AddSignalEvent(nullptr);
   if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
     lane->SetTid(tid);
@@ -337,8 +340,9 @@ void Worker::AdoptLane(TaskLane *lane) {
     // Republish ownership BEFORE the lane becomes visible to our Run loop, so a
     // producer that signals between these two stores still targets this thread.
     lane->SetAssignedWorkerId(worker_id_);
-    if (tid_ != 0) {
-      lane->SetTid(static_cast<int>(tid_));
+    u32 my_tid = tid_.load(std::memory_order_acquire);
+    if (my_tid != 0) {
+      lane->SetTid(static_cast<int>(my_tid));
     }
     lane->SetActive(true);
   }
@@ -534,6 +538,11 @@ double Worker::GetSuspendPeriod() const {
   // We must wake up for the fastest periodic task to avoid starving it
   double min_yield_time_us = 0;
   bool found_task = false;
+
+  // issue #785: the periodic queues are no longer worker-private — the monitor
+  // thread splices them during a rescue — so this scan must hold park_mtx_.
+  // TSan caught it racing MigrateParkedTo on the deque's internal iterators.
+  std::lock_guard<std::mutex> lk(park_mtx_);
 
   // Check all periodic queues (0-3)
   for (u32 queue_idx = 0; queue_idx < NUM_PERIODIC_QUEUES; ++queue_idx) {
@@ -770,7 +779,9 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     // The task is now EXECUTING: count its predicted cost in load_ (whether the
     // value came from the map or from here), and release the queued reservation
     // so it is not double-counted. EndTask subtracts the same PredictedLoad.
-    load_ += task_ptr->PredictedLoad();
+    load_.store(load_.load(std::memory_order_relaxed) +
+                    task_ptr->PredictedLoad(),
+                std::memory_order_relaxed);
     if (reserved != 0.0f) {
       ReleaseReservation(reserved);
       task_ptr->SetSchedReservedUs(0);
@@ -845,7 +856,9 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   ++num_tasks_processed_;
 
   // Subtract predicted load from worker
-  load_ -= task_ptr->PredictedLoad();
+  load_.store(load_.load(std::memory_order_relaxed) -
+                  task_ptr->PredictedLoad(),
+              std::memory_order_relaxed);
 
   // issue #781: defensively release any still-held queued reservation for tasks
   // that reach EndTask WITHOUT executing (e.g. the early-error EACCES path), so a
@@ -988,8 +1001,15 @@ void Worker::ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue,
                                  u32 queue_idx) {
   (void)queue_idx;  // Unused parameter, kept for API consistency
 
-  // Process only first 8 tasks in the queue
-  size_t queue_size = queue.size();
+  // Process only first 8 tasks in the queue.
+  // issue #785: size() reads the deque's internal iterators, which the monitor
+  // thread mutates in MigrateParkedTo — TSan flagged this even though the pops
+  // below are already guarded. It is only a batch hint, so a snapshot is fine.
+  size_t queue_size;
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    queue_size = queue.size();
+  }
   size_t check_limit = std::min(queue_size, size_t(8));
 
   for (size_t i = 0; i < check_limit; i++) {
@@ -1047,7 +1067,11 @@ void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue
 
   // Check up to 8 tasks from the queue
   size_t check_limit = 8;
-  size_t queue_size = queue.size();
+  size_t queue_size;
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);  // #785: see ProcessBlockedQueue
+    queue_size = queue.size();
+  }
   size_t actual_limit = std::min(queue_size, check_limit);
 
   // Capture SINGLE timestamp for ALL tasks processed in this batch

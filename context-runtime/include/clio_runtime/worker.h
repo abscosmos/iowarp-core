@@ -79,6 +79,8 @@ struct WorkerStats {
   u32 num_retry_tasks_;      /**< Number of tasks in retry queue */
   u32 suspend_period_us_;    /**< Time in microseconds before the worker would suspend */
   u32 idle_iterations_;      /**< Number of consecutive idle iterations */
+  // issue #785: atomic — Stop() is called from another thread while Run() polls
+  // it. TSan flagged the plain bool.
   bool is_running_;          /**< Whether the worker is currently running */
   bool is_active_;           /**< Whether the worker's lane is currently active (processing tasks) */
   u32 worker_id_;            /**< Worker identifier */
@@ -171,7 +173,7 @@ class Worker {
   u32 GetId() const;
 
   /** OS thread id of this worker (valid once Run() has started). #642 */
-  u32 GetTid() const { return tid_; }
+  u32 GetTid() const { return tid_.load(std::memory_order_acquire); }
 
   /**
    * Get the event queue for this worker
@@ -242,7 +244,7 @@ class Worker {
   // --- issue #781: measured-load + stall-detection accessors ---
 
   /** Estimated queued CPU time (us), bumped/decremented around ExecTask. */
-  float Load() const { return load_; }
+  float Load() const { return load_.load(std::memory_order_relaxed); }
 
   /** True while a task is actively executing on this worker. */
   bool IsExecuting() const {
@@ -263,7 +265,7 @@ class Worker {
   double RealtimeLoad(double now_us) const {
     long long start = last_exec_start_us_.load(std::memory_order_relaxed);
     double elapsed = (start != 0) ? (now_us - static_cast<double>(start)) : 0.0;
-    return static_cast<double>(load_) +
+    return static_cast<double>(load_.load(std::memory_order_relaxed)) +
            static_cast<double>(queued_load_us_.load(std::memory_order_relaxed)) +
            elapsed;
   }
@@ -527,10 +529,20 @@ class Worker {
   // / task->ResumeCoroutine.
 
   u32 worker_id_;
-  u32 tid_ = 0;  /**< OS thread id, set in Run() (#642) */
-  bool is_running_;
+  // issue #785: atomic. Run() publishes it on the worker thread; AdoptLane
+  // reads it on the monitor thread to republish lane ownership. TSan flagged
+  // the plain u32.
+  std::atomic<u32> tid_{0};  /**< OS thread id, set in Run() (#642) */
+  // issue #785: atomic — Stop() is called from another thread while Run()
+  // polls it. TSan flagged the plain bool.
+  std::atomic<bool> is_running_;
   bool is_initialized_;
-  float load_;          // Estimated total CPU time (us) of active tasks
+  // issue #785: atomic. Written only by the owning worker (ExecTask/EndTask)
+  // but read by the monitor thread via RealtimeLoad() on every LoadBalance
+  // tick, which TSan flags as a race on a plain float. Only load/store is used
+  // — never fetch_add — because atomic<float> RMW is not portable (the #781
+  // atomic<double> fetch_add broke MSVC-STL and icx).
+  std::atomic<float> load_;  // Estimated total CPU time (us) of active tasks
   // issue #781: wall-clock timestamp stamped at the top of ExecTask and cleared
   // when the task returns/yields. While executing, (now() - last_exec_start_) is
   // the current task's elapsed time; the monitor thread uses this to detect a
