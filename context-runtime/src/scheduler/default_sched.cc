@@ -427,8 +427,11 @@ void DefaultScheduler::LoadBalance() {
     // later — no per-task re-pointing, no producer-side handshake. The donor
     // gets a fresh empty queue for whatever its own in-flight task does after
     // it recovers.
-    Worker::EventQueue *evq = w->ReplaceEventQueue();
-    rescuer->AdoptEventQueue(evq);
+    // Hand the donor's queue to the rescuer to DRAIN. The donor keeps the same
+    // pointer for anything its own in-flight task pushes later — the rescuer is
+    // simply the one consuming it now, which is what the parked tasks need,
+    // since their RunContext still points at this exact queue object.
+    rescuer->AdoptEventQueue(w->GetEventQueue());
 
     // ...and the parked state: blocked, periodic and retry queues. These are
     // plain worker-private std::queues, so a wedged worker simply stops

@@ -202,7 +202,17 @@ class Worker {
    * ProcessEventQueue. Called on the monitor thread.
    */
   void AdoptEventQueue(EventQueue *q) {
-    event_queue_.store(q, std::memory_order_release);
+    if (q == nullptr) {
+      return;
+    }
+    // APPEND, never replace. An earlier version stored over event_queue_, which
+    // silently orphaned whatever this worker already owned — a recycled
+    // replacement can hold events for tasks that still point at its original
+    // queue, and those tasks would then never wake. That is task LOSS, not just
+    // a leak. A worker therefore drains its own queue plus every queue it has
+    // adopted.
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    adopted_event_queues_.push_back(q);
   }
 
   /**
@@ -613,6 +623,10 @@ class Worker {
   // issue #785: atomic because the monitor thread reassigns it during a stall
   // rescue. ProcessEventQueue re-reads it each drain.
   std::atomic<EventQueue *> event_queue_;
+
+  // issue #785: queues inherited from rescued workers. Drained alongside
+  // event_queue_ so no parked task is ever orphaned. Guarded by park_mtx_.
+  std::vector<EventQueue *> adopted_event_queues_;
 
   // Boost fiber stacks are pooled by the process-wide BoostStackPool() (a
   // per-thread SlabAllocator over BoostStackAllocator), reused by AllocateStack

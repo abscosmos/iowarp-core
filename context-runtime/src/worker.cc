@@ -632,6 +632,15 @@ void Worker::SuspendMe() {
     if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
       bool work_pending = !lane->Empty();
       EventQueue *eq_chk = event_queue_.load(std::memory_order_acquire);
+      if (!work_pending) {
+        std::lock_guard<std::mutex> lk(park_mtx_);
+        for (EventQueue *aq : adopted_event_queues_) {
+          if (aq && !aq->Empty()) {
+            work_pending = true;
+            break;
+          }
+        }
+      }
       if (!work_pending && eq_chk) {
         work_pending = !eq_chk->Empty();
       }
@@ -1140,12 +1149,20 @@ void Worker::ProcessEventQueue() {
   // the parent coroutine. This avoids stale RunContext* pointers since
   // FUTURE_COMPLETE is never set before the event is consumed.
   Future<Task, CLIO_QUEUE_ALLOC_T> future;
-  // issue #785: re-read — a rescue may have handed this queue to another worker
-  // and installed a fresh one here.
-  EventQueue *eq = event_queue_.load(std::memory_order_acquire);
-  if (eq == nullptr) {
-    return;
+  // issue #785: drain this worker's own queue AND every queue inherited from a
+  // rescued worker. Snapshot the list under park_mtx_ and release before
+  // popping, since ExecTask runs below.
+  std::vector<EventQueue *> queues;
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    EventQueue *own = event_queue_.load(std::memory_order_acquire);
+    if (own != nullptr) {
+      queues.push_back(own);
+    }
+    queues.insert(queues.end(), adopted_event_queues_.begin(),
+                  adopted_event_queues_.end());
   }
+  for (EventQueue *eq : queues) {
   while (eq->Pop(future)) {
     HLOG(kDebug, "Worker {}: ProcessEventQueue popped subtask future",
          worker_id_);
@@ -1193,6 +1210,7 @@ void Worker::ProcessEventQueue() {
 
     // Execute the task
     ExecTask(parent, true);
+  }
   }
 }
 

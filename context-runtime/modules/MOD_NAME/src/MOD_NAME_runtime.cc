@@ -40,6 +40,7 @@
 #include "../include/clio_runtime/MOD_NAME/MOD_NAME_runtime.h"
 
 #include <chrono>
+#include <thread>
 #include <clio_ctp/serialize/msgpack_wrapper.h>
 
 namespace clio::run::MOD_NAME {
@@ -91,6 +92,14 @@ clio::run::TaskResume Runtime::Custom(clio::run::shared_ptr<CustomTask> &task) {
   // time. This is a NON-YIELDING spin on purpose — it models the mislabeled /
   // long-running task class the anti-deadlock scheduler must tolerate, and lets
   // the benchmark sweep 1us..1s to measure quick-task p99 / starvation.
+  // issue #785: blocking-syscall stall. sleep_for deschedules the thread, so
+  // unlike the spin above the worker consumes no CPU — but from the runtime's
+  // side it is the same failure: ExecTask does not return and the worker is
+  // gone. Uses the same non-yielding shape a real blocking read() would.
+  if (task->block_us_ > 0 && task->chain_depth_ == 0) {
+    std::this_thread::sleep_for(std::chrono::microseconds(task->block_us_));
+  }
+
   // A chaining parent does not spin itself — its cost is the time spent parked
   // awaiting the child. Only the leaf (chain_depth_ == 0) burns CPU.
   if (task->spin_us_ > 0 && task->chain_depth_ == 0) {

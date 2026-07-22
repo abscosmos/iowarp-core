@@ -349,7 +349,66 @@ TEST_CASE("stall_after_park_does_not_strand_completion", "[stall][event]") {
 }
 
 //==============================================================================
-// TEST 3 — no task may be DROPPED, however slow the runtime gets
+// TEST 3 — a BLOCKING stall must be rescued too, not just a spinning one
+//
+// #781's premise was a blocking syscall inside a coroutine that never yields,
+// which is the commoner real-world shape: the thread is descheduled rather than
+// burning CPU, so it is invisible in a CPU profile and looks nothing like a
+// spin to the OS. From the runtime's side it is identical — ExecTask does not
+// return — so the rescue should not care. This test proves that rather than
+// assuming it, because a rescue keyed on CPU consumption rather than wall-clock
+// elapsed time would pass every spin test and still leave real I/O stalls
+// unrescued.
+//==============================================================================
+
+TEST_CASE("blocking_stall_is_rescued_like_a_spinning_one", "[stall][blocking]") {
+  StallFixture fixture;
+  clio::run::PoolId pool_id;
+  REQUIRE(fixture.createContainer(kStallPoolId, pool_id));
+
+  clio::run::MOD_NAME::Client client(pool_id);
+
+  SECTION("workers wedged in sleep() do not strand chained tasks") {
+    constexpr int kNumBlockers = 2;
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> blockers;
+    blockers.reserve(kNumBlockers);
+    for (int i = 0; i < kNumBlockers; ++i) {
+      blockers.push_back(client.AsyncCustom(clio::run::PoolQuery::Local(), "b",
+                                            0, /*spin_us=*/0,
+                                            /*chain_depth=*/0,
+                                            /*block_us=*/kSpinUs));
+    }
+    std::this_thread::sleep_for(300ms);
+
+    std::vector<clio::run::Future<clio::run::MOD_NAME::WaitTestTask>> chained;
+    chained.reserve(kNumChained);
+    for (int i = 0; i < kNumChained; ++i) {
+      chained.push_back(client.AsyncWaitTest(clio::run::PoolQuery::Local(),
+                                             kChainDepth,
+                                             static_cast<clio::run::u32>(i)));
+    }
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> control;
+    control.reserve(kNumChained);
+    for (int i = 0; i < kNumChained; ++i) {
+      control.push_back(
+          client.AsyncCustom(clio::run::PoolQuery::Local(), "c", 0, 10));
+    }
+
+    size_t control_pending = WaitAllBounded(control, kChainDeadlineMs);
+    size_t stranded = WaitAllBounded(chained, kChainDeadlineMs);
+    INFO("blocking stall — control pending: " +
+         std::to_string(control_pending) +
+         ", chained pending: " + std::to_string(stranded));
+
+    REQUIRE(control_pending == 0);
+    REQUIRE(stranded == 0);
+
+    WaitAllBounded(blockers, kDropDeadlineMs);
+  }
+}
+
+//==============================================================================
+// TEST 4 — no task may be DROPPED, however slow the runtime gets
 //==============================================================================
 
 TEST_CASE("no_tasks_dropped_under_stall_pressure", "[stall][drop]") {

@@ -98,12 +98,20 @@ struct CustomTask : public clio::run::Task {
   // is what lets a test wedge the parent's worker WHILE the parent is suspended
   // — isolating the completion-path stall from the lane-backlog stall.
   IN clio::run::u32 chain_depth_;
+  // issue #785: when > 0 the handler SLEEPS for this long instead of spinning.
+  // This models the other stall shape #781 was actually about — a blocking
+  // syscall inside a coroutine that never yields. The thread is descheduled
+  // rather than burning CPU, so it looks completely different to the OS while
+  // being identical from the runtime's point of view: one worker that will not
+  // come back. Worth testing separately because a rescue that only works for
+  // spinning tasks would still leave every blocking-IO stall unrescued.
+  IN clio::run::u32 block_us_;
 
   /** SHM default constructor */
   CustomTask()
       : clio::run::Task(),
         data_(CLIO_PRIV_ALLOC), operation_id_(0), spin_us_(0),
-        chain_depth_(0) {
+        chain_depth_(0), block_us_(0) {
   }
 
   /** Emplace constructor */
@@ -114,10 +122,11 @@ struct CustomTask : public clio::run::Task {
       const std::string &data,
       clio::run::u32 operation_id,
       clio::run::u32 spin_us = 0,
-      clio::run::u32 chain_depth = 0)
+      clio::run::u32 chain_depth = 0,
+      clio::run::u32 block_us = 0)
       : clio::run::Task(task_node, pool_id, pool_query, 10),
         data_(CLIO_PRIV_ALLOC, data), operation_id_(operation_id),
-        spin_us_(spin_us), chain_depth_(chain_depth) {
+        spin_us_(spin_us), chain_depth_(chain_depth), block_us_(block_us) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -137,7 +146,7 @@ struct CustomTask : public clio::run::Task {
   template<typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive& ar) {
     Task::SerializeIn(ar);
-    ar(data_, operation_id_, spin_us_, chain_depth_);
+    ar(data_, operation_id_, spin_us_, chain_depth_, block_us_);
   }
 
   template<typename Archive>
@@ -160,6 +169,7 @@ struct CustomTask : public clio::run::Task {
     operation_id_ = other->operation_id_;
     spin_us_ = other->spin_us_;
     chain_depth_ = other->chain_depth_;
+    block_us_ = other->block_us_;
     HLOG(kInfo, "CustomTask::Copy() - EXIT, this={}, this.data_.data()={}",
          (void*)this, (void*)data_.data());
   }
