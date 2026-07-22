@@ -33,7 +33,11 @@ jobs:
         with:
           auto-update-conda: true
           python-version: '3.12'
-          channels: conda-forge,defaults
+          # conda-forge only. The Anaconda `defaults` channels (pkgs/main,
+          # pkgs/r behind repo.anaconda.com) now 403 for CI use without a
+          # license and were an intermittent dependency-install flake. See
+          # CI/ci-deps.sh for the same change and the full explanation.
+          channels: conda-forge
           channel-priority: strict
 
       - name: Install conda-build
