@@ -302,12 +302,61 @@ class IpcManager {
     return main_allocator_;
   }
 
+  /**
+   * Returns the runtime-wide metadata allocator (issue #783), or nullptr if
+   * the metadata segment is not attached. Callers MUST null-check: the segment
+   * is optional, and a client that failed to attach it simply falls back to
+   * the RPC path rather than failing.
+   */
+  CLIO_TASK_ALLOC_T *GetMetadataAllocator() { return metadata_allocator_; }
+
+  /** True if the metadata segment is available for shared-memory caching. */
+  bool HasMetadataSegment() const { return metadata_allocator_ != nullptr; }
+
+  /**
+   * Directory of well-known roots in the metadata segment (issue #783), or
+   * nullptr when unavailable. Resolved in THIS process from the offset the
+   * server published, so it is valid for clients too.
+   */
+  MetadataDirectory *GetMetadataDirectory() {
+    if (metadata_allocator_ == nullptr || metadata_dir_off_ == 0) {
+      return nullptr;
+    }
+    auto *dir = reinterpret_cast<MetadataDirectory *>(
+        reinterpret_cast<char *>(metadata_allocator_) + metadata_dir_off_);
+    if (dir->version_ != MetadataDirectory::kVersion) {
+      return nullptr;  // unknown layout -> decline rather than guess
+    }
+    return dir;
+  }
+
+  /** Offset of the metadata directory; 0 when unavailable. Sent to clients in
+   *  the ClientConnect handshake. */
+  u64 GetMetadataDirOffset() const { return metadata_dir_off_; }
+
+  /** Client-side: record the directory offset learned from ClientConnect. */
+  void SetMetadataDirOffset(u64 off) { metadata_dir_off_ = off; }
+
+  /**
+   * PID of the runtime this process talks to (its own pid when this IS the
+   * runtime). Clients use it to reconstruct per-pool SHM segment names, e.g.
+   * a RAM bdev's data segment (issue #783), without those names having to be
+   * published anywhere.
+   */
+  int GetRuntimePid() const {
+    return runtime_pid_ != 0 ? runtime_pid_
+                             : static_cast<int>(ctp::SystemInfo::GetPid());
+  }
+
   /** Pid-based allocator ids of this runtime's SHM segments (pid.1 main,
-   *  pid.2 queue). Reported to clients via ClientConnect so they attach the
-   *  right allocators instead of assuming (1,0)/(2,0). */
+   *  pid.2 queue, pid.3 metadata). Reported to clients via ClientConnect so
+   *  they attach the right allocators instead of assuming (1,0)/(2,0). */
   ctp::ipc::AllocatorId GetMainAllocatorId() const { return main_allocator_id_; }
   ctp::ipc::AllocatorId GetQueueAllocatorId() const {
     return queue_allocator_id_;
+  }
+  ctp::ipc::AllocatorId GetMetadataAllocatorId() const {
+    return metadata_allocator_id_;
   }
 
   /**
@@ -1366,6 +1415,24 @@ class IpcManager {
 
   // Queue allocator pointer — ArenaAllocator for all TaskQueue structures
   CLIO_QUEUE_ALLOC_T *queue_allocator_ = nullptr;
+
+  // issue #783: runtime-wide metadata segment. Large (default 8 GB), sparse,
+  // never pre-faulted. Owned by the runtime; the CTE shared-memory metadata
+  // cache is its first consumer. Clients attach it read-write but by
+  // convention write only lock words -- metadata itself is runtime-owned.
+  ctp::ipc::PosixShmMmap metadata_backend_;
+
+  // Allocator ID for metadata segment
+  ctp::ipc::AllocatorId metadata_allocator_id_;
+
+  // Metadata allocator. BuddyAllocator (same as main) because the CTE cache
+  // does variable-size allocation with frees, which an ArenaAllocator cannot
+  // service.
+  CLIO_TASK_ALLOC_T *metadata_allocator_ = nullptr;
+
+  // Offset of the MetadataDirectory within metadata_allocator_. Set by the
+  // server when it builds the segment, and by clients from ClientConnect.
+  u64 metadata_dir_off_ = 0;
 
   // Number of workers for which queues are allocated
   u32 num_workers_ = 0;

@@ -175,6 +175,17 @@ class ConfigManager : public ctp::BaseConfig {
   size_t CalculateQueueSegmentSize() const;
 
   /**
+   * Calculate the runtime-wide metadata segment size (issue #783).
+   *
+   * Backs the CTE shared-memory metadata cache. The reservation is large and
+   * sparse: it is never pre-faulted, so untouched pages cost nothing. Sizing is
+   * therefore about the address-space reservation, not RAM.
+   *
+   * @return Calculated size in bytes, or the explicit size if one is configured
+   */
+  size_t CalculateMetadataSegmentSize() const;
+
+  /**
    * Get memory segment size
    * @param segment Memory segment identifier
    * @return Size in bytes
@@ -366,6 +377,17 @@ class ConfigManager : public ctp::BaseConfig {
 
   size_t main_segment_size_ = ctp::Unit<size_t>::Gigabytes(1);
   size_t client_data_segment_size_ = ctp::Unit<size_t>::Megabytes(256);
+  // issue #783: metadata segment. Deliberately huge and never pre-faulted --
+  // shm_open + ftruncate + mmap is lazily populated, so the 8 GB reservation
+  // costs only the pages actually touched. NOTE: on a host whose /dev/shm is
+  // smaller than the live set, touching past the tmpfs limit raises SIGBUS,
+  // not ENOMEM. See CalculateMetadataSegmentSize().
+  // 0 means "auto-calculate" — CalculateMetadataSegmentSize() supplies the
+  // default. Initialising this to a non-zero size would make the explicit
+  // override branch there permanently true and the documented sentinel a lie;
+  // it only worked because LoadDefault() resets it to 0. Set via the
+  // `metadata_segment_size` key under `runtime` in the config file.
+  size_t metadata_segment_size_ = 0;
 
   u32 port_ = 9413;
   // If true (CLIO_EPHEMERAL / --ephemeral), skip the default compose at startup.
@@ -377,6 +399,7 @@ class ConfigManager : public ctp::BaseConfig {
   std::string main_segment_name_ = "chi_main_segment_${USER}";
   std::string client_data_segment_name_ = "chi_client_data_segment_${USER}";
   std::string queue_segment_name_ = "chi_queue_segment_${USER}";
+  std::string metadata_segment_name_ = "chi_metadata_segment_${USER}";
 
   // Networking configuration
   std::string hostfile_path_ = "";
