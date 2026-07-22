@@ -526,7 +526,18 @@ void DefaultScheduler::LoadBalance() {
     // a parked task's RunContext still points at this exact queue, so both the
     // events already in it and every event a still-running subtask pushes later
     // follow automatically, with no per-task re-pointing.
-    rescuer->AdoptEventQueue(w->GetEventQueue());
+    // Hand over the queue OBJECT and give the donor a FRESH one, so there is
+    // exactly ONE consumer per queue.
+    //
+    // An earlier version passed w->GetEventQueue() while leaving the donor
+    // holding the same pointer. Both then drained it: the rescuer via its
+    // adopted list, and the donor via ProcessEventQueue the moment it
+    // un-wedged. That is two consumers on a SINGLE-consumer MPSC ring — memory
+    // corruption, and timing-sensitive enough to be invisible on this Linux box
+    // while segfaulting cr_all_safe_bdev_tests on all three Windows configs.
+    // Parked tasks still point at the old object, which the rescuer now solely
+    // owns, so wakeups still land correctly.
+    rescuer->AdoptEventQueue(w->ReplaceEventQueue());
     size_t parked_moved = w->MigrateParkedTo(rescuer);
 
     if (std::find(elastic_workers_.begin(), elastic_workers_.end(), rescuer) ==

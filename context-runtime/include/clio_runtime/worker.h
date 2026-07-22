@@ -676,7 +676,11 @@ class Worker {
   u64 iteration_count_;  // Number of iterations completed
 
   // Sleep management for idle workers
-  u64 idle_iterations_;   // Number of consecutive iterations with no work
+  // issue #785: atomic. GetWorkerStats() is now called from the monitor thread
+  // on every watchdog tick, so this plain counter became a live cross-thread
+  // race (TSan). Relaxed: it is a diagnostic, only its approximate value
+  // matters.
+  std::atomic<u64> idle_iterations_;  // consecutive iterations with no work
   u32 current_sleep_us_;  // Current sleep duration in microseconds
   u64 sleep_count_;  // Number of times sleep was called in current idle period
   ctp::Timepoint idle_start_;  // Time when worker became idle

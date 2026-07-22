@@ -151,7 +151,7 @@ WorkerStats Worker::GetWorkerStats() const {
   // Basic worker info
   stats.worker_id_ = worker_id_;
   stats.is_running_ = is_running_;
-  stats.idle_iterations_ = idle_iterations_;
+  stats.idle_iterations_ = idle_iterations_.load(std::memory_order_relaxed);
 
   // Calculate number of queued tasks (tasks waiting in the assigned lane)
   stats.num_queued_tasks_ = 0;
@@ -227,6 +227,8 @@ void Worker::Finalize() {
     retry_queue_.pop();
   }
 
+  }  // release park_mtx_
+
   // Boost fiber stacks are owned by the process-wide BoostStackPool() (a
   // per-thread SlabAllocator cache); cached stacks live for the process and are
   // reclaimed at exit — no per-worker drain here.
@@ -236,7 +238,6 @@ void Worker::Finalize() {
 
   is_initialized_ = false;
 }
-  }
 
 void Worker::Run() {
   if (!is_initialized_) {
@@ -312,7 +313,7 @@ void Worker::Run() {
 
     if (did_work_) {
       // Work was done - reset idle counters
-      idle_iterations_ = 0;
+      idle_iterations_.store(0, std::memory_order_relaxed);
       current_sleep_us_ = 0;
       sleep_count_ = 0;
       did_work_ = false;
@@ -580,10 +581,10 @@ void Worker::SuspendMe() {
   }
 
   // No work was done in this iteration - increment idle counter
-  idle_iterations_++;
+  idle_iterations_.fetch_add(1, std::memory_order_relaxed);
 
   // Set idle start time on first idle iteration
-  if (idle_iterations_ == 1) {
+  if (idle_iterations_.load(std::memory_order_relaxed) == 1) {
     idle_start_.Now();
   }
 
