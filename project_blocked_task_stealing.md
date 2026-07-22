@@ -102,6 +102,55 @@ Consequences the plan has to answer for:
   socket-ownership constraint the table encodes does *not* go away — it has to be re-expressed, and
   that is most of what D8 is about.
 
+### 2.4 Measured, not assumed *(P0 complete — commit 05b7a357)*
+
+`context-runtime/modules/MOD_NAME/test/test_stall_migration.cc` reproduces the failure against
+unmodified code, using only existing primitives (`Custom` with `spin_us_` is already a non-yielding
+spin; `WaitTest` with `depth > 1` already self-sends a subtask and `CLIO_CO_AWAIT`s it).
+
+**Result — 4 I/O workers, 2 spinners at 8 s, 3 s deadline:**
+
+```
+control (flat, dependency-free)   0/8 pending    <- runtime demonstrably alive
+chained (co_await)                6/8 pending    <- the bug, isolated
+tasks dropped (30 s deadline)     0              <- nothing lost, only stalled
+```
+
+Three things this settles:
+
+1. **The bug is real and is about dependencies, not load.** Flat tasks submitted at the same instant
+   all complete; chained ones do not. #781's routing works exactly as designed and is simply not
+   sufficient for anything that blocks.
+2. **Nothing is dropped.** Given a generous deadline every task eventually completes. This is a
+   *liveness/latency* defect, not a task-loss defect — which narrows the whole issue. The
+   correctness machinery in D3 (no lost wakeups) is guarding against a regression we would otherwise
+   introduce, not repairing existing loss.
+3. **A control group is mandatory in any test here.** The first run of this test used 8 spinners and
+   showed 8/8 chained pending — which looked like a dramatic repro and was actually just saturation.
+   Without the control it is impossible to tell the two apart, and the wrong conclusion is the
+   flattering one.
+
+### 2.5 The default configuration has ONE general-purpose worker
+
+Found while making the repro valid, and it reframes P1. `DivideWorkers` at the default
+`num_threads = 4` produces:
+
+```
+worker 0  scheduler worker
+worker 1  I/O worker        <- the ONLY general-purpose compute worker
+worker 2  net_send_worker
+worker 3  net_recv_worker
+```
+
+So in the default configuration **a single non-yielding task wedges 100% of compute capacity**, and
+*migration cannot help at all* — there is nowhere to migrate to. Every task-moving mechanism in this
+document is inert until a spare compute worker exists.
+
+That makes `WorkOrchestrator::SpawnAdditionalWorker()` — still a `return nullptr` stub from #781 —
+the load-bearing piece, not a supporting one. **P1 is not "backlog rescue"; it is the precondition
+for the entire issue.** It also means any test here must raise `CLIO_NUM_THREADS` (the fixture sets
+8) or it measures saturation regardless of what the scheduler does.
+
 ---
 
 ## 3. Decisions taken
