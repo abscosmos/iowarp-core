@@ -480,8 +480,13 @@ Worker *WorkOrchestrator::SpawnAdditionalWorker() {
   // parallelism if there is a core to run it on, and a non-yielding task never
   // deschedules itself, so threads past that point take cycles from the tasks
   // we are trying to unblock rather than adding throughput.
-  int ncpu = ctp::SystemInfo::GetCpuCount();
-  size_t elastic_budget = (ncpu > 0) ? static_cast<size_t>(ncpu) : 8;
+  // Must match ConfigManager::GetElasticLaneHeadroom exactly: lanes are
+  // reserved for worker ids baseline..baseline+headroom, so spawning past the
+  // headroom would create a worker with no lane — routable-to by id but with
+  // nothing consuming it, which silently swallows tasks.
+  ConfigManager *cfg = CLIO_CONFIG_MANAGER;
+  size_t elastic_budget =
+      cfg ? static_cast<size_t>(cfg->GetElasticLaneHeadroom()) : 8;
   if (all_workers_.size() >= baseline_worker_count_ + elastic_budget) {
     HLOG(kWarning,
          "[#785] NOT spawning: {} workers >= baseline {} + {} cores. The pool "

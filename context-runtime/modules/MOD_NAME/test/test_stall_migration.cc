@@ -550,7 +550,59 @@ TEST_CASE("small_tasks_queued_behind_massive_ones", "[stall][headofline]") {
 }
 
 //==============================================================================
-// TEST 6 — no task may be DROPPED, however slow the runtime gets
+// TEST 6 — DEPENDENCY DEPTH: a chain longer than the worker pool
+//
+// Everything so far stalls workers with tasks that eventually RETURN. This
+// covers the other way a runtime can wedge itself: a dependency chain deeper
+// than the number of workers. Each parent occupies a worker while parked on its
+// child, so a naive runtime runs out of workers with every one of them waiting
+// on a task that cannot be scheduled — a self-inflicted deadlock with no bad
+// task anywhere in sight.
+//
+// This is the closest honest approximation to "is deadlock impossible" that the
+// existing primitives can express. It is NOT a cycle: A waits on B waits on C
+// is resolvable given enough scheduling, whereas a true cycle (A waits on B,
+// B waits on A) is unresolvable by any amount of migration and the runtime has
+// no detection for it. That gap is documented, not tested, because a test for
+// it could only assert that we hang.
+//==============================================================================
+
+TEST_CASE("deep_dependency_chain_does_not_exhaust_the_pool", "[stall][depth]") {
+  StallFixture fixture;
+  clio::run::PoolId pool_id;
+  REQUIRE(fixture.createContainer(kStallPoolId, pool_id));
+
+  clio::run::MOD_NAME::Client client(pool_id);
+
+  SECTION("chains deeper than the worker pool still complete") {
+    // 8 workers configured -> 4 general-purpose. Depth 12 per chain, several
+    // chains at once, so parked parents far outnumber the workers available to
+    // run their children.
+    constexpr clio::run::u32 kDeep = 12;
+    constexpr int kChains = 6;
+    constexpr int kDeadlineMs = 20000;
+
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> deep;
+    deep.reserve(kChains);
+    for (int i = 0; i < kChains; ++i) {
+      // Leaf spins briefly so the chain is real work rather than instant.
+      deep.push_back(client.AsyncCustom(clio::run::PoolQuery::Local(), "d", 0,
+                                        /*spin_us=*/1000,
+                                        /*chain_depth=*/kDeep));
+    }
+
+    size_t stuck = WaitAllBounded(deep, kDeadlineMs);
+    INFO("depth: " + std::to_string(kChains) + " chains of depth " +
+         std::to_string(kDeep) + " (" +
+         std::to_string(kChains * (kDeep + 1)) +
+         " tasks, far exceeding the worker pool); " + std::to_string(stuck) +
+         " chains incomplete");
+    REQUIRE(stuck == 0);
+  }
+}
+
+//==============================================================================
+// TEST 7 — no task may be DROPPED, however slow the runtime gets
 //==============================================================================
 
 TEST_CASE("no_tasks_dropped_under_stall_pressure", "[stall][drop]") {
