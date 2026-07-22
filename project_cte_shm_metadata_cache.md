@@ -5,6 +5,30 @@ Branch: `783-cte-shm-metadata-cache`
 
 ## Result
 
+### Write-then-read cycle (the pattern callers actually perform)
+
+The read benchmarks below are **steady-state**: they time reads with no
+interleaved writes. That measures the read in isolation. For a caller that
+writes then reads back, the cycle is **write-dominated**, because writes are
+NOT accelerated by this work:
+
+| Measurement | SHM | RPC | Ratio |
+|---|---|---|---|
+| write alone | 79-140 µs | (same) | — |
+| **write + metadata read** | **81-114 µs** | 162-195 µs | **~2x** |
+| **write + payload read** | **83-128 µs** | 187-278 µs | **~2x** |
+
+So the honest headline for write-then-read is **~2x**, not the several-hundred-x
+figure the read-only benchmarks show. The read component goes from ~90-140 µs to
+~0.2 µs — effectively free — but Amdahl caps the cycle at the cost of the write.
+The read-only numbers are the right measure for read-mostly workloads (repeated
+`GetBlobSize`/`GetBlob` on cached blobs); the cycle numbers are the right measure
+for write-then-read.
+
+Note the run-to-run spread: the RPC baseline swings 90-280 µs on this host while
+the SHM path stays at ~0.2 µs, so quote ranges, not single figures.
+
+
 Client reads of node-local CTE data now complete with **zero IPC**. Measured
 cross-process (external daemon), same query and same blobs on both paths:
 
