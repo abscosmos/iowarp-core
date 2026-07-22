@@ -556,9 +556,23 @@ rather than reading a dying segment.
 Verified: bdev chimod suite **21/21** with three devices reporting themselves
 SHM-backed.
 
-*Unrelated pre-existing bug found while testing:* `clio_run_thrpt_bench
---test-case bdev_allocation` segfaults against an external daemon on BOTH the
-ram and file paths, so it predates this work. Worth its own issue.
+*Retracted (was: "unrelated pre-existing bug").* `clio_run_thrpt_bench
+--test-case bdev_allocation` was segfaulting against an external daemon, and I
+recorded it here as pre-existing because the file path crashed too. **That
+conclusion was wrong.** After destroying `build-cpu` and rebuilding the whole
+repo from scratch it does not reproduce (6/6 clean runs, both bdev types).
+
+Root cause was **ABI skew from my own partial rebuilds**: this work changed the
+layout of `IpcManager` and added an OUT field to `ClientConnectTask`, but
+`clio_run_thrpt_bench` was not rebuilt, so the bench carried the old handshake
+layout while the daemon used the new one. The client faulted on the first task
+after `ClientConnect` — exactly where the crash appeared — and the daemon was
+unaffected because only the client's view was stale.
+
+Filed as #786 and closed as invalid. The lesson is the one already recorded in
+Phase 0: **a crash that appears after a layout change is a stale-build suspect
+first.** Rebuild the runtime, every module `.so`, and any test/bench binaries
+together — or do a clean build before concluding anything about the cause.
 
 **Phase 5 COMPLETE — fast path wired and MEASURED.**
 
