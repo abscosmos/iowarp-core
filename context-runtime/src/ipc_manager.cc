@@ -46,6 +46,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -867,6 +870,38 @@ static size_t ReadCgroupMemoryLimit() {
   return 0;
 }
 
+/**
+ * Keep a large shared mapping out of core dumps (Linux MADV_DONTDUMP).
+ *
+ * The runtime shuts down via std::abort() (admin_runtime.cc), so every clean
+ * `clio_run stop` raises SIGABRT and the kernel dumps core wherever cores are
+ * enabled. With a multi-gigabyte metadata segment mapped that dump takes long
+ * enough to blow the 60s shutdown budget in the CLI lifecycle tests
+ * (cr_cli_runtime_command_tests, cr_cli_cte_wal_restart, cr_cli_compose_restart
+ * all failed this way on docker AND ubuntu-arm). It never reproduced locally
+ * because this dev box has `ulimit -c 0`, so no core is written at all.
+ *
+ * The segment is a cache; its contents have no diagnostic value in a core, so
+ * excluding it costs nothing and removes gigabytes of dump work.
+ */
+static void ExcludeFromCoreDump(void *addr, size_t size, const char *what) {
+#if defined(__linux__) && defined(MADV_DONTDUMP)
+  if (addr == nullptr || size == 0) {
+    return;
+  }
+  if (madvise(addr, size, MADV_DONTDUMP) != 0) {
+    HLOG(kWarning, "MADV_DONTDUMP failed for {} ({} bytes): {}", what, size,
+         strerror(errno));
+  } else {
+    HLOG(kInfo, "{}: excluded {} bytes from core dumps", what, size);
+  }
+#else
+  (void)addr;
+  (void)size;
+  (void)what;
+#endif
+}
+
 bool IpcManager::ServerInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
@@ -987,6 +1022,9 @@ bool IpcManager::ServerInitShm() {
            "SHM metadata caching disabled, clients will use the RPC path",
            metadata_segment_name, metadata_segment_size);
     } else {
+      ExcludeFromCoreDump(metadata_backend_.region_,
+                          metadata_backend_.backend_size_,
+                          "metadata segment");
       // Publish the directory of well-known roots as the FIRST object in the
       // segment. Clients learn its offset from ClientConnect, which is what
       // makes discovery independent of who created a pool first.

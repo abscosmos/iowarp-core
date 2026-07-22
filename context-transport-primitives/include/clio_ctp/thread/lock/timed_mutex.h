@@ -45,7 +45,11 @@
 #include <thread>
 #endif
 
-#ifdef __linux__
+// POSIX liveness (kill(pid,0)) is available on Linux and macOS/BSD alike.
+// Only the /proc start-time refinement is Linux-specific.
+#if !defined(_WIN32) && !CTP_IS_DEVICE_PASS
+#define CTP_TIMED_MUTEX_POSIX_LIVENESS 1
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #endif
@@ -368,13 +372,24 @@ struct TimedMutex {
    */
   CTP_INLINE_CROSS_FUN
   static bool IsProcessAlive(min_u32 pid, min_u64 start_time) {
-#if defined(__linux__) && !CTP_IS_DEVICE_PASS
+#if defined(CTP_TIMED_MUTEX_POSIX_LIVENESS)
+    // kill(pid, 0) is POSIX and works on macOS/BSD too, not just Linux. An
+    // earlier version gated this on __linux__ and returned "always alive"
+    // everywhere else, which meant a lease abandoned by a killed process was
+    // NEVER reclaimed off-Linux -- the reclamation torture test hung until the
+    // ctest timeout on macOS.
     if (kill(static_cast<pid_t>(pid), 0) != 0) {
-      return false;  // no such process (or not ours -- see below)
+      // ESRCH => gone. EPERM => it exists but belongs to another user, which
+      // still means it is alive, so only treat "no such process" as dead.
+      if (errno == ESRCH) {
+        return false;
+      }
+      return true;
     }
     // The pid exists, but it may be a REUSED pid belonging to a different
-    // process. If we recorded a start time, a mismatch proves the original
-    // holder is gone.
+    // process. Where a start time is available (Linux /proc), a mismatch
+    // proves the original holder is gone. Platforms without it accept a small
+    // pid-reuse window rather than never reclaiming at all.
     if (start_time != 0) {
       min_u64 cur = GetProcessStartTime(pid);
       if (cur != 0 && cur != start_time) {
@@ -383,8 +398,8 @@ struct TimedMutex {
     }
     return true;
 #else
-    // No portable liveness check: never steal. The lock still works, it just
-    // cannot be reclaimed from a dead holder on this platform.
+    // No liveness check available (Windows, device passes): never steal. The
+    // lock still works, it just cannot be reclaimed from a dead holder here.
     (void)pid;
     (void)start_time;
     return true;
