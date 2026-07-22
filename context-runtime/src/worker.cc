@@ -185,7 +185,8 @@ WorkerStats Worker::GetWorkerStats() const {
   stats.suspend_period_us_ =
       (suspend_period < 0) ? 0 : static_cast<u32>(suspend_period);
 
-  stats.num_tasks_processed_ = num_tasks_processed_;
+  stats.num_tasks_processed_ =
+      num_tasks_processed_.load(std::memory_order_relaxed);
   stats.load_ = load_.load(std::memory_order_relaxed);
 
   return stats;
@@ -862,7 +863,11 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   }
 
   // Track completed tasks
-  ++num_tasks_processed_;
+  num_tasks_processed_.fetch_add(1, std::memory_order_relaxed);
+  if (!task_ptr->IsPeriodic()) {
+    // #785: real work, as opposed to a poller re-arming itself.
+    num_nonperiodic_processed_.fetch_add(1, std::memory_order_relaxed);
+  }
 
   // Subtract predicted load from worker
   load_.store(load_.load(std::memory_order_relaxed) -

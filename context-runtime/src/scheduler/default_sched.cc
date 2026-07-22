@@ -519,6 +519,71 @@ void DefaultScheduler::LoadBalance() {
     return true;
   };
 
+  // ---- Progress watchdog (issue #785) ----------------------------------
+  // Everything else in this function handles a worker wedged by a task that
+  // will eventually return. It is powerless against the classes where the WORK
+  // ITSELF cannot proceed — a true dependency cycle (A awaits B, B awaits A), a
+  // lock cycle, a lost wakeup — because there is no healthy worker to move the
+  // work to. This will not fix those, but it refuses to let them be SILENT,
+  // which is the difference between "the cluster hung" and a diagnosable
+  // defect.
+  //
+  // The signature it keys on is deliberately narrow: tasks are outstanding,
+  // NOT ONE WORKER IS EXECUTING, and nothing has completed for the alarm
+  // window. Everything parked with nothing running is a deadlock. Contrast a
+  // merely slow runtime, where workers ARE executing — that is what the stall
+  // detector below is for, and conflating the two would make this cry wolf on
+  // every long task.
+  //
+  // Two things it must NOT depend on, both learned the hard way:
+  //   - Container::GetWorkRemaining(): most ChiMods do not implement it
+  //     (MOD_NAME returns a hardcoded 0), so it reads "no work" during a real
+  //     stall and the alarm never arms.
+  //   - Worker::TasksProcessed(): periodic pollers complete and re-arm
+  //     continuously, so an all-tasks counter never stops advancing. Polling is
+  //     not progress; use RealTasksProcessed().
+  {
+    u64 processed = 0;
+    u64 outstanding = 0;
+    bool any_executing = false;
+    for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
+      Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
+      if (w == nullptr) continue;
+      processed += w->RealTasksProcessed();
+      if (w->IsExecuting()) any_executing = true;
+      WorkerStats st = w->GetWorkerStats();
+      outstanding += st.num_queued_tasks_ + st.num_blocked_tasks_ +
+                     st.num_retry_tasks_;
+    }
+    const bool wedged_shape = (outstanding > 0) && !any_executing;
+    if (!wedged_shape || processed != last_progress_count_) {
+      last_progress_count_ = processed;
+      last_progress_us_ = now_us;
+      progress_alarm_raised_ = false;
+    } else if (!progress_alarm_raised_ &&
+               (now_us - last_progress_us_) > kNoProgressAlarmSec * 1e6) {
+      progress_alarm_raised_ = true;  // once per stall, not once per tick
+      HLOG(kError,
+           "[#785] DEADLOCK SUSPECTED: {} task(s) outstanding, NO worker "
+           "executing, and no non-periodic task completed in {}s. Migration "
+           "cannot resolve this shape — everything is parked waiting on "
+           "something that is not coming (dependency cycle, lock cycle, or a "
+           "lost wakeup). Worker state:",
+           outstanding, kNoProgressAlarmSec);
+      for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
+        Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
+        if (w == nullptr) continue;
+        WorkerStats st = w->GetWorkerStats();
+        HLOG(kError,
+             "[#785]   worker {}: done={} queued={} blocked={} periodic={} "
+             "retry={}",
+             w->GetId(), st.num_tasks_processed_, st.num_queued_tasks_,
+             st.num_blocked_tasks_, st.num_periodic_tasks_,
+             st.num_retry_tasks_);
+      }
+    }
+  }
+
   u32 stalled = 0;
   if (check(scheduler_worker_, /*migratable=*/true)) ++stalled;
   for (Worker *w : io_workers_) if (check(w, /*migratable=*/true)) ++stalled;

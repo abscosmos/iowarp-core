@@ -253,6 +253,25 @@ class Worker {
 
   // --- issue #781: measured-load + stall-detection accessors ---
 
+  /** issue #785: tasks completed by this worker. Read by the monitor thread's
+   *  progress watchdog; relaxed because it only needs to observe CHANGE. */
+  u64 TasksProcessed() const {
+    return num_tasks_processed_.load(std::memory_order_relaxed);
+  }
+
+  /** issue #785: completions of NON-PERIODIC tasks only.
+   *
+   *  The progress watchdog must use this rather than TasksProcessed(). Periodic
+   *  tasks — the network and client-IPC pollers — complete and reschedule
+   *  continuously whether or not the runtime is making real progress, so a
+   *  counter that includes them never stops advancing and the watchdog can
+   *  never fire. Measured: with every worker occupied by a 14 s blocking task
+   *  and nothing else able to run, the all-tasks counter kept climbing and no
+   *  alarm was raised. Polling is not progress. */
+  u64 RealTasksProcessed() const {
+    return num_nonperiodic_processed_.load(std::memory_order_relaxed);
+  }
+
   /** Estimated queued CPU time (us), bumped/decremented around ExecTask. */
   float Load() const { return load_.load(std::memory_order_relaxed); }
 
@@ -648,7 +667,10 @@ class Worker {
   ctp::Timepoint spawn_time_;  // Time when worker was spawned
 
   // Task completion counter (incremented in EndTask)
-  u64 num_tasks_processed_;  // Total tasks completed by this worker
+  // issue #785: atomic — the monitor thread's progress watchdog reads it.
+  std::atomic<u64> num_tasks_processed_;  // Total tasks completed by this worker
+  // issue #785: non-periodic completions only — see RealTasksProcessed().
+  std::atomic<u64> num_nonperiodic_processed_{0};
 
   // Iteration counter for periodic blocked queue checks
   u64 iteration_count_;  // Number of iterations completed

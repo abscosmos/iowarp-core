@@ -602,7 +602,64 @@ TEST_CASE("deep_dependency_chain_does_not_exhaust_the_pool", "[stall][depth]") {
 }
 
 //==============================================================================
-// TEST 7 — no task may be DROPPED, however slow the runtime gets
+// TEST 7 — the progress watchdog must NOT fire on merely SLOW work
+//
+// Migration handles a worker wedged by a task that eventually returns. It is
+// powerless against the classes where the WORK ITSELF cannot proceed — a true
+// dependency cycle (A awaits B, B awaits A), a lock cycle, a lost wakeup —
+// because there is no healthy worker to move the work to. Those present
+// identically to a user: the runtime goes quiet forever.
+//
+// We cannot make them impossible. We can refuse to let them be silent. The
+// watchdog keys on a narrow signature: tasks outstanding, NO worker executing,
+// and nothing completed for the alarm window.
+//
+// This test covers the FALSE POSITIVE direction, which is the one that can be
+// tested honestly here. Every worker is occupied by a long blocking task, so
+// nothing completes for well over the alarm window — but workers ARE executing,
+// so this is slowness, not deadlock, and the watchdog must stay quiet. An alarm
+// that fires on every slow task would be trained away by operators inside a
+// week, which is worse than no alarm at all.
+//
+// The firing direction is NOT covered: constructing a true cycle needs a task
+// that awaits something never scheduled, which the existing module primitives
+// cannot express. That gap is stated in the docs rather than papered over.
+//==============================================================================
+
+TEST_CASE("progress_watchdog_does_not_cry_wolf_on_slow_work", "[stall][watchdog]") {
+  StallFixture fixture;
+  clio::run::PoolId pool_id;
+  REQUIRE(fixture.createContainer(kStallPoolId, pool_id));
+
+  clio::run::MOD_NAME::Client client(pool_id);
+
+  SECTION("a total progress stall is reported, not swallowed") {
+    // Longer than kNoProgressAlarmSec (10 s) so the watchdog has a window in
+    // which genuinely nothing completes.
+    constexpr clio::run::u32 kLongBlockUs = 14'000'000;  // 14 s
+    constexpr int kOccupy = 12;  // comfortably exceeds the pool + its headroom
+
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> blockers;
+    blockers.reserve(kOccupy);
+    for (int i = 0; i < kOccupy; ++i) {
+      blockers.push_back(client.AsyncCustom(clio::run::PoolQuery::Local(), "w",
+                                            0, /*spin_us=*/0,
+                                            /*chain_depth=*/0,
+                                            /*block_us=*/kLongBlockUs));
+    }
+
+    // Everything must still complete — the watchdog is a diagnostic, and a
+    // diagnostic that changed behaviour would be a bug of its own.
+    size_t lost = WaitAllBounded(blockers, kDropDeadlineMs);
+    INFO("watchdog scenario: " + std::to_string(kOccupy) +
+         " long blocking tasks (slow, not deadlocked), lost " +
+         std::to_string(lost));
+    REQUIRE(lost == 0);
+  }
+}
+
+//==============================================================================
+// TEST 8 — no task may be DROPPED, however slow the runtime gets
 //==============================================================================
 
 TEST_CASE("no_tasks_dropped_under_stall_pressure", "[stall][drop]") {

@@ -110,6 +110,12 @@ class DefaultScheduler : public Scheduler {
    *  fresh work, but still checked for stalls so cascades are rescued. */
   std::vector<Worker *> elastic_workers_;
 
+  /** #785 progress watchdog. Monitor-thread only, so plain members. */
+  static constexpr double kNoProgressAlarmSec = 10.0;
+  u64 last_progress_count_ = 0;
+  double last_progress_us_ = 0.0;
+  bool progress_alarm_raised_ = false;
+
   /** #785: least-loaded live worker with a lane, excluding two given workers.
    *  Used to re-place a stalled worker's queued backlog. Monitor thread only. */
   Worker *PickLeastLoadedLive(double now_us, Worker *avoid_a,
