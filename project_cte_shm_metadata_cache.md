@@ -3,6 +3,62 @@
 Status: **IMPLEMENTED** (phases 0-7 complete)
 Branch: `783-cte-shm-metadata-cache`
 
+## Scaling: how many blobs and tags fit?
+
+**The maps are FIXED CAPACITY and never rehash** (see §5.3b — a rehash would
+free a table out from under untracked cross-process readers). Capacity is set
+once at pool creation and is the permanent ceiling. Defaults: 64K tags, 256K
+blobs per CTE pool, overridable via `CLIO_CTE_SHM_TAG_CAPACITY` /
+`CLIO_CTE_SHM_BLOB_CAPACITY`.
+
+Useful occupancy is **7/8 of capacity** (load cap, below), so the defaults hold
+~229K blobs. **A million blobs does NOT fit the default** — it gets ~23%
+coverage, and the other 77% silently use the RPC path.
+
+Memory is **resident, not sparse**: every slot is constructed at creation.
+
+| Slot | Size | 1M blobs needs | Table size |
+|---|---|---|---|
+| blob | 376 B | 2,097,152 slots | **0.79 GB** |
+| tag (name→id) | 80 B | — | — |
+| tag (id→info) | 56 B | — | — |
+
+So 1M blobs is reachable (0.79 GB inside a 6 GB segment) but must be configured
+deliberately; 10M would need 6.3 GB and does not fit today.
+
+### The load cap exists because a full table was slower than not caching
+
+Measured on a 65536-slot table, before the cap:
+
+| load | hit | **miss** | insert |
+|---|---|---|---|
+| 50% | 0.042 µs | 0.056 µs | 0.15 µs |
+| 90% | 0.037 µs | 0.184 µs | 0.22 µs |
+| 99% | 0.071 µs | **11.8 µs** | 0.85 µs |
+| 100% | 0.046 µs | **108.9 µs** | 1.71 µs |
+
+A probe run only stops at an EMPTY slot, so a table with none makes every miss
+scan all of it. At 100% a miss cost **more than the ~90 µs RPC the cache exists
+to avoid** — and the caller still paid that RPC afterwards. A saturated cache
+was strictly worse than no cache.
+
+Fix: refuse NEW keys past 7/8 load (overwrites still accepted, so a saturated
+cache stays fresh rather than going stale), plus a 1024-probe backstop. Miss
+cost is now **0.09–0.24 µs at every fill level**.
+
+A cautionary detail: the first probe cap I tried (64) became the *binding*
+constraint instead of the load factor — linear-probing clusters run far longer
+than the average, so a 65536-slot table stopped accepting keys at ~51%
+occupancy and 1M coverage *fell* from 26% to 18%. The backstop must be loose
+enough that the load factor is what binds.
+
+### Still open
+
+Overflow is **silent**: blobs beyond capacity simply are not cached and quietly
+take the RPC path. That is the same visibility gap as #787 — the correct
+behaviour is invisible, so a badly-sized deployment looks identical to a
+well-sized one. Exposing cached/refused counters is the follow-up.
+
 ## Result
 
 ### Write-then-read cycle (the pattern callers actually perform)
