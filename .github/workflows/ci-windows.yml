@@ -55,13 +55,29 @@ jobs:
       # Excluding the workspace and the toolchain processes removes the
       # scanner from the link path. Best-effort: if Defender is absent or the
       # runner refuses the call, the build proceeds exactly as before.
+      #
+      # vcpkg.exe/MSBuild.exe and the vcpkg root are excluded too, after a
+      # "Access is denied" failure in the `vcpkg z-applocal` DLL-deployment
+      # step (MSB3075) whose source DLLs live under VCPKG_INSTALLATION_ROOT,
+      # which the workspace exclusion does not cover.
+      #
+      # Caveat: that applocal failure has been seen once, and Defender is not
+      # the only candidate. MSBuild builds many test executables in parallel
+      # and each runs applocal deployment, so two projects copying the same
+      # DLL into build/bin concurrently would also produce a sharing
+      # violation reported as "Access is denied" -- and exclusions would not
+      # help that. If MSB3075 recurs with these exclusions in place, the
+      # parallel-copy explanation is the one to pursue.
       - name: Exclude workspace from Defender (link-flake mitigation)
         shell: pwsh
         continue-on-error: true
         run: |
           try {
             Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
-            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe" -ErrorAction Stop
+            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe","vcpkg.exe","MSBuild.exe" -ErrorAction Stop
+            if ($env:VCPKG_INSTALLATION_ROOT) {
+              Add-MpPreference -ExclusionPath "$env:VCPKG_INSTALLATION_ROOT" -ErrorAction SilentlyContinue
+            }
             Write-Host "Defender exclusions added for ${{ github.workspace }}"
           } catch {
             Write-Host "Could not add Defender exclusions (continuing): $_"
@@ -162,13 +178,29 @@ jobs:
       # Excluding the workspace and the toolchain processes removes the
       # scanner from the link path. Best-effort: if Defender is absent or the
       # runner refuses the call, the build proceeds exactly as before.
+      #
+      # vcpkg.exe/MSBuild.exe and the vcpkg root are excluded too, after a
+      # "Access is denied" failure in the `vcpkg z-applocal` DLL-deployment
+      # step (MSB3075) whose source DLLs live under VCPKG_INSTALLATION_ROOT,
+      # which the workspace exclusion does not cover.
+      #
+      # Caveat: that applocal failure has been seen once, and Defender is not
+      # the only candidate. MSBuild builds many test executables in parallel
+      # and each runs applocal deployment, so two projects copying the same
+      # DLL into build/bin concurrently would also produce a sharing
+      # violation reported as "Access is denied" -- and exclusions would not
+      # help that. If MSB3075 recurs with these exclusions in place, the
+      # parallel-copy explanation is the one to pursue.
       - name: Exclude workspace from Defender (link-flake mitigation)
         shell: pwsh
         continue-on-error: true
         run: |
           try {
             Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
-            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe" -ErrorAction Stop
+            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe","vcpkg.exe","MSBuild.exe" -ErrorAction Stop
+            if ($env:VCPKG_INSTALLATION_ROOT) {
+              Add-MpPreference -ExclusionPath "$env:VCPKG_INSTALLATION_ROOT" -ErrorAction SilentlyContinue
+            }
             Write-Host "Defender exclusions added for ${{ github.workspace }}"
           } catch {
             Write-Host "Could not add Defender exclusions (continuing): $_"
@@ -310,13 +342,29 @@ jobs:
       # Excluding the workspace and the toolchain processes removes the
       # scanner from the link path. Best-effort: if Defender is absent or the
       # runner refuses the call, the build proceeds exactly as before.
+      #
+      # vcpkg.exe/MSBuild.exe and the vcpkg root are excluded too, after a
+      # "Access is denied" failure in the `vcpkg z-applocal` DLL-deployment
+      # step (MSB3075) whose source DLLs live under VCPKG_INSTALLATION_ROOT,
+      # which the workspace exclusion does not cover.
+      #
+      # Caveat: that applocal failure has been seen once, and Defender is not
+      # the only candidate. MSBuild builds many test executables in parallel
+      # and each runs applocal deployment, so two projects copying the same
+      # DLL into build/bin concurrently would also produce a sharing
+      # violation reported as "Access is denied" -- and exclusions would not
+      # help that. If MSB3075 recurs with these exclusions in place, the
+      # parallel-copy explanation is the one to pursue.
       - name: Exclude workspace from Defender (link-flake mitigation)
         shell: pwsh
         continue-on-error: true
         run: |
           try {
             Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
-            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe" -ErrorAction Stop
+            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe","vcpkg.exe","MSBuild.exe" -ErrorAction Stop
+            if ($env:VCPKG_INSTALLATION_ROOT) {
+              Add-MpPreference -ExclusionPath "$env:VCPKG_INSTALLATION_ROOT" -ErrorAction SilentlyContinue
+            }
             Write-Host "Defender exclusions added for ${{ github.workspace }}"
           } catch {
             Write-Host "Could not add Defender exclusions (continuing): $_"
