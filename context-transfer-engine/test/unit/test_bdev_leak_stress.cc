@@ -257,6 +257,14 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
   long iters = 0;
   int put_fail = 0;
   int del_fail = 0;
+  // Sampled once, after the very first completed cycle. If a residue is
+  // present here it is a one-time cost paid at loop entry; if it only shows
+  // up in the final reading it accrues later. Issue #791 sees a residue of
+  // exactly 65536 on Windows whose origin is not yet identified, and this
+  // narrows where to look without needing another CI round-trip. Sampled
+  // once rather than per-iteration because TargetRemaining() now forces a
+  // StatTargets round-trip and would otherwise distort the loop.
+  clio::run::u64 remaining_after_first = 0;
 
   while (std::chrono::steady_clock::now() < deadline) {
     auto put = tag.AsyncPutBlob(blob_name, shm_ptr, kBlobSize, 0, 1.0f);
@@ -277,6 +285,7 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
       break;
     }
     ++iters;
+    if (iters == 1) remaining_after_first = TargetRemaining();
   }
 
   CLIO_IPC->FreeBuffer(shm);
@@ -297,6 +306,9 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
   INFO("Completed " << iters << " Put/Del cycles ("
        << (static_cast<double>(iters) * kBlobSize / (1024.0 * 1024.0))
        << " MiB cumulative); bdev_used_after=" << bdev_used
+       << " remaining_before=" << remaining_before
+       << " remaining_after_first_cycle=" << remaining_after_first
+       << " remaining_after=" << remaining_after
        << " runtime_heap_growth=" << heap_growth
        << " allocator_leak_checker_total="
        << ctp::ipc::AllocatorLeakChecker::Get().TotalLeakedBytes());
