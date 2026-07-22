@@ -224,6 +224,36 @@ class Worker {
   EventQueue *ReplaceEventQueue();
 
   /**
+   * issue #785: hand every queue this worker has ADOPTED to \a dst.
+   *
+   * Rescues cascade — a replacement adopts a donor's queue, then wedges and is
+   * rescued in turn. Without this its adopted queues stay with it and nobody
+   * drains them, so the parked tasks pointing at those queues are stranded
+   * permanently: exactly the failure the adoption was meant to prevent, just
+   * one level deeper. Only the worker's OWN queue moves via ReplaceEventQueue;
+   * this moves the inherited ones.
+   *
+   * Preserves the one-consumer-per-queue invariant: entries are MOVED, never
+   * copied.
+   */
+  void TransferAdoptedEventQueuesTo(Worker *dst) {
+    if (dst == nullptr || dst == this) {
+      return;
+    }
+    // std::lock, matching MigrateParkedTo. Only the monitor thread calls this
+    // today, so a fixed this->dst order would work — but leaving two different
+    // lock orders in the same class is a landmine for whoever adds the second
+    // caller.
+    std::lock(park_mtx_, dst->park_mtx_);
+    std::lock_guard<std::mutex> lk_src(park_mtx_, std::adopt_lock);
+    std::lock_guard<std::mutex> lk_dst(dst->park_mtx_, std::adopt_lock);
+    for (EventQueue *q : adopted_event_queues_) {
+      dst->adopted_event_queues_.push_back(q);
+    }
+    adopted_event_queues_.clear();
+  }
+
+  /**
    * issue #785: move this worker's PARKED state (blocked / periodic / retry
    * queues) to \a dst. Completes the rescue: the lane covers tasks not yet
    * started and the event queue covers tasks parked on a co_await, but a task

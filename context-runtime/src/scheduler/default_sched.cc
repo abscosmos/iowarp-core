@@ -538,6 +538,10 @@ void DefaultScheduler::LoadBalance() {
     // Parked tasks still point at the old object, which the rescuer now solely
     // owns, so wakeups still land correctly.
     rescuer->AdoptEventQueue(w->ReplaceEventQueue());
+    // ...and anything this worker had itself inherited from an earlier rescue.
+    // Rescues cascade, so without this a replacement that wedges strands every
+    // queue it was holding for someone else.
+    w->TransferAdoptedEventQueuesTo(rescuer);
     size_t parked_moved = w->MigrateParkedTo(rescuer);
 
     if (std::find(elastic_workers_.begin(), elastic_workers_.end(), rescuer) ==
