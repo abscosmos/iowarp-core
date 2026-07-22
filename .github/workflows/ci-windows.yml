@@ -128,6 +128,26 @@ jobs:
       #
       # The retry emits a ::warning:: so it appears in the run summary — these
       # stay countable rather than silently absorbing the flake.
+      # Proves the retry control flow below is actually reachable. The risk it
+      # guards is specific: if a future PowerShell makes a native command's
+      # non-zero exit a terminating error (via
+      # $PSNativeCommandUseErrorActionPreference under 'Stop'), the script would
+      # abort at the first cmake failure and the retry would never run — CI
+      # would look exactly as it does today and we would silently lose the
+      # mitigation. Two seconds here turns that silent regression into a loud
+      # one. Deliberately does NOT invoke cmake: it tests the shell semantics,
+      # not the build.
+      - name: Verify build-retry control flow is reachable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cmd /c "exit 3"
+          if ($LASTEXITCODE -ne 3) {
+            Write-Host "::error::RETRY-SELFTEST: expected exit 3, got $LASTEXITCODE"
+            exit 1
+          }
+          Write-Host "RETRY-SELFTEST: ok - native non-zero exit is branchable (LASTEXITCODE=$LASTEXITCODE)"
       - name: Build
         shell: pwsh
         run: |
@@ -268,6 +288,19 @@ jobs:
         with:
           path: ${{ env.ONEAPI_ROOT_DIR }}
           key: oneapi-${{ runner.os }}-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_BASEKIT_URL }}-${{ env.WINDOWS_CPP_COMPONENTS }}
+      # cmd counterpart of the build-test self-test: proves `if errorlevel 1`
+      # branches on a failing command under Actions' cmd shell, so the retry in
+      # the build step below is reachable.
+      - name: Verify build-retry control flow is reachable (cmd)
+        shell: cmd
+        run: |
+          cmd /c "exit 3"
+          if errorlevel 1 (
+            echo RETRY-SELFTEST: ok - errorlevel branch reached
+            exit /b 0
+          )
+          echo ::error::RETRY-SELFTEST: errorlevel branch NOT reached
+          exit /b 1
       - name: Configure and build (icx)
         shell: cmd
         run: |
