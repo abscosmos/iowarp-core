@@ -262,7 +262,8 @@ class ShmMetadataCache {
    *         no metadata segment (small host, attach failure), or the
    *         allocation did not fit. Callers must not treat this as an error.
    */
-  bool Create(size_t tag_capacity, size_t blob_capacity) {
+  bool Create(size_t tag_capacity, size_t blob_capacity,
+              const clio::run::PoolId &owner_pool) {
     auto *ipc = CLIO_IPC;
     if (ipc == nullptr) {
       return false;
@@ -296,8 +297,11 @@ class ShmMetadataCache {
       // Publish in the segment directory so ANY client can find the cache,
       // not just one that happened to trigger pool creation. Registered after
       // ready_ for the same ordering reason.
+      // Register under THIS pool's id. CTE is multi-pool, so a single shared
+      // slot would let the most recently created pool hijack every client.
       if (auto *dir = ipc->GetMetadataDirectory()) {
-        dir->cte_cache_root_off_ = static_cast<clio::run::u64>(RootOffset());
+        dir->RegisterRoot(owner_pool.ToU64(),
+                          static_cast<clio::run::u64>(RootOffset()));
       }
       return true;
     } catch (...) {

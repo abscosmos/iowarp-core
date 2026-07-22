@@ -116,7 +116,9 @@ class Client : public clio::run::ContainerClient {
     if (dir == nullptr) {
       return false;
     }
-    return AttachShmCache(dir->cte_cache_root_off_);
+    // Look up THIS client's pool. Using a shared slot would attach whichever
+    // CTE pool cached last, silently reading another pool's metadata.
+    return AttachShmCache(dir->FindRoot(pool_id_.ToU64()));
   }
 
   /** Convenience: attach from a completed CreateTask, falling back to the

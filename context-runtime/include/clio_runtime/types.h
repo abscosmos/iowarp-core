@@ -627,12 +627,52 @@ enum MemorySegment {
 struct MetadataDirectory {
   static constexpr u32 kVersion = 1;
 
+  /** Max distinct module caches registrable. CTE alone can have many pools. */
+  static constexpr u32 kMaxEntries = 32;
+
+  /**
+   * One registered cache root, keyed by the owning pool.
+   *
+   * Keying by pool is REQUIRED, not cosmetic: CTE is a multi-pool module, and
+   * an earlier single-slot version let each new pool's Create overwrite the
+   * slot. Clients then attached whichever pool created its cache last and
+   * silently read a different pool's metadata -- every lookup missed.
+   */
+  struct Entry {
+    u64 pool_id_;   /**< PoolId::ToU64(); 0 = empty slot */
+    u64 root_off_;  /**< offset of the module's cache root */
+  };
+
   u32 version_;
-  u32 reserved_;
-  /** Offset of the CTE ShmMetadataCacheRoot, or 0 when CTE is not caching. */
-  u64 cte_cache_root_off_;
-  /** Spare slots so a new consumer does not change the layout. */
-  u64 reserved_slots_[6];
+  u32 num_entries_;
+  Entry entries_[kMaxEntries];
+
+  /** Register (or update) a pool's cache root. Returns false if full. */
+  bool RegisterRoot(u64 pool_id, u64 root_off) {
+    for (u32 i = 0; i < num_entries_ && i < kMaxEntries; ++i) {
+      if (entries_[i].pool_id_ == pool_id) {
+        entries_[i].root_off_ = root_off;  // re-created pool: update in place
+        return true;
+      }
+    }
+    if (num_entries_ >= kMaxEntries) {
+      return false;
+    }
+    entries_[num_entries_].pool_id_ = pool_id;
+    entries_[num_entries_].root_off_ = root_off;
+    ++num_entries_;
+    return true;
+  }
+
+  /** Look up a pool's cache root, or 0 if that pool is not caching. */
+  u64 FindRoot(u64 pool_id) const {
+    for (u32 i = 0; i < num_entries_ && i < kMaxEntries; ++i) {
+      if (entries_[i].pool_id_ == pool_id) {
+        return entries_[i].root_off_;
+      }
+    }
+    return 0;
+  }
 };
 
 // Input/Output parameter macros

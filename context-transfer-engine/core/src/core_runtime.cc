@@ -440,7 +440,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   {
     static const size_t kShmTagCapacity = 64 * 1024;
     static const size_t kShmBlobCapacity = 256 * 1024;
-    if (shm_cache_.Create(kShmTagCapacity, kShmBlobCapacity)) {
+    if (shm_cache_.Create(kShmTagCapacity, kShmBlobCapacity, pool_id_)) {
       HLOG(kInfo,
            "CTE: shared-memory metadata cache enabled (tags={}, blobs={}, "
            "root_off={})",

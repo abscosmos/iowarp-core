@@ -2885,5 +2885,170 @@ TEST_CASE("CTE SHM cache direct payload read",
   }
 }
 
+/**
+ * issue #783: WRITE-THEN-READ cycle latency.
+ *
+ * The earlier benchmarks timed reads in steady state, with no interleaved
+ * writes. That flatters the cache: it measures the read in isolation, not the
+ * pattern a real caller actually performs.
+ *
+ * This measures the full cycle -- PutBlob (waited), then read the value back --
+ * with the read served three ways. Writes are NOT accelerated by #783 (they
+ * still go through the runtime), so the cycle is expected to be dominated by
+ * the write, and the read saving is only the fraction Amdahl allows.
+ */
+TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
+          "[cte][core][shm_cache][bench][wtr]") {
+  auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
+  clio::cte::core::CreateParams params;
+
+  // Own pool with a RAM target only, so payload reads are direct-readable.
+  clio::run::PoolId wtr_pool(7802, 0);
+  clio::cte::core::Client client(wtr_pool);
+  {
+    auto t = client.AsyncCreate(pool_query, "cte_shm_wtr_pool", wtr_pool, params);
+    t.Wait();
+    client.AttachShmCache(*t);
+  }
+  {
+    auto t = client.AsyncRegisterTarget(
+        "ram_wtr_target", clio::run::bdev::BdevType::kRam,
+        64ULL * 1024 * 1024, clio::run::PoolQuery::Local(),
+        clio::run::PoolId(672, 0));
+    t.Wait();
+    REQUIRE(t->GetReturnCode() == 0);
+  }
+  if (!client.HasShmCache()) {
+    HLOG(kWarning, "[#783] SHM cache unavailable -- W-T-R benchmark SKIPPED");
+    return;
+  }
+
+  clio::cte::core::TagId tag_id;
+  {
+    auto t = client.AsyncGetOrCreateTag("shm_wtr_tag");
+    t.Wait();
+    tag_id = t->tag_id_;
+  }
+  REQUIRE(!tag_id.IsNull());
+
+  const std::string blob_name = "wtr_blob";
+  const clio::run::u64 kSize = 4096;
+  const int kIters = 300;
+  auto data = fixture->CreateTestData(kSize, 'W');
+
+  // Reusable SHM buffer for the write side.
+  auto wbuf = CLIO_IPC->AllocateBuffer(kSize);
+  REQUIRE(!wbuf.IsNull());
+  REQUIRE(fixture->CopyToSharedMemory(wbuf, data));
+
+  auto do_write = [&]() {
+    auto t = client.AsyncPutBlob(tag_id, blob_name, 0, kSize,
+                                 wbuf.shm_.template Cast<void>(), 0.9f,
+                                 clio::cte::core::Context(), 0);
+    t.Wait();
+    return t->return_code_;
+  };
+
+  // Warm up so first-touch page faults, block-allocator growth and lazy
+  // attach do not land in a measured window. A single warmup write was NOT
+  // enough: the first timed loop absorbed one-time cost and reported a
+  // "write-alone" floor HIGHER than the full write+read cycle measured later,
+  // which is impossible and gave the ordering away.
+  for (int i = 0; i < 50; ++i) {
+    REQUIRE(do_write() == 0);
+  }
+  {
+    clio::cte::core::ShmBlobRecord r;
+    (void)client.TryGetBlobRecordShm(tag_id, blob_name, &r);
+    std::vector<char> tmp(kSize);
+    (void)client.TryReadBlobShm(tag_id, blob_name, tmp.data(), kSize);
+  }
+
+  // ---- (1) write alone: the floor the cycle cannot go below ----
+  auto w0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIters; ++i) {
+    REQUIRE(do_write() == 0);
+  }
+  double write_us = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - w0).count() /
+                    1000.0 / kIters;
+
+  // ---- (2) cycle: write + SHM metadata read ----
+  clio::run::u64 sink = 0;
+  auto a0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIters; ++i) {
+    REQUIRE(do_write() == 0);
+    clio::cte::core::ShmBlobRecord rec;
+    REQUIRE(client.TryGetBlobRecordShm(tag_id, blob_name, &rec));
+    sink += rec.total_size_;
+  }
+  double cycle_shm_meta_us =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - a0).count() / 1000.0 / kIters;
+
+  // ---- (3) cycle: write + RPC metadata read ----
+  auto b0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIters; ++i) {
+    REQUIRE(do_write() == 0);
+    auto g = client.AsyncGetBlobSize(tag_id, blob_name);
+    g.Wait();
+    sink += g->size_;
+  }
+  double cycle_rpc_meta_us =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - b0).count() / 1000.0 / kIters;
+
+  // ---- (4) cycle: write + SHM payload read ----
+  std::vector<char> rbuf(kSize);
+  auto c0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIters; ++i) {
+    REQUIRE(do_write() == 0);
+    REQUIRE(client.TryReadBlobShm(tag_id, blob_name, rbuf.data(), kSize));
+  }
+  double cycle_shm_data_us =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - c0).count() / 1000.0 / kIters;
+
+  // ---- (5) cycle: write + RPC payload read ----
+  auto rd = CLIO_IPC->AllocateBuffer(kSize);
+  REQUIRE(!rd.IsNull());
+  auto d0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIters; ++i) {
+    REQUIRE(do_write() == 0);
+    auto g = client.AsyncGetBlob(tag_id, blob_name.c_str(), 0, kSize, 0,
+                                 rd.shm_.template Cast<void>());
+    g.Wait();
+  }
+  double cycle_rpc_data_us =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - d0).count() / 1000.0 / kIters;
+  CLIO_IPC->FreeBuffer(rd);
+
+  // ---- (6) write alone AGAIN, last. If this disagrees with (1) the numbers
+  // carry an ordering artifact and must not be quoted as a clean floor.
+  auto e0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < kIters; ++i) {
+    REQUIRE(do_write() == 0);
+  }
+  double write_us_last = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - e0).count() /
+                         1000.0 / kIters;
+  CLIO_IPC->FreeBuffer(wbuf);
+
+  HLOG(kWarning,
+       "[#783 WTR] write-alone first={} us last={} us | metadata cycle: SHM {} "
+       "vs RPC {} us | payload cycle: SHM {} vs RPC {} us | iters={} size={} "
+       "(sink={})",
+       write_us, write_us_last, cycle_shm_meta_us, cycle_rpc_meta_us,
+       cycle_shm_data_us, cycle_rpc_data_us, kIters, kSize, sink);
+
+  // The cycle can never beat the write floor, and the SHM variants must not be
+  // slower than the RPC ones. Loose bounds: this is a measurement, not a gate.
+  REQUIRE(cycle_shm_meta_us >= std::min(write_us, write_us_last) * 0.5);
+  REQUIRE(cycle_shm_meta_us < cycle_rpc_meta_us);
+  REQUIRE(cycle_shm_data_us < cycle_rpc_data_us);
+}
+
 // Main function using simple_test.h framework
 SIMPLE_TEST_MAIN()
