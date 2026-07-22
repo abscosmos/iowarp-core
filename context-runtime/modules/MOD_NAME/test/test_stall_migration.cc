@@ -255,7 +255,84 @@ TEST_CASE("stall_does_not_strand_blocked_tasks", "[stall][migration]") {
 }
 
 //==============================================================================
-// TEST 2 — no task may be DROPPED, however slow the runtime gets
+// TEST 2 — a worker wedged AFTER a task parks must not strand that task
+//
+// This is the category the lane rescue does NOT cover. Test 1's chained tasks
+// were stuck because their subtasks sat in a stalled worker's LANE, so moving
+// the lane freed them. Here the parents are already parked on a co_await before
+// any spinner is submitted, so what is stranded is the completion path: the
+// parent is in no queue at all, and its wakeup is routed to the event queue of
+// whichever worker it first ran on. Wedge that worker and the event has nowhere
+// to land, however healthy the rest of the pool is.
+//==============================================================================
+
+TEST_CASE("stall_after_park_does_not_strand_completion", "[stall][event]") {
+  StallFixture fixture;
+  clio::run::PoolId pool_id;
+  REQUIRE(fixture.createContainer(kStallPoolId, pool_id));
+
+  clio::run::MOD_NAME::Client client(pool_id);
+
+  SECTION("parents parked on a subtask still wake when their worker wedges") {
+    // CONCURRENCY BUDGET. Every simultaneously-spinning task occupies one
+    // general-purpose worker, and there are only (num_threads - 4) of those —
+    // 4 at the fixture's CLIO_NUM_THREADS=8. Each parked parent spawns a child
+    // that SPINS, so parents count against the budget too. Exceed it and the
+    // run degenerates into saturation, which is exactly what the control group
+    // catches. Budget here: 2 children + 1 spinner = 3 busy, 1 left for the
+    // control to land on.
+    constexpr int kNumParked = 2;
+    constexpr int kParkSpinners = 1;
+    constexpr clio::run::u32 kParkSpinUs = 2'000'000;  // 2 s
+
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> parked;
+    parked.reserve(kNumParked);
+    for (int i = 0; i < kNumParked; ++i) {
+      parked.push_back(client.AsyncCustom(clio::run::PoolQuery::Local(), "p", 0,
+                                          kParkSpinUs, /*chain_depth=*/1));
+    }
+
+    // Let every parent actually reach its co_await and park.
+    std::this_thread::sleep_for(500ms);
+
+    // NOW wedge workers. Any parent parked on one of these has its completion
+    // routed to a worker that will not drain its event queue for kSpinUs.
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> spinners;
+    spinners.reserve(kParkSpinners);
+    for (int i = 0; i < kParkSpinners; ++i) {
+      spinners.push_back(
+          client.AsyncCustom(clio::run::PoolQuery::Local(), "s", 0, kSpinUs));
+    }
+
+    // Same liveness control as test 1.
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> control;
+    control.reserve(kNumParked);
+    for (int i = 0; i < kNumParked; ++i) {
+      control.push_back(
+          client.AsyncCustom(clio::run::PoolQuery::Local(), "c", 0, 10));
+    }
+    size_t control_pending = WaitAllBounded(control, kChainDeadlineMs);
+
+    // Budget: the child's own spin, plus slack for the rescue to notice and act
+    // (LoadBalance runs on a 500 ms cadence). Still far below kSpinUs, so a
+    // parent that simply waits out the spinner cannot pass this.
+    const int park_deadline_ms =
+        static_cast<int>(kParkSpinUs / 1000) + kChainDeadlineMs;
+    size_t stranded = WaitAllBounded(parked, park_deadline_ms);
+
+    INFO("after " + std::to_string(park_deadline_ms) +
+         "ms — control pending: " + std::to_string(control_pending) +
+         ", parked-then-wedged pending: " + std::to_string(stranded));
+
+    REQUIRE(control_pending == 0);
+    REQUIRE(stranded == 0);
+
+    WaitAllBounded(spinners, kDropDeadlineMs);
+  }
+}
+
+//==============================================================================
+// TEST 3 — no task may be DROPPED, however slow the runtime gets
 //==============================================================================
 
 TEST_CASE("no_tasks_dropped_under_stall_pressure", "[stall][drop]") {
