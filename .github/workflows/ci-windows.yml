@@ -148,6 +148,13 @@ jobs:
             exit 1
           }
           Write-Host "RETRY-SELFTEST: ok - native non-zero exit is branchable (LASTEXITCODE=$LASTEXITCODE)"
+          # The shell is `pwsh -command ". '<script>'"` with no exit-code
+          # wrapper, so pwsh's implicit exit status reflects the last native
+          # command — which we deliberately made fail. Without this the step
+          # reports failure even though the check passed. The Build step below
+          # does not need it: its last statement is a successful cmake (or an
+          # explicit `exit`), so $LASTEXITCODE is already 0 there.
+          exit 0
       - name: Build
         shell: pwsh
         run: |
