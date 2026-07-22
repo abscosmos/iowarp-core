@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -829,6 +830,43 @@ ctp::lbm::ShmMpscTransport *IpcManager::GetOrCreateShmConn(
   return raw;
 }
 
+/**
+ * Memory limit imposed on this process by its cgroup, or 0 when unlimited or
+ * unreadable (cgroup v2 first, then v1).
+ *
+ * Needed because SystemInfo::GetRamCapacity() reports the HOST's physical
+ * memory even inside a container -- sizing a shared-memory reservation off
+ * that number over-commits badly in CI images and constrained deployments.
+ */
+static size_t ReadCgroupMemoryLimit() {
+#ifdef __linux__
+  const char *paths[] = {"/sys/fs/cgroup/memory.max",
+                         "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
+  for (const char *path : paths) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+      continue;
+    }
+    std::string v;
+    if (!(f >> v)) {
+      continue;
+    }
+    if (v == "max") {
+      return 0;  // explicitly unlimited
+    }
+    try {
+      unsigned long long n = std::stoull(v);
+      // cgroup v1 reports a sentinel near SIZE_MAX when unlimited.
+      if (n > 0 && n < (1ULL << 62)) {
+        return static_cast<size_t>(n);
+      }
+    } catch (...) {
+    }
+  }
+#endif
+  return 0;
+}
+
 bool IpcManager::ServerInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
@@ -891,6 +929,16 @@ bool IpcManager::ServerInitShm() {
         config->GetSharedMemorySegmentName(kMetadataSegment);
     size_t metadata_segment_size = config->CalculateMetadataSegmentSize();
 
+    // Sanity-clamp the reservation against the memory this process may
+    // actually use -- which is NOT the same as physical RAM in a container.
+    //
+    // SystemInfo::GetRamCapacity() reads sysinfo().totalram, i.e. the HOST's
+    // memory, and knows nothing about cgroup limits. Inside the docker CI
+    // image that made this reserve half the RUNNER's RAM, several times the
+    // container's own limit, which showed up as daemon lifecycle timeouts
+    // (cr_cli_runtime_command_tests, cr_cli_cte_wal_restart,
+    // cr_cli_compose_restart) in a job that is green on dev. Read the cgroup
+    // limit first and fall back to physical RAM only when there is none.
     // Sanity-clamp the reservation against physical RAM.
     //
     // NOTE ON WHAT BACKS THIS: on Linux these segments are memfd_create()
@@ -908,13 +956,17 @@ bool IpcManager::ServerInitShm() {
     // RAM keeps the default a no-op on real nodes while protecting small
     // dev boxes and constrained containers.
     {
-      size_t ram = ctp::SystemInfo::GetRamCapacity();
-      if (ram > 0 && metadata_segment_size > ram / 2) {
-        size_t clamped = ram / 2;
+      size_t budget = ctp::SystemInfo::GetRamCapacity();
+      size_t cgroup_limit = ReadCgroupMemoryLimit();
+      if (cgroup_limit > 0 && (budget == 0 || cgroup_limit < budget)) {
+        budget = cgroup_limit;
+      }
+      if (budget > 0 && metadata_segment_size > budget / 2) {
+        size_t clamped = budget / 2;
         HLOG(kWarning,
-             "Metadata segment: requested {} bytes exceeds half of RAM ({} "
-             "bytes total); clamping to {} bytes",
-             metadata_segment_size, ram, clamped);
+             "Metadata segment: requested {} bytes exceeds half the memory "
+             "budget ({} bytes; cgroup_limit={}); clamping to {} bytes",
+             metadata_segment_size, budget, cgroup_limit, clamped);
         metadata_segment_size = clamped;
       }
     }
