@@ -289,6 +289,12 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
     auto it = container->task_group_map_.find(group_id);
     if (it == container->task_group_map_.end() || it->second == nullptr) {
       container->task_group_map_[group_id] = selected;
+      // issue #785: bindings are created once and never revisited, and the
+      // group lookup runs BEFORE every other routing rule — so a wrong or stale
+      // binding silently overrides load, role and health checks for the life of
+      // the process. Log each one so the placement is at least observable.
+      HLOG(kInfo, "[#785] task group {} bound to worker {} (method={})",
+           group_id, selected->GetId(), task_ptr->method_);
     }
   }
 
