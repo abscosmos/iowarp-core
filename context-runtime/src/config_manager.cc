@@ -577,8 +577,13 @@ size_t ConfigManager::CalculateQueueSegmentSize() const {
   constexpr size_t BASE_OVERHEAD = 4 * 1024 * 1024;  // 4MB for allocator metadata
   constexpr u32 NUM_PRIORITIES = 2;                   // normal + resumed
 
-  // Calculate total workers: num_threads + 1 network worker
-  u32 total_workers = num_threads_ + 1;
+  // issue #785: size for the elastic replacements too. Lanes are indexed by
+  // worker id (RouteTask resolves GetLane(dest_worker_id, 0)), so a worker
+  // spawned later has no lane at all unless one was reserved up front — and a
+  // worker with no lane can neither be routed to nor receive redistributed
+  // work, which is the constraint that made head-of-line blocking
+  // unrecoverable under saturation.
+  u32 total_workers = num_threads_ + 1 + GetElasticLaneHeadroom();
 
   // Calculate worker task queues size: TaskQueue with total_workers lanes
   size_t worker_queues_size = TaskQueue::CalculateSize(

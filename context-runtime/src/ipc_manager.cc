@@ -1203,10 +1203,13 @@ bool IpcManager::ServerInitQueues() {
     u32 thread_count = config->GetNumThreads();
     // Note: Last worker serves dual roles as both task worker and network
     // worker
-    u32 total_workers = thread_count;
+    // issue #785: reserve lanes for elastic replacements as well — see
+    // ConfigManager::GetElasticLaneHeadroom. Sizing in
+    // CalculateQueueSegmentSize accounts for the same headroom.
+    u32 total_workers = thread_count + config->GetElasticLaneHeadroom();
 
     // Store worker count and scheduling queue count
-    num_workers_ = total_workers;
+    num_workers_ = thread_count;
     num_sched_queues_ = thread_count;
 
     // Get configured queue depth (no longer hardcoded)

@@ -633,6 +633,26 @@ using DestroyTask = DestroyPoolTask;
  * Polls net_queue_ for tasks and sends them to remote nodes
  * This is a periodic task similar to RecvTask
  */
+// issue #785 / D8: scheduling affinity groups for the network periodics.
+//
+// Tasks in a TaskGroup are pinned to the same worker once routed
+// (Container::task_group_map_). The grouping follows SOCKET OWNERSHIP, not
+// verb, because "ZeroMQ sockets are not safe to share across threads, so each
+// socket has exactly one owner thread" (see DefaultScheduler::RuntimeMapTask).
+//
+// Group ids are Container-scoped, so these only need to be unique within the
+// admin pool. Named rather than bare literals: kSend and kRecv previously BOTH
+// used TaskGroup(0), and since RuntimeMapTask consults the group map BEFORE the
+// periodic role table and the insert is first-writer-wins, whichever routed
+// first bound the group and the other simply followed it — silently defeating
+// the deliberate send/recv split (keeping outbound DEALER sends off the recv
+// worker so inbound SWIM probes still get polled). Separate groups restore it.
+static constexpr int64_t kGroupNetPeerSend = 0;  ///< kSend: peer DEALER pool
+static constexpr int64_t kGroupNetPeerRecv = 1;  ///< kRecv: peer ROUTER (9413)
+static constexpr int64_t kGroupNetClient = 2;    ///< kClientRecv + kClientSend
+                                                 ///< share the client ROUTER,
+                                                 ///< so they MUST co-locate.
+
 struct SendTask : public clio::run::Task {
   // Network transfer parameters
   IN clio::run::u32 transfer_flags_;  ///< Flags controlling transfer behavior
@@ -657,7 +677,7 @@ struct SendTask : public clio::run::Task {
     method_ = Method::kSend;
     task_flags_.Clear();
     pool_query_ = pool_query;
-    task_group_ = clio::run::TaskGroup(0);  // Network tasks in affinity group 0
+    task_group_ = clio::run::TaskGroup(kGroupNetPeerSend);
   }
 
   /**
@@ -726,7 +746,7 @@ struct RecvTask : public clio::run::Task {
     method_ = Method::kRecv;
     task_flags_.Clear();
     pool_query_ = pool_query;
-    task_group_ = clio::run::TaskGroup(0);  // Network tasks in affinity group 0
+    task_group_ = clio::run::TaskGroup(kGroupNetPeerRecv);
   }
 
   /**
@@ -939,6 +959,12 @@ struct ClientRecvTask : public clio::run::Task {
     method_ = Method::kClientRecv;
     task_flags_.Clear();
     pool_query_ = pool_query;
+    // issue #785 / D8: kClientRecv and kClientSend drive the SAME
+    // client-facing ROUTER socket, so they must never run on two workers
+    // at once. Today they co-locate only because the periodic role table
+    // sends both to net_recv_worker_; stating it as a group makes the
+    // constraint explicit and survives that table being removed.
+    task_group_ = clio::run::TaskGroup(kGroupNetClient);
   }
 
   template <typename Archive>
@@ -984,6 +1010,12 @@ struct ClientSendTask : public clio::run::Task {
     method_ = Method::kClientSend;
     task_flags_.Clear();
     pool_query_ = pool_query;
+    // issue #785 / D8: kClientRecv and kClientSend drive the SAME
+    // client-facing ROUTER socket, so they must never run on two workers
+    // at once. Today they co-locate only because the periodic role table
+    // sends both to net_recv_worker_; stating it as a group makes the
+    // constraint explicit and survives that table being removed.
+    task_group_ = clio::run::TaskGroup(kGroupNetClient);
   }
 
   template <typename Archive>

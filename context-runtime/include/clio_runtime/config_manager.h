@@ -34,6 +34,7 @@
 #ifndef CLIO_RUNTIME_INCLUDE_MANAGERS_CONFIG_MANAGER_H_
 #define CLIO_RUNTIME_INCLUDE_MANAGERS_CONFIG_MANAGER_H_
 
+#include "clio_ctp/introspect/system_info.h"
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -155,6 +156,25 @@ class ConfigManager : public ctp::BaseConfig {
    * @return Number of worker threads for task execution
    */
   u32 GetNumThreads() const { return num_threads_; }
+
+  /**
+   * issue #785: extra task lanes reserved for elastic replacement workers.
+   * Lanes are indexed by worker id, so replacements spawned by a stall rescue
+   * need lanes allocated up front or they can never be routed to. Matches the
+   * spawn budget in WorkOrchestrator (one replacement per core).
+   */
+  u32 GetElasticLaneHeadroom() const {
+    // Bounded deliberately. Each reserved lane costs queue_depth x priorities
+    // slots in the queue segment, so scaling this with core count would add
+    // ~128 lanes of segment on a large machine purely to hold replacements
+    // that may never be spawned. Rescues are rare and replacements are
+    // recycled, so a modest fixed ceiling is enough: the pool only ever needs
+    // as many replacements as there are workers wedged AT ONCE.
+    static constexpr u32 kMaxElasticLanes = 8;
+    int ncpu = ctp::SystemInfo::GetCpuCount();
+    u32 want = (ncpu > 0) ? static_cast<u32>(ncpu) : 8;
+    return want < kMaxElasticLanes ? want : kMaxElasticLanes;
+  }
 
   /**
    * Get task queue depth per worker
