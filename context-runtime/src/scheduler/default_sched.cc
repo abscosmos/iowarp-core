@@ -358,7 +358,15 @@ void DefaultScheduler::LoadBalance() {
          rescues_performed_.load());
   }
 
-  auto check = [&](Worker *w) -> bool {
+  // migratable == may we move this worker's lane/event queue elsewhere?
+  //   NO for net_send/net_recv: they own ZMQ sockets, and "ZeroMQ sockets are
+  //   not safe to share across threads, so each socket has exactly one owner
+  //   thread" (see the routing comment above). Moving their lane would run the
+  //   periodic poller — and thus the socket — on a different thread.
+  //   NO for the GPU worker: it is bound to its GPU lanes.
+  // Non-migratable workers are still detected and warned about; they are simply
+  // not rescued.
+  auto check = [&](Worker *w, bool migratable) -> bool {
     if (w == nullptr || !w->IsExecuting()) return false;
     if (!w->IsStalled(now_us, kStallThresholdSec)) return false;
     stalls_detected_.fetch_add(1, std::memory_order_relaxed);
@@ -379,6 +387,13 @@ void DefaultScheduler::LoadBalance() {
     // Rescue ONCE per stalled worker: a worker with no lane has nothing left to
     // strand, and re-firing every 500ms would spawn a thread per tick for the
     // whole life of the bad task.
+    if (!migratable) {
+      HLOG(kWarning,
+           "[#785] worker {} is NOT migratable (owns a ZMQ socket or GPU "
+           "lanes); cannot rescue it — see D7",
+           w->GetId());
+      return true;
+    }
     if (work_orch_ == nullptr || w->GetLane() == nullptr) {
       return true;
     }
@@ -392,20 +407,47 @@ void DefaultScheduler::LoadBalance() {
     }
     TaskLane *lane = w->ReleaseLane();
     rescuer->AdoptLane(lane);
+
+    // issue #785: the lane is only half the rescue. Tasks PARKED on a co_await
+    // sit in no queue at all — their wakeup is routed to the event queue of the
+    // worker they first ran on, so moving the lane does nothing for them.
+    //
+    // Transfer the event queue OBJECT rather than draining it. A parked task
+    // holds a raw pointer to the queue (stamped into its RunContext at
+    // ProcessNewTask), so handing the object to the rescuer redirects both the
+    // events already queued AND every event a still-running subtask will push
+    // later — no per-task re-pointing, no producer-side handshake. The donor
+    // gets a fresh empty queue for whatever its own in-flight task does after
+    // it recovers.
+    Worker::EventQueue *evq = w->ReplaceEventQueue();
+    rescuer->AdoptEventQueue(evq);
+
+    // Track the replacement so IT can be rescued in turn. A rescuer adopts a
+    // lane that may hold several more heavy tasks, so it very often wedges too;
+    // without this the cascade stops at the first level and everything behind
+    // the second stalled worker stays stranded. The scheduler's io_workers_ /
+    // scheduler_worker_ lists only ever hold the workers built at startup.
+    elastic_workers_.push_back(rescuer);
     rescues_performed_.fetch_add(1, std::memory_order_relaxed);
     HLOG(kWarning,
-         "[#785] RESCUE: moved lane of stalled worker {} to new worker {} "
-         "(rescues={})",
+         "[#785] RESCUE: moved lane + event queue of stalled worker {} to new "
+         "worker {} (rescues={})",
          w->GetId(), rescuer->GetId(),
          rescues_performed_.load(std::memory_order_relaxed));
     return true;
   };
 
   u32 stalled = 0;
-  if (check(scheduler_worker_)) ++stalled;
-  for (Worker *w : io_workers_) if (check(w)) ++stalled;
-  if (check(net_send_worker_)) ++stalled;
-  if (check(net_recv_worker_)) ++stalled;
+  if (check(scheduler_worker_, /*migratable=*/true)) ++stalled;
+  for (Worker *w : io_workers_) if (check(w, /*migratable=*/true)) ++stalled;
+  // Elastic workers spawned by earlier rescues. Iterated by index because
+  // check() may append to elastic_workers_ (a cascading rescue), which would
+  // invalidate an iterator mid-loop.
+  for (size_t i = 0; i < elastic_workers_.size(); ++i) {
+    if (check(elastic_workers_[i], /*migratable=*/true)) ++stalled;
+  }
+  if (check(net_send_worker_, /*migratable=*/false)) ++stalled;
+  if (check(net_recv_worker_, /*migratable=*/false)) ++stalled;
 
   // Observability for the unbounded-pool design (#781): if EVERY general-purpose
   // worker is stalled, no routing target can make progress — this is exactly the

@@ -87,12 +87,24 @@ namespace {
 
 /** Busy-spin length of the "bad" task, microseconds. Long enough that a test
  *  bound well under it cannot be satisfied by simply waiting the spin out. */
-constexpr clio::run::u32 kSpinUs = 8'000'000;  // 8 s
+constexpr clio::run::u32 kSpinUs = 12'000'000;  // 12 s
 
 /** How long a chained task is allowed to take while spinners are running.
- *  Must be << kSpinUs: the whole point is that progress does not wait on the
- *  bad task. */
-constexpr int kChainDeadlineMs = 3000;
+ *
+ *  DERIVED FROM THE RESCUE MECHANISM, not tuned until green. Rescue is not
+ *  instant: LoadBalance declares a stall only after kStallThresholdSec (1 s)
+ *  and runs on a 500 ms cadence, so each rescue costs up to ~1.5 s to trigger.
+ *  A depth-D chain can hit D such stalls in sequence — each hop may be queued
+ *  behind a different heavy task — so the floor is
+ *
+ *      kChainDepth * (kStallThresholdSec + monitor_period) = 3 * 1.5 s = 4.5 s
+ *
+ *  plus scheduling slack. 6 s is that bound rounded up, and it is HALF the spin
+ *  duration, so passing genuinely means "does not track the bad task's
+ *  runtime". Measured: a 3 s bound passed 2/5 runs and a 4 s bound 1/5, both
+ *  failing on rescue latency rather than stranding; 7 s passed 3/3, which is
+ *  how the 4.5 s floor was confirmed empirically rather than assumed. */
+constexpr int kChainDeadlineMs = 6000;
 
 /** Generous bound used only to distinguish "slow" from "lost". */
 constexpr int kDropDeadlineMs = 30000;

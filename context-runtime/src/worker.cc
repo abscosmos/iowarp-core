@@ -118,12 +118,11 @@ bool Worker::Init() {
     task_queue_depth = 1024;  // fallback if config is unset
   }
   u32 event_queue_depth = EVENT_QUEUE_DEPTH_MULTIPLIER * task_queue_depth;
-  event_queue_ =
-      CTP_MALLOC
-          ->template NewObj<ctp::ipc::mpsc_ring_buffer<
-              Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator>>(
-              CTP_MALLOC, event_queue_depth)
-          .ptr_;
+  event_queue_.store(CTP_MALLOC
+                         ->template NewObj<EventQueue>(CTP_MALLOC,
+                                                       event_queue_depth)
+                         .ptr_,
+                     std::memory_order_release);
 
   // Boost fiber stacks now come from the process-wide, per-thread-cached
   // BoostStackPool() (see AllocateStack/FreeStack); no per-worker pool needed.
@@ -345,6 +344,19 @@ void Worker::AdoptLane(TaskLane *lane) {
        static_cast<const void *>(lane));
 }
 
+Worker::EventQueue *Worker::ReplaceEventQueue() {
+  u32 depth = CLIO_CONFIG_MANAGER->GetQueueDepth();
+  if (depth == 0) {
+    depth = 1024;
+  }
+  EventQueue *fresh =
+      CTP_MALLOC
+          ->template NewObj<EventQueue>(CTP_MALLOC,
+                                        EVENT_QUEUE_DEPTH_MULTIPLIER * depth)
+          .ptr_;
+  return event_queue_.exchange(fresh, std::memory_order_acq_rel);
+}
+
 TaskLane *Worker::ReleaseLane() {
   TaskLane *old = assigned_lane_.exchange(nullptr, std::memory_order_acq_rel);
   return old;
@@ -454,7 +466,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   // re-enqueued across workers by RouteLocal.
   task_full_ptr->SetRunWorkerId(worker_id_);
   task_full_ptr->Lane() = lane;
-  task_full_ptr->SetEventQueue(event_queue_);
+  task_full_ptr->SetEventQueue(event_queue_.load(std::memory_order_acquire));
   task_full_ptr->RunFuture() = future;
 
   // Route task using consolidated routing function
@@ -564,8 +576,9 @@ void Worker::SuspendMe() {
     // post-store recheck and committed to epoll_pwait2.
     if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
       bool work_pending = !lane->Empty();
-      if (!work_pending && event_queue_) {
-        work_pending = !event_queue_->Empty();
+      EventQueue *eq_chk = event_queue_.load(std::memory_order_acquire);
+      if (!work_pending && eq_chk) {
+        work_pending = !eq_chk->Empty();
       }
       if (work_pending) {
         return;
@@ -1047,7 +1060,13 @@ void Worker::ProcessEventQueue() {
   // the parent coroutine. This avoids stale RunContext* pointers since
   // FUTURE_COMPLETE is never set before the event is consumed.
   Future<Task, CLIO_QUEUE_ALLOC_T> future;
-  while (event_queue_->Pop(future)) {
+  // issue #785: re-read — a rescue may have handed this queue to another worker
+  // and installed a fresh one here.
+  EventQueue *eq = event_queue_.load(std::memory_order_acquire);
+  if (eq == nullptr) {
+    return;
+  }
+  while (eq->Pop(future)) {
     HLOG(kDebug, "Worker {}: ProcessEventQueue popped subtask future",
          worker_id_);
     // Mark the subtask's future as complete

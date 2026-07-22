@@ -104,6 +104,11 @@ class DefaultScheduler : public Scheduler {
   std::atomic<u64> load_balance_ticks_{0};  ///< #781 monitor ticks observed
   std::atomic<u64> stalls_detected_{0};     ///< #781 cumulative stall events
   std::atomic<u64> rescues_performed_{0};   ///< #785 lane transfers off stalled workers
+  /** #785: replacement workers spawned by rescues. Only ever touched by
+   *  LoadBalance on the monitor thread, so it needs no lock. Kept separate from
+   *  io_workers_ (which the mapper scans) so a rescuer is not immediately handed
+   *  fresh work, but still checked for stalls so cascades are rescued. */
+  std::vector<Worker *> elastic_workers_;
 
   Worker *scheduler_worker_;              ///< Worker 0: metadata + small I/O
   std::vector<Worker *> io_workers_;      ///< Workers 1..N-3: large I/O

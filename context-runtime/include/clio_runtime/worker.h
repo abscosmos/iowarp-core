@@ -177,7 +177,39 @@ class Worker {
    * Get the event queue for this worker
    * @return Pointer to this worker's event queue
    */
-  auto *GetEventQueue() { return event_queue_; }
+  auto *GetEventQueue() {
+    return event_queue_.load(std::memory_order_acquire);
+  }
+
+  /** Event-queue element type (completion futures for parked parents). */
+  using EventQueue =
+      ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>,
+                                 ctp::ipc::MallocAllocator>;
+
+  /**
+   * issue #785: take ownership of a stalled worker's event queue.
+   *
+   * The insight that makes this cheap: a parked task holds a raw pointer to the
+   * queue OBJECT (stamped into its RunContext at ProcessNewTask). Transferring
+   * the object — rather than draining its contents — therefore redirects both
+   * the events already queued AND every event a still-running subtask will push
+   * later. No per-task re-pointing and no producer-side handshake is needed,
+   * because nothing about the tasks changes.
+   *
+   * Safe because the donor is stalled inside ExecTask and so is provably not in
+   * ProcessEventQueue. Called on the monitor thread.
+   */
+  void AdoptEventQueue(EventQueue *q) {
+    event_queue_.store(q, std::memory_order_release);
+  }
+
+  /**
+   * issue #785: hand off this worker's event queue and install a fresh empty
+   * one, so the donor still has somewhere to put completions for subtasks its
+   * own in-flight task spawns after it recovers.
+   * @return the queue that was released.
+   */
+  EventQueue *ReplaceEventQueue();
 
   /**
    * Check if worker is running
@@ -535,7 +567,9 @@ class Worker {
   // 2x that headroom keeps the WAIT_FOR_SPACE Emplace from ever blocking on a
   // single parent's fan-out (which otherwise self-deadlocks the worker, #620).
   static constexpr u32 EVENT_QUEUE_DEPTH_MULTIPLIER = 2;
-  ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator> *event_queue_;
+  // issue #785: atomic because the monitor thread reassigns it during a stall
+  // rescue. ProcessEventQueue re-reads it each drain.
+  std::atomic<EventQueue *> event_queue_;
 
   // Boost fiber stacks are pooled by the process-wide BoostStackPool() (a
   // per-thread SlabAllocator over BoostStackAllocator), reused by AllocateStack
