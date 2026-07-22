@@ -936,6 +936,37 @@ committed to it.
 
 ---
 
+## 9c. The invariant this design creates — read before extending it
+
+The implementation collapsed most of §4: transferring a queue OBJECT rather than draining it
+redirects both queued entries and every future arrival, because the tasks' raw pointers stay valid.
+That is why D1's `mpmc_ring_buffer` and D3's `sig_mtx_`/`sig_gen_` handshake were never needed.
+
+The price is a new invariant, and it is not enforced by any type:
+
+> **Every transferable structure has exactly ONE owner that drains it, and no owner ever BLOCKS on a
+> structure another thread owns.**
+
+Three bugs came from breaking it, none caught by local tests:
+
+| Break | Symptom | Found by |
+|---|---|---|
+| `AdoptEventQueue(w->GetEventQueue())` left the donor holding the same pointer — two consumers on a single-consumer ring | `cr_all_safe_bdev_tests` SEGFAULT on all 3 Windows configs, clean on Linux | **CI** |
+| `adopted_event_queues_` appended and drained but never transferred — a cascading rescue stranded inherited queues | silent; needs a rescue chain two deep | audit |
+| `TaskLane::Push` is `WAIT_FOR_SPACE`, so pushing from the MONITOR thread into a full lane spins forever | would freeze stall detection, rescues AND the watchdog — silent, because the alarm lives on the frozen thread | audit |
+
+So the review question for any change here is not "is it correct?" but **"who owns this, and can this
+block?"** Every transfer point must answer both. The current points are: `ReleaseLane`/`AdoptLane`,
+`ReplaceEventQueue`/`AdoptEventQueue`, `TransferAdoptedEventQueuesTo`, `MigrateParkedTo`, and the
+per-worker-id lane reservation in `SpawnAdditionalWorker`.
+
+Corollary worth stating: **local green means little for this class.** The Windows segfault was a race
+whose window this 6-core Linux box never opened, and it survived a full TSan pass — TSan only sees
+what actually executes concurrently. Platform CI is not a formality here; it is the only tool that
+found the worst bug in the branch.
+
+---
+
 ## 10. Deferred / out of scope
 
 * **General work stealing by idle workers.** Explicitly deferred per D-a. `StealWork()` stays a
