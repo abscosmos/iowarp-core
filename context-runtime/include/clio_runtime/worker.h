@@ -332,6 +332,32 @@ class Worker {
   TaskLane *GetLane() const;
 
   /**
+   * issue #785: take over \a lane from a stalled worker (D5 lane transfer).
+   *
+   * Lanes are allocated 1:1 with num_threads at startup with no spare, so an
+   * elastic worker cannot be given a fresh lane — the rescue moves the wedged
+   * worker's lane instead, which is a swap rather than an allocation. It also
+   * avoids draining a single-consumer MPSC ring from a foreign thread, which is
+   * the "steal-safe pop" problem #781 left open.
+   *
+   * Safe because the donor worker is, by definition of stalled, inside ExecTask
+   * and provably not popping. Republishes the lane's tid so AwakenWorker's
+   * tgkill reaches THIS thread.
+   *
+   * Called on the monitor thread.
+   * @param lane The lane to adopt (may be null to release without adopting).
+   */
+  void AdoptLane(TaskLane *lane);
+
+  /**
+   * issue #785: give up this worker's lane without taking another. Used on the
+   * stalled donor: it keeps running (we cannot interrupt it) but owns nothing,
+   * so nothing new is stranded behind it.
+   * @return The lane that was released (null if it had none).
+   */
+  TaskLane *ReleaseLane();
+
+  /**
    * Set GPU lanes for this worker to process
    * @param lanes Vector of TaskLane pointers for GPU queues
    */
@@ -471,8 +497,12 @@ class Worker {
   // RunContext lives inside this Task; it is never held as a bare pointer.
   clio::run::shared_ptr<Task> current_task_;
 
-  // Single lane assigned to this worker (one lane per worker)
-  TaskLane *assigned_lane_;
+  // Single lane assigned to this worker (one lane per worker).
+  // issue #785: atomic because the monitor thread reassigns it during a stall
+  // rescue (AdoptLane/ReleaseLane) while this worker is running. Run() re-reads
+  // it every iteration so a wedged worker picks up the change the moment it
+  // finally returns from the bad task.
+  std::atomic<TaskLane *> assigned_lane_;
 
   // GPU lanes assigned to this worker (one lane per GPU, empty when no GPU)
   std::vector<GpuTaskLane *> gpu_lanes_;

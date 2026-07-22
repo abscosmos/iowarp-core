@@ -157,9 +157,10 @@ WorkerStats Worker::GetWorkerStats() const {
   // Calculate number of queued tasks (tasks waiting in the assigned lane)
   stats.num_queued_tasks_ = 0;
   stats.is_active_ = false;
-  if (assigned_lane_) {
-    stats.num_queued_tasks_ = assigned_lane_->Size();
-    stats.is_active_ = assigned_lane_->IsActive();
+  TaskLane *stats_lane = assigned_lane_.load(std::memory_order_acquire);
+  if (stats_lane) {
+    stats.num_queued_tasks_ = stats_lane->Size();
+    stats.is_active_ = stats_lane->IsActive();
   }
 
   // Count blocked tasks across all blocked queues
@@ -226,7 +227,7 @@ void Worker::Finalize() {
   // reclaimed at exit — no per-worker drain here.
 
   // Clear assigned lane reference (don't delete - it's in shared memory)
-  assigned_lane_ = nullptr;
+  assigned_lane_.store(nullptr, std::memory_order_release);
 
   is_initialized_ = false;
 }
@@ -255,8 +256,8 @@ void Worker::Run() {
   int tid = ctp::SystemInfo::GetTid();
   tid_ = static_cast<u32>(tid);  // publish for ClientConnect worker-tid list (#642)
   event_manager_.AddSignalEvent(nullptr);
-  if (assigned_lane_) {
-    assigned_lane_->SetTid(tid);
+  if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
+    lane->SetTid(tid);
   }
 
   // Main worker loop - process tasks from assigned lane
@@ -270,8 +271,11 @@ void Worker::Run() {
     // touch serialized task bytes and need no knowledge of the transport.
 
     // Process tasks from assigned lane
-    if (assigned_lane_) {
-      u32 count = ProcessNewTasks(assigned_lane_);
+    // issue #785: re-read every iteration. The monitor thread may have moved
+    // this lane to a replacement worker while we were wedged in a task, so a
+    // cached pointer would keep us consuming a lane we no longer own.
+    if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
+      u32 count = ProcessNewTasks(lane);
       if (count > 0) did_work_ = true;
     }
     u32 gpu_count = ProcessNewTasksGpu();
@@ -315,14 +319,36 @@ void Worker::Run() {
 void Worker::Stop() { is_running_ = false; }
 
 void Worker::SetLane(TaskLane *lane) {
-  assigned_lane_ = lane;
+  assigned_lane_.store(lane, std::memory_order_release);
   // Mark lane as active when assigned to worker
-  if (assigned_lane_) {
-    assigned_lane_->SetActive(true);
+  if (lane) {
+    lane->SetActive(true);
   }
 }
 
-TaskLane *Worker::GetLane() const { return assigned_lane_; }
+TaskLane *Worker::GetLane() const {
+  return assigned_lane_.load(std::memory_order_acquire);
+}
+
+void Worker::AdoptLane(TaskLane *lane) {
+  if (lane != nullptr) {
+    // Republish ownership BEFORE the lane becomes visible to our Run loop, so a
+    // producer that signals between these two stores still targets this thread.
+    lane->SetAssignedWorkerId(worker_id_);
+    if (tid_ != 0) {
+      lane->SetTid(static_cast<int>(tid_));
+    }
+    lane->SetActive(true);
+  }
+  assigned_lane_.store(lane, std::memory_order_release);
+  HLOG(kWarning, "[#785] worker {} adopted lane {}", worker_id_,
+       static_cast<const void *>(lane));
+}
+
+TaskLane *Worker::ReleaseLane() {
+  TaskLane *old = assigned_lane_.exchange(nullptr, std::memory_order_acq_rel);
+  return old;
+}
 
 void Worker::SetGpuLanes(const std::vector<GpuTaskLane *> &lanes) {
   gpu_lanes_ = lanes;
@@ -536,8 +562,8 @@ void Worker::SuspendMe() {
     // (4n 256m, multi-tier bdev) where active_=true at the producer's
     // load suppressed the signal while the worker was already past its
     // post-store recheck and committed to epoll_pwait2.
-    if (assigned_lane_) {
-      bool work_pending = !assigned_lane_->Empty();
+    if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
+      bool work_pending = !lane->Empty();
       if (!work_pending && event_queue_) {
         work_pending = !event_queue_->Empty();
       }

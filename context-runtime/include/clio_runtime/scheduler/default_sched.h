@@ -103,6 +103,7 @@ class DefaultScheduler : public Scheduler {
   std::array<std::atomic<u64>, kNumPerfBins> perf_pdf_{};  ///< #781 telemetry
   std::atomic<u64> load_balance_ticks_{0};  ///< #781 monitor ticks observed
   std::atomic<u64> stalls_detected_{0};     ///< #781 cumulative stall events
+  std::atomic<u64> rescues_performed_{0};   ///< #785 lane transfers off stalled workers
 
   Worker *scheduler_worker_;              ///< Worker 0: metadata + small I/O
   std::vector<Worker *> io_workers_;      ///< Workers 1..N-3: large I/O

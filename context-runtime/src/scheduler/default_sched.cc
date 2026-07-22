@@ -354,6 +354,8 @@ void DefaultScheduler::LoadBalance() {
          perf_pdf_[kLt50ms].load(), perf_pdf_[kLt500ms].load(),
          perf_pdf_[kLt1s].load(), perf_pdf_[kGe1s].load(),
          stalls_detected_.load());
+    HLOG(kWarning, "[#785] lane rescues performed: {}",
+         rescues_performed_.load());
   }
 
   auto check = [&](Worker *w) -> bool {
@@ -362,9 +364,40 @@ void DefaultScheduler::LoadBalance() {
     stalls_detected_.fetch_add(1, std::memory_order_relaxed);
     HLOG(kWarning,
          "[#781] worker {} STALLED on one task (load_us={} realtime_load_us={} "
-         "threshold_s={}) — routing new work around it; backlog awaits rescue",
+         "threshold_s={})",
          w->GetId(), (double)w->Load(), w->RealtimeLoad(now_us),
          kStallThresholdSec);
+
+    // issue #785: LANE RESCUE. The stalled worker is inside ExecTask and is
+    // provably not popping its lane, so its queued backlog is stranded behind a
+    // task that may never return. Move the lane to a fresh worker rather than
+    // draining a single-consumer MPSC ring from this thread (the "steal-safe
+    // pop" problem #781 left open) — a transfer needs no new lane, which
+    // matters because lanes are allocated 1:1 with num_threads and there is no
+    // spare.
+    //
+    // Rescue ONCE per stalled worker: a worker with no lane has nothing left to
+    // strand, and re-firing every 500ms would spawn a thread per tick for the
+    // whole life of the bad task.
+    if (work_orch_ == nullptr || w->GetLane() == nullptr) {
+      return true;
+    }
+    Worker *rescuer = work_orch_->SpawnAdditionalWorker();
+    if (rescuer == nullptr) {
+      HLOG(kWarning,
+           "[#785] worker {} stalled but no replacement could be spawned; "
+           "its backlog stays stranded",
+           w->GetId());
+      return true;
+    }
+    TaskLane *lane = w->ReleaseLane();
+    rescuer->AdoptLane(lane);
+    rescues_performed_.fetch_add(1, std::memory_order_relaxed);
+    HLOG(kWarning,
+         "[#785] RESCUE: moved lane of stalled worker {} to new worker {} "
+         "(rescues={})",
+         w->GetId(), rescuer->GetId(),
+         rescues_performed_.load(std::memory_order_relaxed));
     return true;
   };
 
