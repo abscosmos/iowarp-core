@@ -113,8 +113,31 @@ jobs:
             -DCLIO_CORE_ENABLE_BENCHMARKS=OFF `
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
             -DCLIO_CTP_LOG_LEVEL=0
+      # Retry the build once on failure. Windows link steps intermittently fail
+      # with "Access is denied" / "being used by another process" while cmake
+      # replaces a freshly written .exe (issue #800). The Defender exclusions
+      # above cut that rate ~3x but did NOT eliminate it, and the process
+      # actually holding the file is still unconfirmed — so this retry is a
+      # mitigation that works whoever the holder turns out to be.
+      #
+      # Safe against masking real breakage: the build is incremental, so a
+      # genuine compile error fails identically on the second pass and the step
+      # still goes red. The only cost is one extra attempt. Transient link
+      # locks, by contrast, clear in seconds and the retry completes just the
+      # failed link.
+      #
+      # The retry emits a ::warning:: so it appears in the run summary — these
+      # stay countable rather than silently absorbing the flake.
       - name: Build
-        run: cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
+        shell: pwsh
+        run: |
+          cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::BUILD-RETRY: first build attempt failed (exit $LASTEXITCODE); retrying once — see issue #800"
+            Start-Sleep -Seconds 5
+            cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Run tests
         run: ctest --test-dir build -T Test --build-config Debug --output-on-failure --timeout 120 -LE ollama
       - name: Submit results to CDash
@@ -271,7 +294,15 @@ jobs:
             -DCLIO_CORE_ENABLE_BENCHMARKS=OFF ^
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ^
             -DCLIO_CTP_LOG_LEVEL=0 || exit /b 1
-          cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
+          rem Retry once on a transient Windows link lock — see the Build step
+          rem in build-test and issue #800. A real compile error fails the same
+          rem way on the retry, so this cannot turn genuine breakage green.
+          cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 (
+            echo ::warning::BUILD-RETRY: first icx build attempt failed; retrying once - see issue #800
+            timeout /t 5 /nobreak >nul
+            cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
+          )
       - name: Run ctest
         shell: cmd
         run: |
@@ -401,7 +432,17 @@ jobs:
             -DCLIO_CORE_ENABLE_BENCHMARKS=OFF `
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
             -DCLIO_CTP_LOG_LEVEL=0
+      # Retry once on a transient Windows link lock — see the build-test Build
+      # step and issue #800.
       - name: Build
-        run: cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
+        shell: pwsh
+        run: |
+          cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::BUILD-RETRY: first boost build attempt failed (exit $LASTEXITCODE); retrying once — see issue #800"
+            Start-Sleep -Seconds 5
+            cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Run tests
         run: ctest --test-dir build-boost --build-config Release --output-on-failure --timeout 180 --repeat until-pass:3 -LE ollama
