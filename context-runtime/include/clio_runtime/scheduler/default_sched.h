@@ -110,6 +110,11 @@ class DefaultScheduler : public Scheduler {
    *  fresh work, but still checked for stalls so cascades are rescued. */
   std::vector<Worker *> elastic_workers_;
 
+  /** #785: least-loaded live worker with a lane, excluding two given workers.
+   *  Used to re-place a stalled worker's queued backlog. Monitor thread only. */
+  Worker *PickLeastLoadedLive(double now_us, Worker *avoid_a,
+                              Worker *avoid_b) const;
+
   Worker *scheduler_worker_;              ///< Worker 0: metadata + small I/O
   std::vector<Worker *> io_workers_;      ///< Workers 1..N-3: large I/O
   Worker *net_send_worker_;               ///< Worker N-2: kSend / kClientSend

@@ -330,6 +330,28 @@ Worker *DefaultScheduler::PickAltWorker(u32 avoid_id) const {
 //   2. update perf_pdf_ from recently-completed exec times (telemetry);
 //   3. retire elastic workers idle > kRetireCooldownSec (hysteresis);
 //   4. emit sched.threads.* metrics; WARN when live threads are abnormal.
+Worker *DefaultScheduler::PickLeastLoadedLive(double now_us, Worker *avoid_a,
+                                              Worker *avoid_b) const {
+  // issue #785: least measured-load worker that is alive, has a lane, and is
+  // not itself stalled. Used when redistributing a stalled worker's backlog.
+  Worker *best = nullptr;
+  double best_load = 0.0;
+  auto consider = [&](Worker *w) {
+    if (w == nullptr || w == avoid_a || w == avoid_b) return;
+    if (w->GetLane() == nullptr) return;
+    if (w->IsStalled(now_us, kStallThresholdSec)) return;
+    double l = w->RealtimeLoad(now_us);
+    if (best == nullptr || l < best_load) {
+      best = w;
+      best_load = l;
+    }
+  };
+  consider(scheduler_worker_);
+  for (Worker *w : io_workers_) consider(w);
+  for (Worker *w : elastic_workers_) consider(w);
+  return best;
+}
+
 void DefaultScheduler::LoadBalance() {
   // Runs on the WorkOrchestrator monitor thread every ~500ms (NOT a worker).
   // This pass implements the OBSERVABILITY half of the safety net: detect a
@@ -399,62 +421,94 @@ void DefaultScheduler::LoadBalance() {
     if (work_orch_ == nullptr || w->GetLane() == nullptr) {
       return true;
     }
-    // Prefer recycling a replacement that has finished its previous rescue.
-    // Spawning unconditionally would make the pool grow with the CUMULATIVE
-    // number of stalls rather than the number of workers wedged at once.
+    // STEP 1 — drain and redistribute the backlog. This needs NO replacement
+    // worker, which is the whole point: when the pool is capped and every
+    // replacement is itself wedged, spawning is impossible but re-placing the
+    // queued tasks on healthy workers is still both possible and exactly what
+    // the small tasks stuck behind heavy ones need. Splitting this from the
+    // handover is what makes head-of-line blocking recoverable under
+    // saturation rather than only when a spare thread happens to be available.
+    //
+    // Release first: the donor re-reads assigned_lane_ every Run() iteration,
+    // so after this it never pops again and the monitor is the lane's only
+    // consumer. That is what makes draining it safe.
+    TaskLane *lane = w->ReleaseLane();
+    size_t redistributed = 0;
+    if (lane != nullptr) {
+      Future<Task> queued;
+      while (lane->Pop(queued)) {
+        Worker *target = PickLeastLoadedLive(now_us, w, nullptr);
+        if (target == nullptr || target->GetLane() == nullptr) {
+          if (!lane->Push(queued)) {
+            HLOG(kError, "[#785] lost a task re-queuing during rescue");
+          }
+          break;  // nowhere healthy to put it; leave the rest in place
+        }
+        // Move the #781 cost reservation with the task, or the donor's
+        // queued_load_ never drains and the target under-reports its load.
+        Task *tp = queued.get();
+        if (tp != nullptr) {
+          float resv = tp->SchedReservedUs();
+          if (resv != 0.0f) {
+            w->ReleaseReservation(resv);
+            target->ReserveLoad(resv);
+          }
+        }
+        if (!target->GetLane()->Push(queued)) {
+          HLOG(kError, "[#785] failed to re-place task during rescue");
+          break;
+        }
+        CLIO_IPC->AwakenWorker(target->GetLane());
+        ++redistributed;
+      }
+    }
+
+    // Give the lane straight back. Transferring ownership to the replacement
+    // was a mistake: after a few rescues the original workers had permanently
+    // lost their lanes to elastic ones, so the set of "healthy workers that own
+    // a lane" could be EMPTY even with most of the pool idle — and then there
+    // was nowhere to redistribute to, which is precisely when it matters.
+    //
+    // Keeping worker<->lane fixed avoids that entirely. The donor is still
+    // wedged so it will not drain the lane, but every LoadBalance tick
+    // redistributes whatever has accumulated, bounding the delay by the monitor
+    // period rather than by the bad task's runtime. It also removes a whole
+    // class of ownership bugs: no orphaned lanes, and RouteTask's
+    // resolve-lane-by-worker-id stays consistent.
+    w->AdoptLane(lane);
+
+    // A replacement is still wanted for the state that needs a LIVE THREAD to
+    // make progress: tasks parked on a co_await are reachable only through the
+    // event queue, and the blocked/periodic/retry queues need someone to scan
+    // them. Neither can be fixed by re-placing work on another lane.
     Worker *rescuer = work_orch_->FindIdleElasticWorker();
     if (rescuer == nullptr) {
       rescuer = work_orch_->SpawnAdditionalWorker();
     }
     if (rescuer == nullptr) {
       HLOG(kWarning,
-           "[#785] worker {} stalled but no replacement could be spawned; "
-           "its backlog stays stranded",
-           w->GetId());
+           "[#785] worker {} stalled, no replacement available; redistributed "
+           "{} queued task(s). Parked tasks stay put until one frees up.",
+           w->GetId(), redistributed);
       return true;
     }
-    TaskLane *lane = w->ReleaseLane();
-    rescuer->AdoptLane(lane);
 
-    // issue #785: the lane is only half the rescue. Tasks PARKED on a co_await
-    // sit in no queue at all — their wakeup is routed to the event queue of the
-    // worker they first ran on, so moving the lane does nothing for them.
-    //
-    // Transfer the event queue OBJECT rather than draining it. A parked task
-    // holds a raw pointer to the queue (stamped into its RunContext at
-    // ProcessNewTask), so handing the object to the rescuer redirects both the
-    // events already queued AND every event a still-running subtask will push
-    // later — no per-task re-pointing, no producer-side handshake. The donor
-    // gets a fresh empty queue for whatever its own in-flight task does after
-    // it recovers.
-    // Hand the donor's queue to the rescuer to DRAIN. The donor keeps the same
-    // pointer for anything its own in-flight task pushes later — the rescuer is
-    // simply the one consuming it now, which is what the parked tasks need,
-    // since their RunContext still points at this exact queue object.
+    // Transfer the event queue by handing the OBJECT to the rescuer to drain —
+    // a parked task's RunContext still points at this exact queue, so both the
+    // events already in it and every event a still-running subtask pushes later
+    // follow automatically, with no per-task re-pointing.
     rescuer->AdoptEventQueue(w->GetEventQueue());
-
-    // ...and the parked state: blocked, periodic and retry queues. These are
-    // plain worker-private std::queues, so a wedged worker simply stops
-    // scanning them. Periodic tasks are the ones that matter — they re-route
-    // through RouteTask every period, so moving them to a worker that actually
-    // scans is the entire fix for their placement.
     size_t parked_moved = w->MigrateParkedTo(rescuer);
 
-    // Track the replacement so IT can be rescued in turn. A rescuer adopts a
-    // lane that may hold several more heavy tasks, so it very often wedges too;
-    // without this the cascade stops at the first level and everything behind
-    // the second stalled worker stays stranded. The scheduler's io_workers_ /
-    // scheduler_worker_ lists only ever hold the workers built at startup.
-    // Only track a NEW replacement; a recycled one is already in the list.
     if (std::find(elastic_workers_.begin(), elastic_workers_.end(), rescuer) ==
         elastic_workers_.end()) {
       elastic_workers_.push_back(rescuer);
     }
     rescues_performed_.fetch_add(1, std::memory_order_relaxed);
     HLOG(kWarning,
-         "[#785] RESCUE: moved lane + event queue + {} parked task(s) of "
-         "stalled worker {} to worker {} (rescues={})",
-         parked_moved, w->GetId(), rescuer->GetId(),
+         "[#785] RESCUE: stalled worker {} -> worker {} ({} parked task(s) "
+         "moved, {} queued task(s) redistributed, rescues={})",
+         w->GetId(), rescuer->GetId(), parked_moved, redistributed,
          rescues_performed_.load(std::memory_order_relaxed));
     return true;
   };

@@ -499,6 +499,25 @@ Worker *WorkOrchestrator::SpawnAdditionalWorker() {
   }
 
   Worker *worker_ptr = worker.get();
+
+  // issue #785: hand it the lane reserved for this worker id. Lanes are indexed
+  // by worker id because RouteTask resolves GetLane(dest_worker_id, 0), so
+  // without this a replacement can never be routed to and cannot receive
+  // redistributed work — which is exactly what small tasks stuck behind heavy
+  // ones need.
+  IpcManager *ipc = CLIO_IPC;
+  TaskQueue *queues = ipc ? ipc->GetTaskQueue() : nullptr;
+  if (queues != nullptr && worker_id < queues->GetNumLanes()) {
+    TaskLane *lane = &queues->GetLane(worker_id, 0);
+    lane->SetAssignedWorkerId(worker_id);
+    worker_ptr->SetLane(lane);
+  } else {
+    HLOG(kWarning,
+         "[#785] elastic worker {} has no reserved lane (lanes={}); it can "
+         "drain adopted state but cannot be routed to",
+         worker_id, queues ? queues->GetNumLanes() : 0);
+  }
+
   workers_.push_back(std::move(worker));
   all_workers_.push_back(worker_ptr);
 
@@ -529,7 +548,8 @@ Worker *WorkOrchestrator::FindIdleElasticWorker() {
   // AT ONCE rather than how many have ever been wedged.
   for (size_t i = baseline_worker_count_; i < all_workers_.size(); ++i) {
     Worker *w = all_workers_[i];
-    if (w != nullptr && w->GetLane() == nullptr && !w->IsExecuting()) {
+    // Idle == not currently running a task.
+    if (w != nullptr && !w->IsExecuting()) {
       return w;
     }
   }
