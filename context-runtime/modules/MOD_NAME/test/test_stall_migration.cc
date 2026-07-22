@@ -408,7 +408,75 @@ TEST_CASE("blocking_stall_is_rescued_like_a_spinning_one", "[stall][blocking]") 
 }
 
 //==============================================================================
-// TEST 4 — no task may be DROPPED, however slow the runtime gets
+// TEST 4 — SOAK: repeated stall/rescue cycles must not lose tasks or grow
+//
+// One rescue working says little about a daemon that runs for weeks. Each cycle
+// allocates and reassigns real state — replacement workers, lanes, event
+// queues, parked-task lists — so the failure modes that only appear under
+// repetition are exactly the dangerous ones: a queue orphaned on the Nth
+// rescue, a worker leaked per cycle, a task quietly lost when a replacement is
+// recycled. An earlier version of the rescue orphaned an event queue on every
+// single cycle and it did not show up in any one-shot test.
+//
+// Asserts every task of every round completes. The pool bound itself is
+// enforced in SpawnAdditionalWorker (baseline + one thread per core); this test
+// exercises the path that would blow through it.
+//==============================================================================
+
+TEST_CASE("repeated_stall_cycles_lose_nothing", "[stall][soak]") {
+  StallFixture fixture;
+  clio::run::PoolId pool_id;
+  REQUIRE(fixture.createContainer(kStallPoolId, pool_id));
+
+  clio::run::MOD_NAME::Client client(pool_id);
+
+  SECTION("five stall/rescue rounds, nothing dropped") {
+    constexpr int kRounds = 5;
+    // Short stalls so the suite stays quick, but still well over
+    // kStallThresholdSec (1 s) so every round genuinely triggers a rescue.
+    constexpr clio::run::u32 kRoundStallUs = 2'500'000;  // 2.5 s
+    size_t total_submitted = 0;
+    size_t total_lost = 0;
+
+    for (int round = 0; round < kRounds; ++round) {
+      std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> stallers;
+      // Alternate the stall SHAPE per round: spinning and blocking exercise
+      // different worker states, and a rescue path that handled only one would
+      // pass a uniform soak.
+      const bool blocking = (round % 2 == 1);
+      for (int i = 0; i < 2; ++i) {
+        stallers.push_back(client.AsyncCustom(
+            clio::run::PoolQuery::Local(), "s", 0,
+            /*spin_us=*/blocking ? 0 : kRoundStallUs, /*chain_depth=*/0,
+            /*block_us=*/blocking ? kRoundStallUs : 0));
+      }
+      std::this_thread::sleep_for(200ms);
+
+      std::vector<clio::run::Future<clio::run::MOD_NAME::WaitTestTask>> chained;
+      std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> quick;
+      for (int i = 0; i < 4; ++i) {
+        chained.push_back(client.AsyncWaitTest(
+            clio::run::PoolQuery::Local(), kChainDepth,
+            static_cast<clio::run::u32>(round * 100 + i)));
+        quick.push_back(
+            client.AsyncCustom(clio::run::PoolQuery::Local(), "q", 0, 10));
+      }
+
+      total_submitted += stallers.size() + chained.size() + quick.size();
+      total_lost += WaitAllBounded(quick, kDropDeadlineMs);
+      total_lost += WaitAllBounded(chained, kDropDeadlineMs);
+      total_lost += WaitAllBounded(stallers, kDropDeadlineMs);
+    }
+
+    INFO("soak: " + std::to_string(total_submitted) + " tasks over " +
+         std::to_string(kRounds) + " rounds, lost " +
+         std::to_string(total_lost));
+    REQUIRE(total_lost == 0);
+  }
+}
+
+//==============================================================================
+// TEST 5 — no task may be DROPPED, however slow the runtime gets
 //==============================================================================
 
 TEST_CASE("no_tasks_dropped_under_stall_pressure", "[stall][drop]") {
