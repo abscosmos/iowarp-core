@@ -327,9 +327,17 @@ TEST_CASE("Lease torture: readers killed at random never tear or wedge",
                  << " retries=" << s->read_retry.load()
                  << " steals=" << s->rec.lease_mutex_.GetStealCount());
   REQUIRE(s->torn_count.load() == 0);
-  // Sanity: the test actually exercised the paths it claims to.
-  REQUIRE(s->writes.load() > 10);
-  REQUIRE(s->read_ok.load() > 10);
+  // Sanity bounds only -- "did this actually exercise anything", NOT
+  // correctness. Keep them loose: the writer is heavily starved by the reader
+  // fleet, so on a slow or contended runner it lands far lower than on a quiet
+  // one. A macos-26-intel run recorded writes=10 against 8.2M reads and failed
+  // a "> 10" bound by exactly one, which says nothing about the code.
+  //
+  // The starvation itself is worth noting: 57M retries for 8.2M successful
+  // reads, with the WRITER getting only a handful of update windows. That is
+  // the contention question tracked in #787, surfacing here as a side effect.
+  REQUIRE(s->writes.load() >= 1);
+  REQUIRE(s->read_ok.load() > 1000);
   REQUIRE(s->rec.lease_mutex_.GetStealCount() >= 1);
 
   UnmapShared(s);
