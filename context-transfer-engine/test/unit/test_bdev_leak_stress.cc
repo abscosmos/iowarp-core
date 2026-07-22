@@ -151,6 +151,30 @@ static clio::run::u64 TargetRemaining() {
 
 // Poll the runtime-heap counter until it stops changing (so async server-side
 // frees that lag the client's Wait() have settled), or a short bound elapses.
+/**
+ * Read the bdev target's remaining bytes, waiting for it to stop moving first.
+ *
+ * DelBlob's block free completes asynchronously, so sampling immediately after
+ * the loop can catch the tail of the last cycle still in flight. That is what
+ * made this test fail on Windows force-net -- the slowest configuration -- with
+ * a constant 65536-byte residue (constant, not proportional to iteration count,
+ * which is the tell that it is the tail rather than a per-op leak). The same
+ * test passes on Linux and Linux/ARM, where the frees land before the sample.
+ *
+ * Mirrors StabilizeRuntimeHeap: poll until two consecutive reads agree, with a
+ * bounded wait so a genuine leak still fails rather than hanging.
+ */
+static clio::run::u64 StabilizeTargetRemaining() {
+  clio::run::u64 prev = TargetRemaining();
+  for (int i = 0; i < 50; ++i) {  // up to ~1 s
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    clio::run::u64 cur = TargetRemaining();
+    if (cur == prev) return cur;
+    prev = cur;
+  }
+  return prev;
+}
+
 static size_t StabilizeRuntimeHeap() {
   auto *ipc = CLIO_IPC;
   size_t prev = ipc->GetRuntimeHeapAllocatedBytes();
@@ -197,7 +221,7 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
     REQUIRE(del->GetReturnCode() == 0);
   }
 
-  const clio::run::u64 remaining_before = TargetRemaining();
+  const clio::run::u64 remaining_before = StabilizeTargetRemaining();
   const size_t heap_before = StabilizeRuntimeHeap();
 
   INFO("Baseline: bdev remaining=" << remaining_before
@@ -233,8 +257,11 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
 
   CLIO_IPC->FreeBuffer(shm);
 
-  // Let any trailing async frees settle before measuring.
-  const clio::run::u64 remaining_after = TargetRemaining();
+  // Let any trailing async frees settle before measuring. This MUST stabilize
+  // rather than sample once: the previous code took this reading before
+  // StabilizeRuntimeHeap() ran, so nothing had actually settled despite the
+  // comment saying so.
+  const clio::run::u64 remaining_after = StabilizeTargetRemaining();
   const size_t heap_after = StabilizeRuntimeHeap();
 
   const clio::run::u64 bdev_used =
