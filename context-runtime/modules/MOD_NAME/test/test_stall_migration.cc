@@ -62,6 +62,7 @@
 #include "simple_test.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -96,9 +97,24 @@ constexpr int kChainDeadlineMs = 3000;
 /** Generous bound used only to distinguish "slow" from "lost". */
 constexpr int kDropDeadlineMs = 30000;
 
-/** Enough spinners to wedge every worker in a default 4-thread runtime, with
- *  headroom, so at least one blocked task lands behind a stalled worker. */
-constexpr int kNumSpinners = 8;
+/** Number of non-yielding spinners.
+ *
+ * This MUST stay below the number of general-purpose (I/O) workers, or the test
+ * measures saturation instead of stranding: with every compute worker spinning,
+ * nothing runs and the result says nothing about whether blocked tasks can be
+ * rescued. The control group below enforces that empirically.
+ *
+ * Note the default runtime has only ONE general-purpose worker: num_threads=4
+ * divides into 1 scheduler + 1 I/O + net_send + net_recv, so a single bad task
+ * wedges all compute. These tests therefore need CLIO_NUM_THREADS raised to
+ * leave spare compute workers. Overridable via CLIO_STALL_TEST_SPINNERS. */
+int NumSpinners() {
+  if (const char *env = std::getenv("CLIO_STALL_TEST_SPINNERS")) {
+    int n = std::atoi(env);
+    if (n > 0) return n;
+  }
+  return 2;
+}
 constexpr int kNumChained = 8;
 constexpr clio::run::u32 kChainDepth = 3;
 
@@ -110,6 +126,13 @@ class StallFixture {
  public:
   StallFixture() {
     if (!g_initialized) {
+      // The default num_threads=4 divides into 1 scheduler + 1 I/O + net_send +
+      // net_recv, leaving exactly ONE general-purpose worker — so a single
+      // non-yielding task wedges all compute and every run degenerates into
+      // saturation. Raise it before CLIO_INIT reads the config so there is
+      // provably spare compute capacity for the control group to land on.
+      // setenv with overwrite=0 keeps an externally-supplied value.
+      setenv("CLIO_NUM_THREADS", "8", 0);
       bool success =
           clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       if (success) {
@@ -165,7 +188,7 @@ size_t WaitAllBounded(std::vector<FutureT> &futures, int deadline_ms) {
 // TEST 1 — a wedged worker must not stall tasks blocked on co_await
 //==============================================================================
 
-TEST_CASE("stall_does_not_strand_blocked_tasks") {
+TEST_CASE("stall_does_not_strand_blocked_tasks", "[stall][migration]") {
   StallFixture fixture;
   clio::run::PoolId pool_id;
   REQUIRE(fixture.createContainer(kStallPoolId, pool_id));
@@ -176,8 +199,9 @@ TEST_CASE("stall_does_not_strand_blocked_tasks") {
     // Wedge the pool with non-yielding spinners. These are submitted and NOT
     // waited on — they own their workers for kSpinUs.
     std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> spinners;
-    spinners.reserve(kNumSpinners);
-    for (int i = 0; i < kNumSpinners; ++i) {
+    const int num_spinners = NumSpinners();
+    spinners.reserve(num_spinners);
+    for (int i = 0; i < num_spinners; ++i) {
       spinners.push_back(client.AsyncCustom(clio::run::PoolQuery::Local(), "s",
                                             0, kSpinUs));
     }
@@ -196,13 +220,33 @@ TEST_CASE("stall_does_not_strand_blocked_tasks") {
                                              static_cast<clio::run::u32>(i)));
     }
 
+    // CONTROL GROUP. Flat, dependency-free quick tasks submitted at the same
+    // moment. #781 already routes these around a stalled worker, so they must
+    // sail through. Without this control the test cannot tell the bug
+    // ("dependency chains are stranded behind a wedged worker") apart from mere
+    // saturation ("every worker is busy, nothing runs"). If the control fails
+    // too, the spinner count is simply swamping the pool and the run proves
+    // nothing about stranding.
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> control;
+    control.reserve(kNumChained);
+    for (int i = 0; i < kNumChained; ++i) {
+      control.push_back(
+          client.AsyncCustom(clio::run::PoolQuery::Local(), "c", 0, 10));
+    }
+
+    size_t control_pending = WaitAllBounded(control, kChainDeadlineMs);
     size_t stranded = WaitAllBounded(chained, kChainDeadlineMs);
-    INFO("chained tasks still pending after " +
-         std::to_string(kChainDeadlineMs) + "ms: " + std::to_string(stranded));
+    INFO("after " + std::to_string(kChainDeadlineMs) +
+         "ms — control (flat) pending: " + std::to_string(control_pending) +
+         ", chained (co_await) pending: " + std::to_string(stranded));
+
+    // Runtime liveness: if this fails, the pool is saturated and the chained
+    // result below is not evidence of anything.
+    REQUIRE(control_pending == 0);
 
     // The acceptance criterion for #785: chained-task completion must not track
     // the spin duration. Any non-zero count here is a task stranded behind a
-    // wedged worker.
+    // wedged worker while the runtime is demonstrably still alive.
     REQUIRE(stranded == 0);
 
     // Drain the spinners so the next test starts from a quiet runtime.
@@ -214,7 +258,7 @@ TEST_CASE("stall_does_not_strand_blocked_tasks") {
 // TEST 2 — no task may be DROPPED, however slow the runtime gets
 //==============================================================================
 
-TEST_CASE("no_tasks_dropped_under_stall_pressure") {
+TEST_CASE("no_tasks_dropped_under_stall_pressure", "[stall][drop]") {
   StallFixture fixture;
   clio::run::PoolId pool_id;
   REQUIRE(fixture.createContainer(kStallPoolId, pool_id));
