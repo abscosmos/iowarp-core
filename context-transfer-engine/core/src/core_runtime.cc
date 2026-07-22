@@ -4504,10 +4504,17 @@ clio::run::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
+  // NOTE: .c_str(), not .data(). The logger formats a char* as a
+  // null-terminated C string (operator<< -> strlen), but priv::string::data()
+  // returns the raw buffer WITHOUT a guaranteed terminator — only c_str()
+  // writes ptr[size_] = '\0'. Passing .data() here caused strlen to run off
+  // the end of the heap buffer, an AddressSanitizer heap-buffer-overflow on
+  // the hot PutBlob path (core_runtime.cc via ExtendBlob/AllocateFromTarget).
   HLOG(kDebug,
        "AllocateFromTarget: ENTER - target_name={}, "
        "bdev_client_.pool_id_=({},{}), size={}, remaining_space={}",
-       target_info.target_name_.data(), target_info.bdev_client_.pool_id_.major_,
+       target_info.target_name_.c_str(),
+       target_info.bdev_client_.pool_id_.major_,
        target_info.bdev_client_.pool_id_.minor_, size,
        target_info.remaining_space_);
 
