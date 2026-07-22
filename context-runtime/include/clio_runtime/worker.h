@@ -212,6 +212,28 @@ class Worker {
   EventQueue *ReplaceEventQueue();
 
   /**
+   * issue #785: move this worker's PARKED state (blocked / periodic / retry
+   * queues) to \a dst. Completes the rescue: the lane covers tasks not yet
+   * started and the event queue covers tasks parked on a co_await, but a task
+   * that yielded with a timer, or is waiting to be re-routed, sits in a plain
+   * worker-private std::queue that no other thread can reach.
+   *
+   * Periodic tasks matter most here. ProcessPeriodicQueue re-routes each task
+   * through RouteTask every period, so a non-pinned periodic task self-heals
+   * its placement as soon as ANYONE scans it — moving the queue to a live
+   * worker is the whole fix. A wedged worker never scans, so its periodic
+   * tasks simply stop running.
+   *
+   * Both workers' park locks are taken with std::lock to avoid deadlock, and
+   * the lock is never held across ExecTask (see park_mtx_), so a wedged donor
+   * can never block the monitor thread here.
+   *
+   * @param dst worker to receive the parked tasks.
+   * @return number of tasks moved.
+   */
+  size_t MigrateParkedTo(Worker *dst);
+
+  /**
    * Check if worker is running
    * @return true if worker is active, false otherwise
    */
@@ -547,6 +569,15 @@ class Worker {
   // - Queue[2]: Tasks blocked <= 8 times (checked every % 8 iterations)
   // - Queue[3]: Tasks blocked > 8 times (checked every % 16 iterations)
   // Using std::queue for O(1) enqueue/dequeue operations
+  // issue #785: guards blocked_queues_, periodic_queues_ and retry_queue_ —
+  // plain std::queues that, before this, only the owning thread ever touched.
+  // The monitor thread takes it to migrate parked work off a stalled worker.
+  //
+  // INVARIANT: never held across ExecTask. Callers pop under the lock, RELEASE,
+  // then execute. That is what guarantees a worker wedged inside a task holds
+  // nothing the monitor thread needs.
+  mutable std::mutex park_mtx_;
+
   static constexpr u32 NUM_BLOCKED_QUEUES = 4;
   static constexpr u32 BLOCKED_QUEUE_SIZE = 1024;
   std::queue<clio::run::shared_ptr<Task>> blocked_queues_[NUM_BLOCKED_QUEUES];

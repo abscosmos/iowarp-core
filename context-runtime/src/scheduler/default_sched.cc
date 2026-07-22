@@ -430,6 +430,13 @@ void DefaultScheduler::LoadBalance() {
     Worker::EventQueue *evq = w->ReplaceEventQueue();
     rescuer->AdoptEventQueue(evq);
 
+    // ...and the parked state: blocked, periodic and retry queues. These are
+    // plain worker-private std::queues, so a wedged worker simply stops
+    // scanning them. Periodic tasks are the ones that matter — they re-route
+    // through RouteTask every period, so moving them to a worker that actually
+    // scans is the entire fix for their placement.
+    size_t parked_moved = w->MigrateParkedTo(rescuer);
+
     // Track the replacement so IT can be rescued in turn. A rescuer adopts a
     // lane that may hold several more heavy tasks, so it very often wedges too;
     // without this the cascade stops at the first level and everything behind
@@ -442,9 +449,9 @@ void DefaultScheduler::LoadBalance() {
     }
     rescues_performed_.fetch_add(1, std::memory_order_relaxed);
     HLOG(kWarning,
-         "[#785] RESCUE: moved lane + event queue of stalled worker {} to new "
-         "worker {} (rescues={})",
-         w->GetId(), rescuer->GetId(),
+         "[#785] RESCUE: moved lane + event queue + {} parked task(s) of "
+         "stalled worker {} to worker {} (rescues={})",
+         parked_moved, w->GetId(), rescuer->GetId(),
          rescues_performed_.load(std::memory_order_relaxed));
     return true;
   };

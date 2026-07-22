@@ -164,6 +164,8 @@ WorkerStats Worker::GetWorkerStats() const {
 
   // Count blocked tasks across all blocked queues
   stats.num_blocked_tasks_ = 0;
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);  // #785
   for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
     stats.num_blocked_tasks_ += blocked_queues_[i].size();
   }
@@ -176,6 +178,7 @@ WorkerStats Worker::GetWorkerStats() const {
 
   // Count retry tasks
   stats.num_retry_tasks_ = retry_queue_.size();
+  }
 
   // Get suspend period (time until next periodic task or 0 if none)
   double suspend_period = GetSuspendPeriod();
@@ -355,6 +358,49 @@ Worker::EventQueue *Worker::ReplaceEventQueue() {
                                         EVENT_QUEUE_DEPTH_MULTIPLIER * depth)
           .ptr_;
   return event_queue_.exchange(fresh, std::memory_order_acq_rel);
+}
+
+size_t Worker::MigrateParkedTo(Worker *dst) {
+  if (dst == nullptr || dst == this) {
+    return 0;
+  }
+  // std::lock takes both without a fixed order, so two concurrent migrations
+  // involving the same pair cannot deadlock. Neither lock is ever held across
+  // ExecTask, so a wedged donor cannot block us here.
+  std::lock(park_mtx_, dst->park_mtx_);
+  std::lock_guard<std::mutex> lk_src(park_mtx_, std::adopt_lock);
+  std::lock_guard<std::mutex> lk_dst(dst->park_mtx_, std::adopt_lock);
+
+  size_t moved = 0;
+  for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
+    while (!blocked_queues_[i].empty()) {
+      dst->blocked_queues_[i].push(blocked_queues_[i].front());
+      blocked_queues_[i].pop();
+      ++moved;
+    }
+  }
+  for (u32 i = 0; i < NUM_PERIODIC_QUEUES; ++i) {
+    while (!periodic_queues_[i].empty()) {
+      clio::run::shared_ptr<Task> t = periodic_queues_[i].front();
+      periodic_queues_[i].pop();
+      // Reset the block timestamp. A periodic task stranded behind a wedged
+      // worker has elapsed >> its period, so every migrated task would fire on
+      // the destination's very first scan — a thundering herd proportional to
+      // how long the stall lasted. Restarting the clock costs at most one
+      // period of delay and keeps the cadence sane.
+      if (!t.IsNull()) {
+        t->BlockStart().Now();
+      }
+      dst->periodic_queues_[i].push(t);
+      ++moved;
+    }
+  }
+  while (!retry_queue_.empty()) {
+    dst->retry_queue_.push(retry_queue_.front());
+    retry_queue_.pop();
+    ++moved;
+  }
+  return moved;
 }
 
 TaskLane *Worker::ReleaseLane() {
@@ -947,15 +993,19 @@ void Worker::ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue,
   size_t check_limit = std::min(queue_size, size_t(8));
 
   for (size_t i = 0; i < check_limit; i++) {
-    if (queue.empty()) {
-      break;
+    // issue #785: pop under park_mtx_, then RELEASE before ExecTask. Holding it
+    // across execution would let a wedged worker block the monitor thread.
+    clio::run::shared_ptr<Task> task;
+    {
+      std::lock_guard<std::mutex> lk(park_mtx_);
+      if (queue.empty()) {
+        break;
+      }
+      // The queue OWNS the task (shared_ptr), which keeps both the task and its
+      // RunContext (owned by the task) alive while blocked.
+      task = queue.front();
+      queue.pop();
     }
-
-    // The queue OWNS the task (shared_ptr), which keeps both the task and its
-    // RunContext (owned by the task) alive while blocked. The task's execution
-    // state is reached through its accessors.
-    clio::run::shared_ptr<Task> task = queue.front();
-    queue.pop();
 
     if (task.IsNull()) {
       continue;
@@ -1008,12 +1058,17 @@ void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue
 
   // Get current time for all checks
   for (size_t i = 0; i < actual_limit; i++) {
-    if (queue.empty()) {
-      break;
+    // issue #785: same rule as ProcessBlockedQueue — pop under the lock,
+    // execute outside it.
+    clio::run::shared_ptr<Task> task;
+    {
+      std::lock_guard<std::mutex> lk(park_mtx_);
+      if (queue.empty()) {
+        break;
+      }
+      task = queue.front();
+      queue.pop();
     }
-
-    clio::run::shared_ptr<Task> task = queue.front();
-    queue.pop();
 
     if (task.IsNull()) {
       continue;
@@ -1048,6 +1103,7 @@ void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue
       }
     } else {
       // Time threshold not reached yet - re-add to same queue
+      std::lock_guard<std::mutex> lk(park_mtx_);
       queue.push(task);
     }
   }
@@ -1216,6 +1272,7 @@ void Worker::AddToBlockedQueue(const clio::run::shared_ptr<Task> &task,
 
     // Add to the appropriate blocked queue. Store the task (owning shared_ptr)
     // so the task + its RunContext stay alive while blocked.
+    std::lock_guard<std::mutex> lk(park_mtx_);  // #785
     blocked_queues_[queue_idx].push(task);
   } else {
     // Time-based periodic task - add to periodic queue
@@ -1246,19 +1303,32 @@ void Worker::AddToBlockedQueue(const clio::run::shared_ptr<Task> &task,
     }
 
     // Add to the appropriate periodic queue (store the owning task handle).
+    std::lock_guard<std::mutex> lk(park_mtx_);  // #785
     periodic_queues_[queue_idx].push(task);
   }
 }
 
 void Worker::AddToRetryQueue(const clio::run::shared_ptr<Task> &task) {
+  std::lock_guard<std::mutex> lk(park_mtx_);  // #785
   retry_queue_.push(task);
 }
 
 void Worker::ProcessRetryQueue() {
-  size_t count = retry_queue_.size();
+  size_t count;
+  {
+    std::lock_guard<std::mutex> lk(park_mtx_);
+    count = retry_queue_.size();
+  }
   for (size_t i = 0; i < count; ++i) {
-    clio::run::shared_ptr<Task> task_ptr = retry_queue_.front();
-    retry_queue_.pop();
+    clio::run::shared_ptr<Task> task_ptr;
+    {
+      std::lock_guard<std::mutex> lk(park_mtx_);  // #785
+      if (retry_queue_.empty()) {
+        break;
+      }
+      task_ptr = retry_queue_.front();
+      retry_queue_.pop();
+    }
 
     if (task_ptr.IsNull()) {
       continue;  // Skip invalid entries
@@ -1288,11 +1358,27 @@ void Worker::ReschedulePeriodicTask(clio::run::shared_ptr<Task> &task_ptr) {
   task_ptr->SetPredictedWallUs(0);
   task_ptr->PredictedStat() = TaskStat();
 
-  // Get the lane from the run context
+  // Get the lane from the run context.
   TaskLane *lane = task_ptr->Lane();
   if (!lane) {
-    // No lane information, cannot reschedule
-    return;
+    // issue #785: this used to return silently, DROPPING the periodic task —
+    // it would simply stop running with no diagnostic anywhere. Fall back to
+    // this worker's current lane so the task survives, and say so loudly if
+    // even that is unavailable. A periodic task that vanishes is how a runtime
+    // quietly stops polling.
+    lane = assigned_lane_.load(std::memory_order_acquire);
+    if (!lane) {
+      HLOG(kError,
+           "[#785] DROPPING periodic task (pool={} method={}): its RunContext "
+           "has no lane and this worker has none either",
+           task_ptr->pool_id_, task_ptr->method_);
+      return;
+    }
+    task_ptr->Lane() = lane;
+    HLOG(kWarning,
+         "[#785] periodic task (pool={} method={}) had no lane; recovered onto "
+         "worker {}'s lane",
+         task_ptr->pool_id_, task_ptr->method_, worker_id_);
   }
 
   // Unset started when rescheduling periodic task
