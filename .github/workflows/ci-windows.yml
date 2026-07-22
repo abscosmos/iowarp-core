@@ -44,6 +44,28 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: recursive
+      # Windows link steps intermittently fail with "Access is denied" or
+      # "The process cannot access the file because it is being used by another
+      # process" while cmake replaces a freshly written .exe. The holder is
+      # Defender's real-time scanner opening the new binary the instant it
+      # lands. Observed on 3 of the last 5 dev CI Windows runs, hitting a
+      # different random target each time (test_blob_block_reuse,
+      # test_ring_buffer_ext, ...), which is why it reads as a flake.
+      #
+      # Excluding the workspace and the toolchain processes removes the
+      # scanner from the link path. Best-effort: if Defender is absent or the
+      # runner refuses the call, the build proceeds exactly as before.
+      - name: Exclude workspace from Defender (link-flake mitigation)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe" -ErrorAction Stop
+            Write-Host "Defender exclusions added for ${{ github.workspace }}"
+          } catch {
+            Write-Host "Could not add Defender exclusions (continuing): $_"
+          }
       - name: Bootstrap vcpkg
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
@@ -129,6 +151,28 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: recursive
+      # Windows link steps intermittently fail with "Access is denied" or
+      # "The process cannot access the file because it is being used by another
+      # process" while cmake replaces a freshly written .exe. The holder is
+      # Defender's real-time scanner opening the new binary the instant it
+      # lands. Observed on 3 of the last 5 dev CI Windows runs, hitting a
+      # different random target each time (test_blob_block_reuse,
+      # test_ring_buffer_ext, ...), which is why it reads as a flake.
+      #
+      # Excluding the workspace and the toolchain processes removes the
+      # scanner from the link path. Best-effort: if Defender is absent or the
+      # runner refuses the call, the build proceeds exactly as before.
+      - name: Exclude workspace from Defender (link-flake mitigation)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe" -ErrorAction Stop
+            Write-Host "Defender exclusions added for ${{ github.workspace }}"
+          } catch {
+            Write-Host "Could not add Defender exclusions (continuing): $_"
+          }
       # 3.31.x: 4.x's bindexplib fails to open icx object files under Ninja,
       # breaking the clio_ctp_host.dll link.
       - name: Install CMake 3.31.6
@@ -255,6 +299,28 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: recursive
+      # Windows link steps intermittently fail with "Access is denied" or
+      # "The process cannot access the file because it is being used by another
+      # process" while cmake replaces a freshly written .exe. The holder is
+      # Defender's real-time scanner opening the new binary the instant it
+      # lands. Observed on 3 of the last 5 dev CI Windows runs, hitting a
+      # different random target each time (test_blob_block_reuse,
+      # test_ring_buffer_ext, ...), which is why it reads as a flake.
+      #
+      # Excluding the workspace and the toolchain processes removes the
+      # scanner from the link path. Best-effort: if Defender is absent or the
+      # runner refuses the call, the build proceeds exactly as before.
+      - name: Exclude workspace from Defender (link-flake mitigation)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe" -ErrorAction Stop
+            Write-Host "Defender exclusions added for ${{ github.workspace }}"
+          } catch {
+            Write-Host "Could not add Defender exclusions (continuing): $_"
+          }
       - name: Bootstrap vcpkg
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
