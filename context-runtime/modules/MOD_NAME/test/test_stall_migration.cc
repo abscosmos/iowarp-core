@@ -476,7 +476,81 @@ TEST_CASE("repeated_stall_cycles_lose_nothing", "[stall][soak]") {
 }
 
 //==============================================================================
-// TEST 5 — no task may be DROPPED, however slow the runtime gets
+// TEST 5 — HEAD-OF-LINE BLOCKING: small tasks queued BEHIND massive ones
+//
+// The other tests submit small tasks while free workers exist, so
+// RuntimeMapTask (#781) routes them AROUND the busy ones and they never queue
+// behind anything. That measures routing, not head-of-line blocking, and it is
+// the easy half of the problem.
+//
+// This test removes the escape route: it saturates every general-purpose worker
+// with massive tasks FIRST, so that by the time the small tasks arrive there is
+// no unloaded worker to route them to and they must land in a lane behind a
+// massive task. That is the practically important shape — a 10 us request stuck
+// behind a multi-second one — and the one lane transfer does NOT trivially fix,
+// because moving a lane preserves its FIFO order: the replacement pops the next
+// queued task, and if that is another massive task it wedges in turn.
+//
+// The expected cost is therefore roughly (massive tasks ahead) x (rescue
+// latency), NOT (massive tasks ahead) x (massive duration) — which is the whole
+// point. The assertion is deliberately generous about the constant and strict
+// about the scaling: small tasks must not wait out the massive ones.
+//==============================================================================
+
+TEST_CASE("small_tasks_queued_behind_massive_ones", "[stall][headofline]") {
+  StallFixture fixture;
+  clio::run::PoolId pool_id;
+  REQUIRE(fixture.createContainer(kStallPoolId, pool_id));
+
+  clio::run::MOD_NAME::Client client(pool_id);
+
+  SECTION("a small task does not wait out the massive tasks ahead of it") {
+    // Sized against the general-purpose worker count (num_threads 8 -> 4 I/O
+    // workers): enough massive tasks to fill every worker AND leave some
+    // queued, so small tasks provably cannot avoid landing behind one.
+    constexpr int kMassive = 6;
+    constexpr clio::run::u32 kMassiveUs = 6'000'000;  // 6 s each
+    constexpr int kSmall = 12;
+
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> massive;
+    massive.reserve(kMassive);
+    for (int i = 0; i < kMassive; ++i) {
+      massive.push_back(client.AsyncCustom(clio::run::PoolQuery::Local(), "M",
+                                           0, kMassiveUs));
+    }
+    // Let them be picked up and fill the lanes before the small ones arrive.
+    std::this_thread::sleep_for(400ms);
+
+    auto t0 = std::chrono::steady_clock::now();
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> small;
+    small.reserve(kSmall);
+    for (int i = 0; i < kSmall; ++i) {
+      small.push_back(
+          client.AsyncCustom(clio::run::PoolQuery::Local(), "s", 0, 10));
+    }
+
+    // Generous ceiling: still well under what waiting out even ONE massive
+    // task would cost if the small tasks were simply stuck.
+    constexpr int kSmallDeadlineMs = 5000;
+    size_t stuck = WaitAllBounded(small, kSmallDeadlineMs);
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+
+    INFO("head-of-line: " + std::to_string(kSmall) + " small tasks behind " +
+         std::to_string(kMassive) + " massive (" +
+         std::to_string(kMassiveUs / 1000) + "ms each); " +
+         std::to_string(stuck) + " still pending after " +
+         std::to_string(elapsed_ms) + "ms");
+
+    REQUIRE(stuck == 0);
+
+    WaitAllBounded(massive, kDropDeadlineMs);
+  }
+}
+
+//==============================================================================
+// TEST 6 — no task may be DROPPED, however slow the runtime gets
 //==============================================================================
 
 TEST_CASE("no_tasks_dropped_under_stall_pressure", "[stall][drop]") {
