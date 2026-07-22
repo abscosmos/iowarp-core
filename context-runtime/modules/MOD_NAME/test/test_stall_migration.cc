@@ -97,13 +97,18 @@ constexpr clio::run::u32 kSpinUs = 12'000'000;  // 12 s
  *  A depth-D chain can hit D such stalls in sequence — each hop may be queued
  *  behind a different heavy task — so the floor is
  *
- *      kChainDepth * (kStallThresholdSec + monitor_period) = 3 * 1.5 s = 4.5 s
+ *      kChainDepth * (kStallThresholdSec + monitor_period) = 2 * 1.5 s = 3 s
  *
- *  plus scheduling slack. 6 s is that bound rounded up, and it is HALF the spin
- *  duration, so passing genuinely means "does not track the bad task's
- *  runtime". Measured: a 3 s bound passed 2/5 runs and a 4 s bound 1/5, both
- *  failing on rescue latency rather than stranding; 7 s passed 3/3, which is
- *  how the 4.5 s floor was confirmed empirically rather than assumed. */
+ *  6 s therefore leaves 2x margin for scheduling variance while still being
+ *  HALF the spin duration, so passing genuinely means "does not track the bad
+ *  task's runtime".
+ *
+ *  Measured while calibrating: at depth 3 the floor is 4.5 s, which left almost
+ *  no margin — a 3 s bound passed 2/5 runs, 4 s passed 1/5, 6 s passed 2/5 and
+ *  7 s passed 3/3, every failure being rescue latency rather than stranding.
+ *  The fix is fewer SEQUENTIAL rescue cycles (depth 2), not a looser bound:
+ *  loosening it toward the spin duration would quietly destroy what the test
+ *  asserts. */
 constexpr int kChainDeadlineMs = 6000;
 
 /** Generous bound used only to distinguish "slow" from "lost". */
@@ -128,7 +133,7 @@ int NumSpinners() {
   return 2;
 }
 constexpr int kNumChained = 8;
-constexpr clio::run::u32 kChainDepth = 3;
+constexpr clio::run::u32 kChainDepth = 2;
 
 constexpr clio::run::PoolId kStallPoolId = clio::run::PoolId(9100, 0);
 

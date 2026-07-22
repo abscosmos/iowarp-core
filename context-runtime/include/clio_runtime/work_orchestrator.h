@@ -176,6 +176,13 @@ class WorkOrchestrator {
   Worker *SpawnAdditionalWorker();
 
   /**
+   * issue #785: find an already-spawned replacement that is idle (no lane, not
+   * executing) so a rescue can reuse it instead of spawning another thread.
+   * Prefer this over SpawnAdditionalWorker(). Monitor thread only.
+   */
+  Worker *FindIdleElasticWorker();
+
+  /**
    * Retire an idle elastic worker spawned by SpawnAdditionalWorker (issue #781):
    * park it, join its thread, and drop it from the pool — the hysteresis that
    * returns the runtime to the minimum thread count after a burst clears.
@@ -237,6 +244,10 @@ class WorkOrchestrator {
   // ClientConnect's worker-tid publication) acquire it. all_workers_.size() is
   // NOT safe to read concurrently with a spawn.
   std::atomic<size_t> num_workers_published_{0};
+
+  // issue #785: workers created at Init. Anything at or beyond this index is an
+  // elastic replacement and is eligible for reuse.
+  size_t baseline_worker_count_ = 0;
 
   // Active lanes pointer to IPC Manager worker queues
   void* active_lanes_;

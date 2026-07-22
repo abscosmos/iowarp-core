@@ -111,6 +111,7 @@ bool WorkOrchestrator::Init() {
     }
   }
   num_workers_published_.store(all_workers_.size(), std::memory_order_release);
+  baseline_worker_count_ = all_workers_.size();  // #785: elastic growth starts here
 
   // Mark as initialized so GetWorker() works during DivideWorkers
   is_initialized_ = true;
@@ -466,6 +467,30 @@ Worker *WorkOrchestrator::SpawnAdditionalWorker() {
     return nullptr;
   }
 
+  // issue #785: BOUND THE POOL BY CONCURRENT, NOT CUMULATIVE, STALLS.
+  //
+  // #781 chose an unbounded elastic pool. That is sound as long as replacements
+  // are REUSED, because the pool then tracks how many workers are wedged at
+  // once, which is self-limiting. Spawning a fresh thread per rescue instead
+  // makes it track the TOTAL number of stalls over the process lifetime, which
+  // grows without bound on a long-running daemon. Callers must try
+  // FindIdleElasticWorker() first.
+  //
+  // The ceiling is baseline + one thread per core: a replacement only buys
+  // parallelism if there is a core to run it on, and a non-yielding task never
+  // deschedules itself, so threads past that point take cycles from the tasks
+  // we are trying to unblock rather than adding throughput.
+  int ncpu = ctp::SystemInfo::GetCpuCount();
+  size_t elastic_budget = (ncpu > 0) ? static_cast<size_t>(ncpu) : 8;
+  if (all_workers_.size() >= baseline_worker_count_ + elastic_budget) {
+    HLOG(kWarning,
+         "[#785] NOT spawning: {} workers >= baseline {} + {} cores. The pool "
+         "is CPU-bound; another thread would only take cycles from running "
+         "tasks. Backlog on the stalled worker stays queued.",
+         all_workers_.size(), baseline_worker_count_, elastic_budget);
+    return nullptr;
+  }
+
   u32 worker_id = static_cast<u32>(all_workers_.size());
   auto worker = std::make_unique<Worker>(worker_id);
   if (!worker->Init()) {
@@ -496,6 +521,19 @@ Worker *WorkOrchestrator::SpawnAdditionalWorker() {
   HLOG(kWarning, "[#785] spawned elastic worker {} (pool now {} workers)",
        worker_id, num_workers_published_.load(std::memory_order_relaxed));
   return worker_ptr;
+}
+
+Worker *WorkOrchestrator::FindIdleElasticWorker() {
+  // issue #785: a replacement that finished its rescued work sits idle with no
+  // lane. Reusing it keeps the pool proportional to how many workers are wedged
+  // AT ONCE rather than how many have ever been wedged.
+  for (size_t i = baseline_worker_count_; i < all_workers_.size(); ++i) {
+    Worker *w = all_workers_[i];
+    if (w != nullptr && w->GetLane() == nullptr && !w->IsExecuting()) {
+      return w;
+    }
+  }
+  return nullptr;
 }
 
 void WorkOrchestrator::RetireWorker(Worker *worker) {

@@ -32,6 +32,8 @@
  */
 
 // Copyright 2024 IOWarp contributors
+#include <algorithm>
+
 #include "clio_runtime/scheduler/default_sched.h"
 
 #include <chrono>
@@ -397,7 +399,13 @@ void DefaultScheduler::LoadBalance() {
     if (work_orch_ == nullptr || w->GetLane() == nullptr) {
       return true;
     }
-    Worker *rescuer = work_orch_->SpawnAdditionalWorker();
+    // Prefer recycling a replacement that has finished its previous rescue.
+    // Spawning unconditionally would make the pool grow with the CUMULATIVE
+    // number of stalls rather than the number of workers wedged at once.
+    Worker *rescuer = work_orch_->FindIdleElasticWorker();
+    if (rescuer == nullptr) {
+      rescuer = work_orch_->SpawnAdditionalWorker();
+    }
     if (rescuer == nullptr) {
       HLOG(kWarning,
            "[#785] worker {} stalled but no replacement could be spawned; "
@@ -427,7 +435,11 @@ void DefaultScheduler::LoadBalance() {
     // without this the cascade stops at the first level and everything behind
     // the second stalled worker stays stranded. The scheduler's io_workers_ /
     // scheduler_worker_ lists only ever hold the workers built at startup.
-    elastic_workers_.push_back(rescuer);
+    // Only track a NEW replacement; a recycled one is already in the list.
+    if (std::find(elastic_workers_.begin(), elastic_workers_.end(), rescuer) ==
+        elastic_workers_.end()) {
+      elastic_workers_.push_back(rescuer);
+    }
     rescues_performed_.fetch_add(1, std::memory_order_relaxed);
     HLOG(kWarning,
          "[#785] RESCUE: moved lane + event queue of stalled worker {} to new "
