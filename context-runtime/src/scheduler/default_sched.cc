@@ -467,7 +467,24 @@ void DefaultScheduler::LoadBalance() {
       Future<Task> queued;
       while (lane->Pop(queued)) {
         Worker *target = PickLeastLoadedLive(now_us, w, nullptr);
+        // A target whose lane is (nearly) full is unusable HERE even though it
+        // would be fine for a worker thread: TaskLane::Push uses
+        // WAIT_FOR_SPACE, so it busy-spins until space appears. On a worker
+        // that is back-pressure; on THIS thread it would freeze the monitor
+        // loop — no more stall detection, no more rescues, no watchdog. The
+        // machinery meant to prevent deadlock would itself deadlock. Leave the
+        // remaining tasks in the donor's lane instead; they are handed back to
+        // it below and retried on the next tick.
+        if (target != nullptr && target->GetLane() != nullptr) {
+          TaskLane *tl = target->GetLane();
+          size_t depth = tl->GetDepth();
+          if (depth > 0 && tl->Size() + 2 >= depth) {
+            target = nullptr;  // treat as "nowhere healthy to put it"
+          }
+        }
         if (target == nullptr || target->GetLane() == nullptr) {
+          // Safe to push back: we just popped from this very lane, so it has
+          // room and cannot spin.
           if (!lane->Push(queued)) {
             HLOG(kError, "[#785] lost a task re-queuing during rescue");
           }
