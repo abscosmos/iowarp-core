@@ -140,9 +140,27 @@ class BdevLeakStressFixture {
 
 static BdevLeakStressFixture *g_fixture = nullptr;
 
-// Query the bdev target's remaining allocatable bytes via the CTE client.
+/**
+ * Query the bdev target's remaining allocatable bytes via the CTE client.
+ *
+ * GetTargetInfo does NOT query the allocator — it returns the cached
+ * TargetInfo::remaining_space_, which is only refreshed when a StatTargets
+ * task runs. That task is periodic at config_.performance_.stat_targets_
+ * period_ms_, default *5000 ms*. Reading GetTargetInfo on its own therefore
+ * reports whatever the allocator looked like up to five seconds ago.
+ *
+ * So force a one-shot StatTargets and wait for it before reading. Without
+ * this, the value below is a stale snapshot and any leak assertion built on
+ * it is a coin flip.
+ */
 static clio::run::u64 TargetRemaining() {
   auto *cte = CLIO_CTE_CLIENT;
+  // period_ms = 0 -> one-shot: refresh the cache now rather than waiting for
+  // the next periodic tick.
+  auto refresh = cte->AsyncStatTargets();
+  refresh.Wait();
+  REQUIRE(refresh->GetReturnCode() == 0);
+
   auto info = cte->AsyncGetTargetInfo(kTargetName);
   info.Wait();
   REQUIRE(info->GetReturnCode() == 0);
@@ -155,14 +173,20 @@ static clio::run::u64 TargetRemaining() {
  * Read the bdev target's remaining bytes, waiting for it to stop moving first.
  *
  * DelBlob's block free completes asynchronously, so sampling immediately after
- * the loop can catch the tail of the last cycle still in flight. That is what
- * made this test fail on Windows force-net -- the slowest configuration -- with
- * a constant 65536-byte residue (constant, not proportional to iteration count,
- * which is the tell that it is the tail rather than a per-op leak). The same
- * test passes on Linux and Linux/ARM, where the frees land before the sample.
+ * the loop can catch the tail of the last cycle still in flight.
  *
  * Mirrors StabilizeRuntimeHeap: poll until two consecutive reads agree, with a
- * bounded wait so a genuine leak still fails rather than hanging.
+ * bounded wait so a genuine leak still fails rather than hanging. This is only
+ * meaningful because TargetRemaining() forces a StatTargets refresh per read —
+ * polling the cached value alone would "stabilize" instantly on a stale number
+ * that nothing was updating, since the periodic refresh (5 s) is far longer
+ * than this loop's 1 s bound.
+ *
+ * NOTE: an earlier revision of this comment claimed the Windows force-net
+ * failure was simply this settling race, with a "constant 65536-byte residue"
+ * as the tell. That was wrong — adding the stabilize loop did not fix it (see
+ * issue #791). The stale-cache problem described above is a real defect in how
+ * this test measures, but whether it fully accounts for #791 is unconfirmed.
  */
 static clio::run::u64 StabilizeTargetRemaining() {
   clio::run::u64 prev = TargetRemaining();
