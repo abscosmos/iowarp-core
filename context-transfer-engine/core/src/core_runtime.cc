@@ -438,8 +438,34 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // the RPC path rather than growing. Failure here is NOT an error: it just
   // means clients keep using RPC.
   {
-    static const size_t kShmTagCapacity = 64 * 1024;
-    static const size_t kShmBlobCapacity = 256 * 1024;
+    // Capacity is PERMANENT: the SHM maps never rehash (a rehash would free a
+    // table out from under untracked cross-process readers), so this is the
+    // one chance to size them. Entries beyond capacity are simply not cached
+    // and those blobs keep using the RPC path.
+    //
+    // COST IS RESIDENT, NOT SPARSE. Every slot is constructed at creation, so
+    // capacity is paid in RAM immediately: ~376 B per blob slot and ~80 B per
+    // tag slot. The defaults below are ~100 MB of blob table. Raise them for
+    // large deployments -- 1M blobs wants ~2M slots (~0.79 GB) since the load
+    // factor caps useful occupancy at 7/8.
+    size_t tag_capacity = 64 * 1024;
+    size_t blob_capacity = 256 * 1024;
+    if (const char *env = clio::run::env::GetCompat("CTE_SHM_TAG_CAPACITY")) {
+      char *end = nullptr;
+      unsigned long long v = std::strtoull(env, &end, 10);
+      if (end != env && v > 0) {
+        tag_capacity = static_cast<size_t>(v);
+      }
+    }
+    if (const char *env = clio::run::env::GetCompat("CTE_SHM_BLOB_CAPACITY")) {
+      char *end = nullptr;
+      unsigned long long v = std::strtoull(env, &end, 10);
+      if (end != env && v > 0) {
+        blob_capacity = static_cast<size_t>(v);
+      }
+    }
+    const size_t kShmTagCapacity = tag_capacity;
+    const size_t kShmBlobCapacity = blob_capacity;
     if (shm_cache_.Create(kShmTagCapacity, kShmBlobCapacity, pool_id_)) {
       HLOG(kInfo,
            "CTE: shared-memory metadata cache enabled (tags={}, blobs={}, "

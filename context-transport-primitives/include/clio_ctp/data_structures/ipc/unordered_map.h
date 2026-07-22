@@ -102,6 +102,42 @@ class unordered_map : public ShmContainer<AllocT> {
 
   enum SlotState : min_u32 { kEmpty = 0, kOccupied = 1, kTombstone = 2 };
 
+  /**
+   * Maximum load factor (7/8). NEW keys are refused past this point even
+   * though slots remain.
+   *
+   * This is not tidiness, it is the difference between a plateau and a cliff.
+   * A probe run only terminates at an EMPTY slot, so a table with none makes
+   * every MISS scan the whole table. Measured on a 65536-slot table:
+   *
+   *     load  50%  ->  miss   0.06 us
+   *     load  90%  ->  miss   0.18 us
+   *     load  99%  ->  miss  11.8  us
+   *     load 100%  ->  miss 108.9  us
+   *
+   * At 100% a miss costs MORE than the ~90 us RPC it exists to avoid -- and
+   * the caller then pays that RPC anyway, so the cache turns net-negative.
+   * Reserving 1/8 of the slots keeps the expected miss probe length ~8 and
+   * bounds it in practice.
+   */
+  static constexpr size_t kMaxLoadNum = 7;
+  static constexpr size_t kMaxLoadDen = 8;
+
+  /**
+   * Hard cap on probe length for a single lookup.
+   *
+   * Purely a pathological-case backstop: it must NOT be the binding
+   * constraint, the load factor must be. Linear probing forms clusters far
+   * longer than the average probe length, so a tight cap silently rejects
+   * legitimate inserts long before the table is full -- measured at 64, a
+   * 65536-slot table stopped accepting new keys at ~51% occupancy instead of
+   * 87.5%, cutting cache coverage for 1M blobs from 26% to 18%.
+   *
+   * 1024 leaves the load factor in charge while still bounding a worst-case
+   * miss to ~1 us, versus the ~109 us unbounded scan it replaces.
+   */
+  static constexpr size_t kMaxProbe = 1024;
+
   struct Slot {
     ipc::atomic<min_u32> state_;
     /** Seqlock counter. Odd => a write is in progress on this slot. */
@@ -113,6 +149,7 @@ class unordered_map : public ShmContainer<AllocT> {
  private:
   size_t capacity_;  /**< Power of two; never changes after construction */
   size_t size_;      /**< Occupied slots. Writer-only; advisory for readers */
+  size_t max_fill_;  /**< Refuse NEW keys past this; see kMaxLoadNum */
   OffsetPtr<Slot> slots_;
 
  public:
@@ -121,6 +158,7 @@ class unordered_map : public ShmContainer<AllocT> {
       : ShmContainer<AllocT>(),
         capacity_(0),
         size_(0),
+        max_fill_(0),
         slots_(OffsetPtr<Slot>::GetNull()) {}
 
   /**
@@ -133,6 +171,7 @@ class unordered_map : public ShmContainer<AllocT> {
       : ShmContainer<AllocT>(alloc),
         capacity_(0),
         size_(0),
+        max_fill_(0),
         slots_(OffsetPtr<Slot>::GetNull()) {
     Allocate(capacity);
   }
@@ -182,8 +221,14 @@ class unordered_map : public ShmContainer<AllocT> {
     size_t mask = capacity_ - 1;
     size_t idx = key_hash & mask;
     size_t first_tombstone = capacity_;  // sentinel: none seen
+    // Overwrites of an existing key are always allowed; only NEW keys are
+    // subject to the load cap, so a saturated cache keeps serving (and
+    // updating) what it already holds instead of going stale.
+    const bool accept_new = (size_ < max_fill_);
+    const size_t probe_limit =
+        capacity_ < kMaxProbe ? capacity_ : kMaxProbe;
 
-    for (size_t probe = 0; probe < capacity_; ++probe) {
+    for (size_t probe = 0; probe < probe_limit; ++probe) {
       Slot &s = slots[idx];
       min_u32 st = s.state_.load();
       if (st == kOccupied) {
@@ -197,6 +242,9 @@ class unordered_map : public ShmContainer<AllocT> {
         if (st == kTombstone && first_tombstone == capacity_) {
           first_tombstone = idx;
         } else if (st == kEmpty) {
+          if (!accept_new) {
+            return false;  // at load cap: not cached, caller uses RPC
+          }
           // Prefer an earlier tombstone to keep probe sequences short.
           size_t target = (first_tombstone != capacity_) ? first_tombstone : idx;
           Slot &t = slots[target];
@@ -219,7 +267,7 @@ class unordered_map : public ShmContainer<AllocT> {
       }
       idx = (idx + 1) & mask;
     }
-    return false;  // table full
+    return false;  // at load cap, or probe limit hit
   }
 
   /**
@@ -237,7 +285,8 @@ class unordered_map : public ShmContainer<AllocT> {
     Slot *slots = Slots();
     size_t mask = capacity_ - 1;
     size_t idx = key_hash & mask;
-    for (size_t probe = 0; probe < capacity_; ++probe) {
+    const size_t probe_limit = capacity_ < kMaxProbe ? capacity_ : kMaxProbe;
+    for (size_t probe = 0; probe < probe_limit; ++probe) {
       Slot &s = slots[idx];
       min_u32 st = s.state_.load();
       if (st == kEmpty) {
@@ -293,7 +342,9 @@ class unordered_map : public ShmContainer<AllocT> {
     for (min_u32 attempt = 0; attempt < max_retries; ++attempt) {
       size_t idx = key_hash & mask;
       bool saw_torn = false;
-      for (size_t probe = 0; probe < capacity_; ++probe) {
+      const size_t probe_limit =
+          capacity_ < kMaxProbe ? capacity_ : kMaxProbe;
+      for (size_t probe = 0; probe < probe_limit; ++probe) {
         const Slot &s = slots[idx];
         min_u64 g0 = s.gen_.load();
         if ((g0 & 1) != 0) {
@@ -445,6 +496,10 @@ class unordered_map : public ShmContainer<AllocT> {
     }
     slots_ = OffsetPtr<Slot>(off.load());
     capacity_ = cap;
+    max_fill_ = (cap * kMaxLoadNum) / kMaxLoadDen;
+    if (max_fill_ == 0) {
+      max_fill_ = cap > 1 ? cap - 1 : 1;  // always leave one empty slot
+    }
     Slot *slots = Slots();
     for (size_t i = 0; i < cap; ++i) {
       // The allocation is raw memory, so every slot member must be constructed

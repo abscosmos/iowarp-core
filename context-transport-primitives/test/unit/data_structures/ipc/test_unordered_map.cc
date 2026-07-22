@@ -178,9 +178,49 @@ TEST_CASE("IpcMap: full table reports failure and never grows", "[ipc_map]") {
   }
   // Must have refused the overflow rather than rehashing -- a rehash would
   // free the table out from under cross-process readers.
-  REQUIRE(inserted == 8);
+  //
+  // Note it stops at the LOAD CAP (7/8), not at 100%. Filling every slot
+  // leaves no empty slot to terminate a probe run, which makes every MISS scan
+  // the entire table: measured at 108.9 us on a 65536-slot table, i.e. worse
+  // than the RPC the cache exists to avoid. Reserving 1/8 keeps misses at
+  // ~0.1 us.
+  REQUIRE(inserted == 7);
   REQUIRE(m.capacity() == 8);
-  REQUIRE(m.size() == 8);
+  REQUIRE(m.size() == 7);
+
+  // The entries that WERE accepted must still be readable, and a miss on the
+  // saturated table must still return quickly rather than scanning it.
+  Rec out;
+  REQUIRE(m.TryGetBytes("k0", 2, &out));
+  REQUIRE_FALSE(m.TryGetBytes("k63", 3, &out));
+}
+
+TEST_CASE("IpcMap: load cap leaves headroom at scale", "[ipc_map]") {
+  MallocBackend backend;
+  auto *alloc = CreateTestAllocator(backend, 256 * 1024 * 1024);
+
+  StrMap m(alloc, 4096);
+  REQUIRE(m.capacity() == 4096);
+  int inserted = 0;
+  for (int i = 0; i < 8192; ++i) {
+    if (Put(m, "load_key_" + std::to_string(i), Rec(i, i))) {
+      ++inserted;
+    }
+  }
+  // 7/8 of 4096. The load factor must be the binding constraint, NOT the
+  // probe-length cap: an over-tight probe cap silently rejects inserts far
+  // below the load limit (measured: a 64-probe cap stopped a 65536-slot table
+  // at ~51% occupancy).
+  REQUIRE(inserted == 3584);
+  REQUIRE(m.size() == 3584);
+
+  // Overwrites of existing keys must still succeed at the cap, so a saturated
+  // cache keeps its entries fresh instead of going stale.
+  REQUIRE(Put(m, "load_key_0", Rec(999, 999)));
+  Rec out;
+  REQUIRE(m.TryGetBytes("load_key_0", 10, &out));
+  REQUIRE(out == Rec(999, 999));
+  REQUIRE(m.size() == 3584);
 }
 
 TEST_CASE("IpcMap: many keys round-trip", "[ipc_map]") {
