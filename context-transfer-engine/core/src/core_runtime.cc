@@ -2130,6 +2130,14 @@ void Runtime::CollectOrganizerBlobStats(clio::run::u32 replica_id,
         // organizer replica. The key hash partitions the blob space
         // disjointly across the `organizer_tasks` periodic replicas.
         if (blob_info.blocks_.empty()) return;
+        // Skip blobs whose access timestamps have not been written yet. A
+        // BlobInfo is constructed with last_modified_/last_read_ zeroed and
+        // stamped shortly after (PutBlobImpl), so a periodic organizer round
+        // can observe one in between. Scoring it would treat the zero as a
+        // real timestamp and derive an age from the steady_clock epoch — see
+        // the sentinel note in FrecencyDataOrganizer::ComputeScore (#792).
+        // Skipping costs nothing: the next round rescores it correctly.
+        if (blob_info.last_modified_ == 0 && blob_info.last_read_ == 0) return;
         if (num_replicas > 1 && (hasher(key) % num_replicas) != replica_id) {
           return;
         }
