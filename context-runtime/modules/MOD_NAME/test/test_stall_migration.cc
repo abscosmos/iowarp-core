@@ -71,6 +71,8 @@
 
 using namespace std::chrono_literals;
 
+#include "clio_ctp/introspect/system_info.h"
+
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/pool_query.h>
 #include <clio_runtime/singletons.h>
@@ -148,8 +150,12 @@ class StallFixture {
       // non-yielding task wedges all compute and every run degenerates into
       // saturation. Raise it before CLIO_INIT reads the config so there is
       // provably spare compute capacity for the control group to land on.
-      // setenv with overwrite=0 keeps an externally-supplied value.
-      setenv("CLIO_NUM_THREADS", "8", 0);
+      // Routed through SystemInfo::Setenv: MSVC has no setenv(), so the raw
+      // call is a Windows build break. overwrite=0 keeps an externally
+      // supplied value.
+      if (std::getenv("CLIO_NUM_THREADS") == nullptr) {
+        ctp::SystemInfo::Setenv("CLIO_NUM_THREADS", "8", /*overwrite=*/1);
+      }
       bool success =
           clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       if (success) {
