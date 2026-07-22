@@ -263,7 +263,7 @@ Supporting changes:
   `RunContext::awaited_fshm_` is a raw `const void*` (`task.h:885`). Dereferencing it is safe *while
   the parent is suspended* (the parent's coroutine frame holds the owning `Future`, which holds the
   `shared_ptr<FutureShm>`), but that is an invariant worth making explicit — consider storing an
-  owning `Future` instead of the raw pointer. See open decision §8.1.
+  owning `Future` instead of the raw pointer. See open decision 1.
 * **Ownership.** Parking adds a second owning `shared_ptr<Task>` reference. A task that completes
   through a path which never erases its entry is retained forever by the queue. The
   `IsCoroCompleted()` branch above makes this self-correcting, but given #620/#680 were both
@@ -353,7 +353,7 @@ will do something unsafe.
 worker (pending §7.6) and worker 0's batch duty, which is the point: **role gating is a temporary
 scaffold, not the destination.**
 
-Note this also dissolves what was open decision §8.2 — `DefaultScheduler::PickAltWorker`
+Note this also dissolves what was an open decision — `DefaultScheduler::PickAltWorker`
 (`default_sched.cc:302-319`) deliberately falls back to the net workers, which made "protect them by
 prevention" unworkable. With no net worker to protect, the hole closes by construction.
 
@@ -564,7 +564,7 @@ quarantined queues (§7.2); retry queue; load accounting moves (D6).
 ### P3 — Observability + quarantine policy
 
 * Suspended-duration histogram, migration counters surfaced through `clio_run_cmd_monitor`.
-* Wedged-worker readmission policy (§8.3).
+* Wedged-worker readmission policy (open decision 3).
 
 ---
 
