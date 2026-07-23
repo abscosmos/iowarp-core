@@ -157,6 +157,9 @@ class ConfigManager : public ctp::BaseConfig {
    */
   u32 GetNumThreads() const { return num_threads_; }
 
+  /** issue #807: number of parallel inbound SHM rings + drain threads. */
+  u32 GetShmInShards() const { return shm_in_shards_; }
+
   /**
    * issue #785: extra task lanes reserved for elastic replacement workers.
    * Lanes are indexed by worker id, so replacements spawned by a stall rescue
@@ -393,6 +396,7 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Configuration parameters
   u32 num_threads_ = 4;
+  u32 shm_in_shards_ = 4;  // issue #807: parallel inbound SHM rings
   u32 queue_depth_ = 1024;
 
   size_t main_segment_size_ = ctp::Unit<size_t>::Gigabytes(1);

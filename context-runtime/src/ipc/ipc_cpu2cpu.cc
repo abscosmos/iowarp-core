@@ -11,18 +11,19 @@
 
 namespace clio::run {
 
-bool IpcCpu2Cpu::RecvIn(IpcManager *ipc) {
-  // Drain the runtime's SINGLE inbound ring (shm_in_server_, DONTWAIT) and
-  // enqueue any received external-client task onto the normal dispatch path.
-  // The only caller is IpcManager::RecvShmServerThread, a dedicated non-worker
-  // thread — that satisfies the ring's single-consumer contract on its own and
-  // keeps every byte of task/future deserialization off the workers.
-  if (!ipc->shm_in_server_ok_) {
+bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, u32 shard) {
+  // Drain ONE inbound shard ring (shm_in_servers_[shard], DONTWAIT) and enqueue
+  // any received external-client task onto the normal dispatch path. issue #807:
+  // there are now S shard rings, each with its own dedicated drain thread, so
+  // each ring still has exactly one consumer — the MPSC single-consumer contract
+  // holds per shard — and S clients-worth of deserialize+route runs on S cores.
+  if (!ipc->shm_in_server_ok_ || shard >= ipc->shm_in_servers_.size() ||
+      ipc->shm_in_servers_[shard] == nullptr) {
     return false;
   }
   LoadTaskArchive archive;
   ctp::lbm::ClientInfo info =
-      ipc->shm_in_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+      ipc->shm_in_servers_[shard]->Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
   if (info.rc != 0) {
     return false;
   }

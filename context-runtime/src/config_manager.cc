@@ -186,6 +186,18 @@ void ConfigManager::ApplyEnvOverrides() {
       num_threads_ = static_cast<u32>(n);
     }
   }
+
+  // issue #807: number of parallel inbound SHM rings (each with its own drain
+  // thread). CLIO_SHM_IN_SHARDS overrides. Default 4 spreads the MPSC tail
+  // contention and the deserialize+route work across cores without oversubscribing
+  // a small box; 1 restores the single-ring behaviour.
+  if (const char *env = clio::run::env::GetCompat("SHM_IN_SHARDS")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env && n >= 1) {
+      shm_in_shards_ = static_cast<u32>(n);
+    }
+  }
 }
 
 bool ConfigManager::ServerInit() {

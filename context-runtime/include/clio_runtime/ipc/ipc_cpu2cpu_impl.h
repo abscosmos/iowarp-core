@@ -69,12 +69,16 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
     ipc->pending_zmq_futures_[net_key] = {task_ptr.get()};
   }
 
-  // Send the task to the runtime's single inbound ring. Clients no longer
-  // load-balance across per-worker rings (worker_tids_); the net_recv worker
-  // drains this one ring and fans tasks out to worker lanes, mirroring the ZMQ
-  // ROUTER model. The runtime pid (learned via ClientConnect) keys the name.
+  // issue #807: shard across the runtime's S inbound rings. Key by this client
+  // thread's tid so a given thread always targets the same ring — preserves
+  // per-thread request order and keeps the ring's producer set stable (locality).
+  // Each shard ring has its own dedicated drain thread on the runtime, so this
+  // spreads both the MPSC-tail contention and the deserialize+route work.
+  u32 shards = ipc->shm_in_shards_ >= 1 ? ipc->shm_in_shards_ : 1;
+  u32 shard = static_cast<u32>(ctp::SystemInfo::GetTid()) % shards;
   ctp::lbm::ShmMpscTransport *conn = ipc->GetOrCreateShmConn(
-      "clio-" + std::to_string(ipc->runtime_pid_) + "-shm-in");
+      "clio-" + std::to_string(ipc->runtime_pid_) + "-shm-in-" +
+      std::to_string(shard));
   if (conn == nullptr) {
     HLOG(kError, "IpcCpu2Cpu::SendIn: inbound SHM ring unavailable");
     task_ptr->SetComplete();  // unblock the waiter on the error path

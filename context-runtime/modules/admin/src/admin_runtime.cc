@@ -591,6 +591,8 @@ clio::run::TaskResume Runtime::ClientConnect(clio::run::shared_ptr<ClientConnect
   task->server_generation_ = CLIO_IPC->GetServerGeneration();
   task->server_pid_ = static_cast<int32_t>(getpid());
   task->worker_queues_off_ = CLIO_IPC->GetWorkerQueuesOffset();
+  // issue #807: tell the client how many inbound SHM rings to shard across.
+  task->shm_in_shards_ = CLIO_CONFIG_MANAGER->GetShmInShards();
   // Report this runtime's pid-based allocator ids so the client attaches the
   // correct allocators (segments are no longer the hardcoded (1,0)/(2,0)).
   task->main_alloc_id_ = CLIO_IPC->GetMainAllocatorId();

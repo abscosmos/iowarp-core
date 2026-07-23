@@ -938,7 +938,7 @@ class IpcManager {
    * scheduler needs to know the ring exists: this thread IS the ring's single
    * consumer.
    */
-  void RecvShmServerThread();
+  void RecvShmServerThread(u32 shard);  // #807: drains shm_in_servers_[shard]
 
   /**
    * Start RecvShmServerThread. Called once from the admin ChiMod's Create,
@@ -1445,6 +1445,11 @@ class IpcManager {
   // PID of the runtime process (for tgkill)
   pid_t runtime_pid_ = 0;
 
+  // issue #807: number of parallel inbound SHM rings. On the runtime this is
+  // GetShmInShards(); on a client it is learned from ClientConnect and selects
+  // which shard (clio-<pid>-shm-in-<k>) a request is sent to.
+  u32 shm_in_shards_ = 1;
+
   // Monotonic counter, set from epoch nanos at init
   std::atomic<u64> server_generation_{0};
 
@@ -1477,7 +1482,12 @@ class IpcManager {
   //   (RecvShmClientThread), which demuxes by net_key and wakes waiters. This
   //   mirrors the ZMQ model (one recv path, event-woken waiters) instead of
   //   clients load-balancing across per-worker rings.
-  ctp::lbm::ShmMpscTransport shm_in_server_;
+  // issue #807: S parallel inbound rings (clio-<pid>-shm-in-<k>), each with its
+  // own drain thread, replacing the single shm_in_server_. unique_ptr because
+  // ShmMpscTransport owns SHM handles and is not movable into a vector. Index k
+  // is the shard the producing client selected. shm_in_server_ok_ is true once
+  // ALL shards initialised.
+  std::vector<std::unique_ptr<ctp::lbm::ShmMpscTransport>> shm_in_servers_;
   bool shm_in_server_ok_ = false;
   ctp::lbm::ShmMpscTransport shm_out_server_;
   bool shm_out_server_ok_ = false;
@@ -1591,7 +1601,7 @@ class IpcManager {
   // inbound ring) and pushes tasks onto worker lanes, mirroring the ZMQ path's
   // ClientRecvThread. Owning the drain here — rather than on a designated
   // worker — is what keeps the schedulers and Worker free of transport state.
-  std::thread shm_in_recv_thread_;
+  std::vector<std::thread> shm_in_recv_threads_;  // #807: one per shard
   std::atomic<bool> shm_in_recv_running_{false};
 
   // Background heartbeat thread for server liveness detection

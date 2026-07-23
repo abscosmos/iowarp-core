@@ -37,7 +37,7 @@ struct IpcCpu2Cpu {
    * scheduler involvement is needed to establish it.
    * @return true if a task was received and enqueued.
    */
-  static bool RecvIn(IpcManager *ipc);
+  static bool RecvIn(IpcManager *ipc, u32 shard);  // #807: drains shard ring
 
   /** Deserialize task from SHM ring buffer on runtime side (inbound). */
   static clio::run::shared_ptr<clio::run::Task> RecvIn(

@@ -712,7 +712,10 @@ void IpcManager::ServerFinalize() {
 #if CTP_IS_HOST
   StopShmServerRecvThread();
   if (shm_in_server_ok_) {
-    shm_in_server_.Shutdown();  // unmap + unlink "clio-<pid>-shm-in"
+    for (auto &ring : shm_in_servers_) {
+      if (ring) ring->Shutdown();  // unmap + unlink clio-<pid>-shm-in-<k>
+    }
+    shm_in_servers_.clear();
     shm_in_server_ok_ = false;
   }
 #endif
@@ -1066,15 +1069,31 @@ bool IpcManager::ServerInitShm() {
     // producer in SendBytes. The name is derived from the runtime pid so a
     // client can form it from the server_pid_ it learns via ClientConnect.
     {
-      std::string in_name = "clio-" + std::to_string(pid) + "-shm-in";
-      shm_in_server_ok_ =
-          shm_in_server_.ServerInit(in_name, ctp::Unit<size_t>::Megabytes(128));
-      if (!shm_in_server_ok_) {
-        HLOG(kError, "ServerInitShm: failed to create inbound SHM ring '{}'",
-             in_name);
-        return false;
+      // issue #807: S parallel inbound rings clio-<pid>-shm-in-<k>, each drained
+      // by its own thread, replacing the single ring. Spreads MPSC-tail
+      // contention and deserialize+route work across cores. Each ring is sized
+      // down proportionally so total inbound SHM stays ~128MB regardless of S.
+      u32 shards = CLIO_CONFIG_MANAGER->GetShmInShards();
+      if (shards < 1) shards = 1;
+      shm_in_shards_ = shards;
+      size_t per_ring_mb = std::max<size_t>(8, 128 / shards);
+      shm_in_servers_.clear();
+      shm_in_server_ok_ = true;
+      for (u32 k = 0; k < shards; ++k) {
+        std::string in_name =
+            "clio-" + std::to_string(pid) + "-shm-in-" + std::to_string(k);
+        auto ring = std::make_unique<ctp::lbm::ShmMpscTransport>();
+        if (!ring->ServerInit(in_name,
+                              ctp::Unit<size_t>::Megabytes(per_ring_mb))) {
+          HLOG(kError, "ServerInitShm: failed to create inbound SHM ring '{}'",
+               in_name);
+          shm_in_server_ok_ = false;
+          return false;
+        }
+        shm_in_servers_.push_back(std::move(ring));
       }
-      HLOG(kInfo, "ServerInitShm: inbound SHM ring '{}' (128MB)", in_name);
+      HLOG(kInfo, "ServerInitShm: {} inbound SHM ring(s) '{}-shm-in-0..{}' ({}MB each)",
+           shards, "clio-" + std::to_string(pid), shards - 1, per_ring_mb);
     }
 #endif
 
@@ -1438,8 +1457,14 @@ retry_attempt:
     if (task->server_pid_ > 0) {
       runtime_pid_ = static_cast<int>(task->server_pid_);
     }
-    HLOG(kInfo, "Successfully connected to runtime (generation={}, server_pid={})",
-         client_generation_, runtime_pid_);
+    // issue #807: learn how many inbound SHM rings to shard requests across.
+    if (task->shm_in_shards_ >= 1) {
+      shm_in_shards_ = task->shm_in_shards_;
+    }
+    HLOG(kInfo,
+         "Successfully connected to runtime (generation={}, server_pid={}, "
+         "shm_in_shards={})",
+         client_generation_, runtime_pid_, shm_in_shards_);
 
     // Client-side GPU queue init was for the cpu2gpu / gpu2gpu queues
     // of the GPU runtime. With the runtime gone, kernels submit
@@ -3307,9 +3332,13 @@ void IpcManager::RecvShmClientThread() {
 #endif
 }
 
-void IpcManager::RecvShmServerThread() {
+void IpcManager::RecvShmServerThread(u32 shard) {
 #if CTP_IS_HOST
   ctp::SystemInfo::SetCurrentThreadName("chi-shm-in-recv");
+  if (shard >= shm_in_servers_.size() || shm_in_servers_[shard] == nullptr) {
+    return;
+  }
+  ctp::lbm::ShmMpscTransport &ring = *shm_in_servers_[shard];
   // Runtime-side analogue of the ZMQ ClientRecvThread. This thread is the
   // inbound ring's single consumer, which is the whole reason the schedulers
   // and Worker need no knowledge of it: there is no "which worker drains it"
@@ -3319,24 +3348,24 @@ void IpcManager::RecvShmServerThread() {
   // blocks SIGUSR1 on this thread) plus publishing our tid in the ring header
   // so producing clients know whom to wake.
   ctp::lbm::EventManager *em = &GetTls()->event_manager_;
-  shm_in_server_.RegisterConsumer();
+  ring.RegisterConsumer();
   size_t idle_spins = 0;
   while (shm_in_recv_running_.load(std::memory_order_acquire)) {
     bool drained_any = false;
     // Drain everything currently queued before parking, so a burst is ingested
     // in one pass rather than one task per wakeup.
     while (shm_in_recv_running_.load(std::memory_order_acquire) &&
-           IpcCpu2Cpu::RecvIn(this)) {
+           IpcCpu2Cpu::RecvIn(this, shard)) {
       drained_any = true;
     }
     if (drained_any) {
       idle_spins = 0;
     } else {
-      ShmDrainIdle(shm_in_server_, em, idle_spins);
+      ShmDrainIdle(ring, em, idle_spins);
     }
   }
-  shm_in_server_.UnregisterConsumer();
-  HLOG(kInfo, "[ShmServerRecvThread] shutting down");
+  ring.UnregisterConsumer();
+  HLOG(kInfo, "[ShmServerRecvThread] shard {} shutting down", shard);
 #endif
 }
 
@@ -3348,21 +3377,28 @@ void IpcManager::StartShmServerRecvThread() {
     return;
   }
   shm_in_recv_running_.store(true, std::memory_order_release);
-  shm_in_recv_thread_ = std::thread([this]() { RecvShmServerThread(); });
-  HLOG(kInfo, "[ShmServerRecvThread] started");
+  // issue #807: one drain thread per shard ring.
+  for (u32 k = 0; k < shm_in_servers_.size(); ++k) {
+    shm_in_recv_threads_.emplace_back(
+        [this, k]() { RecvShmServerThread(k); });
+  }
+  HLOG(kInfo, "[ShmServerRecvThread] started {} shard drainer(s)",
+       shm_in_servers_.size());
 #endif
 }
 
 void IpcManager::StopShmServerRecvThread() {
 #if CTP_IS_HOST
   shm_in_recv_running_.store(false, std::memory_order_release);
-  // Kick the drainer in case it is parked, so the join doesn't wait out the
-  // park timeout. Harmless if it is awake, and the bounded wait bounds the
-  // worst case anyway if this signal races the park.
-  shm_in_server_.SignalConsumerIfParked();
-  if (shm_in_recv_thread_.joinable()) {
-    shm_in_recv_thread_.join();
+  // Kick each drainer in case it is parked, so joins don't wait out the park
+  // timeout. Harmless if awake.
+  for (auto &ring : shm_in_servers_) {
+    if (ring) ring->SignalConsumerIfParked();
   }
+  for (auto &t : shm_in_recv_threads_) {
+    if (t.joinable()) t.join();
+  }
+  shm_in_recv_threads_.clear();
 #endif
 }
 
