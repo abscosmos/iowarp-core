@@ -193,6 +193,34 @@ TEST_CASE("clio-fs SHM read: correctness and latency", "[cfs][shm][noleak]") {
     }
   }
 
+  // ---- a shrink must not keep being served from the old mirror -----------
+  // Truncate frees page blobs back to the bdev, where another blob can take
+  // them. If the mirror kept the old size the client would happily read
+  // through freed storage, and the placement_gen_ guard could not catch it
+  // either -- an un-republished record shows the reader the same generation
+  // twice. Both halves (fs record + blob record) are invalidated by the
+  // runtime before the pages go away.
+  {
+    const clio::run::u64 kShrunk = 8192;
+    REQUIRE(cfs_io->FtruncateFd(fd, static_cast<off_t>(kShrunk)) == 0);
+
+    clio::cte::filesystem::ShmFileRecord shrunk;
+    REQUIRE(fs_client->TryGetFileRecordShm(kBackendPath, &shrunk));
+    REQUIRE(shrunk.size_ == kShrunk);
+
+    std::vector<char> after(4096, 0x5A);
+    // Inside the surviving prefix: still correct, still served.
+    REQUIRE(cfs_io->Pread(fd, after.data(), 4096, 4096) == 4096);
+    REQUIRE(std::memcmp(after.data(), src.data() + 4096, 4096) == 0);
+    // Past the new EOF: nothing, not stale bytes.
+    REQUIRE(cfs_io->Pread(fd, after.data(), 4096,
+                          static_cast<off_t>(kShrunk)) == 0);
+
+    // Restore the file for the latency measurement below.
+    REQUIRE(cfs_io->Pwrite(fd, src.data(), kFileSize, 0) ==
+            static_cast<ssize_t>(kFileSize));
+  }
+
   // ---- latency: same 4 KiB read, both paths ------------------------------
   const size_t kIoSize = 4096;
   const int kIters = 20000;

@@ -310,6 +310,9 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
   out->last_modified_ = info.last_modified_;
   out->last_read_ = info.last_read_;
   out->score_ = info.score_;
+  // Carries the block-layout generation to the client, which compares it
+  // before and after copying a payload (issue #817).
+  out->placement_gen_ = info.placement_gen_;
 
   size_t n = info.blocks_.size();
   if (n > kMaxInlineBlocks) {
@@ -2327,6 +2330,17 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     }
     clio::run::u64 final_size = blob_info_ptr->GetTotalSize();
 
+    // issue #817: republish the resized block list. ResizeBlob returned the
+    // dropped blocks to the bdev free pool, so a mirror still describing them
+    // points a client at storage that can be handed to another blob. The
+    // before/after placement_gen_ check cannot save it either -- a mirror that
+    // is never updated shows the reader the SAME stale generation twice.
+    {
+      std::string shm_key = std::to_string(tag_id.major_) + "." +
+                            std::to_string(tag_id.minor_) + "." + blob_name;
+      MirrorBlobToShm(shm_key, *blob_info_ptr);
+    }
+
     // Update the tag's total_size_ by the delta.
     {
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
@@ -3594,6 +3608,10 @@ clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &t
     // Update blob blocks to only keep nonvolatile blocks
     blob_info_ptr->blocks_ = nonvolatile_blocks;
     blob_info_ptr->RecomputeTotalSize();  // blocks_ replaced: resync size cache
+    blob_info_ptr->BumpPlacementGen();    // #817: blocks moved under readers
+    // Republish immediately: the volatile blocks were just freed, so a mirror
+    // still naming them points clients at reusable storage.
+    MirrorBlobToShm(entry.composite_key, *blob_info_ptr);
 
     // Step 3: Re-put data using AsyncPutBlob with persistence context
     Context flush_ctx;
@@ -4245,6 +4263,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
       // push_back (the debit lock + next AllocateFromTarget below both co_await),
       // so a concurrent reader never sees grown blocks_ with a stale cache.
       blob_info.total_size_cache_ += logical;
+      blob_info.BumpPlacementGen();  // #817: block layout changed
 
       // Debit the CANONICAL target's remaining_space_ by the PHYSICAL bytes
       // taken (mirror of FreeAllBlobBlocks' capacity_ credit); AllocateFromTarget
@@ -4351,6 +4370,9 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
   for (auto &b : keep) {
     blob_info.blocks_.push_back(b);
   }
+  // #817: the dropped blocks go back to the bdev free pool and can be handed
+  // to another blob, so a client copying from them must be told to discard.
+  blob_info.BumpPlacementGen();
   // The kept blocks span exactly [0, new_size) (the boundary block was trimmed),
   // so the O(1) size cache is precisely new_size.
   blob_info.total_size_cache_ = new_size;
@@ -4860,6 +4882,7 @@ clio::run::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
   // Clear all blocks
   blob_info.blocks_.clear();
   blob_info.total_size_cache_ = 0;  // blocks_ emptied: size cache is now 0
+  blob_info.BumpPlacementGen();     // #817: every block just became reusable
   error_code = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

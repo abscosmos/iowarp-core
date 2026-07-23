@@ -1,7 +1,82 @@
 # clio-fs over the CTE shared-memory cache + async writes (issue #817)
 
-Status: **PLANNED** (no code yet)
+Status: **READ PATH IMPLEMENTED** (phases 0-3, commit c63cc476). Async writes
+(phases 4-5) not started.
 Branch: `817-cfs-shm-reads-async-writes`, cut from `origin/dev` @ 2dc4911d
+
+## Result so far
+
+| | before | after |
+|---|---|---|
+| 4 KiB cached `pread` through `CfsIo` | 245.6 µs | **0.386 µs** (636x) |
+
+Measured same-query on one host: the RPC number is the same read issued
+through `filesystem::Client::AsyncRead` against the same open handle, so the
+only difference is which path serves the bytes. It is ~2.7x the ~90 µs a bare
+CTE `GetBlob` costs, which is the two-hop shape of a CFS read (client → fs
+chimod → per-page `GetBlob`) plus the runtime's page loop.
+
+Suites: `cfs_shm_read` new, CTE core functional 13/13, SHM cache model 7/7,
+POSIX adapter 77 assertions / 8 cases.
+
+### The blocker that was not in the plan
+
+**The payload fast path was unreachable for clio-fs by construction.**
+`ExtendBlob` caps every physical block at `kMaxBlockChunk = 64 KB` on purpose
+(freed extents must be reusable under fragmentation — issues 074/521/522), so
+block count scales with blob size: a 1 MiB page is **16 blocks**. With
+`kMaxInlineBlocks = 8` every blob over 512 KB — i.e. every clio-fs page — was
+marked truncated, and a truncated record was refused wholesale.
+
+Two changes, both in the CTE core:
+- A truncated record is now readable over the **prefix its cached blocks
+  describe**. They are the blob's leading blocks in logical order, so the
+  information is exact; refusing the whole blob threw away complete knowledge
+  of the part it had. Reads bound against `CoveredBytes()`, not `total_size_`.
+- `kMaxInlineBlocks` 8 → 16, so one whole page fits. Costs +256 B per cached
+  blob (record is 560 B), and the layout version went to 2 so a v1 client
+  refuses rather than misreads.
+
+The prefix rule is the load-bearing half: it is what keeps the bound safe for
+*any* blob larger than the inline array, rather than moving the cliff.
+
+### The other thing that was not in the plan: `placement_gen_` was never bumped
+
+The client's payload read validates `ShmBlobRecord::placement_gen_` before and
+after the memcpy, and that check was the design's whole answer to "the
+DataOrganizer moved this blob while I was copying it". **Nothing in the runtime
+ever incremented it** — the comparison was `0 == 0` and could only ever catch
+an outright erase. Making the read path hot for every clio-fs read made that
+worth fixing rather than noting.
+
+Three parts, because a generation alone is not enough:
+
+- `BlobInfo::placement_gen_`, bumped by every mutation of `blocks_`
+  (`ExtendBlob`, `TruncateBlobBlocks`, `FreeAllBlobBlocks`, `FlushData`).
+- It is drawn from a **runtime-wide monotonic counter, not a per-blob
+  increment**. `ReorganizeBlob` moves a blob by DelBlob + PutBlob, so the
+  replacement `BlobInfo` starts at zero and a same-size blob re-extends into
+  the same block count — landing on the exact generation it had before the
+  move, and silently passing the check.
+- **The mirror must be republished wherever blocks change.** `TruncateBlob`
+  did not, so after a shrink the cache still described blocks that had gone
+  back to the bdev free pool. A generation cannot rescue this on its own: a
+  record that is never rewritten shows the reader the same value twice.
+
+A test covers the shrink case end to end (truncate, then read inside and past
+the new EOF).
+
+### Remaining headroom (not pursued — the target is met with 2.6x margin)
+
+At 0.386 µs the dominant cost is no longer IPC, it is copying: `TryReadBlobShm`
+copies the whole 560 B blob record **twice** (the seqlock read, then the
+placement re-validation) plus the ~100 B file record, so ~1.2 KB of metadata
+moves to deliver a 4 KB read. Two obvious follow-ups, in order of payoff:
+a re-validation that reads only `placement_gen_` instead of the whole record,
+and dropping `bdev_type_`/`node_id_` from `ShmBlockDesc` (nothing reads them —
+their conclusion is already baked into the direct-readable flag), which would
+take the record from 560 B to 432 B. There is also one heap allocation per
+read: `CfsIo::Read`/`Pread` copy the path string out of the fd table.
 
 Companion issue: #818 — compressed blobs in the SHM cache (out of scope here,
 but it constrains §4.3).
@@ -154,15 +229,24 @@ is mandatory), drop the wait:
 
 ## 5. Phasing
 
-| Phase | Deliverable | Exit criterion |
+| Phase | Deliverable | Status |
 |---|---|---|
-| 0 | `ClientInit` attaches the SHM cache | ordinary client reports `HasShmCache()==true` against a composed runtime |
-| 1 | fs chimod publishes per-path attrs (size/mode/times) to SHM | attach from an unrelated process, read a live file's size |
-| 2 | zero-IPC `getattr`/`stat` in `CfsIo` | `stat()` latency before/after; miss falls back |
-| 3 | zero-IPC page reads in `Read`/`Pread` | 4 KiB cached `pread` latency; forced-miss test covers fallback |
-| 4 | async writes + bounded window + real `fsync`/`close` | write throughput before/after; error latch test |
-| 5 | RYOW dirty-page tracking | write-then-read same offset, with and without `fsync` |
-| 6 | regression sweep | `cfs_distributed`, `scripts/xfstests` subset, FUSE + HDF5-VFD suites |
+| 0 | `ClientInit` attaches the SHM cache | **done** — test asserts `HasShmCache()` on an ordinary client |
+| 1 | fs chimod publishes per-path attrs to SHM | **done** — `ShmFsCache`, mirrored at open/write/append/truncate/unlink/rename/utimens/chown |
+| 2 | zero-IPC `getattr`/`stat` in `CfsIo` | **not done** — see below; reads do not need it |
+| 3 | zero-IPC page reads in `Read`/`Pread` | **done** — 0.386 µs, fallback covered |
+| 4 | async writes + bounded window + real `fsync`/`close` | not started |
+| 5 | RYOW dirty-page tracking | not started |
+| 6 | regression sweep | partial — CTE + POSIX adapter green; xfstests/FUSE/VFD not run |
+
+Phase 2 is deliberately still open. Accelerating `stat` means resolving a
+NAME from a path-keyed cache, and that brings in the descendant problem a
+directory rename creates: a renamed directory's children keep the right tag
+(rename preserves the TagId, so pages follow it), which is exactly right for
+an already-open descriptor and exactly wrong for name resolution. The read
+path is reached only through an open fd, so it sidesteps this; a stat fast
+path cannot, and needs a descendant sweep or a generation on the path space
+first.
 
 Phases 0–2 are independently valuable and independently mergeable; 3 depends on
 1; 5 must land with or before 4 is enabled by default.
