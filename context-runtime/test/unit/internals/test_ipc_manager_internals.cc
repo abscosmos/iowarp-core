@@ -13,6 +13,7 @@
 
 #include "simple_test.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -274,13 +275,28 @@ TEST_CASE("IpcInternals - main segment size is configurable (issue #727)",
   REQUIRE(config->CalculateMainSegmentSize() ==
           ctp::Unit<size_t>::Megabytes(128));
 
-  SECTION("0 selects the auto default (sized at segment creation)");
+  // The auto default: a quarter of the process's memory budget, capped at the
+  // historical 1 GiB and floored at 64 MiB (1 GiB flat when the budget is
+  // unknown). Recomputed here rather than hardcoded so the expectation holds
+  // on tiny CI containers as well as real nodes.
+  const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
+  size_t expect_auto = ctp::Unit<size_t>::Gigabytes(1);
+  if (budget > 0) {
+    expect_auto = std::min(
+        expect_auto, std::max(ctp::Unit<size_t>::Megabytes(64), budget / 4));
+  }
+
+  SECTION("0 selects the auto default");
   {
     std::ofstream f(cfg);
     f << "runtime:\n  main_segment_size: 0\n";
   }
   REQUIRE(config->LoadYaml(cfg.string()));
-  REQUIRE(config->CalculateMainSegmentSize() == 0);
+  REQUIRE(config->CalculateMainSegmentSize() == expect_auto);
+  // Whatever the budget, the auto default must be a usable segment — callers
+  // (GetMemorySegmentSize included) never see a 0 sentinel.
+  REQUIRE(config->CalculateMainSegmentSize() >=
+          ctp::Unit<size_t>::Megabytes(64));
 
   SECTION("an unparseable value keeps the default instead of dying");
   {
@@ -288,7 +304,7 @@ TEST_CASE("IpcInternals - main segment size is configurable (issue #727)",
     f << "runtime:\n  main_segment_size: \"lots\"\n";
   }
   REQUIRE(config->LoadYaml(cfg.string()));
-  REQUIRE(config->CalculateMainSegmentSize() == 0);
+  REQUIRE(config->CalculateMainSegmentSize() == expect_auto);
 
   SECTION("CLIO_MAIN_SEGMENT_SIZE env wins over yaml");
   {

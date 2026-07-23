@@ -38,6 +38,8 @@
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/ipc_manager.h"
+#include <clio_ctp/introspect/system_info.h>
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -614,12 +616,22 @@ size_t ConfigManager::CalculateMainSegmentSize() const {
   }
 
   // 0 = auto. The main segment holds task data (FutureShm, BuddyAllocator
-  // metadata); the actual size is decided at the creation site
-  // (IpcManager::ServerInitShm), which knows the process's real memory
-  // budget — cgroup-aware, not host RAM (issue #727). Returning the sentinel
-  // instead of a flat 1 GiB keeps this config-layer function free of
-  // platform introspection.
-  return 0;
+  // metadata). Size it from the process's real memory budget — cgroup-aware,
+  // not host RAM (issue #727): a quarter of the budget, capped at the
+  // historical 1 GiB so real nodes see no change, floored at 64 MiB so
+  // task/FutureShm traffic keeps flowing on tiny budgets. When the budget is
+  // unknown, keep the historical flat default.
+  //
+  // Resolved here rather than at the creation site so that every reader of
+  // this value — GetMemorySegmentSize(kMainSegment) included — sees the size
+  // the segment will actually get, never a bare sentinel.
+  const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
+  size_t auto_size = ctp::Unit<size_t>::Gigabytes(1);
+  if (budget > 0) {
+    auto_size = std::min(auto_size,
+                         std::max(ctp::Unit<size_t>::Megabytes(64), budget / 4));
+  }
+  return auto_size;
 }
 
 size_t ConfigManager::CalculateMetadataSegmentSize() const {

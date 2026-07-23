@@ -203,9 +203,9 @@ class ConfigManager : public ctp::BaseConfig {
   /**
    * Size of the main task-data segment (issue #727).
    * @return The explicit size when main_segment_size_ > 0 (yaml
-   *         `runtime: main_segment_size` or CLIO_MAIN_SEGMENT_SIZE), or 0
-   *         meaning "auto" — the creation site (IpcManager::ServerInitShm)
-   *         then sizes it from the process's cgroup-aware memory budget.
+   *         `runtime: main_segment_size` or CLIO_MAIN_SEGMENT_SIZE), else the
+   *         auto default: a quarter of the process's cgroup-aware memory
+   *         budget, capped at 1 GiB and floored at 64 MiB. Never 0.
    */
   size_t CalculateMainSegmentSize() const;
 

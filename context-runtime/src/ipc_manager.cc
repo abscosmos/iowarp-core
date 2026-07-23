@@ -837,57 +837,6 @@ ctp::lbm::ShmMpscTransport *IpcManager::GetOrCreateShmConn(
 }
 
 /**
- * Memory limit imposed on this process by its cgroup, or 0 when unlimited or
- * unreadable (cgroup v2 first, then v1).
- *
- * Needed because SystemInfo::GetRamCapacity() reports the HOST's physical
- * memory even inside a container -- sizing a shared-memory reservation off
- * that number over-commits badly in CI images and constrained deployments.
- */
-static size_t ReadCgroupMemoryLimit() {
-#ifdef __linux__
-  const char *paths[] = {"/sys/fs/cgroup/memory.max",
-                         "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
-  for (const char *path : paths) {
-    std::ifstream f(path);
-    if (!f.is_open()) {
-      continue;
-    }
-    std::string v;
-    if (!(f >> v)) {
-      continue;
-    }
-    if (v == "max") {
-      return 0;  // explicitly unlimited
-    }
-    try {
-      unsigned long long n = std::stoull(v);
-      // cgroup v1 reports a sentinel near SIZE_MAX when unlimited.
-      if (n > 0 && n < (1ULL << 62)) {
-        return static_cast<size_t>(n);
-      }
-    } catch (...) {
-    }
-  }
-#endif
-  return 0;
-}
-
-/**
- * The memory this process may actually use: the cgroup limit when running in
- * a container, physical RAM otherwise; 0 when neither is known. The shared
- * basis for sizing/clamping the shm segments (issues #783, #727).
- */
-static size_t ProcessMemoryBudget() {
-  size_t budget = ctp::SystemInfo::GetRamCapacity();
-  size_t cgroup_limit = ReadCgroupMemoryLimit();
-  if (cgroup_limit > 0 && (budget == 0 || cgroup_limit < budget)) {
-    budget = cgroup_limit;
-  }
-  return budget;
-}
-
-/**
  * Keep a large shared mapping out of core dumps (Linux MADV_DONTDUMP).
  *
  * The runtime shuts down via std::abort() (admin_runtime.cc), so every clean
@@ -934,29 +883,22 @@ bool IpcManager::ServerInitShm() {
     std::string main_segment_name =
         config->GetSharedMemorySegmentName(kMainSegment);
 
-    // Explicit main_segment_size (yaml / CLIO_MAIN_SEGMENT_SIZE) or 0 = auto
-    // (issue #727). On Linux the segment is a sparse memfd, so the exposure is
-    // not the reservation but the LIVE SET in memory-limited containers — and
-    // on Windows the whole size is commit charge up front. The old flat 1 GiB
-    // default could be several times a small deployment's entire budget.
+    // Main segment size (issue #727): yaml `runtime: main_segment_size` /
+    // CLIO_MAIN_SEGMENT_SIZE when set, otherwise the budget-aware auto default
+    // CalculateMainSegmentSize() resolves. On Linux the segment is a sparse
+    // memfd, so the exposure is not the reservation but the LIVE SET in
+    // memory-limited containers — and on Windows the whole size is commit
+    // charge up front. The old flat 1 GiB default could be several times a
+    // small deployment's entire budget.
     //
-    // Auto: a quarter of the budget, capped at the historical 1 GiB (real
-    // nodes see no change) and floored at 64 MiB (enough task/FutureShm
-    // headroom to keep traffic flowing). Explicit values are respected up to
-    // the same half-budget guard the metadata segment uses — beyond that the
-    // live set can only end in SIGBUS/OOM, so clamp loudly instead of booting
-    // a time bomb.
+    // Explicit values are respected up to the same half-budget guard the
+    // metadata segment uses — beyond that the live set can only end in
+    // SIGBUS/OOM, so clamp loudly instead of booting a time bomb. The auto
+    // default is already a quarter of the budget, so it never trips this.
     size_t main_segment_size = config->CalculateMainSegmentSize();
     {
-      const size_t budget = ProcessMemoryBudget();
-      if (main_segment_size == 0) {
-        main_segment_size = ctp::Unit<size_t>::Gigabytes(1);
-        if (budget > 0) {
-          main_segment_size =
-              std::min(main_segment_size,
-                       std::max(ctp::Unit<size_t>::Megabytes(64), budget / 4));
-        }
-      } else if (budget > 0 && main_segment_size > budget / 2) {
+      const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
+      if (budget > 0 && main_segment_size > budget / 2) {
         HLOG(kWarning,
              "Main segment: requested {} bytes exceeds half the memory "
              "budget ({} bytes); clamping to {} bytes",
@@ -1036,7 +978,7 @@ bool IpcManager::ServerInitShm() {
     // RAM keeps the default a no-op on real nodes while protecting small
     // dev boxes and constrained containers.
     {
-      size_t budget = ProcessMemoryBudget();
+      size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
       if (budget > 0 && metadata_segment_size > budget / 2) {
         size_t clamped = budget / 2;
         HLOG(kWarning,

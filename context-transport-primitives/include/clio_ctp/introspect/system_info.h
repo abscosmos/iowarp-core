@@ -188,6 +188,18 @@ class SystemInfo {
 
   CTP_DLL static size_t GetRamAvailable();
 
+  /**
+   * The memory this process may actually use: the cgroup limit when running
+   * in a container, physical RAM otherwise; 0 when neither is known.
+   *
+   * GetRamCapacity() reports the HOST's physical memory even inside a
+   * container, so sizing a shared-memory reservation off that number
+   * over-commits badly in CI images and constrained deployments. This is the
+   * shared basis for sizing/clamping the runtime's shm segments (issues #783,
+   * #727).
+   */
+  CTP_DLL static size_t GetProcessMemoryBudget();
+
   CTP_DLL static CpuTimes GetCpuTimes();
 
   static float ComputeCpuUtilization(const CpuTimes &prev,
