@@ -1,14 +1,15 @@
 # clio-fs over the CTE shared-memory cache + async writes (issue #817)
 
-Status: **READ PATH IMPLEMENTED** (phases 0-3, commit c63cc476). Async writes
-(phases 4-5) not started.
+Status: **IMPLEMENTED** — reads (phases 0-3) and async writes (4-5).
+Phase 2 (zero-IPC stat) deliberately still open, see below.
 Branch: `817-cfs-shm-reads-async-writes`, cut from `origin/dev` @ 2dc4911d
 
 ## Result so far
 
 | | before | after |
 |---|---|---|
-| 4 KiB cached `pread` through `CfsIo` | 245.6 µs | **0.386 µs** (636x) |
+| 4 KiB cached `pread` through `CfsIo` | 118–246 µs | **0.27–0.50 µs** (>100x) |
+| 128 × 64 KiB overwrite + fsync | 6.86 ms | **5.77 ms** (~13%) |
 
 Measured same-query on one host: the RPC number is the same read issued
 through `filesystem::Client::AsyncRead` against the same open handle, so the
@@ -295,3 +296,62 @@ Phases 0–2 are independently valuable and independently mergeable; 3 depends o
 - Whether the fs attr mirror should be a separate map or reuse the CTE tag map
   with an fs-specific record (separate map is cleaner; costs another fixed
   capacity to size).
+
+
+## Async writes (phases 4-5)
+
+`write(2)` hands the bytes to the chimod and returns; `fsync`/`close` drain and
+report. On by default; `CLIO_CFS_ASYNC_WRITES=0` restores blocking writes.
+
+The contract:
+
+- **Read-your-own-writes**, no fsync required. A queued write is invisible to
+  both read paths until its task runs, so a read overlapping one waits for it.
+  Tracked per **path**, not per descriptor — RYOW is a property of the file,
+  and per-fd tracking would satisfy the common case while quietly breaking two
+  descriptors on one file.
+- `stat` / `lseek(SEEK_END)` / `truncate` / `unlink` / `close` drain first, so a
+  size query never reports less than a completed `write(2)` established.
+- **Errors latch** and surface on the next `write`/`fsync`/`close` — the caller
+  that queued the doomed write had already returned success. Kernel
+  page-cache writeback has the same contract.
+- **Bounded window** (8 MiB / 64 writes, env-overridable): past it, submitting
+  blocks on the oldest. Without it a `dd` grows staging buffers without bound.
+- `O_SYNC`/`O_DSYNC` still block.
+
+### How I measured this wrong, twice
+
+The gain is modest — median 5.77 ms vs 6.86 ms over five runs each, ranges
+overlapping. Getting to that number took two corrections worth recording:
+
+1. **Timing a fresh file against a warmed one.** The first pass over a new file
+   allocates every block; a second does not. Timing one mode on a fresh file
+   and the other on the warmed file compares *allocation against overwrite*.
+   That produced a confident "async is 2.3x SLOWER", which I had already
+   written into the code as the documented reason to ship it disabled. The tell
+   was that the two arms differed by 40% while running the **same code path**.
+2. **Believing a plausible mechanism.** The first explanation for the (bogus)
+   slowdown was per-blob write-token contention (#680), whose contender
+   busy-polls on a ~2 ms cadence. It is a real mechanism and it predicted the
+   result — so I implemented one-outstanding-write-per-page around it. That
+   changed nothing, which should have been the signal to re-examine the
+   measurement rather than the mechanism.
+
+The per-page serialization was kept: it costs nothing on the sequential path
+and the contention it avoids is real, even if it was not what was being
+measured.
+
+## The SHM path off Linux
+
+macOS had **no metadata segment at all**, so no #783 cache and no #817 fast
+path — everything silently on RPC. The 8 GB default reservation is justified by
+"never pre-faulted, only pages actually written consume RAM", which describes
+`memfd_create` — and `SystemInfo::CreateNewSharedMemory` only uses memfd on
+Linux. macOS/BSD fall back to a **regular file** under `/tmp/clio_$USER`, where
+that reasoning does not hold: the ftruncate and mmap go against the disk.
+Clamped to 1 GB where the segment is file-backed (~1.9M cached blobs at 560 B).
+
+The test distinguishes "this feature failed" from "the substrate does not exist
+here": it skips loudly when the runtime has no metadata allocator, and still
+fails when the segment exists but the cache is off — which is the case that
+would actually mean regression.
