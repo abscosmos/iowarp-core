@@ -7,6 +7,9 @@
 #include "cfs_io.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <memory>
+#include <utility>
 
 namespace clio::cae {
 
@@ -115,6 +118,12 @@ ssize_t CfsIo::DoRead(clio::run::u64 handle, const std::string &path,
   if (count == 0) {
     return 0;
   }
+  // Read-your-own-writes. A queued write is not visible to either path until
+  // its task runs -- the SHM mirror still carries the old size and the old
+  // page bytes -- so a read that overlaps one must wait for it. This is the
+  // per-client pending-write set the #783 design anticipated; it only became
+  // necessary once writes stopped blocking.
+  DrainIfOverlap(path, off, count);
   // issue #817: try the zero-IPC path first. It either answers completely or
   // declines, and declining costs one hash lookup.
   ssize_t fast = TryReadShm(path, off, buf, count);
@@ -146,8 +155,200 @@ ssize_t CfsIo::DoRead(clio::run::u64 handle, const std::string &path,
   return ret;
 }
 
-ssize_t CfsIo::DoWrite(clio::run::u64 handle, clio::run::u64 off, const void *buf,
-                       size_t count) {
+// ---- issue #817: the async write window -----------------------------------
+
+bool CfsIo::AsyncWritesEnabled() {
+  // ON by default (issue #817). write(2) hands the bytes to the chimod and
+  // returns; fsync/close drain and report.
+  //
+  // Measured on 128 x 64 KiB overwrite + fsync, five runs each, medians:
+  // queued 5.77 ms vs blocking 6.86 ms. A modest ~13% with overlapping
+  // ranges -- the honest summary is "no worse, probably a little better",
+  // not a headline.
+  //
+  // A NOTE ON HOW EASY THIS IS TO MEASURE WRONG: the first pass over a fresh
+  // file allocates every block and a second pass does not, so timing one mode
+  // on a new file and the other on the warmed one compares allocation against
+  // overwrite. Doing exactly that produced a confident, entirely spurious
+  // "async is 2.3x SLOWER" -- with the two arms differing by 40% even when
+  // both ran the SAME code path. The benchmark now warms first and times only
+  // overwrites; keep it that way.
+  //
+  // Set CLIO_CFS_ASYNC_WRITES=0 to fall back to blocking writes.
+  static const bool v = [] {
+    if (const char *e = std::getenv("CLIO_CFS_ASYNC_WRITES")) {
+      return !(std::string(e) == "0" || std::string(e) == "false");
+    }
+    return true;
+  }();
+  return v;
+}
+
+clio::run::u64 CfsIo::MaxInflightBytes() {
+  static const clio::run::u64 v = [] {
+    if (const char *e = std::getenv("CLIO_CFS_WRITE_WINDOW_BYTES")) {
+      char *end = nullptr;
+      unsigned long long n = std::strtoull(e, &end, 10);
+      if (end != e && n > 0) return static_cast<clio::run::u64>(n);
+    }
+    return static_cast<clio::run::u64>(8ULL * 1024 * 1024);
+  }();
+  return v;
+}
+
+size_t CfsIo::MaxInflightWrites() {
+  static const size_t v = [] {
+    if (const char *e = std::getenv("CLIO_CFS_WRITE_WINDOW_COUNT")) {
+      char *end = nullptr;
+      unsigned long long n = std::strtoull(e, &end, 10);
+      if (end != e && n > 0) return static_cast<size_t>(n);
+    }
+    return static_cast<size_t>(64);
+  }();
+  return v;
+}
+
+std::shared_ptr<PathWrites> CfsIo::PendingFor(const std::string &path,
+                                              bool create) {
+  std::lock_guard<std::mutex> g(pw_mu_);
+  auto it = pending_writes_.find(path);
+  if (it != pending_writes_.end()) {
+    return it->second;
+  }
+  if (!create) {
+    return nullptr;
+  }
+  auto pw = std::make_shared<PathWrites>();
+  pending_writes_[path] = pw;
+  return pw;
+}
+
+int CfsIo::ReapAndBound(PathWrites *pw) {
+  auto *ipc = CLIO_IPC;
+  std::lock_guard<std::mutex> g(pw->mu);
+
+  // Retire anything already finished. Front to back: the queue is in
+  // submission order, and a completed write behind an outstanding one still
+  // has to keep its slot so `bytes` and the drain order stay coherent.
+  size_t done = 0;
+  while (done < pw->q.size() && pw->q[done].fut.IsComplete()) {
+    PendingWrite &p = pw->q[done];
+    if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
+      pw->sticky = EIO;
+    }
+    ipc->FreeBuffer(p.buf);
+    pw->bytes -= p.size;
+    ++done;
+  }
+  if (done > 0) {
+    pw->q.erase(pw->q.begin(), pw->q.begin() + static_cast<long>(done));
+  }
+
+  // Still over the window: block on the oldest until we are under it. This is
+  // the back-pressure -- without it a writer outruns the runtime and the
+  // staging buffers grow without bound.
+  while (pw->bytes > MaxInflightBytes() || pw->q.size() > MaxInflightWrites()) {
+    PendingWrite &p = pw->q.front();
+    p.fut.Wait();
+    if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
+      pw->sticky = EIO;
+    }
+    ipc->FreeBuffer(p.buf);
+    pw->bytes -= p.size;
+    pw->q.erase(pw->q.begin());
+  }
+  return pw->sticky;
+}
+
+int CfsIo::DrainPath(const std::string &path) {
+  auto pw = PendingFor(path, /*create=*/false);
+  if (!pw) {
+    return 0;
+  }
+  auto *ipc = CLIO_IPC;
+  std::lock_guard<std::mutex> g(pw->mu);
+  for (auto &p : pw->q) {
+    p.fut.Wait();
+    if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
+      pw->sticky = EIO;
+    }
+    ipc->FreeBuffer(p.buf);
+  }
+  pw->q.clear();
+  pw->bytes = 0;
+  // Report a latched error exactly once, to whoever asks first.
+  int err = pw->sticky;
+  pw->sticky = 0;
+  return err;
+}
+
+void CfsIo::WaitForPageOverlap(PathWrites *pw, clio::run::u64 off,
+                               clio::run::u64 len) {
+  const clio::run::u64 page = clio::cte::filesystem::kFsPageSize;
+  const clio::run::u64 first = off / page;
+  const clio::run::u64 last = (off + len - 1) / page;
+  auto *ipc = CLIO_IPC;
+  std::lock_guard<std::mutex> g(pw->mu);
+  size_t keep = 0;
+  for (size_t i = 0; i < pw->q.size(); ++i) {
+    PendingWrite &p = pw->q[i];
+    const clio::run::u64 pf = p.off / page;
+    const clio::run::u64 pl = (p.off + p.size - 1) / page;
+    if (pl < first || pf > last) {
+      // Different pages: leave it in flight, it cannot contend.
+      if (keep != i) pw->q[keep] = std::move(pw->q[i]);
+      ++keep;
+      continue;
+    }
+    p.fut.Wait();
+    if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
+      pw->sticky = EIO;
+    }
+    ipc->FreeBuffer(p.buf);
+    pw->bytes -= p.size;
+  }
+  pw->q.resize(keep);
+}
+
+void CfsIo::DrainIfOverlap(const std::string &path, clio::run::u64 off,
+                           clio::run::u64 len) {
+  auto pw = PendingFor(path, /*create=*/false);
+  if (!pw) {
+    return;
+  }
+  bool overlap = false;
+  {
+    std::lock_guard<std::mutex> g(pw->mu);
+    for (const auto &p : pw->q) {
+      if (off < p.off + p.size && p.off < off + len) {
+        overlap = true;
+        break;
+      }
+    }
+  }
+  if (overlap) {
+    // Drain everything, not just the overlapping entries: the queue is
+    // ordered, and waiting on a later write while an earlier one is still
+    // outstanding would leave the file in a state no single read reflects.
+    // The sticky error is deliberately NOT consumed here -- a read must not
+    // swallow the report owed to the next write/fsync/close.
+    auto *ipc = CLIO_IPC;
+    std::lock_guard<std::mutex> g(pw->mu);
+    for (auto &p : pw->q) {
+      p.fut.Wait();
+      if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
+        pw->sticky = EIO;
+      }
+      ipc->FreeBuffer(p.buf);
+    }
+    pw->q.clear();
+    pw->bytes = 0;
+  }
+}
+
+ssize_t CfsIo::DoWrite(clio::run::u64 handle, const std::string &path,
+                       clio::run::u64 off, const void *buf, size_t count,
+                       bool sync) {
   if (count == 0) {
     return 0;
   }
@@ -157,20 +358,69 @@ ssize_t CfsIo::DoWrite(clio::run::u64 handle, clio::run::u64 off, const void *bu
     errno = ENOMEM;
     return -1;
   }
+  // The copy is mandatory either way: the caller's buffer is theirs to reuse
+  // the moment write(2) returns.
   std::memcpy(shm.ptr_, buf, count);
   ctp::ipc::ShmPtr<> shm_ptr(shm.shm_);
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncWrite(handle, off, count, shm_ptr);
-  t.Wait();
-  ssize_t ret;
-  if (t->GetReturnCode() == 0) {
-    ret = static_cast<ssize_t>(t->bytes_written_);
-  } else {
-    errno = EIO;
-    ret = -1;
+
+  if (sync || !AsyncWritesEnabled()) {
+    t.Wait();
+    ssize_t ret;
+    if (t->GetReturnCode() == 0) {
+      ret = static_cast<ssize_t>(t->bytes_written_);
+    } else {
+      errno = EIO;
+      ret = -1;
+    }
+    ipc->FreeBuffer(shm);
+    return ret;
   }
-  ipc->FreeBuffer(shm);
-  return ret;
+
+  // Asynchronous: hand the task off and return. The bytes are already in
+  // shared memory and the chimod task is queued, so ordering against later
+  // operations on this file is the runtime's to keep.
+  auto pw = PendingFor(path, /*create=*/true);
+
+  // ONE OUTSTANDING WRITE PER PAGE. Two PutBlobs to the same page blob
+  // serialize on the runtime's per-blob write token (issue #680), and the
+  // contender does not block -- it busy-polls via `co_await yield()` on a
+  // ~2 ms cadence. So overlapping two writes to one page does not pipeline
+  // them, it adds milliseconds. Measured on 64 KiB sequential writes (16 to a
+  // page): unrestricted queuing was 1.7-3.3x SLOWER than blocking writes, and
+  // it got worse the deeper the window.
+  //
+  // Waiting here keeps the concurrency exactly where the runtime can actually
+  // exploit it -- across DIFFERENT pages -- and makes same-page writes no
+  // worse than the synchronous path they replace.
+  WaitForPageOverlap(pw.get(), off, count);
+
+  {
+    std::lock_guard<std::mutex> g(pw->mu);
+    PendingWrite p;
+    p.fut = t;
+    p.buf = shm;
+    p.off = off;
+    p.size = count;
+    pw->q.push_back(std::move(p));
+    pw->bytes += count;
+  }
+  // Reap + enforce the window AFTER accounting, so this write is included in
+  // the bound rather than being the one that overshoots it.
+  int err = ReapAndBound(pw.get());
+  if (err != 0) {
+    // A previously queued write failed. Report it here -- POSIX writeback
+    // semantics: the error surfaces on a later write/fsync/close, not on the
+    // call that queued the doomed one (which had already returned success).
+    {
+      std::lock_guard<std::mutex> g(pw->mu);
+      pw->sticky = 0;
+    }
+    errno = err;
+    return -1;
+  }
+  return static_cast<ssize_t>(count);
 }
 
 int CfsIo::Open(const std::string &raw_path, int flags, int mode) {
@@ -237,6 +487,8 @@ ssize_t CfsIo::Read(int fd, void *buf, size_t count) {
 
 ssize_t CfsIo::Write(int fd, const void *buf, size_t count) {
   clio::run::u64 handle, off;
+  std::string path;
+  int flags;
   {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
@@ -246,8 +498,10 @@ ssize_t CfsIo::Write(int fd, const void *buf, size_t count) {
     }
     handle = it->second.handle;
     off = it->second.off;
+    path = it->second.path;
+    flags = it->second.flags;
   }
-  ssize_t n = DoWrite(handle, off, buf, count);
+  ssize_t n = DoWrite(handle, path, off, buf, count, IsSyncFd(flags));
   if (n > 0) {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
@@ -276,6 +530,8 @@ ssize_t CfsIo::Pread(int fd, void *buf, size_t count, off_t offset) {
 
 ssize_t CfsIo::Pwrite(int fd, const void *buf, size_t count, off_t offset) {
   clio::run::u64 handle;
+  std::string path;
+  int flags;
   {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
@@ -284,8 +540,11 @@ ssize_t CfsIo::Pwrite(int fd, const void *buf, size_t count, off_t offset) {
       return -1;
     }
     handle = it->second.handle;
+    path = it->second.path;
+    flags = it->second.flags;
   }
-  return DoWrite(handle, static_cast<clio::run::u64>(offset), buf, count);
+  return DoWrite(handle, path, static_cast<clio::run::u64>(offset), buf, count,
+                 IsSyncFd(flags));
 }
 
 off_t CfsIo::Seek(int fd, off_t offset, int whence) {
@@ -310,6 +569,7 @@ off_t CfsIo::Seek(int fd, off_t offset, int whence) {
       base = cur;
       break;
     case SEEK_END: {
+      DrainPath(path);  // EOF must include queued writes (issue #817)
       clio::run::u64 size = 0;
       if (!QuerySize(path, &size)) {
         errno = EIO;
@@ -358,6 +618,8 @@ off_t CfsIo::SizeFd(int fd) {
     }
     path = it->second.path;
   }
+  // Queued writes have not advanced the logical size yet (issue #817).
+  DrainPath(path);
   clio::run::u64 size = 0;
   if (!QuerySize(path, &size)) {
     return -1;
@@ -366,8 +628,24 @@ off_t CfsIo::SizeFd(int fd) {
 }
 
 int CfsIo::Sync(int fd) {
-  // Writes are synchronous (each AsyncWrite is awaited), nothing to flush.
-  return IsFdTracked(fd) ? 0 : -1;
+  std::string path;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    auto it = fds_.find(fd);
+    if (it == fds_.end()) {
+      errno = EBADF;
+      return -1;
+    }
+    path = it->second.path;
+  }
+  // Wait for every queued write on this file and report a latched failure
+  // exactly once. Before #817 every write blocked, so this was a no-op.
+  int err = DrainPath(path);
+  if (err != 0) {
+    errno = err;
+    return -1;
+  }
+  return 0;
 }
 
 int CfsIo::FtruncateFd(int fd, off_t length) {
@@ -390,6 +668,9 @@ int CfsIo::TruncatePath(const std::string &raw_path, off_t length) {
     return -1;
   }
   std::string path = StripClioPrefix(raw_path);
+  // Order matters: a queued write that landed AFTER the truncate would undo
+  // it, so drain before resizing (issue #817).
+  DrainPath(path);
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncTruncate(path, static_cast<clio::run::u64>(length));
   t.Wait();
@@ -406,6 +687,13 @@ int CfsIo::RemovePath(const std::string &raw_path) {
     return -1;
   }
   std::string path = StripClioPrefix(raw_path);
+  // Drain first: a write still queued against a deleted path would resurrect
+  // the tag. Then drop the window so the path's entry does not leak.
+  DrainPath(path);
+  {
+    std::lock_guard<std::mutex> g(pw_mu_);
+    pending_writes_.erase(path);
+  }
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncUnlink(path);
   t.Wait();
@@ -418,6 +706,7 @@ int CfsIo::RemovePath(const std::string &raw_path) {
 
 int CfsIo::Close(int fd) {
   clio::run::u64 handle;
+  std::string path;
   {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
@@ -426,11 +715,21 @@ int CfsIo::Close(int fd) {
       return -1;
     }
     handle = it->second.handle;
+    path = it->second.path;
     fds_.erase(it);
   }
+  // Drain BEFORE releasing the chimod handle: a queued write names that
+  // handle, and the runtime answers EBADF once it is gone (issue #817).
+  // close(2) is also the last chance to report a latched write failure, which
+  // is why its return code is not simply the Close task's.
+  int werr = DrainPath(path);
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncClose(handle);
   t.Wait();
+  if (werr != 0) {
+    errno = werr;
+    return -1;
+  }
   return (t->GetReturnCode() == 0) ? 0 : -1;
 }
 

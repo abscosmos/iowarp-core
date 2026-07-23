@@ -40,6 +40,33 @@ Two changes, both in the CTE core:
 The prefix rule is the load-bearing half: it is what keeps the bound safe for
 *any* blob larger than the inline array, rather than moving the cliff.
 
+### The one that mattered most: it was switched off in every real deployment
+
+Everything above was measured against a **co-located** runtime (the test
+process hosting its own runtime). Under a real `clio_run` daemon, composed from
+YAML, the fast path did not engage at all — `flags=0x0`, every read falling
+back to RPC, with nothing to indicate it.
+
+`BuildShmBlobRecord` decided a block was node-local by asking whether its
+target's routing query was literally written as `PoolQuery::Local()`. But
+`Runtime::Create` registers every composed target as
+`DirectHash(target_node)` (the sliding neighborhood window). So `IsLocalMode()`
+was false for every target in any composed daemon, `kShmBlobDirectReadable` was
+never set, and the payload fast path could not turn on — on any node, for any
+blob. The only thing that ever satisfied it was a test hand-registering a
+target with `PoolQuery::Local()`, which is exactly what the #783 tests do.
+
+`TargetIsNodeLocal` now *resolves* the query to a node (DirectHash → hash %
+num_containers → ask the pool manager where that container lives; DirectId and
+Physical likewise; Broadcast/Range/Dynamic refuse), mirroring
+`ResolveDirectHashQuery` so the fast path and the router cannot disagree about
+what "local" means.
+
+**The test now spawns its own daemon and composes it from YAML.** That is the
+lesson worth keeping: an in-process runtime shares the address space and
+hand-registers its targets, so it cannot tell a working fast path from one that
+is off everywhere that matters.
+
 ### The other thing that was not in the plan: `placement_gen_` was never bumped
 
 The client's payload read validates `ShmBlobRecord::placement_gen_` before and

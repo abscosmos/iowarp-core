@@ -23,9 +23,11 @@
 
 #include <cerrno>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_cte/core/content_transfer_engine.h"
@@ -79,6 +81,36 @@ static constexpr size_t kCfsBlkSize = 1024 * 1024;
 static constexpr dev_t kClioStDev = static_cast<dev_t>(0xC110);
 
 /**
+ * One write submitted to the chimod but not yet known to have completed
+ * (issue #817).
+ *
+ * Owns the staging buffer until the task is done: the caller's buffer is
+ * reusable the instant write(2) returns, so the copy is mandatory, and it
+ * cannot be freed until the runtime has read it.
+ */
+struct PendingWrite {
+  clio::run::Future<clio::cte::filesystem::WriteTask> fut;
+  ctp::ipc::FullPtr<char> buf;
+  clio::run::u64 off = 0;
+  clio::run::u64 size = 0;
+};
+
+/**
+ * The in-flight write window for ONE path.
+ *
+ * Keyed by path rather than by descriptor because POSIX read-your-own-writes
+ * is a property of the FILE, not of the handle: two descriptors on the same
+ * file in one process must still see each other's writes. Per-fd tracking
+ * would satisfy the common case and quietly break that one.
+ */
+struct PathWrites {
+  std::mutex mu;
+  std::vector<PendingWrite> q;   ///< submission order; drained front to back
+  clio::run::u64 bytes = 0;      ///< sum of q[i].size, for the window bound
+  int sticky = 0;                ///< latched errno from a failed async write
+};
+
+/**
  * Process-wide, thread-safe table of open clio:: descriptors, each delegating
  * to the context-filesystem chimod. Byte-oriented (offset/length); the
  * higher-level adapters (POSIX fd, STDIO FILE*, MPI-IO MPI_File) map their
@@ -98,6 +130,16 @@ class CfsIo {
   /** A path is intercepted iff it carries the clio:: marker. */
   static bool IsPathTracked(const std::string &path) {
     return HasClioPrefix(path);
+  }
+
+  /** O_SYNC/O_DSYNC keep the pre-#817 behaviour: the write blocks. The caller
+   *  asked for durability over latency, and honouring that is the whole point
+   *  of the flag. */
+  static bool IsSyncFd(int flags) {
+#ifdef O_DSYNC
+    if (flags & O_DSYNC) return true;
+#endif
+    return (flags & O_SYNC) != 0;
   }
 
   /**
@@ -147,7 +189,11 @@ class CfsIo {
   off_t SizeFd(int fd);
   /** close(2): release the chimod handle + descriptor. */
   int Close(int fd);
-  /** fsync(2): writes are synchronous, so a no-op success. */
+  /**
+   * fsync(2): wait for this file's outstanding async writes and report any
+   * error they latched (issue #817). Before async writes this was a no-op,
+   * because every write blocked.
+   */
   int Sync(int fd);
   /** ftruncate(2): set logical size of the fd's file. */
   int FtruncateFd(int fd, off_t length);
@@ -169,6 +215,9 @@ class CfsIo {
       }
       of = it->second;
     }
+    // A queued write has not updated the file's logical size yet, and stat(2)
+    // must report the size a completed write(2) established (issue #817).
+    DrainPath(of.path);
     clio::run::u64 size = 0;
     if (!QuerySize(of.path, &size)) {
       errno = EBADF;
@@ -182,6 +231,7 @@ class CfsIo {
   template <typename StatT>
   int StatPath(const std::string &raw_path, StatT *buf) {
     std::string path = StripClioPrefix(raw_path);
+    DrainPath(path);  // see StatFd: stat must see queued writes
     clio::run::u64 size = 0;
     bool exists = false;
     if (!QueryGetattr(path, &exists, &size) || !exists) {
@@ -198,6 +248,55 @@ class CfsIo {
   std::unordered_map<int, OpenFile> fds_;
   int next_fd_ = kCfsFdBase;
   bool client_ready_ = false;
+
+  // ---- issue #817: async writes ------------------------------------------
+  // write(2) hands the bytes to the chimod and returns without waiting. The
+  // window below is what keeps that from turning a `dd` into unbounded
+  // staging-buffer growth: past the limit, submitting blocks on the oldest
+  // outstanding write until it drains. Overridable per deployment.
+  std::mutex pw_mu_;  ///< guards pending_writes_ only, never held across a Wait
+  std::unordered_map<std::string, std::shared_ptr<PathWrites>> pending_writes_;
+
+  /** Whether write(2) may return before the runtime has the bytes. Off by
+   *  default -- see the definition for the measurement that decided it. */
+  static bool AsyncWritesEnabled();
+
+  /** Window bounds, read once from the environment. */
+  static clio::run::u64 MaxInflightBytes();
+  static size_t MaxInflightWrites();
+
+  /** The write window for `path`, creating it on demand when `create`. */
+  std::shared_ptr<PathWrites> PendingFor(const std::string &path, bool create);
+
+  /**
+   * Retire finished writes from the front of the queue, then block until the
+   * window is under its bounds. Returns a latched errno (0 if all is well).
+   * Caller must NOT hold pw->mu.
+   */
+  int ReapAndBound(PathWrites *pw);
+
+  /** Wait for every outstanding write on `path`, freeing buffers. Returns the
+   *  latched errno and clears it -- errors are reported exactly once, to the
+   *  fsync/close/write that observes them. */
+  int DrainPath(const std::string &path);
+
+  /**
+   * Wait for any outstanding write that touches the same PAGE as
+   * [off, off+len), leaving writes to other pages in flight. Same-page
+   * concurrency does not pipeline -- it collides on the runtime's per-blob
+   * write token, whose contender busy-polls on a ~2 ms cadence.
+   */
+  void WaitForPageOverlap(PathWrites *pw, clio::run::u64 off,
+                          clio::run::u64 len);
+
+  /**
+   * Drain if any outstanding write overlaps [off, off+len) -- the
+   * read-your-own-writes rule. The runtime only makes a write visible (and
+   * only mirrors the new size) when the task runs, so a read that raced it
+   * could otherwise return pre-write bytes or clamp against a stale EOF.
+   */
+  void DrainIfOverlap(const std::string &path, clio::run::u64 off,
+                      clio::run::u64 len);
 
   /** Lazily create/bind the filesystem pool on first tracked use. */
   bool EnsureClient();
@@ -226,7 +325,14 @@ class CfsIo {
   /** Core read/write against a chimod handle (no offset bookkeeping). */
   ssize_t DoRead(clio::run::u64 handle, const std::string &path,
                  clio::run::u64 off, void *buf, size_t count);
-  ssize_t DoWrite(clio::run::u64 handle, clio::run::u64 off, const void *buf, size_t count);
+  /**
+   * @param sync when true, wait for completion before returning (O_SYNC /
+   *        O_DSYNC). Otherwise the write is queued and write(2) returns
+   *        immediately; see PathWrites for the window and the error contract.
+   */
+  ssize_t DoWrite(clio::run::u64 handle, const std::string &path,
+                  clio::run::u64 off, const void *buf, size_t count,
+                  bool sync);
 
   /** Stable 64-bit synthetic inode from the bare path. */
   static uint64_t SyntheticInode(const std::string &path) {
