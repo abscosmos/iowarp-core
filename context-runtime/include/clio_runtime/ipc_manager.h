@@ -37,6 +37,8 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <condition_variable>
+#include <deque>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -1480,10 +1482,43 @@ class IpcManager {
   ctp::lbm::ShmMpscTransport shm_out_server_;
   bool shm_out_server_ok_ = false;
 
+  // issue #807 D2: nonblocking, ordered, PER-DESTINATION response send.
+  //
+  // The old SHM SendOut ran INLINE on the executing worker: it serialized the
+  // result and did a blocking MPSC transfer into the client's out-ring, so a
+  // full client ring stalled task processing — the exact thing the transport
+  // was meant to avoid. Now a worker ENQUEUES an owning future here (nonblocking)
+  // and returns; a dedicated background sender thread drains each destination's
+  // queue in order and does the serialize + transfer, mirroring the ZMQ path's
+  // EnqueueSendOut. One queue per destination ring keeps per-client response
+  // ordering while letting different clients' responses proceed independently.
+  struct ShmSendQueue {
+    std::mutex mtx;
+    std::deque<clio::run::Future<Task>> pending;
+  };
+  std::unordered_map<std::string, std::unique_ptr<ShmSendQueue>>
+      shm_send_queues_;
+  std::mutex shm_send_queues_mutex_;   // guards the MAP (not the per-queue FIFOs)
+  std::thread shm_send_thread_;        // single sender for now; a pool in P1b
+  std::atomic<bool> shm_send_running_{false};
+  std::mutex shm_send_wake_mutex_;
+  std::condition_variable shm_send_wake_cv_;
+
  public:
   /** Get (or lazily create) a cached MPSC client connection to `name`. Returns
    *  nullptr if the named server cannot be attached. #642 */
   ctp::lbm::ShmMpscTransport *GetOrCreateShmConn(const std::string &name);
+
+  /** issue #807: enqueue an owning response future onto the per-destination SHM
+   *  send queue named `dest` and wake the sender thread. Nonblocking; never runs
+   *  serialization or a ring transfer on the caller (worker) thread. */
+  void EnqueueShmSend(const std::string &dest, clio::run::Future<Task> &&future);
+
+  /** issue #807: background sender loop — drains every per-destination queue in
+   *  order (serialize + MPSC transfer into the client's out-ring). */
+  void SendShmServerThread();
+  void StartShmServerSendThread();
+  void StopShmServerSendThread();
 
  private:
 #endif

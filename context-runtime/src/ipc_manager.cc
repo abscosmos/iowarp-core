@@ -3366,6 +3366,126 @@ void IpcManager::StopShmServerRecvThread() {
 #endif
 }
 
+// ===========================================================================
+// issue #807 D2: nonblocking, per-destination, background response sender.
+// ===========================================================================
+
+void IpcManager::EnqueueShmSend(const std::string &dest,
+                                clio::run::Future<Task> &&future) {
+#if CTP_IS_HOST
+  ShmSendQueue *q = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(shm_send_queues_mutex_);
+    auto it = shm_send_queues_.find(dest);
+    if (it == shm_send_queues_.end()) {
+      it = shm_send_queues_
+               .emplace(dest, std::make_unique<ShmSendQueue>())
+               .first;
+    }
+    q = it->second.get();
+  }
+  {
+    std::lock_guard<std::mutex> lk(q->mtx);
+    q->pending.push_back(std::move(future));
+  }
+  // Wake the sender. notify under the wake mutex so a concurrent park cannot
+  // miss it (the classic lost-wakeup: enqueue between the sender's empty-check
+  // and its wait).
+  {
+    std::lock_guard<std::mutex> lk(shm_send_wake_mutex_);
+  }
+  shm_send_wake_cv_.notify_one();
+#else
+  (void)dest;
+  (void)future;
+#endif
+}
+
+void IpcManager::SendShmServerThread() {
+#if CTP_IS_HOST
+  ctp::SystemInfo::SetCurrentThreadName("chi-shm-out-send");
+  // Dedicated non-worker thread that owns response serialization + transfer, so
+  // no task-processing worker ever serializes or blocks on a full client ring.
+  // Drains every destination queue in FIFO order (per-client ordering) each
+  // pass; parks on a CV when everything is empty.
+  //
+  // Its own SHM transport, created ON this thread, used only to Expose bulk
+  // descriptors while building each response archive (task_archive.cc). One
+  // sender thread => one transport => no cross-thread sharing.
+  ctp::lbm::TransportPtr send_transport = ctp::lbm::TransportFactory::Get(
+      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
+  size_t idle_spins = 0;
+  while (shm_send_running_.load(std::memory_order_acquire)) {
+    bool did_work = false;
+    // Snapshot the destination list so we don't hold the map lock across a
+    // send (a send may lazily create a new dest conn, and we must not block
+    // enqueues on the map lock meanwhile).
+    std::vector<ShmSendQueue *> queues;
+    {
+      std::lock_guard<std::mutex> lk(shm_send_queues_mutex_);
+      queues.reserve(shm_send_queues_.size());
+      for (auto &kv : shm_send_queues_) queues.push_back(kv.second.get());
+    }
+    for (ShmSendQueue *q : queues) {
+      for (;;) {
+        clio::run::Future<Task> fut;
+        {
+          std::lock_guard<std::mutex> lk(q->mtx);
+          if (q->pending.empty()) break;
+          fut = std::move(q->pending.front());
+          q->pending.pop_front();
+        }
+        clio::run::shared_ptr<Task> task = fut.GetTaskPtr();
+        if (!task.IsNull()) {
+          // The actual serialize + MPSC transfer + completion, off the worker.
+          IpcCpu2Cpu::SendOutTransfer(this, task, send_transport.get());
+        }
+        did_work = true;
+        // `fut` drops here: the owning reference that kept the task alive
+        // across the async send releases, freeing the task by RAII on THIS
+        // (non-worker) thread once the worker's own ref is already gone.
+      }
+    }
+    if (did_work) {
+      idle_spins = 0;
+      continue;
+    }
+    // Nothing to send. Spin briefly (low latency for a busy runtime), then park
+    // on the CV until an enqueue notifies or shutdown flips the flag.
+    if (++idle_spins < kShmSpinBudget) {
+      CTP_THREAD_MODEL->Yield();
+      continue;
+    }
+    idle_spins = 0;
+    std::unique_lock<std::mutex> lk(shm_send_wake_mutex_);
+    shm_send_wake_cv_.wait_for(lk, std::chrono::milliseconds(2));
+  }
+  HLOG(kInfo, "[ShmServerSendThread] shutting down");
+#endif
+}
+
+void IpcManager::StartShmServerSendThread() {
+#if CTP_IS_HOST
+  // Only a SHM-mode runtime services SHM responses. Idempotent.
+  if (shm_send_running_.load()) {
+    return;
+  }
+  shm_send_running_.store(true, std::memory_order_release);
+  shm_send_thread_ = std::thread([this]() { SendShmServerThread(); });
+  HLOG(kInfo, "[ShmServerSendThread] started");
+#endif
+}
+
+void IpcManager::StopShmServerSendThread() {
+#if CTP_IS_HOST
+  shm_send_running_.store(false, std::memory_order_release);
+  shm_send_wake_cv_.notify_all();
+  if (shm_send_thread_.joinable()) {
+    shm_send_thread_.join();
+  }
+#endif
+}
+
 void IpcManager::HeartbeatThread() {
   while (heartbeat_running_.load()) {
     bool alive = IsServerAlive();

@@ -44,8 +44,20 @@ struct IpcCpu2Cpu {
       IpcManager *ipc, Future<Task> &future,
       u32 method_id, ctp::lbm::Transport *recv_transport);
 
-  /** Serialize outputs and set FUTURE_COMPLETE (outbound). */
+  /** Outbound response (SHM). issue #807: this no longer transfers on the
+   *  caller (worker) thread — it enqueues an owning future onto the
+   *  destination's per-client send queue (IpcManager::EnqueueShmSend),
+   *  nonblocking, and returns. The background sender thread later calls
+   *  SendOutTransfer to do the serialize + ring transfer + completion. */
   static void SendOut(
+      IpcManager *ipc, const clio::run::shared_ptr<Task> &task_ptr,
+      ctp::lbm::Transport *send_transport);
+
+  /** issue #807: the actual serialize + MPSC transfer + completion, run on the
+   *  background sender thread (IpcManager::SendShmServerThread), never on a
+   *  worker. `send_transport` is a SHM transport owned by the sender thread,
+   *  used only to Expose bulk descriptors. */
+  static void SendOutTransfer(
       IpcManager *ipc, const clio::run::shared_ptr<Task> &task_ptr,
       ctp::lbm::Transport *send_transport);
 

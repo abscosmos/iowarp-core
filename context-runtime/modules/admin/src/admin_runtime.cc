@@ -128,10 +128,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // otherwise). Same rationale and same lifetime as the threads above: by this
   // point the pool manager, task queue and scheduler it pushes into all exist.
   CLIO_IPC->StartShmServerRecvThread();
+  // issue #807: dedicated background thread that owns SHM response send, so no
+  // worker ever serializes or blocks on a full client ring. Same lifetime.
+  CLIO_IPC->StartShmServerSendThread();
   // Stop recv threads before the main transport is freed.
   CLIO_IPC->RegisterTransportShutdownHook([]() {
     CLIO_IPC->GetRun2Run()->StopRecvThreads();
     CLIO_IPC->StopShmServerRecvThread();
+    CLIO_IPC->StopShmServerSendThread();
   });
 
   // Spawn periodic WreapDeadIpcs task with 1 second period
