@@ -61,8 +61,24 @@ jobs:
           export CMAKE_PREFIX_PATH="${CONDA_PREFIX}${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
           export PKG_CONFIG_PATH="${CONDA_PREFIX}/lib/pkgconfig:${CONDA_PREFIX}/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 
+          # Pin ar/ranlib to the Xcode toolchain, NOT conda's llvm-tools (#797).
+          # The conda env puts llvm-ranlib on PATH; CMake's toolchain detection
+          # picks it up, but it is invoked from the conda *package cache*
+          # (~/miniconda3/pkgs/llvm-tools-.../bin/llvm-ranlib), where its sibling
+          # libLLVM.*.dylib does not exist — so archiving a static lib dies with
+          #   dyld: Library not loaded: @rpath/libLLVM.22.1.dylib
+          # intermittently (flakes boost + build-test macOS jobs; hit PR #764).
+          # The system ar/ranlib have no such dependency and are correct here:
+          # this project builds no LTO/bitcode archives (verified: no
+          # INTERPROCEDURAL_OPTIMIZATION / -flto anywhere), so plain Mach-O
+          # archiving is all that is needed.
+          AR_BIN="$(xcrun -f ar 2>/dev/null || echo /usr/bin/ar)"
+          RANLIB_BIN="$(xcrun -f ranlib 2>/dev/null || echo /usr/bin/ranlib)"
+
           # SITE/BUILDNAME label the CDash build (cnd = conda deps, d = debug).
           cmake --preset=debug \
+            -DCMAKE_AR="${AR_BIN}" \
+            -DCMAKE_RANLIB="${RANLIB_BIN}" \
             -DSITE="${{ matrix.os }}" \
             -DBUILDNAME="cnd/d" \
             -DCLIO_CORE_ENABLE_COVERAGE=OFF \
@@ -160,7 +176,13 @@ jobs:
             eval "$(conda shell.bash hook)"
           fi
           conda activate iowarp
-          cmake --preset boost
+          # Pin ar/ranlib to Xcode's, not conda's llvm-tools — see the
+          # "Configure and build" step above and #797.
+          AR_BIN="$(xcrun -f ar 2>/dev/null || echo /usr/bin/ar)"
+          RANLIB_BIN="$(xcrun -f ranlib 2>/dev/null || echo /usr/bin/ranlib)"
+          cmake --preset boost \
+            -DCMAKE_AR="${AR_BIN}" \
+            -DCMAKE_RANLIB="${RANLIB_BIN}"
           cmake --build build-boost -j"$(sysctl -n hw.ncpu)"
           # #619's fallback-runtime punting has no macOS support yet (#634);
           # those cases are excluded until it lands.
