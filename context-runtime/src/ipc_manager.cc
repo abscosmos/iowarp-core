@@ -3450,12 +3450,14 @@ void IpcManager::SendShmServerThread() {
   // sender thread => one transport => no cross-thread sharing.
   ctp::lbm::TransportPtr send_transport = ctp::lbm::TransportFactory::Get(
       "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
-  size_t idle_spins = 0;
-  while (shm_send_running_.load(std::memory_order_acquire)) {
+
+  // One full pass over every destination queue; returns whether it sent
+  // anything. Factored out so the shutdown path can flush remaining responses.
+  auto drain_all = [&]() -> bool {
     bool did_work = false;
-    // Snapshot the destination list so we don't hold the map lock across a
-    // send (a send may lazily create a new dest conn, and we must not block
-    // enqueues on the map lock meanwhile).
+    // Snapshot the destination list so we don't hold the map lock across a send
+    // (a send may lazily create a new dest conn, and we must not block enqueues
+    // on the map lock meanwhile).
     std::vector<ShmSendQueue *> queues;
     {
       std::lock_guard<std::mutex> lk(shm_send_queues_mutex_);
@@ -3477,12 +3479,17 @@ void IpcManager::SendShmServerThread() {
           IpcCpu2Cpu::SendOutTransfer(this, task, send_transport.get());
         }
         did_work = true;
-        // `fut` drops here: the owning reference that kept the task alive
-        // across the async send releases, freeing the task by RAII on THIS
-        // (non-worker) thread once the worker's own ref is already gone.
+        // `fut` drops here: the owning reference that kept the task alive across
+        // the async send releases, freeing the task by RAII on THIS (non-worker)
+        // thread once the worker's own ref is already gone.
       }
     }
-    if (did_work) {
+    return did_work;
+  };
+
+  size_t idle_spins = 0;
+  while (shm_send_running_.load(std::memory_order_acquire)) {
+    if (drain_all()) {
       idle_spins = 0;
       continue;
     }
@@ -3495,6 +3502,16 @@ void IpcManager::SendShmServerThread() {
     idle_spins = 0;
     std::unique_lock<std::mutex> lk(shm_send_wake_mutex_);
     shm_send_wake_cv_.wait_for(lk, std::chrono::milliseconds(2));
+  }
+  // Shutdown flush: recv threads are already stopped, so drain whatever
+  // responses are still queued instead of dropping them (which would hang the
+  // waiting clients). Loop until two consecutive empty passes so a response a
+  // worker enqueued during teardown is not missed.
+  int empty_passes = 0;
+  int total_passes = 0;
+  while (empty_passes < 2 && total_passes < 10000) {
+    empty_passes = drain_all() ? 0 : empty_passes + 1;
+    ++total_passes;
   }
   HLOG(kInfo, "[ShmServerSendThread] shutting down");
 #endif
