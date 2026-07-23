@@ -186,6 +186,34 @@ void ConfigManager::ApplyEnvOverrides() {
       num_threads_ = static_cast<u32>(n);
     }
   }
+
+  // issue #807: number of parallel inbound SHM rings (each with its own drain
+  // thread). CLIO_SHM_IN_SHARDS overrides. Default 4 spreads the MPSC tail
+  // contention and the deserialize+route work across cores without oversubscribing
+  // a small box; 1 restores the single-ring behaviour.
+  if (const char *env = clio::run::env::GetCompat("SHM_IN_SHARDS")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env && n >= 1) {
+      shm_in_shards_ = static_cast<u32>(n);
+    }
+  }
+
+  // issue #807: CLIO_SHM_ASYNC_SEND=1 defers SHM response send to a background
+  // thread. Off by default (see GetShmAsyncSend — 3x latency regression on
+  // latency-bound workloads).
+  if (const char *env = clio::run::env::GetCompat("SHM_ASYNC_SEND")) {
+    shm_async_send_ = (env[0] == '1' || env[0] == 't' || env[0] == 'T');
+  }
+
+  // issue #807/#784: CLIO_SHM_CLIENT_SPIN_US — waiter spin-before-park budget.
+  if (const char *env = clio::run::env::GetCompat("SHM_CLIENT_SPIN_US")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env) {
+      shm_client_spin_us_ = static_cast<u32>(n);
+    }
+  }
 }
 
 bool ConfigManager::ServerInit() {

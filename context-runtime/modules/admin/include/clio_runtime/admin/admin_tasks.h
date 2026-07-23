@@ -806,6 +806,9 @@ struct ClientConnectTask : public clio::run::Task {
 
   // Worker task queue SHM offset (for SHM-mode client attach)
   OUT clio::run::u64 worker_queues_off_;  ///< SHM offset of worker_queues_ within queue allocator
+  // issue #807: number of parallel inbound SHM rings the runtime is draining.
+  // The client shards its requests across clio-<pid>-shm-in-<k> for k in [0,S).
+  OUT clio::run::u32 shm_in_shards_;
 
   // #642: worker OS thread ids so an SHM client can address each worker's
   // "clio-<server_pid>-<worker_tid>" MPSC receive server.
@@ -841,6 +844,7 @@ struct ClientConnectTask : public clio::run::Task {
         server_generation_(0),
         server_pid_(0),
         worker_queues_off_(0),
+        shm_in_shards_(1),
         num_worker_tids_(0),
         num_gpus_(0),
         gpu_queue_depth_(0) {
@@ -862,6 +866,7 @@ struct ClientConnectTask : public clio::run::Task {
         server_generation_(0),
         server_pid_(0),
         worker_queues_off_(0),
+        shm_in_shards_(1),
         num_worker_tids_(0),
         num_gpus_(0),
         gpu_queue_depth_(0) {
@@ -889,7 +894,7 @@ struct ClientConnectTask : public clio::run::Task {
     Task::SerializeOut(ar);
     ar(response_, server_generation_, server_pid_, worker_queues_off_,
        main_alloc_id_, queue_alloc_id_, num_gpus_, gpu_queue_depth_,
-       metadata_dir_off_);
+       metadata_dir_off_, shm_in_shards_);
     ar(num_worker_tids_);
     for (clio::run::u32 i = 0; i < kMaxWorkerTids; ++i) {
       ar(worker_tids_[i]);

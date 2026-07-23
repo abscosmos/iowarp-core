@@ -391,6 +391,25 @@ inline CTP_CROSS_FUN LockOwnerId GetCurrentLockOwnerId() {
 }
 #endif
 
+/**
+ * The calling OS thread's id, cached in TLS, for the CoMutex/CoRwLock
+ * reentrancy fast paths. Every legitimate reentrant acquire happens on the
+ * OS thread that already owns the lock (same-stack nesting, or a same-worker
+ * subtask of the holding parent), so gating the fast path on this id is what
+ * makes the unsynchronized holder_/depth accesses sound — see CoRwLock.
+ * Returns 0 under a device pass (device code never takes these locks);
+ * callers treat 0 as "no fast path".
+ */
+#if !CTP_IS_DEVICE_PASS
+inline u64 GetCoLockThreadId() {
+  static thread_local const u64 kTid =
+      static_cast<u64>(ctp::SystemInfo::GetTid());
+  return kTid;
+}
+#else
+inline CTP_CROSS_FUN u64 GetCoLockThreadId() { return 0; }
+#endif
+
 using MethodId = u32;
 
 // Worker and Lane identifiers

@@ -228,6 +228,35 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
     selected = scheduler_worker_;
   }
 
+  // issue #807: PREFER INLINE EXECUTION on the calling worker for a quick task.
+  // When a worker ingests a request off its SHM shard (or routes any cheap
+  // task) and is not itself backlogged, run it right here instead of handing it
+  // to another worker via a lane + AwakenWorker SIGUSR1. That cross-worker hop
+  // is the bulk of the per-request latency vs the original inline design; for a
+  // sub-100us task it dominates the actual work. Heavy tasks (high predicted
+  // cost) and a backlogged caller fall through to least-loaded routing, so the
+  // ingesting worker is never blocked from draining its shard by a big task.
+  // The client sharding provides the cross-worker load balancing.
+  if (selected == nullptr && worker != nullptr && task_ptr != nullptr &&
+      container != nullptr && !kFunnel) {
+    constexpr double kInlineCostThresholdUs = 100.0;   // "quick"
+    constexpr double kInlineCallerLoadUs = 250.0;      // caller not backlogged
+    double now_us = NowUs();
+    clio::run::TaskStat stat = container->GetTaskStats(task_ptr);
+    double predicted = container->InferCpuTime(task_ptr->method_, stat);
+    if (predicted <= kInlineCostThresholdUs &&
+        worker->RealtimeLoad(now_us) <= kInlineCallerLoadUs) {
+      // Account the predicted cost on the caller so a burst of quick ingests
+      // doesn't all decide "I'm idle" simultaneously and pile onto one worker.
+      if (predicted > 0.0) {
+        task_ptr->SetPredictedLoad(static_cast<float>(predicted));
+        task_ptr->SetSchedReservedUs(static_cast<float>(predicted));
+        worker->ReserveLoad(predicted);
+      }
+      return worker->GetId();  // ExecHere -> RouteAndExec runs it inline
+    }
+  }
+
   if (selected == nullptr) {
     // Build the compute candidate pool. Prefer the dedicated I/O workers so the
     // scheduler worker (lane 0) stays a pure INGRESS DISPATCHER — a heavy task

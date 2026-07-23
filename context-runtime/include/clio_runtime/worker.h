@@ -561,6 +561,17 @@ class Worker {
    */
   bool ProcessNewTask(TaskLane *lane);
 
+  /** issue #807: bind a resolved Future to this worker, route it, and execute it
+   *  INLINE if it maps here (else RouteTask enqueues it to the right worker).
+   *  Shared by the lane path (ProcessNewTask) and the inline SHM-ingest path
+   *  (DrainMyShard). `lane` is where the task's RunContext should point for
+   *  subtask wakeups (the popped lane, or this worker's own lane on ingest). */
+  void RouteAndExec(Future<Task> &future, TaskLane *lane);
+
+  /** issue #807: drain this worker's inbound SHM shard, executing each request
+   *  INLINE (no lane round-trip, no per-request wakeup). Returns count handled. */
+  u32 DrainMyShard();
+
   /**
    * Get the time remaining before the next periodic task should resume
    * Scans all periodic queues to find the task with the shortest remaining time

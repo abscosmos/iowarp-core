@@ -266,16 +266,30 @@ void Worker::Run() {
   if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
     lane->SetTid(tid);
   }
+  // issue #807: become the consumer of this worker's inbound SHM shard ring, so
+  // a producing client's SignalConsumerIfParked SIGUSR1s THIS worker (its tid is
+  // now published on the ring). Must run after AddSignalEvent, which blocks
+  // SIGUSR1 on this thread — otherwise the wake would kill the process.
+  CLIO_IPC->RegisterShardConsumer(worker_id_);
 
   // Main worker loop - process tasks from assigned lane
   while (is_running_) {
     did_work_ = false;  // Reset work tracker at start of each loop iteration
     task_did_work_ = false;  // Reset task-level work tracker
 
-    // NOTE: the inbound SHM ring is NOT drained here. A dedicated thread
-    // (IpcManager::RecvShmServerThread) owns it and pushes tasks onto worker
-    // lanes, mirroring the ZMQ path's ClientRecvThread. Workers therefore never
-    // touch serialized task bytes and need no knowledge of the transport.
+    // issue #807: drain THIS worker's inbound SHM shard ring (worker w owns
+    // shard w) and execute each request INLINE — no lane round-trip, no
+    // per-request wakeup. A no-op for workers that own no shard / non-SHM.
+    if (DrainMyShard() > 0) {
+      did_work_ = true;
+    }
+    // issue #807: also drain any DEFERRED SHM responses (opt-in async send path)
+    // onto the client rings, using this worker's own send transport. A cheap
+    // no-op on the inline-default path (queues stay empty). Bounded so it can't
+    // starve this worker's own task processing.
+    if (CLIO_IPC->DrainShmSends(shm_send_transport_.get(), 16) > 0) {
+      did_work_ = true;
+    }
 
     // Process tasks from assigned lane
     // issue #785: re-read every iteration. The monitor thread may have moved
@@ -319,6 +333,10 @@ void Worker::Run() {
       did_work_ = false;
     }
   }
+
+  // issue #807: stop being the shard ring's consumer before this thread's tid
+  // can be recycled by an unrelated thread that does not block SIGUSR1.
+  CLIO_IPC->UnregisterShardConsumer(worker_id_);
 
   // EventManager destructor handles signalfd and epoll cleanup
 }
@@ -511,6 +529,16 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     return true;
   }
 
+  // Bind + route + execute (shared with the inline SHM-ingest path).
+  RouteAndExec(future, lane);
+  return true;
+}
+
+void Worker::RouteAndExec(Future<Task> &future, TaskLane *lane) {
+  clio::run::shared_ptr<Task> task_full_ptr = future.GetTaskPtr();
+  if (task_full_ptr.IsNull()) {
+    return;
+  }
   // The RunContext (with its container resolved) was allocated by the ipc
   // receive/send site that introduced this task (Task::BeginRunContext). Bind it
   // to THIS worker/lane and record the future so subtask-completion events and
@@ -531,8 +559,35 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     ExecTask(task_full_ptr, is_started);
 #endif
   }
+}
 
-  return true;
+u32 Worker::DrainMyShard() {
+#if CTP_IS_HOST
+  // issue #807: pop requests off this worker's inbound SHM shard and execute
+  // each INLINE — bind, route, and (when it maps here, the common case for a
+  // quick local task) run it right here, then the response is sent inline. No
+  // lane push, no per-request AwakenWorker SIGUSR1: those were the bulk of the
+  // latency gap vs the original inline design. A task that maps elsewhere is
+  // enqueued by RouteTask as usual.
+  constexpr u32 kShardDrainBudget = 16;
+  TaskLane *my_lane = assigned_lane_.load(std::memory_order_acquire);
+  u32 n = 0;
+  while (n < kShardDrainBudget) {
+    Future<Task> f = IpcCpu2Cpu::RecvIn(CLIO_IPC, worker_id_);
+    if (f.get() == nullptr) {
+      break;  // shard empty
+    }
+    // Bind + route + execute. RuntimeMapTask decides whether this ingesting
+    // worker keeps the task (inline, the quick-local common case) or routes it
+    // to another worker (heavy tasks), so all placement policy stays in the
+    // scheduler.
+    RouteAndExec(f, my_lane);
+    ++n;
+  }
+  return n;
+#else
+  return 0;
+#endif
 }
 
 double Worker::GetSuspendPeriod() const {
@@ -609,7 +664,10 @@ void Worker::SuspendMe() {
     // FUSE thread that must submit it), livelocking the whole pipeline. That
     // is why the embedded-FUSE xfstests (generic/006/007/011/013/089/100/113/
     // 127/286/363/438/471) pass on a 16-core box but hang in CI. Yielding lets
-    // the runnable thread get scheduled so forward progress resumes.
+    // the runnable thread get scheduled so forward progress resumes. (issue
+    // #807: measured a bare tight-spin here at only ~1us over the yield on a
+    // spare-core box — sched_yield is already ~free when a core is idle — so it
+    // is not worth risking the oversubscription livelock the yield prevents.)
     CTP_THREAD_MODEL->Yield();
     return;
   } else {
@@ -650,6 +708,11 @@ void Worker::SuspendMe() {
         return;
       }
     }
+    // issue #807: last-chance check of this worker's inbound SHM shard, so a
+    // request that arrived before we park is not missed.
+    if (!CLIO_IPC->ShardEmpty(worker_id_)) {
+      return;
+    }
 
     // Calculate timeout from periodic tasks, then cap it by max_sleep so a
     // worker NEVER sleeps indefinitely. GetSuspendPeriod() returns -1 when this
@@ -668,8 +731,27 @@ void Worker::SuspendMe() {
                          : std::min(static_cast<int>(suspend_period_us),
                                     static_cast<int>(max_sleep));
 
+    // issue #807: park protocol for the inbound SHM shard. The ORDER is
+    // load-bearing and must match the transport's documented rendezvous:
+    // publish "parked" BEFORE the final empty re-check, so it interlocks with a
+    // producer that does "reserve slot (tail++) THEN check consumer_parked_".
+    // The store(parked) and the load(tail, via ShardEmpty) form a Dekker
+    // StoreLoad pair — if a request landed after our earlier fast-path check, we
+    // now either observe its slot here (and skip the park) or it observes us
+    // parked (and signals). Doing the re-check BEFORE setting parked (as an
+    // earlier cut did) loses the wakeup: the producer pushes in the gap, sees
+    // parked==0, skips the signal, and we park anyway — bounded only by the
+    // 50ms max_sleep re-poll, which under the ARM weak-memory model fires
+    // constantly and crawled cr_cli_cfs_parallel_stress into its timeout (x86
+    // TSO mostly hid it).
+    CLIO_IPC->SetShardParked(worker_id_, true);
+    if (!CLIO_IPC->ShardEmpty(worker_id_)) {
+      CLIO_IPC->SetShardParked(worker_id_, false);
+      return;  // a request arrived during/before the park setup — go drain it
+    }
     // Wait for signal using EventManager
     int nfds = event_manager_.Wait(timeout_us);
+    CLIO_IPC->SetShardParked(worker_id_, false);
 
     if (nfds == 0) {
       sleep_count_++;

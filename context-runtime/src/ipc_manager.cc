@@ -712,7 +712,10 @@ void IpcManager::ServerFinalize() {
 #if CTP_IS_HOST
   StopShmServerRecvThread();
   if (shm_in_server_ok_) {
-    shm_in_server_.Shutdown();  // unmap + unlink "clio-<pid>-shm-in"
+    for (auto &ring : shm_in_servers_) {
+      if (ring) ring->Shutdown();  // unmap + unlink clio-<pid>-shm-in-<k>
+    }
+    shm_in_servers_.clear();
     shm_in_server_ok_ = false;
   }
 #endif
@@ -1066,15 +1069,36 @@ bool IpcManager::ServerInitShm() {
     // producer in SendBytes. The name is derived from the runtime pid so a
     // client can form it from the server_pid_ it learns via ClientConnect.
     {
-      std::string in_name = "clio-" + std::to_string(pid) + "-shm-in";
-      shm_in_server_ok_ =
-          shm_in_server_.ServerInit(in_name, ctp::Unit<size_t>::Megabytes(128));
-      if (!shm_in_server_ok_) {
-        HLOG(kError, "ServerInitShm: failed to create inbound SHM ring '{}'",
-             in_name);
-        return false;
+      // issue #807: S parallel inbound rings clio-<pid>-shm-in-<k>, each drained
+      // by its own thread, replacing the single ring. Spreads MPSC-tail
+      // contention and deserialize+route work across cores. Each ring is sized
+      // down proportionally so total inbound SHM stays ~128MB regardless of S.
+      // issue #807: 0 = auto = one shard per worker (default). Worker w owns
+      // shard w, so cap at the worker count — a shard beyond the last worker
+      // would have no consumer and its clients would hang.
+      u32 nworkers = CLIO_CONFIG_MANAGER->GetNumThreads();
+      u32 shards = CLIO_CONFIG_MANAGER->GetShmInShards();
+      if (shards == 0 || shards > nworkers) shards = nworkers;
+      if (shards < 1) shards = 1;
+      shm_in_shards_ = shards;
+      size_t per_ring_mb = std::max<size_t>(8, 128 / shards);
+      shm_in_servers_.clear();
+      shm_in_server_ok_ = true;
+      for (u32 k = 0; k < shards; ++k) {
+        std::string in_name =
+            "clio-" + std::to_string(pid) + "-shm-in-" + std::to_string(k);
+        auto ring = std::make_unique<ctp::lbm::ShmMpscTransport>();
+        if (!ring->ServerInit(in_name,
+                              ctp::Unit<size_t>::Megabytes(per_ring_mb))) {
+          HLOG(kError, "ServerInitShm: failed to create inbound SHM ring '{}'",
+               in_name);
+          shm_in_server_ok_ = false;
+          return false;
+        }
+        shm_in_servers_.push_back(std::move(ring));
       }
-      HLOG(kInfo, "ServerInitShm: inbound SHM ring '{}' (128MB)", in_name);
+      HLOG(kInfo, "ServerInitShm: {} inbound SHM ring(s) '{}-shm-in-0..{}' ({}MB each)",
+           shards, "clio-" + std::to_string(pid), shards - 1, per_ring_mb);
     }
 #endif
 
@@ -1438,8 +1462,14 @@ retry_attempt:
     if (task->server_pid_ > 0) {
       runtime_pid_ = static_cast<int>(task->server_pid_);
     }
-    HLOG(kInfo, "Successfully connected to runtime (generation={}, server_pid={})",
-         client_generation_, runtime_pid_);
+    // issue #807: learn how many inbound SHM rings to shard requests across.
+    if (task->shm_in_shards_ >= 1) {
+      shm_in_shards_ = task->shm_in_shards_;
+    }
+    HLOG(kInfo,
+         "Successfully connected to runtime (generation={}, server_pid={}, "
+         "shm_in_shards={})",
+         client_generation_, runtime_pid_, shm_in_shards_);
 
     // Client-side GPU queue init was for the cpu2gpu / gpu2gpu queues
     // of the GPU runtime. With the runtime gone, kernels submit
@@ -2528,6 +2558,29 @@ bool IpcManager::RegisterMemory(const ctp::ipc::AllocatorId &alloc_id) {
   }
 }
 
+bool IpcManager::TryLazyRegisterClientSegment(
+    const ctp::ipc::AllocatorId &alloc_id) {
+#if CTP_IS_HOST
+  // Runtime only: clients never resolve other processes' segments, and the
+  // attach below is the server-side registration RegisterMemory performs.
+  if (CLIO_RUNTIME_MANAGER == nullptr || !CLIO_RUNTIME_MANAGER->IsRuntime()) {
+    return false;
+  }
+  if (alloc_id == ctp::ipc::AllocatorId::GetNull()) {
+    return false;
+  }
+  HLOG(kWarning,
+       "IpcManager::TryLazyRegisterClientSegment: resolving ({}.{}) before "
+       "its RegisterMemory round-trip landed — attaching on demand (#807)",
+       alloc_id.major_, alloc_id.minor_);
+  // Idempotent: returns true if the segment is already registered.
+  return RegisterMemory(alloc_id);
+#else
+  (void)alloc_id;
+  return false;
+#endif
+}
+
 ClientShmInfo IpcManager::GetClientShmInfo(u32 index) const {
   std::lock_guard<std::mutex> lock(shm_mutex_);
 
@@ -3258,45 +3311,11 @@ void IpcManager::RecvShmClientThread() {
   shm_out_server_.RegisterConsumer();
   size_t idle_spins = 0;
   while (shm_recv_running_.load()) {
-    bool drained_any = false;
-    // Drain everything currently available before parking.
-    while (shm_recv_running_.load()) {
-      auto archive = std::make_unique<LoadTaskArchive>();
-      ctp::lbm::ClientInfo info =
-          shm_out_server_.Recv(*archive, ctp::lbm::SHM_MPSC_DONTWAIT);
-      if (info.rc != 0) break;  // EAGAIN: nothing more in flight right now
-      drained_any = true;
-
-      if (archive->GetTaskInfos().empty()) {
-        HLOG(kError, "RecvShmClientThread: response with no task_infos");
-        continue;
-      }
-      size_t net_key = archive->GetTaskInfos()[0].task_id_.net_key_;
-
-      std::lock_guard<std::mutex> lock(pending_futures_mutex_);
-      auto it = pending_zmq_futures_.find(net_key);
-      if (it == pending_zmq_futures_.end()) {
-        ++miss_count;
-        HLOG(kError,
-             "RecvShmClientThread: no pending future for net_key {} "
-             "(received={}, misses={})",
-             net_key, recv_count, miss_count);
-        continue;
-      }
-      Task *task = it->second.task;
-      // Park the archive; RecvOut moves it out and deserializes into the task.
-      pending_response_archives_[net_key] = std::move(archive);
-      // Publish the parked archive before the waiter observes completion.
-      std::atomic_thread_fence(std::memory_order_release);
-      task->SetNewData();
-      task->SetComplete();
-      if (task->WaiterPid() != 0) {
-        ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
-                                       static_cast<int>(task->WaiterTid()));
-      }
-      pending_zmq_futures_.erase(it);
-      ++recv_count;
-    }
+    // issue #807: the shared drainer. When app threads are actively waiting they
+    // drain inline (RecvOut) and win the try-lock, so this thread mostly falls
+    // through to park; when they are parked, it wins the lock and drains for
+    // them. Either way exactly one consumer runs at a time.
+    bool drained_any = DrainShmResponses();
     if (drained_any) {
       idle_spins = 0;
     } else {
@@ -3304,64 +3323,251 @@ void IpcManager::RecvShmClientThread() {
     }
   }
   shm_out_server_.UnregisterConsumer();
+  (void)recv_count;
+  (void)miss_count;
 #endif
 }
 
-void IpcManager::RecvShmServerThread() {
+bool IpcManager::DrainShmResponses() {
 #if CTP_IS_HOST
-  ctp::SystemInfo::SetCurrentThreadName("chi-shm-in-recv");
-  // Runtime-side analogue of the ZMQ ClientRecvThread. This thread is the
-  // inbound ring's single consumer, which is the whole reason the schedulers
-  // and Worker need no knowledge of it: there is no "which worker drains it"
-  // question to answer. IpcCpu2Cpu::RecvIn deserializes one task per call and
-  // pushes it onto a scheduler-chosen lane.
-  // Same rendezvous as the client drainer: our signalfd EventManager (which
-  // blocks SIGUSR1 on this thread) plus publishing our tid in the ring header
-  // so producing clients know whom to wake.
-  ctp::lbm::EventManager *em = &GetTls()->event_manager_;
-  shm_in_server_.RegisterConsumer();
-  size_t idle_spins = 0;
-  while (shm_in_recv_running_.load(std::memory_order_acquire)) {
-    bool drained_any = false;
-    // Drain everything currently queued before parking, so a burst is ingested
-    // in one pass rather than one task per wakeup.
-    while (shm_in_recv_running_.load(std::memory_order_acquire) &&
-           IpcCpu2Cpu::RecvIn(this)) {
-      drained_any = true;
-    }
-    if (drained_any) {
-      idle_spins = 0;
-    } else {
-      ShmDrainIdle(shm_in_server_, em, idle_spins);
-    }
+  if (!shm_out_server_ok_) {
+    return false;
   }
-  shm_in_server_.UnregisterConsumer();
-  HLOG(kInfo, "[ShmServerRecvThread] shutting down");
+  // Sole-consumer gate: if another thread (a spinning waiter or this fallback
+  // thread) is already draining, back off — the caller polls its own IsComplete.
+  std::unique_lock<std::mutex> drain_lk(shm_out_drain_mutex_, std::try_to_lock);
+  if (!drain_lk.owns_lock()) {
+    return false;
+  }
+  bool any = false;
+  while (true) {
+    // Cheap check before allocating: a spinning waiter calls this every
+    // iteration, so allocating a LoadTaskArchive only to hit EAGAIN on an empty
+    // ring dominated the spin (measured +7us). IsEmpty is two atomic loads and
+    // is safe here — we hold the sole-consumer lock.
+    if (shm_out_server_.IsEmpty()) {
+      break;
+    }
+    auto archive = std::make_unique<LoadTaskArchive>();
+    ctp::lbm::ClientInfo info =
+        shm_out_server_.Recv(*archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+    if (info.rc != 0) {
+      break;  // EAGAIN: nothing more in flight right now
+    }
+    any = true;
+    if (archive->GetTaskInfos().empty()) {
+      HLOG(kError, "DrainShmResponses: response with no task_infos");
+      continue;
+    }
+    size_t net_key = archive->GetTaskInfos()[0].task_id_.net_key_;
+
+    std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+    auto it = pending_zmq_futures_.find(net_key);
+    if (it == pending_zmq_futures_.end()) {
+      HLOG(kError, "DrainShmResponses: no pending future for net_key {}",
+           net_key);
+      continue;
+    }
+    Task *task = it->second.task;
+    // Park the archive; RecvOut moves it out and deserializes into the task.
+    // Demuxing here (not just for our own net_key) is what lets one draining
+    // waiter serve every waiter's response.
+    pending_response_archives_[net_key] = std::move(archive);
+    // Publish the parked archive before the waiter observes completion.
+    std::atomic_thread_fence(std::memory_order_release);
+    task->SetNewData();
+    task->SetComplete();
+    if (task->WaiterPid() != 0) {
+      ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
+                                     static_cast<int>(task->WaiterTid()));
+    }
+    pending_zmq_futures_.erase(it);
+  }
+  return any;
+#else
+  return false;
 #endif
 }
+
+// issue #807: RecvShmServerThread removed — workers drain shards inline
+// (Worker::DrainMyShard). No dedicated inbound drain thread exists.
+
 
 void IpcManager::StartShmServerRecvThread() {
 #if CTP_IS_HOST
-  // Only a SHM-mode runtime has an inbound ring; every other configuration
-  // (client processes, ZMQ/TCP/IPC runtimes) makes this a no-op.
-  if (!shm_in_server_ok_ || shm_in_recv_running_.load()) {
-    return;
-  }
+  // issue #807: NO dedicated inbound drain threads. The workers drain the shard
+  // rings themselves (RegisterShardConsumer / DrainShard from Worker::Run), so
+  // parallel ingress comes from oversubscribing the existing pool rather than
+  // from spawning threads that contend for cores — which is what made the first
+  // cut regress. Intentionally a no-op; rings are created in ServerInitShm and
+  // consumed by workers.
   shm_in_recv_running_.store(true, std::memory_order_release);
-  shm_in_recv_thread_ = std::thread([this]() { RecvShmServerThread(); });
-  HLOG(kInfo, "[ShmServerRecvThread] started");
 #endif
 }
 
 void IpcManager::StopShmServerRecvThread() {
 #if CTP_IS_HOST
   shm_in_recv_running_.store(false, std::memory_order_release);
-  // Kick the drainer in case it is parked, so the join doesn't wait out the
-  // park timeout. Harmless if it is awake, and the bounded wait bounds the
-  // worst case anyway if this signal races the park.
-  shm_in_server_.SignalConsumerIfParked();
-  if (shm_in_recv_thread_.joinable()) {
-    shm_in_recv_thread_.join();
+#endif
+}
+
+// --- issue #807: worker-driven shard draining --------------------------------
+
+void IpcManager::RegisterShardConsumer(u32 worker_id) {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return;
+  }
+  // Publishes THIS worker thread's tid as the ring's consumer, so a producing
+  // client's SignalConsumerIfParked SIGUSR1s this worker — the same signalfd
+  // path Worker::SuspendMe already parks on.
+  shm_in_servers_[worker_id]->RegisterConsumer();
+#else
+  (void)worker_id;
+#endif
+}
+
+void IpcManager::UnregisterShardConsumer(u32 worker_id) {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return;
+  }
+  shm_in_servers_[worker_id]->UnregisterConsumer();
+#else
+  (void)worker_id;
+#endif
+}
+
+bool IpcManager::ShardEmpty(u32 worker_id) const {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return true;
+  }
+  return shm_in_servers_[worker_id]->IsEmpty();
+#else
+  (void)worker_id;
+  return true;
+#endif
+}
+
+void IpcManager::SetShardParked(u32 worker_id, bool parked) {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return;
+  }
+  shm_in_servers_[worker_id]->SetConsumerParked(parked);
+#else
+  (void)worker_id;
+  (void)parked;
+#endif
+}
+
+// ===========================================================================
+// issue #807 D2: nonblocking, per-destination, background response sender.
+// ===========================================================================
+
+void IpcManager::EnqueueShmSend(const std::string &dest,
+                                clio::run::Future<Task> &&future) {
+#if CTP_IS_HOST
+  ShmSendQueue *q = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(shm_send_queues_mutex_);
+    auto it = shm_send_queues_.find(dest);
+    if (it == shm_send_queues_.end()) {
+      it = shm_send_queues_
+               .emplace(dest, std::make_unique<ShmSendQueue>())
+               .first;
+    }
+    q = it->second.get();
+  }
+  {
+    std::lock_guard<std::mutex> lk(q->mtx);
+    q->pending.push_back(std::move(future));
+  }
+  // No wake needed: the workers drain these queues in their poll loop
+  // (DrainShmSends), and the enqueuing worker itself will drain on its next
+  // iteration; the 50ms max_sleep cap bounds the worst case if all workers park.
+#else
+  (void)dest;
+  (void)future;
+#endif
+}
+
+u32 IpcManager::DrainShmSends(ctp::lbm::Transport *transport, u32 budget) {
+#if CTP_IS_HOST
+  // issue #807: called from the WORKERS' poll loop (and the shutdown flush), so
+  // deferred response send is oversubscribed onto the existing pool rather than
+  // owned by a dedicated thread. Bounded per call so one worker cannot spend a
+  // whole iteration here and starve its own lane. A no-op when the queues are
+  // empty, which is always the case on the inline-default path.
+  //
+  // Multiple workers may drain concurrently: pops are atomic under each queue's
+  // mutex, and conn->Send serialises per client ring via its own send_mu_, so
+  // two workers transferring to the same client are safe. The client demuxes
+  // responses by net_key, so cross-worker delivery order does not matter.
+  u32 sent = 0;
+  std::vector<ShmSendQueue *> queues;
+  {
+    std::lock_guard<std::mutex> lk(shm_send_queues_mutex_);
+    queues.reserve(shm_send_queues_.size());
+    for (auto &kv : shm_send_queues_) queues.push_back(kv.second.get());
+  }
+  for (ShmSendQueue *q : queues) {
+    while (sent < budget) {
+      clio::run::Future<Task> fut;
+      {
+        std::lock_guard<std::mutex> lk(q->mtx);
+        if (q->pending.empty()) break;
+        fut = std::move(q->pending.front());
+        q->pending.pop_front();
+      }
+      clio::run::shared_ptr<Task> task = fut.GetTaskPtr();
+      if (!task.IsNull()) {
+        IpcCpu2Cpu::SendOutTransfer(this, task, transport);
+      }
+      ++sent;
+      // `fut` drops here, freeing the task by RAII on this worker thread.
+    }
+    if (sent >= budget) break;
+  }
+  return sent;
+#else
+  (void)transport;
+  (void)budget;
+  return 0;
+#endif
+}
+
+void IpcManager::StartShmServerSendThread() {
+#if CTP_IS_HOST
+  // issue #807: no dedicated sender thread. The default (inline) send transfers
+  // on the executing worker; the opt-in async send is drained by the workers via
+  // DrainShmSends in their poll loop. Kept as a no-op so the admin bring-up call
+  // site is unchanged.
+  shm_send_running_.store(true, std::memory_order_release);
+#endif
+}
+
+void IpcManager::StopShmServerSendThread() {
+#if CTP_IS_HOST
+  shm_send_running_.store(false, std::memory_order_release);
+  // Shutdown flush: workers have stopped draining, so transfer whatever
+  // responses are still queued instead of dropping them (which would hang the
+  // waiting clients). A temp transport on this thread; bounded so a pathological
+  // producer cannot hang shutdown.
+  ctp::lbm::TransportPtr flush_transport = ctp::lbm::TransportFactory::Get(
+      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
+  int empty_passes = 0;
+  int total_passes = 0;
+  while (empty_passes < 2 && total_passes < 10000) {
+    empty_passes = (DrainShmSends(flush_transport.get(), 4096) > 0)
+                       ? 0
+                       : empty_passes + 1;
+    ++total_passes;
   }
 #endif
 }
