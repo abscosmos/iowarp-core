@@ -264,6 +264,19 @@ class ShmMetadataCache {
    */
   bool Create(size_t tag_capacity, size_t blob_capacity,
               const clio::run::PoolId &owner_pool) {
+#if !CTP_IS_HOST
+    // The metadata cache lives in the runtime's host-side segment and is
+    // constructed by the runtime. GetMetadataAllocator()/GetMetadataDirectory()
+    // are host-only IpcManager members, absent in the device (nvcc) pass — so
+    // this body does not compile there. Device code never owns or builds the
+    // cache; report "caching off", which callers already treat as a valid,
+    // non-error state (see the docstring above). Without this guard the whole
+    // header failed the CUDA build (GPU Tests workflow).
+    (void)tag_capacity;
+    (void)blob_capacity;
+    (void)owner_pool;
+    return false;
+#else
     auto *ipc = CLIO_IPC;
     if (ipc == nullptr) {
       return false;
@@ -309,6 +322,7 @@ class ShmMetadataCache {
       alloc_ = nullptr;
       return false;
     }
+#endif  // CTP_IS_HOST
   }
 
   bool IsEnabled() const { return root_ != nullptr && alloc_ != nullptr; }
