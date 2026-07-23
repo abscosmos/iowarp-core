@@ -167,6 +167,14 @@ class ConfigManager : public ctp::BaseConfig {
    *  the common case. Enable for overload/back-pressure-heavy deployments. */
   bool GetShmAsyncSend() const { return shm_async_send_; }
 
+  /** issue #807/#784: microseconds a SHM client waiter spins polling for its
+   *  response before parking on its EventManager. On SHM the round-trip is
+   *  microseconds, so a brief spin catches the completion without a park/wake +
+   *  signal syscall — the dominant cost at low latency. Larger values trade
+   *  throughput for latency (#784: 1ms spin = 2.2x latency, -45% throughput), so
+   *  keep it small. Default 50us. */
+  u32 GetShmClientSpinUs() const { return shm_client_spin_us_; }
+
   /**
    * issue #785: extra task lanes reserved for elastic replacement workers.
    * Lanes are indexed by worker id, so replacements spawned by a stall rescue
@@ -412,6 +420,7 @@ class ConfigManager : public ctp::BaseConfig {
   // Raise via CLIO_SHM_IN_SHARDS / runtime.shm_in_shards there.
   u32 shm_in_shards_ = 1;
   bool shm_async_send_ = false;  // issue #807: deferred SHM response send (opt-in)
+  u32 shm_client_spin_us_ = 50;  // issue #807/#784: waiter spin before park
   u32 queue_depth_ = 1024;
 
   size_t main_segment_size_ = ctp::Unit<size_t>::Gigabytes(1);

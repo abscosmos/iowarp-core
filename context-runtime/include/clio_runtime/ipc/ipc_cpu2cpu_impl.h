@@ -124,6 +124,22 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
   ctp::lbm::EventManager *em = &ipc->GetTls()->event_manager_;
   ctp::Timepoint start;
   start.Now();
+
+  // issue #807/#784: spin-poll for the response before parking. On SHM the
+  // round-trip is microseconds; a brief spin catches the completion (set by
+  // RecvShmClientThread when it demuxes our archive) without the park/wake +
+  // signal syscall that otherwise dominates low-latency round-trips. Bounded by
+  // config so a slow/absent response still falls through to the parked Wait.
+  const double spin_us =
+      static_cast<double>(CLIO_CONFIG_MANAGER->GetShmClientSpinUs());
+  if (spin_us > 0.0 && !task_ptr->IsComplete()) {
+    ctp::Timepoint spin_now;
+    do {
+      if (task_ptr->IsComplete()) break;
+      spin_now.Now();
+    } while (start.GetUsecFromStart(spin_now) < spin_us);
+  }
+
   while (!task_ptr->IsComplete()) {
     em->Wait(100);
     if (max_sec > 0) {

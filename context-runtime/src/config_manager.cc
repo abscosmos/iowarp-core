@@ -205,6 +205,15 @@ void ConfigManager::ApplyEnvOverrides() {
   if (const char *env = clio::run::env::GetCompat("SHM_ASYNC_SEND")) {
     shm_async_send_ = (env[0] == '1' || env[0] == 't' || env[0] == 'T');
   }
+
+  // issue #807/#784: CLIO_SHM_CLIENT_SPIN_US — waiter spin-before-park budget.
+  if (const char *env = clio::run::env::GetCompat("SHM_CLIENT_SPIN_US")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env) {
+      shm_client_spin_us_ = static_cast<u32>(n);
+    }
+  }
 }
 
 bool ConfigManager::ServerInit() {
