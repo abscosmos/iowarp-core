@@ -1075,6 +1075,10 @@ bool IpcManager::ServerInitShm() {
       // down proportionally so total inbound SHM stays ~128MB regardless of S.
       u32 shards = CLIO_CONFIG_MANAGER->GetShmInShards();
       if (shards < 1) shards = 1;
+      // issue #807: cap at the worker count. Worker w owns shard w, so a shard
+      // beyond the last worker would have no consumer (its clients would hang).
+      u32 nworkers = CLIO_CONFIG_MANAGER->GetNumThreads();
+      if (shards > nworkers) shards = nworkers;
       shm_in_shards_ = shards;
       size_t per_ring_mb = std::max<size_t>(8, 128 / shards);
       shm_in_servers_.clear();
@@ -3371,34 +3375,94 @@ void IpcManager::RecvShmServerThread(u32 shard) {
 
 void IpcManager::StartShmServerRecvThread() {
 #if CTP_IS_HOST
-  // Only a SHM-mode runtime has an inbound ring; every other configuration
-  // (client processes, ZMQ/TCP/IPC runtimes) makes this a no-op.
-  if (!shm_in_server_ok_ || shm_in_recv_running_.load()) {
-    return;
-  }
+  // issue #807: NO dedicated inbound drain threads. The workers drain the shard
+  // rings themselves (RegisterShardConsumer / DrainShard from Worker::Run), so
+  // parallel ingress comes from oversubscribing the existing pool rather than
+  // from spawning threads that contend for cores — which is what made the first
+  // cut regress. Intentionally a no-op; rings are created in ServerInitShm and
+  // consumed by workers.
   shm_in_recv_running_.store(true, std::memory_order_release);
-  // issue #807: one drain thread per shard ring.
-  for (u32 k = 0; k < shm_in_servers_.size(); ++k) {
-    shm_in_recv_threads_.emplace_back(
-        [this, k]() { RecvShmServerThread(k); });
-  }
-  HLOG(kInfo, "[ShmServerRecvThread] started {} shard drainer(s)",
-       shm_in_servers_.size());
 #endif
 }
 
 void IpcManager::StopShmServerRecvThread() {
 #if CTP_IS_HOST
   shm_in_recv_running_.store(false, std::memory_order_release);
-  // Kick each drainer in case it is parked, so joins don't wait out the park
-  // timeout. Harmless if awake.
-  for (auto &ring : shm_in_servers_) {
-    if (ring) ring->SignalConsumerIfParked();
+#endif
+}
+
+// --- issue #807: worker-driven shard draining --------------------------------
+
+void IpcManager::RegisterShardConsumer(u32 worker_id) {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return;
   }
-  for (auto &t : shm_in_recv_threads_) {
-    if (t.joinable()) t.join();
+  // Publishes THIS worker thread's tid as the ring's consumer, so a producing
+  // client's SignalConsumerIfParked SIGUSR1s this worker — the same signalfd
+  // path Worker::SuspendMe already parks on.
+  shm_in_servers_[worker_id]->RegisterConsumer();
+#else
+  (void)worker_id;
+#endif
+}
+
+void IpcManager::UnregisterShardConsumer(u32 worker_id) {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return;
   }
-  shm_in_recv_threads_.clear();
+  shm_in_servers_[worker_id]->UnregisterConsumer();
+#else
+  (void)worker_id;
+#endif
+}
+
+u32 IpcManager::DrainShard(u32 worker_id) {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return 0;
+  }
+  // Bounded batch so a burst on one shard can't starve the worker's own lane /
+  // blocked-queue processing in the same poll iteration.
+  constexpr u32 kShardDrainBudget = 16;
+  u32 n = 0;
+  while (n < kShardDrainBudget && IpcCpu2Cpu::RecvIn(this, worker_id)) {
+    ++n;
+  }
+  return n;
+#else
+  (void)worker_id;
+  return 0;
+#endif
+}
+
+bool IpcManager::ShardEmpty(u32 worker_id) const {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return true;
+  }
+  return shm_in_servers_[worker_id]->IsEmpty();
+#else
+  (void)worker_id;
+  return true;
+#endif
+}
+
+void IpcManager::SetShardParked(u32 worker_id, bool parked) {
+#if CTP_IS_HOST
+  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
+      shm_in_servers_[worker_id] == nullptr) {
+    return;
+  }
+  shm_in_servers_[worker_id]->SetConsumerParked(parked);
+#else
+  (void)worker_id;
+  (void)parked;
 #endif
 }
 

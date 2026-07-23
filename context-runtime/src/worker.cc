@@ -266,16 +266,24 @@ void Worker::Run() {
   if (TaskLane *lane = assigned_lane_.load(std::memory_order_acquire)) {
     lane->SetTid(tid);
   }
+  // issue #807: become the consumer of this worker's inbound SHM shard ring, so
+  // a producing client's SignalConsumerIfParked SIGUSR1s THIS worker (its tid is
+  // now published on the ring). Must run after AddSignalEvent, which blocks
+  // SIGUSR1 on this thread — otherwise the wake would kill the process.
+  CLIO_IPC->RegisterShardConsumer(worker_id_);
 
   // Main worker loop - process tasks from assigned lane
   while (is_running_) {
     did_work_ = false;  // Reset work tracker at start of each loop iteration
     task_did_work_ = false;  // Reset task-level work tracker
 
-    // NOTE: the inbound SHM ring is NOT drained here. A dedicated thread
-    // (IpcManager::RecvShmServerThread) owns it and pushes tasks onto worker
-    // lanes, mirroring the ZMQ path's ClientRecvThread. Workers therefore never
-    // touch serialized task bytes and need no knowledge of the transport.
+    // issue #807: drain THIS worker's inbound SHM shard ring (worker w owns
+    // shard w). Deserialize+route runs on the existing workers — oversubscribed
+    // — instead of on dedicated drain threads that would contend for cores. A
+    // no-op for workers that own no shard and for non-SHM runtimes.
+    if (CLIO_IPC->DrainShard(worker_id_) > 0) {
+      did_work_ = true;
+    }
 
     // Process tasks from assigned lane
     // issue #785: re-read every iteration. The monitor thread may have moved
@@ -319,6 +327,10 @@ void Worker::Run() {
       did_work_ = false;
     }
   }
+
+  // issue #807: stop being the shard ring's consumer before this thread's tid
+  // can be recycled by an unrelated thread that does not block SIGUSR1.
+  CLIO_IPC->UnregisterShardConsumer(worker_id_);
 
   // EventManager destructor handles signalfd and epoll cleanup
 }
@@ -650,6 +662,11 @@ void Worker::SuspendMe() {
         return;
       }
     }
+    // issue #807: last-chance check of this worker's inbound SHM shard, so a
+    // request that arrived before we park is not missed.
+    if (!CLIO_IPC->ShardEmpty(worker_id_)) {
+      return;
+    }
 
     // Calculate timeout from periodic tasks, then cap it by max_sleep so a
     // worker NEVER sleeps indefinitely. GetSuspendPeriod() returns -1 when this
@@ -668,8 +685,15 @@ void Worker::SuspendMe() {
                          : std::min(static_cast<int>(suspend_period_us),
                                     static_cast<int>(max_sleep));
 
+    // issue #807: announce to producing clients that we are about to park, so
+    // their SignalConsumerIfParked wakes us. Publish BEFORE the wait; a request
+    // that lands after this still SIGUSR1s us out of the Wait (or the max_sleep
+    // cap re-polls). Cleared immediately on wake so a send during processing
+    // does not waste a signal.
+    CLIO_IPC->SetShardParked(worker_id_, true);
     // Wait for signal using EventManager
     int nfds = event_manager_.Wait(timeout_us);
+    CLIO_IPC->SetShardParked(worker_id_, false);
 
     if (nfds == 0) {
       sleep_count_++;

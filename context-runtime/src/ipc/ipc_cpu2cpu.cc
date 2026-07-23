@@ -66,11 +66,15 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, u32 shard) {
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   f.GetTaskPtr()->BeginRunContext();
-  // issue #781: ClientMapTask removed. Like the ZMQ client recv thread
-  // (IpcCpu2CpuZmq::RecvIn), this SHM recv path deposits on the shared ingress
-  // lane (0); the runtime maps the task to a worker via RuntimeMapTask. Always
-  // signal: see ipc_cpu2cpu_impl.h for the enqueue/sleep race this closes.
-  LaneId lane_id = 0;
+  // issue #807: deposit on the DRAINING worker's own lane (shard k is drained by
+  // worker k), not a shared ingress lane 0. The worker that deserialized the
+  // task also routes it, so both halves parallelise across the pool instead of
+  // funnelling every shard's traffic through lane 0. RuntimeMapTask still
+  // re-routes from here if a different worker is a better fit. Bounded to the
+  // lane count defensively. Always signal: see ipc_cpu2cpu_impl.h for the
+  // enqueue/sleep race this closes.
+  u32 num_lanes = ipc->GetTaskQueue()->GetNumLanes();
+  LaneId lane_id = (num_lanes > 0) ? (shard % num_lanes) : 0;
   auto &lane_ref = ipc->GetTaskQueue()->GetLane(lane_id, 0);
   lane_ref.Push(f);
   ipc->AwakenWorker(&lane_ref);
