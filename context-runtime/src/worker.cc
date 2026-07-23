@@ -664,7 +664,10 @@ void Worker::SuspendMe() {
     // FUSE thread that must submit it), livelocking the whole pipeline. That
     // is why the embedded-FUSE xfstests (generic/006/007/011/013/089/100/113/
     // 127/286/363/438/471) pass on a 16-core box but hang in CI. Yielding lets
-    // the runnable thread get scheduled so forward progress resumes.
+    // the runnable thread get scheduled so forward progress resumes. (issue
+    // #807: measured a bare tight-spin here at only ~1us over the yield on a
+    // spare-core box — sched_yield is already ~free when a core is idle — so it
+    // is not worth risking the oversubscription livelock the yield prevents.)
     CTP_THREAD_MODEL->Yield();
     return;
   } else {
