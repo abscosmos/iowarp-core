@@ -396,7 +396,14 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Configuration parameters
   u32 num_threads_ = 4;
-  u32 shm_in_shards_ = 4;  // issue #807: parallel inbound SHM rings
+  // issue #807: parallel inbound SHM rings. Default 1 (single ring, identical to
+  // pre-#807 behaviour). Sharding is OPT-IN: measured on a 6-core box, S>1
+  // REGRESSED throughput (S=4 gave 4413 ops/s vs S=1's 5729 at 8 client threads)
+  // because the extra drain threads contend with workers for cores. It only pays
+  // off when client concurrency exceeds what one drain thread can service AND
+  // there are spare cores — high-core-count, high-client-count deployments.
+  // Raise via CLIO_SHM_IN_SHARDS / runtime.shm_in_shards there.
+  u32 shm_in_shards_ = 1;
   u32 queue_depth_ = 1024;
 
   size_t main_segment_size_ = ctp::Unit<size_t>::Gigabytes(1);
