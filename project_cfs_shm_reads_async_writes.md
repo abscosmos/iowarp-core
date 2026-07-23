@@ -263,8 +263,8 @@ is mandatory), drop the wait:
 | 1 | fs chimod publishes per-path attrs to SHM | **done** — `ShmFsCache`, mirrored at open/write/append/truncate/unlink/rename/utimens/chown |
 | 2 | zero-IPC `getattr`/`stat` in `CfsIo` | **not done** — see below; reads do not need it |
 | 3 | zero-IPC page reads in `Read`/`Pread` | **done** — 0.386 µs, fallback covered |
-| 4 | async writes + bounded window + real `fsync`/`close` | not started |
-| 5 | RYOW dirty-page tracking | not started |
+| 4 | async writes + bounded window + real `fsync`/`close` | **done** — 5.77 ms vs 6.86 ms, `CLIO_CFS_ASYNC_WRITES=0` reverts |
+| 5 | RYOW dirty-page tracking | **done** — per-path write windows, drained by any read/stat/truncate that overlaps |
 | 6 | regression sweep | partial — CTE + POSIX adapter green; xfstests/FUSE/VFD not run |
 
 Phase 2 is deliberately still open. Accelerating `stat` means resolving a
