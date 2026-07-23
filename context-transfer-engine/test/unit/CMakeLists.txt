@@ -1126,7 +1126,12 @@ set_tests_properties(
 
 # ------------------------------------------------------------------------------
 # clio-fs zero-IPC read path (issue #817): correctness + latency
+#
+# UNIX-only, like the cfs adapter it drives: cfs_io.h is built on unistd.h /
+# sys/stat.h / off_t and has no Windows port, so clio_cte_cfs_adapter does not
+# exist there.
 # ------------------------------------------------------------------------------
+if(UNIX)
 add_executable(test_cfs_shm_read
     test_cfs_shm_read.cc
 )
@@ -1134,6 +1139,14 @@ add_executable(test_cfs_shm_read
 target_include_directories(test_cfs_shm_read PRIVATE
     ${CMAKE_SOURCE_DIR}/context-runtime/test
 )
+
+# Spawns its own clio_run daemon (RuntimeServer) and composes it from YAML, so
+# the fast path is exercised across a real process boundary. A co-located
+# runtime cannot prove that -- it shares the address space and hand-registers
+# its targets, which is precisely how the production-dead locality check
+# (issue #817) stayed invisible.
+target_compile_definitions(test_cfs_shm_read PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
 
 target_link_libraries(test_cfs_shm_read
     clio_cte_cfs_adapter
@@ -1152,6 +1165,7 @@ target_link_libraries(test_cfs_shm_read
 
 # The co-located runtime dlopens the chimods from CLIO_REPO_PATH.
 add_dependencies(test_cfs_shm_read
+    clio_run
     clio_cte_core_runtime
     clio_cte_filesystem_runtime
     clio_bdev_runtime
@@ -1166,6 +1180,7 @@ set_tests_properties(cfs_shm_read PROPERTIES
     RESOURCE_LOCK "clio_runtime_port"
     TIMEOUT 180
     LABELS "unit;cte;cfs;msan_skip")
+endif()  # UNIX
 
 add_executable(test_cte_gpu_metadata_cache
     test_cte_gpu_metadata_cache.cc

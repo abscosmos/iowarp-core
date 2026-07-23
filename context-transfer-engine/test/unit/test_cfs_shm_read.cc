@@ -16,9 +16,15 @@
  */
 
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,6 +34,7 @@
 #include "clio_cte/filesystem/filesystem_client.h"
 #include "clio_runtime/bdev/bdev_client.h"
 #include "clio_runtime/clio_runtime.h"
+#include "runtime_server.h"
 #include "simple_test.h"
 
 using namespace std::chrono_literals;
@@ -37,6 +44,8 @@ namespace {
 // A RAM target is what makes page payloads SHM-resident and therefore
 // direct-readable; a file target would (correctly) refuse the fast path.
 constexpr clio::run::u64 kRamTargetBytes = 256ULL * 1024 * 1024;
+/** Own port so this can run alongside nothing else (RESOURCE_LOCK enforces). */
+constexpr unsigned kPort = 10617;
 const std::string kBackendPath = "/tmp/clio_cfs_shm_read_test.dat";
 const std::string kClioPath = "clio::" + kBackendPath;
 
@@ -47,6 +56,50 @@ double NowUs() {
       .count();
 }
 
+/** Run `clio_run <args>` to completion, returning its exit code. */
+int RunCli(const std::vector<std::string> &args, int timeout_sec) {
+  std::vector<std::string> full;
+  full.push_back(CLIO_RUN_EXE);
+  full.insert(full.end(), args.begin(), args.end());
+  std::vector<char *> argv;
+  for (auto &a : full) argv.push_back(a.data());
+  argv.push_back(nullptr);
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    execv(argv[0], argv.data());
+    _exit(127);
+  }
+  auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
+  int status = 0;
+  while (true) {
+    pid_t r = waitpid(pid, &status, WNOHANG);
+    if (r == pid) return WIFEXITED(status) ? WEXITSTATUS(status) : -2;
+    if (std::chrono::steady_clock::now() >= deadline) {
+      kill(pid, SIGKILL);
+      waitpid(pid, &status, 0);
+      return -3;
+    }
+    std::this_thread::sleep_for(100ms);
+  }
+}
+
+// The daemon runs for the whole test case; destroying it SIGTERMs the child.
+clio::run::test::RuntimeServer *g_server = nullptr;
+
+/**
+ * Bring up a REAL daemon in its own process and compose it from YAML, exactly
+ * as a deployment does, then attach as a pure client.
+ *
+ * This shape is the point. An in-process (co-located) runtime shares the
+ * address space and registers its targets by hand, and under it the fast path
+ * looked healthy while it was in fact DEAD in every real deployment: compose
+ * registers every target as PoolQuery::DirectHash(node), so the runtime's
+ * "is this target local" test -- written as IsLocalMode() -- was false for
+ * every production target and kShmBlobDirectReadable was never set. Only a
+ * composed daemon in another process exposes that.
+ */
 bool InitRuntime() {
   static bool ok = false;
   static bool tried = false;
@@ -55,34 +108,55 @@ bool InitRuntime() {
   }
   tried = true;
 
-  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
+  const std::string work = "/tmp/clio_cfs_shm_read_test";
+  std::filesystem::remove_all(work);
+  std::filesystem::create_directories(work);
+  const std::string yaml = work + "/compose.yaml";
+  {
+    std::ofstream f(yaml);
+    f << "compose:\n"
+         "  - mod_name: clio_cte_core\n"
+         "    pool_name: \"cfs_shm_cte\"\n"
+         "    pool_query: local\n"
+         "    pool_id: \"512.0\"\n"
+         "    storage:\n"
+         "      - path: " << work << "/ram_dev\n"
+         "        bdev_type: ram\n"
+         "        capacity_limit: " << (kRamTargetBytes / (1024 * 1024))
+      << "mb\n"
+         "    dpe:\n"
+         "      dpe_type: random\n"
+         "  - mod_name: clio_cte_filesystem\n"
+         "    pool_name: \"clio_cte_filesystem\"\n"
+         "    pool_query: local\n"
+         "    pool_id: \"560.0\"\n"
+         "    next_pool_id: \"512.0\"\n";
+  }
+
+  setenv("CLIO_WAIT_SERVER", "15", 1);
+  setenv("CLIO_BIND_ADDR", "127.0.0.1", 1);
+
+  static clio::run::test::RuntimeServer server;
+  g_server = &server;
+  if (!server.Start(kPort) || !server.WaitForReady()) {
+    return false;
+  }
+  if (RunCli({"compose", "start", yaml}, 60) != 0) {
+    return false;
+  }
+
+  // kClient with NO co-located runtime: this process is a plain client of the
+  // daemon above, so every shared-memory offset it resolves comes from a
+  // segment another process created.
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
     return false;
   }
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
     return false;
   }
-
-  // Register a RAM target on the default CTE core pool -- the filesystem
-  // chimod sits over that pool, so this is the pool whose placement decides
-  // whether a page is direct-readable.
-  auto *cte_client = CLIO_CTE_CLIENT;
-  clio::run::PoolId bdev_pool_id(8171, 0);
-  clio::run::bdev::Client bdev_client(bdev_pool_id);
-  auto create_task = bdev_client.AsyncCreate(
-      clio::run::PoolQuery::Dynamic(), "cfs_shm_read_ram", bdev_pool_id,
-      clio::run::bdev::BdevType::kRam);
-  create_task.Wait();
-  std::this_thread::sleep_for(100ms);
-
-  auto reg = cte_client->AsyncRegisterTarget(
-      "cfs_shm_read_ram", clio::run::bdev::BdevType::kRam, kRamTargetBytes,
-      clio::run::PoolQuery::Local(), bdev_pool_id);
-  reg.Wait();
-  if (reg->GetReturnCode() != 0) {
-    return false;
-  }
-  std::this_thread::sleep_for(100ms);
-
+  // Storage comes from the compose above; registering another target here
+  // would give the DPE a second placement choice and make the outcome depend
+  // on which one it picked.
   ok = true;
   return ok;
 }

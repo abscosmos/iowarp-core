@@ -296,6 +296,61 @@ void Runtime::FixupAfterCopy(clio::run::u32 method,
   }
 }
 
+namespace {
+
+/**
+ * Does this target's storage live on THIS node? (issue #817)
+ *
+ * Resolves the target's routing query to a node, rather than asking whether
+ * the query was literally written as `Local`. That distinction is the whole
+ * bug: `Runtime::Create` registers every composed target as
+ * `PoolQuery::DirectHash(target_node)` (the sliding neighborhood window), so
+ * `IsLocalMode()` is false for every target in a real deployment. The payload
+ * fast path was therefore only ever enabled for a target a test had
+ * hand-registered with `PoolQuery::Local()` -- it could never turn on in
+ * production, on any node, for any blob.
+ *
+ * Mirrors ResolveDirectHashQuery's own resolution (hash % num_containers, then
+ * ask the pool manager where that container lives), so "the fast path thinks
+ * it is local" and "the router would keep the task local" cannot disagree.
+ *
+ * Unknown or multi-destination modes return false: the default must be refuse.
+ */
+bool TargetIsNodeLocal(const clio::run::PoolQuery &q,
+                       const clio::run::PoolId &bdev_pool) {
+  if (q.IsLocalMode()) {
+    return true;
+  }
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  auto *ipc = CLIO_IPC;
+  if (pool_manager == nullptr || ipc == nullptr) {
+    return false;
+  }
+  clio::run::ContainerId container_id = 0;
+  if (q.IsDirectIdMode()) {
+    container_id = q.GetContainerId();
+  } else if (q.IsDirectHashMode()) {
+    const clio::run::PoolInfo *pi = pool_manager->GetPoolInfo(bdev_pool);
+    if (pi == nullptr || pi->num_containers_ == 0) {
+      return false;
+    }
+    container_id = q.GetHash() % pi->num_containers_;
+  } else if (q.IsPhysicalMode()) {
+    return q.GetNodeId() == ipc->GetNodeId();
+  } else {
+    // Broadcast/Range/Dynamic name zero or many destinations; a payload read
+    // needs exactly one, and it must be here.
+    return false;
+  }
+  if (pool_manager->HasContainer(bdev_pool, container_id)) {
+    return true;
+  }
+  return pool_manager->GetContainerNodeId(bdev_pool, container_id) ==
+         ipc->GetNodeId();
+}
+
+}  // namespace
+
 // ===========================================================================
 // issue #783: projection of the authoritative BlobInfo into its shared-memory
 // cache record. Deliberately lossy -- the cache stores only what a client
@@ -353,7 +408,9 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
     }
     d.bdev_type_ = static_cast<clio::run::u32>(tinfo->bdev_type_);
     const bool is_ram = (tinfo->bdev_type_ == clio::run::bdev::BdevType::kRam);
-    const bool is_local = tinfo->target_query_.IsLocalMode();
+    const bool is_local =
+        TargetIsNodeLocal(tinfo->target_query_, d.target_pool_);
+    d.node_id_ = is_local ? CLIO_IPC->GetNodeId() : 0xFFFFFFFFu;
     if (!is_ram || !is_local) {
       // kPinned/kHbm are excluded deliberately: their pages come from GPU
       // allocators and are not SHM-backed, so their offsets are meaningless
