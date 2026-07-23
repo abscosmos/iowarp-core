@@ -5,15 +5,19 @@
 # CTE adapter singleton implementation - moved to filesystem directory
 # to leverage existing working build configuration
 
+# Shared cfs-backed I/O core the interceptors delegate to (replaces the old
+# clio_cte_fs_base filesystem layer; backed by the context-filesystem chimod
+# via clio::cte::filesystem::Client).
+#
+# Built unconditionally: unlike the interceptors it never touches real_api.h,
+# so gating it on ELF only meant an ELF-less build could not test the byte-I/O
+# core at all -- which is where the #817 zero-IPC read path lives.
+add_subdirectory(cfs)
+
 # Adapters require ELF support (for real_api.h)
 # Disable all adapters when ELF is disabled
 if(CLIO_CORE_ENABLE_ELF)
     message(STATUS "CTE Adapters: ENABLED (ELF support available)")
-
-    # Shared cfs-backed I/O core the interceptors delegate to (replaces the
-    # old clio_cte_fs_base filesystem layer; backed by the context-filesystem
-    # chimod via clio::cte::filesystem::Client).
-    add_subdirectory(cfs)
 
     # Optional adapters - controlled by root CMakeLists.txt options
     if (CLIO_CTE_ENABLE_POSIX_ADAPTER)

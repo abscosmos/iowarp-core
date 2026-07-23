@@ -313,18 +313,23 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
 
   size_t n = info.blocks_.size();
   if (n > kMaxInlineBlocks) {
-    // Too many blocks to represent. Cache the metadata but mark it truncated
-    // so no client ever tries a payload read from a partial block list.
+    // More blocks than fit. Cache the first kMaxInlineBlocks -- they are the
+    // blob's leading blocks in logical order, so they describe a known PREFIX
+    // exactly (issue #817). The truncated flag tells a client to bound its
+    // read by CoveredBytes() instead of total_size_; it no longer means
+    // "unreadable", which used to refuse every blob over 512 KB (= 8 x the
+    // 64 KB kMaxBlockChunk) and so refused every 1 MiB clio-fs page.
     out->flags_ |= kShmBlobTruncated;
     n = kMaxInlineBlocks;
   }
   out->num_blocks_ = static_cast<clio::run::u32>(n);
 
-  // A payload may only be read directly out of shared memory when EVERY block
-  // is node-local and RAM-backed. This starts true and is cleared by the first
-  // block that fails to qualify -- the default must be "refuse", so an
-  // unknown target can never be mistaken for a readable one.
-  bool all_direct = (n > 0) && ((out->flags_ & kShmBlobTruncated) == 0);
+  // A payload may only be read directly out of shared memory when every
+  // CACHED block is node-local and RAM-backed. This starts true and is cleared
+  // by the first block that fails to qualify -- the default must be "refuse",
+  // so an unknown target can never be mistaken for a readable one. Blocks past
+  // the cached prefix are not inspected and are never read from.
+  bool all_direct = (n > 0);
 
   for (size_t i = 0; i < n; ++i) {
     const BlobBlock &b = info.blocks_[i];

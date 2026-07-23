@@ -183,9 +183,13 @@ class Client : public clio::run::ContainerClient {
       return false;
     }
     if (!rec.IsDirectReadable()) {
-      return false;  // file/remote/GPU-tier blob, or truncated block list
+      return false;  // file/remote/GPU-tier blob
     }
-    if (offset + size > rec.total_size_) {
+    // Bound by the CACHED PREFIX, not by the blob's total size: a truncated
+    // record describes only its first kMaxInlineBlocks blocks, and a read past
+    // them has no block to resolve against. For an untruncated record the two
+    // are equal, so this is strictly the safer of the two bounds.
+    if (offset + size > rec.CoveredBytes()) {
       return false;
     }
     const clio::run::u64 gen_before = rec.placement_gen_;

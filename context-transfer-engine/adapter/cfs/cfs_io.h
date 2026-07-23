@@ -100,6 +100,20 @@ class CfsIo {
     return HasClioPrefix(path);
   }
 
+  /**
+   * The chimod handle behind an fd, or 0 if untracked.
+   *
+   * Exists so a test or benchmark can drive the filesystem client's RPC path
+   * against the same open file the adapter is using -- otherwise the RPC
+   * baseline would be measuring a different handle, and any latency
+   * comparison between the two paths would be apples to oranges.
+   */
+  clio::run::u64 HandleOf(int fd) {
+    std::lock_guard<std::mutex> g(mu_);
+    auto it = fds_.find(fd);
+    return it == fds_.end() ? 0 : it->second.handle;
+  }
+
   /** Whether fd was issued by us (and is still open). */
   bool IsFdTracked(int fd) {
     if (fd < kCfsFdBase) {
@@ -193,8 +207,25 @@ class CfsIo {
   /** Existence + logical size of a tag. */
   bool QueryGetattr(const std::string &path, bool *exists, clio::run::u64 *size);
 
+  /**
+   * Zero-IPC read straight out of shared memory (issue #817).
+   *
+   * Resolves the path to its tag + logical size in the filesystem chimod's SHM
+   * mirror, then copies each 1 MiB page blob out of the RAM bdev segment via
+   * the CTE core's payload fast path. No round trip, no staging buffer.
+   *
+   * @return bytes read (possibly 0 at EOF), or -1 meaning "not fast-pathable"
+   *         -- NOT an error. -1 covers every refusal: cache absent, path not
+   *         mirrored, pending appends, a hole, a page on a file/remote/GPU
+   *         tier, or placement moving mid-copy. The caller must then use the
+   *         RPC path, which is always correct.
+   */
+  ssize_t TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
+                     size_t count);
+
   /** Core read/write against a chimod handle (no offset bookkeeping). */
-  ssize_t DoRead(clio::run::u64 handle, clio::run::u64 off, void *buf, size_t count);
+  ssize_t DoRead(clio::run::u64 handle, const std::string &path,
+                 clio::run::u64 off, void *buf, size_t count);
   ssize_t DoWrite(clio::run::u64 handle, clio::run::u64 off, const void *buf, size_t count);
 
   /** Stable 64-bit synthetic inode from the bare path. */
