@@ -1033,6 +1033,23 @@ class IpcManager {
     allocator_map_lock_.ReadUnlock();
     if (result.ptr_ != nullptr) return result;
 
+    // Issue #807: a multithreaded client can hand the runtime a ShmPtr into a
+    // freshly created segment BEFORE the creating thread's RegisterMemory
+    // admin round-trip lands — segment creation exposes the allocator to the
+    // client's sibling threads immediately, and the SHM data plane is much
+    // faster than the TCP control plane the registration rides on. Attach the
+    // segment on demand and retry, instead of handing back a null resolution
+    // (which a bdev write would memcpy from).
+    if (TryLazyRegisterClientSegment(shm_ptr.alloc_id_)) {
+      allocator_map_lock_.ReadLock();
+      auto retry_it = alloc_map_.find(alloc_key);
+      if (retry_it != alloc_map_.end()) {
+        result = ctp::ipc::FullPtr<T>(retry_it->second, shm_ptr);
+      }
+      allocator_map_lock_.ReadUnlock();
+      if (result.ptr_ != nullptr) return result;
+    }
+
     // Case 4: Check GPU client backends (kPinnedHost / kManagedUvm /
     // kDeviceMem). The IpcGpu2Cpu producer convention stashes the raw
     // device-or-host-accessible address in `off_` directly, so resolution
@@ -1251,6 +1268,17 @@ class IpcManager {
    * @return true if successful (or already registered), false on error
    */
   bool RegisterMemory(const ctp::ipc::AllocatorId &alloc_id);
+
+  /**
+   * Runtime-side fallback for ToFullPtr: attach a client segment whose
+   * RegisterMemory control-plane round-trip has not landed yet (issue #807 —
+   * the SHM data plane outruns the TCP admin path, so a sibling client
+   * thread's first use of a fresh segment can reach a worker before the
+   * creating thread's registration does). No-op on clients / null ids.
+   * @return true if the segment is now registered (attached here or already
+   *         present), false otherwise
+   */
+  bool TryLazyRegisterClientSegment(const ctp::ipc::AllocatorId &alloc_id);
 
   /**
    * Get the current process's shared memory info for registration

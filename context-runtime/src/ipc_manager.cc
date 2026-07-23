@@ -2558,6 +2558,29 @@ bool IpcManager::RegisterMemory(const ctp::ipc::AllocatorId &alloc_id) {
   }
 }
 
+bool IpcManager::TryLazyRegisterClientSegment(
+    const ctp::ipc::AllocatorId &alloc_id) {
+#if CTP_IS_HOST
+  // Runtime only: clients never resolve other processes' segments, and the
+  // attach below is the server-side registration RegisterMemory performs.
+  if (CLIO_RUNTIME_MANAGER == nullptr || !CLIO_RUNTIME_MANAGER->IsRuntime()) {
+    return false;
+  }
+  if (alloc_id == ctp::ipc::AllocatorId::GetNull()) {
+    return false;
+  }
+  HLOG(kWarning,
+       "IpcManager::TryLazyRegisterClientSegment: resolving ({}.{}) before "
+       "its RegisterMemory round-trip landed — attaching on demand (#807)",
+       alloc_id.major_, alloc_id.minor_);
+  // Idempotent: returns true if the segment is already registered.
+  return RegisterMemory(alloc_id);
+#else
+  (void)alloc_id;
+  return false;
+#endif
+}
+
 ClientShmInfo IpcManager::GetClientShmInfo(u32 index) const {
   std::lock_guard<std::mutex> lock(shm_mutex_);
 

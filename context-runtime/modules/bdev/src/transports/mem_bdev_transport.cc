@@ -291,6 +291,20 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
+  // A task's data pointer comes from another process; if it does not resolve
+  // (unregistered/reaped segment), fail the write instead of memcpy'ing from
+  // NULL — this segfaulted the whole runtime under the #807 stress test.
+  if (data_ptr.ptr_ == nullptr && task->length_ > 0) {
+    HLOG(kError,
+         "MemBdevTransport::WriteBlocks: unresolvable data ShmPtr "
+         "alloc_id=({}.{}) off={} length={} — failing with EIO",
+         task->data_.alloc_id_.major_, task->data_.alloc_id_.minor_,
+         task->data_.off_.load(), task->length_);
+    task->return_code_ = EIO;
+    task->bytes_written_ = 0;
+    CLIO_CO_RETURN;
+  }
+
   // Host source: a synchronous host->host memcpy is fastest and gains nothing
   // from a GPU stream.
   if (!ctp::IsDevicePointer(data_ptr.ptr_)) {
@@ -416,6 +430,19 @@ clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> t
 
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
+
+  // Mirror of the WriteBlocks guard: never memset/memcpy into an
+  // unresolvable destination pointer.
+  if (data_ptr.ptr_ == nullptr && task->length_ > 0) {
+    HLOG(kError,
+         "MemBdevTransport::ReadBlocks: unresolvable data ShmPtr "
+         "alloc_id=({}.{}) off={} length={} — failing with EIO",
+         task->data_.alloc_id_.major_, task->data_.alloc_id_.minor_,
+         task->data_.off_.load(), task->length_);
+    task->return_code_ = EIO;
+    task->bytes_read_ = 0;
+    CLIO_CO_RETURN;
+  }
 
   // Host destination: synchronous host<->host copy.
   if (!ctp::IsDevicePointer(data_ptr.ptr_)) {
