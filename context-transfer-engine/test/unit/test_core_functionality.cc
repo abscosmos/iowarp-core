@@ -3043,11 +3043,34 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
        write_us, write_us_last, cycle_shm_meta_us, cycle_rpc_meta_us,
        cycle_shm_data_us, cycle_rpc_data_us, kIters, kSize, sink);
 
-  // The cycle can never beat the write floor, and the SHM variants must not be
-  // slower than the RPC ones. Loose bounds: this is a measurement, not a gate.
+  // Structural sanity: a write+read cycle includes a write, so it cannot take
+  // less than half the write-alone floor. This catches a broken/near-zero
+  // measurement, and holds regardless of runner load.
   REQUIRE(cycle_shm_meta_us >= std::min(write_us, write_us_last) * 0.5);
-  REQUIRE(cycle_shm_meta_us < cycle_rpc_meta_us);
-  REQUIRE(cycle_shm_data_us < cycle_rpc_data_us);
+
+  // SHM is EXPECTED to beat RPC — that is the point of the cache — but this is
+  // a wall-clock comparison of two timing samples, so on a loaded CI runner
+  // the faster path occasionally samples slower and the strict inequality
+  // inverts. This used to be REQUIRE(shm < rpc), which flaked
+  // (cte_functional_all, retry-masked on dev boost/docker). The comment above
+  // it already declared the intent — "a measurement, not a gate" — so the hard
+  // assertion was the bug. Report the comparison and warn if the expectation
+  // is not met, but do not fail the test on sample noise. A genuine
+  // performance regression shows up as a persistent warning across runs, not a
+  // single-sample flake; gate it in a dedicated perf job with repetition and
+  // statistics if it needs gating at all.
+  if (!(cycle_shm_meta_us < cycle_rpc_meta_us)) {
+    HLOG(kWarning,
+         "[#783 WTR] metadata SHM cycle ({} us) did not beat RPC ({} us) this "
+         "run — expected SHM faster; treating as sample noise, not a failure",
+         cycle_shm_meta_us, cycle_rpc_meta_us);
+  }
+  if (!(cycle_shm_data_us < cycle_rpc_data_us)) {
+    HLOG(kWarning,
+         "[#783 WTR] payload SHM cycle ({} us) did not beat RPC ({} us) this "
+         "run — expected SHM faster; treating as sample noise, not a failure",
+         cycle_shm_data_us, cycle_rpc_data_us);
+  }
 }
 
 // Main function using simple_test.h framework
