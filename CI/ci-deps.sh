@@ -150,18 +150,35 @@ ensure_conda() {
 # Ensure conda is available
 ensure_conda
 
-# Accept Conda Terms of Service for Anaconda channels
-echo -e "${BLUE}Accepting Conda Terms of Service...${NC}"
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
-echo -e "${GREEN}Conda ToS accepted${NC}"
-echo ""
-
-# Configure conda channels (add conda-forge if not already present)
-echo -e "${BLUE}Configuring conda channels...${NC}"
+# Configure conda to use conda-forge ONLY, and never the Anaconda `defaults`
+# channels (pkgs/main, pkgs/r).
+#
+# Those channels sit behind repo.anaconda.com, which now returns HTTP 403
+# Forbidden for CI/commercial use unless the org has an Anaconda license:
+#
+#   CondaHTTPError: HTTP 403 Forbidden for url
+#     <https://repo.anaconda.com/pkgs/main/noarch/repodata.json>
+#   - The channel requires authentication.
+#
+# Previously this script did `conda tos accept ...` for pkgs/main and pkgs/r
+# and then `conda config --add channels conda-forge`, which only PREPENDED
+# conda-forge while leaving `defaults` in the channel list. conda still
+# fetched pkgs/main repodata and intermittently 403'd — a flake that fails the
+# dependency-install step before any build begins, and the create-retry loop
+# below could not help because every retry hit the same forbidden channel.
+# Accepting a ToS also does nothing when the runner IP is refused outright.
+#
+# `--remove-key channels` clears whatever the base install seeded (which
+# includes defaults), then we add only conda-forge and pin strict priority so
+# conda never falls back to defaults for a package conda-forge lacks.
+echo -e "${BLUE}Configuring conda channels (conda-forge only, no defaults)...${NC}"
+conda config --remove-key channels 2>/dev/null || true
 conda config --add channels conda-forge 2>/dev/null || true
-conda config --set channel_priority flexible 2>/dev/null || true
-echo -e "${GREEN}Conda channels configured${NC}"
+conda config --set channel_priority strict 2>/dev/null || true
+# Belt and braces: some conda versions still consult the implicit `defaults`
+# unless it is explicitly disabled.
+conda config --set default_channels "[]" 2>/dev/null || true
+echo -e "${GREEN}Conda channels configured (conda-forge only)${NC}"
 echo ""
 
 # Create and activate environment if not already in one
@@ -176,7 +193,7 @@ if [ -z "$CONDA_PREFIX" ]; then
         # Retry up to 3 times: conda-forge CDN occasionally returns 403/502.
         _created=0
         for _attempt in 1 2 3; do
-            if conda create -n "$ENV_NAME" -y "python=$PYVER"; then
+            if conda create -n "$ENV_NAME" -y -c conda-forge --override-channels "python=$PYVER"; then
                 _created=1
                 break
             fi
