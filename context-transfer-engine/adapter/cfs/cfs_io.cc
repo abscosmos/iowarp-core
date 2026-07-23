@@ -282,6 +282,22 @@ int CfsIo::DrainPath(const std::string &path) {
   return err;
 }
 
+void CfsIo::ForgetIfIdle(const std::string &path) {
+  std::lock_guard<std::mutex> g(pw_mu_);
+  auto it = pending_writes_.find(path);
+  if (it == pending_writes_.end()) {
+    return;
+  }
+  // Only drop a window that is genuinely finished: an empty queue with no
+  // error still owed to someone. Otherwise a long-lived process (an
+  // interceptor lives as long as the application) accumulates one entry per
+  // file it ever wrote.
+  std::lock_guard<std::mutex> g2(it->second->mu);
+  if (it->second->q.empty() && it->second->sticky == 0) {
+    pending_writes_.erase(it);
+  }
+}
+
 void CfsIo::WaitForPageOverlap(PathWrites *pw, clio::run::u64 off,
                                clio::run::u64 len) {
   const clio::run::u64 page = clio::cte::filesystem::kFsPageSize;
@@ -723,6 +739,7 @@ int CfsIo::Close(int fd) {
   // close(2) is also the last chance to report a latched write failure, which
   // is why its return code is not simply the Close task's.
   int werr = DrainPath(path);
+  ForgetIfIdle(path);
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncClose(handle);
   t.Wait();

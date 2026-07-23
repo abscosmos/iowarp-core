@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -509,6 +510,94 @@ TEST_CASE("clio-fs async writes: RYOW, fsync, throughput", "[cfs][shm][noleak]")
 
   cfs_io->RemovePath(wpath);
   (void)wbare;
+}
+
+TEST_CASE("clio-fs SHM path under concurrent readers and writers",
+          "[cfs][shm][noleak]") {
+  REQUIRE(InitRuntime());
+  auto *cfs_io = CLIO_CTE_CFS;
+  REQUIRE(cfs_io != nullptr);
+  if (CLIO_CPU_IPC == nullptr ||
+      CLIO_CPU_IPC->GetMetadataAllocator() == nullptr) {
+    std::printf("\n[#817] SKIP (concurrency): no metadata segment here\n");
+    return;
+  }
+
+  // The fast path is reached from arbitrary application threads through the
+  // POSIX/STDIO interceptors, and it touches process-wide state that was NOT
+  // originally guarded: the CTE client's attached-RAM-bdev cache. Two threads
+  // racing the first read of a target rehashed that map concurrently, which is
+  // a use-after-free -- a segfault on the hot path, not a wrong answer. This
+  // test exists to make that reachable rather than theoretical.
+  const std::string cpath = "clio::/tmp/clio_cfs_concurrent_test.dat";
+  const size_t kSize = 2 * 1024 * 1024;  // spans 2 pages
+  std::vector<char> src(kSize);
+  for (size_t i = 0; i < kSize; ++i) {
+    src[i] = static_cast<char>((i * 7 + 11) % 251);
+  }
+
+  cfs_io->RemovePath(cpath);
+  int wfd = cfs_io->Open(cpath, O_CREAT | O_RDWR | O_TRUNC, 0644);
+  REQUIRE(wfd >= 0);
+  REQUIRE(cfs_io->Write(wfd, src.data(), kSize) ==
+          static_cast<ssize_t>(kSize));
+  REQUIRE(cfs_io->Sync(wfd) == 0);
+
+  const int kThreads = 8;
+  const int kItersPerThread = 400;
+  std::atomic<int> mismatches{0};
+  std::atomic<int> errors{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&, t]() {
+      // Each thread opens its OWN descriptor, so they contend on the fd table,
+      // the write windows and the shared client caches simultaneously.
+      int fd = cfs_io->Open(cpath, O_RDWR, 0644);
+      if (fd < 0) {
+        ++errors;
+        return;
+      }
+      std::vector<char> buf(4096);
+      for (int i = 0; i < kItersPerThread; ++i) {
+        clio::run::u64 off =
+            (static_cast<clio::run::u64>(i) * 4096 * (t + 1)) % (kSize - 4096);
+        ssize_t n = cfs_io->Pread(fd, buf.data(), 4096,
+                                  static_cast<off_t>(off));
+        if (n != 4096) {
+          ++errors;
+          break;
+        }
+        if (std::memcmp(buf.data(), src.data() + off, 4096) != 0) {
+          ++mismatches;
+          break;
+        }
+        // Every eighth iteration, write back the same bytes. Concurrent
+        // writers keep the mirror, the write windows and the placement
+        // generation moving underneath the readers.
+        if ((i & 7) == 0) {
+          if (cfs_io->Pwrite(fd, buf.data(), 4096,
+                             static_cast<off_t>(off)) != 4096) {
+            ++errors;
+            break;
+          }
+        }
+      }
+      cfs_io->Sync(fd);
+      cfs_io->Close(fd);
+    });
+  }
+  for (auto &th : threads) {
+    th.join();
+  }
+
+  std::printf("[#817] concurrency: %d threads x %d reads, %d mismatches, "
+              "%d errors\n",
+              kThreads, kItersPerThread, mismatches.load(), errors.load());
+  REQUIRE(mismatches.load() == 0);
+  REQUIRE(errors.load() == 0);
+
+  cfs_io->Close(wfd);
+  cfs_io->RemovePath(cpath);
 }
 
 SIMPLE_TEST_MAIN()

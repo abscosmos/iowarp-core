@@ -275,6 +275,10 @@ class CfsIo {
    */
   int ReapAndBound(PathWrites *pw);
 
+  /** Drop a path's window once it is drained and owes nobody an error, so a
+   *  long-lived interceptor does not keep one entry per file ever written. */
+  void ForgetIfIdle(const std::string &path);
+
   /** Wait for every outstanding write on `path`, freeing buffers. Returns the
    *  latched errno and clears it -- errors are reported exactly once, to the
    *  fsync/close/write that observes them. */
