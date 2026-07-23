@@ -411,14 +411,14 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Configuration parameters
   u32 num_threads_ = 4;
-  // issue #807: parallel inbound SHM rings. Default 1 (single ring, identical to
-  // pre-#807 behaviour). Sharding is OPT-IN: measured on a 6-core box, S>1
-  // REGRESSED throughput (S=4 gave 4413 ops/s vs S=1's 5729 at 8 client threads)
-  // because the extra drain threads contend with workers for cores. It only pays
-  // off when client concurrency exceeds what one drain thread can service AND
-  // there are spare cores — high-core-count, high-client-count deployments.
-  // Raise via CLIO_SHM_IN_SHARDS / runtime.shm_in_shards there.
-  u32 shm_in_shards_ = 1;
+  // issue #807: parallel inbound SHM rings, ENABLED by default. 0 = auto (=
+  // worker count, so every worker drains its own shard). Since the drain is
+  // done by the EXISTING workers in their poll loop (not dedicated threads),
+  // more shards spreads ingest across the pool with no extra threads — measured
+  // worker-driven S=1 1.48x and S=4 1.68x over dev. Capped at the worker count
+  // in ServerInitShm (worker w owns shard w). CLIO_SHM_IN_SHARDS overrides;
+  // set 1 to restore a single ingest ring.
+  u32 shm_in_shards_ = 0;
   bool shm_async_send_ = false;  // issue #807: deferred SHM response send (opt-in)
   u32 shm_client_spin_us_ = 50;  // issue #807/#784: waiter spin before park
   u32 queue_depth_ = 1024;

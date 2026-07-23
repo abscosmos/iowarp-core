@@ -1073,12 +1073,13 @@ bool IpcManager::ServerInitShm() {
       // by its own thread, replacing the single ring. Spreads MPSC-tail
       // contention and deserialize+route work across cores. Each ring is sized
       // down proportionally so total inbound SHM stays ~128MB regardless of S.
-      u32 shards = CLIO_CONFIG_MANAGER->GetShmInShards();
-      if (shards < 1) shards = 1;
-      // issue #807: cap at the worker count. Worker w owns shard w, so a shard
-      // beyond the last worker would have no consumer (its clients would hang).
+      // issue #807: 0 = auto = one shard per worker (default). Worker w owns
+      // shard w, so cap at the worker count — a shard beyond the last worker
+      // would have no consumer and its clients would hang.
       u32 nworkers = CLIO_CONFIG_MANAGER->GetNumThreads();
-      if (shards > nworkers) shards = nworkers;
+      u32 shards = CLIO_CONFIG_MANAGER->GetShmInShards();
+      if (shards == 0 || shards > nworkers) shards = nworkers;
+      if (shards < 1) shards = 1;
       shm_in_shards_ = shards;
       size_t per_ring_mb = std::max<size_t>(8, 128 / shards);
       shm_in_servers_.clear();
