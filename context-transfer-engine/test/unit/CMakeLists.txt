@@ -1175,8 +1175,18 @@ add_test(NAME cfs_shm_read
     COMMAND test_cfs_shm_read
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# This test spawns a live daemon, so it inherits the macOS caveat from the CLI
+# live-runtime tests (issue #482): the local ZMQ DEALER->ROUTER control plane
+# does not deliver ClientConnect replies on the macOS runners, so drive the
+# client over the unix-socket IPC transport there.
+set(_cfs_shm_read_env
+    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
+if(APPLE)
+  string(APPEND _cfs_shm_read_env ";CLIO_IPC_MODE=ipc")
+endif()
+
 set_tests_properties(cfs_shm_read PROPERTIES
-    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+    ENVIRONMENT "${_cfs_shm_read_env}"
     RESOURCE_LOCK "clio_runtime_port"
     TIMEOUT 180
     LABELS "unit;cte;cfs;msan_skip")

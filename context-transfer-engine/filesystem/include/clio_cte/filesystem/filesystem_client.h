@@ -42,11 +42,19 @@ class Client : public clio::cte::core::Client {
     auto *alloc = ipc->GetMetadataAllocator();
     auto *dir = ipc->GetMetadataDirectory();
     if (alloc == nullptr || dir == nullptr) {
-      return false;  // no metadata segment (e.g. TCP client, remote node)
+      // No metadata segment (e.g. TCP client, remote node).
+      HLOG(kDebug, "[#817] AttachShmCache: no metadata segment (alloc={}, dir={})",
+           static_cast<const void *>(alloc), static_cast<const void *>(dir));
+      return false;
     }
     clio::run::u64 root_off = dir->FindRoot(pool_id_.ToU64());
     if (root_off == 0) {
-      return false;  // this pool is not caching
+      // Either this pool is not caching, or its chimod has not registered its
+      // root YET -- a client that raced pool creation must be able to attach
+      // later, which is why callers retry rather than latching a failure.
+      HLOG(kDebug, "[#817] AttachShmCache: no root for fs pool {} ({} entries)",
+           pool_id_.ToString(), dir->num_entries_);
+      return false;
     }
     auto *root = reinterpret_cast<ShmFsCacheRoot *>(
         reinterpret_cast<char *>(alloc) + root_off);

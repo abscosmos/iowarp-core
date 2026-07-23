@@ -52,12 +52,19 @@ bool CfsIo::QuerySize(const std::string &path, clio::run::u64 *size) {
 
 ssize_t CfsIo::TryReadShm(const std::string &path, clio::run::u64 off,
                           void *buf, size_t count) {
+  // Attach lazily, and RETRY when not yet attached, rather than latching the
+  // result of one attempt at init. A client can legitimately come up before
+  // its pool has been composed (or before the chimod has registered its cache
+  // root), and a one-shot attach at init would leave that process on the RPC
+  // path forever -- silently, since a disabled cache and a working one look
+  // identical from the outside. Retrying costs a scan of a <=32-entry
+  // directory, against an RPC that costs ~100 us.
   auto *cfs = CLIO_CFS_CLIENT;
-  if (cfs == nullptr || !cfs->HasShmCache()) {
+  if (cfs == nullptr || (!cfs->HasShmCache() && !cfs->AttachShmCache())) {
     return -1;
   }
   auto *cte = CLIO_CTE_CLIENT;
-  if (cte == nullptr || !cte->HasShmCache()) {
+  if (cte == nullptr || (!cte->HasShmCache() && !cte->AttachShmCache())) {
     return -1;  // page payloads come from the core cache; both are required
   }
 
