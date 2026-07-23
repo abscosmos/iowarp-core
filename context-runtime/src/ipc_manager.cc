@@ -3488,125 +3488,86 @@ void IpcManager::EnqueueShmSend(const std::string &dest,
     std::lock_guard<std::mutex> lk(q->mtx);
     q->pending.push_back(std::move(future));
   }
-  // Wake the sender. Publish the pending flag BEFORE notify and check it in the
-  // sender's CV predicate, so an enqueue that lands between the sender's
-  // drain-came-up-empty and its park is not lost (which would cost up to the
-  // park timeout in response latency).
-  shm_send_pending_.store(true, std::memory_order_release);
-  shm_send_wake_cv_.notify_one();
+  // No wake needed: the workers drain these queues in their poll loop
+  // (DrainShmSends), and the enqueuing worker itself will drain on its next
+  // iteration; the 50ms max_sleep cap bounds the worst case if all workers park.
 #else
   (void)dest;
   (void)future;
 #endif
 }
 
-void IpcManager::SendShmServerThread() {
+u32 IpcManager::DrainShmSends(ctp::lbm::Transport *transport, u32 budget) {
 #if CTP_IS_HOST
-  ctp::SystemInfo::SetCurrentThreadName("chi-shm-out-send");
-  // Dedicated non-worker thread that owns response serialization + transfer, so
-  // no task-processing worker ever serializes or blocks on a full client ring.
-  // Drains every destination queue in FIFO order (per-client ordering) each
-  // pass; parks on a CV when everything is empty.
+  // issue #807: called from the WORKERS' poll loop (and the shutdown flush), so
+  // deferred response send is oversubscribed onto the existing pool rather than
+  // owned by a dedicated thread. Bounded per call so one worker cannot spend a
+  // whole iteration here and starve its own lane. A no-op when the queues are
+  // empty, which is always the case on the inline-default path.
   //
-  // Its own SHM transport, created ON this thread, used only to Expose bulk
-  // descriptors while building each response archive (task_archive.cc). One
-  // sender thread => one transport => no cross-thread sharing.
-  ctp::lbm::TransportPtr send_transport = ctp::lbm::TransportFactory::Get(
-      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
-
-  // One full pass over every destination queue; returns whether it sent
-  // anything. Factored out so the shutdown path can flush remaining responses.
-  auto drain_all = [&]() -> bool {
-    bool did_work = false;
-    // Snapshot the destination list so we don't hold the map lock across a send
-    // (a send may lazily create a new dest conn, and we must not block enqueues
-    // on the map lock meanwhile).
-    std::vector<ShmSendQueue *> queues;
-    {
-      std::lock_guard<std::mutex> lk(shm_send_queues_mutex_);
-      queues.reserve(shm_send_queues_.size());
-      for (auto &kv : shm_send_queues_) queues.push_back(kv.second.get());
-    }
-    for (ShmSendQueue *q : queues) {
-      for (;;) {
-        clio::run::Future<Task> fut;
-        {
-          std::lock_guard<std::mutex> lk(q->mtx);
-          if (q->pending.empty()) break;
-          fut = std::move(q->pending.front());
-          q->pending.pop_front();
-        }
-        clio::run::shared_ptr<Task> task = fut.GetTaskPtr();
-        if (!task.IsNull()) {
-          // The actual serialize + MPSC transfer + completion, off the worker.
-          IpcCpu2Cpu::SendOutTransfer(this, task, send_transport.get());
-        }
-        did_work = true;
-        // `fut` drops here: the owning reference that kept the task alive across
-        // the async send releases, freeing the task by RAII on THIS (non-worker)
-        // thread once the worker's own ref is already gone.
+  // Multiple workers may drain concurrently: pops are atomic under each queue's
+  // mutex, and conn->Send serialises per client ring via its own send_mu_, so
+  // two workers transferring to the same client are safe. The client demuxes
+  // responses by net_key, so cross-worker delivery order does not matter.
+  u32 sent = 0;
+  std::vector<ShmSendQueue *> queues;
+  {
+    std::lock_guard<std::mutex> lk(shm_send_queues_mutex_);
+    queues.reserve(shm_send_queues_.size());
+    for (auto &kv : shm_send_queues_) queues.push_back(kv.second.get());
+  }
+  for (ShmSendQueue *q : queues) {
+    while (sent < budget) {
+      clio::run::Future<Task> fut;
+      {
+        std::lock_guard<std::mutex> lk(q->mtx);
+        if (q->pending.empty()) break;
+        fut = std::move(q->pending.front());
+        q->pending.pop_front();
       }
+      clio::run::shared_ptr<Task> task = fut.GetTaskPtr();
+      if (!task.IsNull()) {
+        IpcCpu2Cpu::SendOutTransfer(this, task, transport);
+      }
+      ++sent;
+      // `fut` drops here, freeing the task by RAII on this worker thread.
     }
-    return did_work;
-  };
-
-  size_t idle_spins = 0;
-  while (shm_send_running_.load(std::memory_order_acquire)) {
-    if (drain_all()) {
-      idle_spins = 0;
-      continue;
-    }
-    // Nothing to send. Spin briefly (low latency for a busy runtime), then park
-    // on the CV until an enqueue notifies or shutdown flips the flag.
-    if (++idle_spins < kShmSpinBudget) {
-      CTP_THREAD_MODEL->Yield();
-      continue;
-    }
-    idle_spins = 0;
-    std::unique_lock<std::mutex> lk(shm_send_wake_mutex_);
-    shm_send_wake_cv_.wait_for(lk, std::chrono::milliseconds(2), [this]() {
-      return shm_send_pending_.load(std::memory_order_acquire) ||
-             !shm_send_running_.load(std::memory_order_acquire);
-    });
-    shm_send_pending_.store(false, std::memory_order_release);
+    if (sent >= budget) break;
   }
-  // Shutdown flush: recv threads are already stopped, so drain whatever
-  // responses are still queued instead of dropping them (which would hang the
-  // waiting clients). Loop until two consecutive empty passes so a response a
-  // worker enqueued during teardown is not missed.
-  int empty_passes = 0;
-  int total_passes = 0;
-  while (empty_passes < 2 && total_passes < 10000) {
-    empty_passes = drain_all() ? 0 : empty_passes + 1;
-    ++total_passes;
-  }
-  HLOG(kInfo, "[ShmServerSendThread] shutting down");
+  return sent;
+#else
+  (void)transport;
+  (void)budget;
+  return 0;
 #endif
 }
 
 void IpcManager::StartShmServerSendThread() {
 #if CTP_IS_HOST
-  // issue #807: the background sender only exists for the opt-in async path.
-  // The default (inline) path transfers on the worker, so no thread is needed.
-  if (!CLIO_CONFIG_MANAGER->GetShmAsyncSend()) {
-    return;
-  }
-  // Only a SHM-mode runtime services SHM responses. Idempotent.
-  if (shm_send_running_.load()) {
-    return;
-  }
+  // issue #807: no dedicated sender thread. The default (inline) send transfers
+  // on the executing worker; the opt-in async send is drained by the workers via
+  // DrainShmSends in their poll loop. Kept as a no-op so the admin bring-up call
+  // site is unchanged.
   shm_send_running_.store(true, std::memory_order_release);
-  shm_send_thread_ = std::thread([this]() { SendShmServerThread(); });
-  HLOG(kInfo, "[ShmServerSendThread] started");
 #endif
 }
 
 void IpcManager::StopShmServerSendThread() {
 #if CTP_IS_HOST
   shm_send_running_.store(false, std::memory_order_release);
-  shm_send_wake_cv_.notify_all();
-  if (shm_send_thread_.joinable()) {
-    shm_send_thread_.join();
+  // Shutdown flush: workers have stopped draining, so transfer whatever
+  // responses are still queued instead of dropping them (which would hang the
+  // waiting clients). A temp transport on this thread; bounded so a pathological
+  // producer cannot hang shutdown.
+  ctp::lbm::TransportPtr flush_transport = ctp::lbm::TransportFactory::Get(
+      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
+  int empty_passes = 0;
+  int total_passes = 0;
+  while (empty_passes < 2 && total_passes < 10000) {
+    empty_passes = (DrainShmSends(flush_transport.get(), 4096) > 0)
+                       ? 0
+                       : empty_passes + 1;
+    ++total_passes;
   }
 #endif
 }

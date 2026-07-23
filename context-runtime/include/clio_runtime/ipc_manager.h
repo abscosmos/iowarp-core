@@ -1523,14 +1523,7 @@ class IpcManager {
   std::unordered_map<std::string, std::unique_ptr<ShmSendQueue>>
       shm_send_queues_;
   std::mutex shm_send_queues_mutex_;   // guards the MAP (not the per-queue FIFOs)
-  std::thread shm_send_thread_;        // single sender for now; a pool in P1b
-  std::atomic<bool> shm_send_running_{false};
-  std::mutex shm_send_wake_mutex_;
-  std::condition_variable shm_send_wake_cv_;
-  // Set by EnqueueShmSend before notify; checked in the sender's CV predicate so
-  // an enqueue that races the park is not lost (which would cost up to the park
-  // timeout in response latency).
-  std::atomic<bool> shm_send_pending_{false};
+  std::atomic<bool> shm_send_running_{false};  // #807: SHM-mode gate for flush
 
  public:
   /** Get (or lazily create) a cached MPSC client connection to `name`. Returns
@@ -1542,11 +1535,12 @@ class IpcManager {
    *  serialization or a ring transfer on the caller (worker) thread. */
   void EnqueueShmSend(const std::string &dest, clio::run::Future<Task> &&future);
 
-  /** issue #807: background sender loop — drains every per-destination queue in
-   *  order (serialize + MPSC transfer into the client's out-ring). */
-  void SendShmServerThread();
-  void StartShmServerSendThread();
-  void StopShmServerSendThread();
+  /** issue #807: drain up to `budget` deferred responses across the
+   *  per-destination queues (serialize + MPSC transfer). Called from the
+   *  WORKERS' poll loop — no dedicated sender thread. Returns the count sent. */
+  u32 DrainShmSends(ctp::lbm::Transport *transport, u32 budget);
+  void StartShmServerSendThread();  // #807: no-op (workers drain)
+  void StopShmServerSendThread();   // #807: shutdown flush
 
  private:
 #endif

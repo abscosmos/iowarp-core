@@ -284,6 +284,13 @@ void Worker::Run() {
     if (CLIO_IPC->DrainShard(worker_id_) > 0) {
       did_work_ = true;
     }
+    // issue #807: also drain any DEFERRED SHM responses (opt-in async send path)
+    // onto the client rings, using this worker's own send transport. A cheap
+    // no-op on the inline-default path (queues stay empty). Bounded so it can't
+    // starve this worker's own task processing.
+    if (CLIO_IPC->DrainShmSends(shm_send_transport_.get(), 16) > 0) {
+      did_work_ = true;
+    }
 
     // Process tasks from assigned lane
     // issue #785: re-read every iteration. The monitor thread may have moved
