@@ -3424,12 +3424,11 @@ void IpcManager::EnqueueShmSend(const std::string &dest,
     std::lock_guard<std::mutex> lk(q->mtx);
     q->pending.push_back(std::move(future));
   }
-  // Wake the sender. notify under the wake mutex so a concurrent park cannot
-  // miss it (the classic lost-wakeup: enqueue between the sender's empty-check
-  // and its wait).
-  {
-    std::lock_guard<std::mutex> lk(shm_send_wake_mutex_);
-  }
+  // Wake the sender. Publish the pending flag BEFORE notify and check it in the
+  // sender's CV predicate, so an enqueue that lands between the sender's
+  // drain-came-up-empty and its park is not lost (which would cost up to the
+  // park timeout in response latency).
+  shm_send_pending_.store(true, std::memory_order_release);
   shm_send_wake_cv_.notify_one();
 #else
   (void)dest;
@@ -3501,7 +3500,11 @@ void IpcManager::SendShmServerThread() {
     }
     idle_spins = 0;
     std::unique_lock<std::mutex> lk(shm_send_wake_mutex_);
-    shm_send_wake_cv_.wait_for(lk, std::chrono::milliseconds(2));
+    shm_send_wake_cv_.wait_for(lk, std::chrono::milliseconds(2), [this]() {
+      return shm_send_pending_.load(std::memory_order_acquire) ||
+             !shm_send_running_.load(std::memory_order_acquire);
+    });
+    shm_send_pending_.store(false, std::memory_order_release);
   }
   // Shutdown flush: recv threads are already stopped, so drain whatever
   // responses are still queued instead of dropping them (which would hang the
@@ -3519,6 +3522,11 @@ void IpcManager::SendShmServerThread() {
 
 void IpcManager::StartShmServerSendThread() {
 #if CTP_IS_HOST
+  // issue #807: the background sender only exists for the opt-in async path.
+  // The default (inline) path transfers on the worker, so no thread is needed.
+  if (!CLIO_CONFIG_MANAGER->GetShmAsyncSend()) {
+    return;
+  }
   // Only a SHM-mode runtime services SHM responses. Idempotent.
   if (shm_send_running_.load()) {
     return;

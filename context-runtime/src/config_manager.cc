@@ -198,6 +198,13 @@ void ConfigManager::ApplyEnvOverrides() {
       shm_in_shards_ = static_cast<u32>(n);
     }
   }
+
+  // issue #807: CLIO_SHM_ASYNC_SEND=1 defers SHM response send to a background
+  // thread. Off by default (see GetShmAsyncSend — 3x latency regression on
+  // latency-bound workloads).
+  if (const char *env = clio::run::env::GetCompat("SHM_ASYNC_SEND")) {
+    shm_async_send_ = (env[0] == '1' || env[0] == 't' || env[0] == 'T');
+  }
 }
 
 bool ConfigManager::ServerInit() {

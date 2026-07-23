@@ -1513,6 +1513,10 @@ class IpcManager {
   std::atomic<bool> shm_send_running_{false};
   std::mutex shm_send_wake_mutex_;
   std::condition_variable shm_send_wake_cv_;
+  // Set by EnqueueShmSend before notify; checked in the sender's CV predicate so
+  // an enqueue that races the park is not lost (which would cost up to the park
+  // timeout in response latency).
+  std::atomic<bool> shm_send_pending_{false};
 
  public:
   /** Get (or lazily create) a cached MPSC client connection to `name`. Returns

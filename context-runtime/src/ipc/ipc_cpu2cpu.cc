@@ -93,18 +93,27 @@ clio::run::shared_ptr<clio::run::Task> IpcCpu2Cpu::RecvIn(
 void IpcCpu2Cpu::SendOut(
     IpcManager *ipc, const clio::run::shared_ptr<Task> &task_ptr,
     ctp::lbm::Transport *send_transport) {
-  // issue #807: do NOT serialize or transfer on the worker. Enqueue an OWNING
-  // future onto the destination client's per-client send queue and return; the
-  // background sender thread does the work via SendOutTransfer.
+  // issue #807: two paths.
   //
-  // The owning copy is mandatory, exactly as in IpcCpu2CpuZmq::EnqueueSendOut:
-  // task_ptr->RunFuture()'s task_ptr_ may be a NON-OWNING self-handle (RouteGlobal
-  // / RouteManyToOne rebind it non-owning to break the leak cycle), so enqueuing
-  // that handle could let the task free before the sender drains it — its
-  // GetFutureShm() would then resolve through freed memory and the client's
-  // Wait() would hang. An owning copy keeps the task alive until the response is
-  // on the wire; run_ctx_->future_ stays non-owning, so no leak is added.
-  (void)send_transport;  // the sender thread owns the transport it serializes on
+  // Default (fast): serialize + transfer INLINE on the worker, right here. The
+  // client's dedicated recv thread always drains its out-ring, so this Send only
+  // ever blocks transiently under back-pressure, never deadlocks (that is what
+  // the #768 refactor's client recv thread guarantees). Measured ~3x faster than
+  // the deferred path on latency-bound workloads, because there is no thread
+  // handoff on the critical path.
+  //
+  // Opt-in (CLIO_SHM_ASYNC_SEND): enqueue an OWNING future onto the destination's
+  // per-client send queue and return nonblocking; the background sender thread
+  // does the transfer. This never stalls a worker on a full client ring, which
+  // matters under sustained overload — at a latency cost that is pure overhead
+  // when the ring is not full. The owning copy is mandatory (same non-owning
+  // self-handle hazard as IpcCpu2CpuZmq::EnqueueSendOut): RunFuture's task_ptr
+  // may be a non-owning self-handle, so we take an owning copy to keep the task
+  // alive until the sender drains it.
+  if (!CLIO_CONFIG_MANAGER->GetShmAsyncSend()) {
+    SendOutTransfer(ipc, task_ptr, send_transport);
+    return;
+  }
   clio::run::Future<Task> owning = task_ptr->RunFuture();
   owning.GetTaskPtr() = task_ptr;
   std::string dest =
