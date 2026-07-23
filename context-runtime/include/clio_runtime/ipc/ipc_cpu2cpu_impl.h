@@ -135,6 +135,15 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
   if (spin_us > 0.0 && !task_ptr->IsComplete()) {
     ctp::Timepoint spin_now;
     do {
+      // issue #807: DRAIN INLINE while spinning instead of waiting for the
+      // dedicated RecvShmClientThread to demux our response and signal us. The
+      // try-lock inside makes us the sole consumer when we win it (no concurrent
+      // Recv with the fallback thread); if another drainer holds it we just poll
+      // our own completion below. Draining here also demuxes other waiters'
+      // responses, so one active waiter serves the whole process — and it cuts
+      // the entire RecvShmClientThread wake+demux hop off the response path,
+      // which the split-timing showed dominates the round-trip.
+      ipc->DrainShmResponses();
       if (task_ptr->IsComplete()) break;
       spin_now.Now();
     } while (start.GetUsecFromStart(spin_now) < spin_us);

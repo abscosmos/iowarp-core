@@ -3287,45 +3287,11 @@ void IpcManager::RecvShmClientThread() {
   shm_out_server_.RegisterConsumer();
   size_t idle_spins = 0;
   while (shm_recv_running_.load()) {
-    bool drained_any = false;
-    // Drain everything currently available before parking.
-    while (shm_recv_running_.load()) {
-      auto archive = std::make_unique<LoadTaskArchive>();
-      ctp::lbm::ClientInfo info =
-          shm_out_server_.Recv(*archive, ctp::lbm::SHM_MPSC_DONTWAIT);
-      if (info.rc != 0) break;  // EAGAIN: nothing more in flight right now
-      drained_any = true;
-
-      if (archive->GetTaskInfos().empty()) {
-        HLOG(kError, "RecvShmClientThread: response with no task_infos");
-        continue;
-      }
-      size_t net_key = archive->GetTaskInfos()[0].task_id_.net_key_;
-
-      std::lock_guard<std::mutex> lock(pending_futures_mutex_);
-      auto it = pending_zmq_futures_.find(net_key);
-      if (it == pending_zmq_futures_.end()) {
-        ++miss_count;
-        HLOG(kError,
-             "RecvShmClientThread: no pending future for net_key {} "
-             "(received={}, misses={})",
-             net_key, recv_count, miss_count);
-        continue;
-      }
-      Task *task = it->second.task;
-      // Park the archive; RecvOut moves it out and deserializes into the task.
-      pending_response_archives_[net_key] = std::move(archive);
-      // Publish the parked archive before the waiter observes completion.
-      std::atomic_thread_fence(std::memory_order_release);
-      task->SetNewData();
-      task->SetComplete();
-      if (task->WaiterPid() != 0) {
-        ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
-                                       static_cast<int>(task->WaiterTid()));
-      }
-      pending_zmq_futures_.erase(it);
-      ++recv_count;
-    }
+    // issue #807: the shared drainer. When app threads are actively waiting they
+    // drain inline (RecvOut) and win the try-lock, so this thread mostly falls
+    // through to park; when they are parked, it wins the lock and drains for
+    // them. Either way exactly one consumer runs at a time.
+    bool drained_any = DrainShmResponses();
     if (drained_any) {
       idle_spins = 0;
     } else {
@@ -3333,6 +3299,69 @@ void IpcManager::RecvShmClientThread() {
     }
   }
   shm_out_server_.UnregisterConsumer();
+  (void)recv_count;
+  (void)miss_count;
+#endif
+}
+
+bool IpcManager::DrainShmResponses() {
+#if CTP_IS_HOST
+  if (!shm_out_server_ok_) {
+    return false;
+  }
+  // Sole-consumer gate: if another thread (a spinning waiter or this fallback
+  // thread) is already draining, back off — the caller polls its own IsComplete.
+  std::unique_lock<std::mutex> drain_lk(shm_out_drain_mutex_, std::try_to_lock);
+  if (!drain_lk.owns_lock()) {
+    return false;
+  }
+  bool any = false;
+  while (true) {
+    // Cheap check before allocating: a spinning waiter calls this every
+    // iteration, so allocating a LoadTaskArchive only to hit EAGAIN on an empty
+    // ring dominated the spin (measured +7us). IsEmpty is two atomic loads and
+    // is safe here — we hold the sole-consumer lock.
+    if (shm_out_server_.IsEmpty()) {
+      break;
+    }
+    auto archive = std::make_unique<LoadTaskArchive>();
+    ctp::lbm::ClientInfo info =
+        shm_out_server_.Recv(*archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+    if (info.rc != 0) {
+      break;  // EAGAIN: nothing more in flight right now
+    }
+    any = true;
+    if (archive->GetTaskInfos().empty()) {
+      HLOG(kError, "DrainShmResponses: response with no task_infos");
+      continue;
+    }
+    size_t net_key = archive->GetTaskInfos()[0].task_id_.net_key_;
+
+    std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+    auto it = pending_zmq_futures_.find(net_key);
+    if (it == pending_zmq_futures_.end()) {
+      HLOG(kError, "DrainShmResponses: no pending future for net_key {}",
+           net_key);
+      continue;
+    }
+    Task *task = it->second.task;
+    // Park the archive; RecvOut moves it out and deserializes into the task.
+    // Demuxing here (not just for our own net_key) is what lets one draining
+    // waiter serve every waiter's response.
+    pending_response_archives_[net_key] = std::move(archive);
+    // Publish the parked archive before the waiter observes completion.
+    std::atomic_thread_fence(std::memory_order_release);
+    task->SetNewData();
+    task->SetComplete();
+    if (task->WaiterPid() != 0) {
+      ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
+                                     static_cast<int>(task->WaiterTid()));
+    }
+    pending_zmq_futures_.erase(it);
+  }
+  return any;
+#else
+  return false;
 #endif
 }
 

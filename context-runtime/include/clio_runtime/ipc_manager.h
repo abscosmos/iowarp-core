@@ -930,6 +930,15 @@ class IpcManager {
    */
   void RecvShmClientThread();
 
+  /** issue #807: drain + demux available SHM responses off the client out-ring,
+   *  under a try-lock so exactly one thread consumes at a time. Called BOTH by a
+   *  waiter spinning in RecvOut (inline fast path) and by RecvShmClientThread
+   *  (fallback when waiters are parked). Returns true if it drained anything;
+   *  false if another thread holds the drain lock (caller just polls its own
+   *  completion) or the ring was empty. Sets IsComplete + stashes the archive
+   *  for every response it demuxes, so one draining waiter serves all waiters. */
+  bool DrainShmResponses();
+
   /**
    * Runtime-side thread that drains the single inbound SHM ring
    * (shm_in_server_) in SHM mode, deserializing each client task and pushing it
@@ -1504,6 +1513,11 @@ class IpcManager {
   bool shm_in_server_ok_ = false;
   ctp::lbm::ShmMpscTransport shm_out_server_;
   bool shm_out_server_ok_ = false;
+  // issue #807: serialises out-ring consumption. The out-ring is single-consumer
+  // (recv_conns_ reassembly state is shared, not thread-local), so a waiter that
+  // drains inline (RecvOut spin) and the fallback RecvShmClientThread must never
+  // Recv concurrently — whoever holds this try-lock is the sole consumer.
+  std::mutex shm_out_drain_mutex_;
 
   // issue #807 D2: nonblocking, ordered, PER-DESTINATION response send.
   //
