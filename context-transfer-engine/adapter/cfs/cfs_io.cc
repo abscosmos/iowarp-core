@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <utility>
 
 namespace clio::cae {
@@ -110,6 +111,18 @@ ssize_t CfsIo::TryReadShm(const std::string &path, clio::run::u64 off,
     done += to_read;
     cur += to_read;
   }
+
+  // Say so, once, the first time a read is actually served from shared
+  // memory. "The fast path is on" is otherwise unobservable from outside --
+  // a disabled cache and a working one differ only in latency -- and the
+  // failure this whole change was chasing was precisely a fast path that was
+  // silently off everywhere. Operators need something to grep for.
+  static std::once_flag announced;
+  std::call_once(announced, [] {
+    HLOG(kInfo,
+         "clio-fs: serving reads from shared memory (zero-IPC fast path "
+         "active)");
+  });
   return static_cast<ssize_t>(done);
 }
 
