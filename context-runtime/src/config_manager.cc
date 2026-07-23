@@ -63,15 +63,8 @@ namespace {
  * a config file should not take the runtime down, and the recognised suffixes
  * are checked here first.
  */
-bool ParseSegmentSizeNode(const YAML::Node &node, const char *key,
+bool ParseSegmentSizeText(const std::string &text, const char *key,
                           size_t &out) {
-  std::string text;
-  try {
-    text = node.as<std::string>();
-  } catch (const std::exception &) {
-    HLOG(kError, "Config: {} is not a scalar value; ignoring", key);
-    return false;
-  }
   if (text.empty()) {
     HLOG(kError, "Config: {} is empty; ignoring", key);
     return false;
@@ -120,6 +113,19 @@ bool ParseSegmentSizeNode(const YAML::Node &node, const char *key,
       (!suffix.empty() && suffix[0] == 'b') ? text.substr(0, i) : text;
   out = static_cast<size_t>(ctp::ConfigParse::ParseSize(for_parse));
   return true;
+}
+
+/** YAML wrapper over ParseSegmentSizeText — same semantics for config keys. */
+bool ParseSegmentSizeNode(const YAML::Node &node, const char *key,
+                          size_t &out) {
+  std::string text;
+  try {
+    text = node.as<std::string>();
+  } catch (const std::exception &) {
+    HLOG(kError, "Config: {} is not a scalar value; ignoring", key);
+    return false;
+  }
+  return ParseSegmentSizeText(text, key, out);
 }
 
 }  // namespace
@@ -212,6 +218,17 @@ void ConfigManager::ApplyEnvOverrides() {
     unsigned long n = std::strtoul(env, &end, 10);
     if (end != env) {
       shm_client_spin_us_ = static_cast<u32>(n);
+    }
+  }
+
+  // issue #727: CLIO_MAIN_SEGMENT_SIZE bounds the main task-data segment
+  // (byte count or size string, e.g. "512m"). Last word after any config
+  // file, so a deployment can cap the daemon's footprint without editing
+  // yaml; 0 restores the auto default.
+  if (const char *env = clio::run::env::GetCompat("MAIN_SEGMENT_SIZE")) {
+    size_t parsed = 0;
+    if (ParseSegmentSizeText(env, "CLIO_MAIN_SEGMENT_SIZE", parsed)) {
+      main_segment_size_ = parsed;
     }
   }
 }
@@ -435,6 +452,21 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
       }
     }
 
+    // Size of the main task-data segment (issue #727): FutureShm + task
+    // payload allocations (BuddyAllocator). Accepts a byte count or a size
+    // string ("512m", "1g"); 0 restores the auto default. Tunable because
+    // this segment dominates the daemon's commit charge on Windows and the
+    // shmem live-set exposure in memory-limited containers regardless of
+    // actual data volume — the previous flat 1 GiB could be several times
+    // an embedded deployment's whole budget.
+    if (runtime["main_segment_size"]) {
+      size_t parsed = 0;
+      if (ParseSegmentSizeNode(runtime["main_segment_size"],
+                               "main_segment_size", parsed)) {
+        main_segment_size_ = parsed;
+      }
+    }
+
     // Note: stack_size parameter removed (was never used)
     // Note: heartbeat_interval parsing removed (not used by runtime)
   }
@@ -576,14 +608,18 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
 }
 
 size_t ConfigManager::CalculateMainSegmentSize() const {
-  // If main_segment_size is explicitly set (non-zero), use it
+  // Explicit (yaml main_segment_size / CLIO_MAIN_SEGMENT_SIZE) wins verbatim.
   if (main_segment_size_ > 0) {
     return main_segment_size_;
   }
 
-  // Main segment holds task data (FutureShm, BuddyAllocator metadata) — no queues
-  // Use 1 GB default for task/data allocations
-  return ctp::Unit<size_t>::Gigabytes(1);
+  // 0 = auto. The main segment holds task data (FutureShm, BuddyAllocator
+  // metadata); the actual size is decided at the creation site
+  // (IpcManager::ServerInitShm), which knows the process's real memory
+  // budget — cgroup-aware, not host RAM (issue #727). Returning the sentinel
+  // instead of a flat 1 GiB keeps this config-layer function free of
+  // platform introspection.
+  return 0;
 }
 
 size_t ConfigManager::CalculateMetadataSegmentSize() const {

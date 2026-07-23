@@ -248,4 +248,68 @@ TEST_CASE("IpcInternals - ConfigManager yaml sections and env overrides",
   fs::remove(empty_cfg);
 }
 
+TEST_CASE("IpcInternals - main segment size is configurable (issue #727)",
+          "[ipc][config]") {
+  EnsureInitialized();
+  auto *config = CLIO_CONFIG_MANAGER;
+  REQUIRE(config != nullptr);
+
+  fs::path cfg = fs::temp_directory_path() / "clio_test_mainseg_cfg.yaml";
+
+  SECTION("yaml size string is honored verbatim");
+  {
+    std::ofstream f(cfg);
+    f << "runtime:\n  main_segment_size: \"256m\"\n";
+  }
+  REQUIRE(config->LoadYaml(cfg.string()));
+  REQUIRE(config->CalculateMainSegmentSize() ==
+          ctp::Unit<size_t>::Megabytes(256));
+
+  SECTION("bare byte count is honored");
+  {
+    std::ofstream f(cfg);
+    f << "runtime:\n  main_segment_size: 134217728\n";
+  }
+  REQUIRE(config->LoadYaml(cfg.string()));
+  REQUIRE(config->CalculateMainSegmentSize() ==
+          ctp::Unit<size_t>::Megabytes(128));
+
+  SECTION("0 selects the auto default (sized at segment creation)");
+  {
+    std::ofstream f(cfg);
+    f << "runtime:\n  main_segment_size: 0\n";
+  }
+  REQUIRE(config->LoadYaml(cfg.string()));
+  REQUIRE(config->CalculateMainSegmentSize() == 0);
+
+  SECTION("an unparseable value keeps the default instead of dying");
+  {
+    std::ofstream f(cfg);
+    f << "runtime:\n  main_segment_size: \"lots\"\n";
+  }
+  REQUIRE(config->LoadYaml(cfg.string()));
+  REQUIRE(config->CalculateMainSegmentSize() == 0);
+
+  SECTION("CLIO_MAIN_SEGMENT_SIZE env wins over yaml");
+  {
+    std::ofstream f(cfg);
+    f << "runtime:\n  main_segment_size: \"256m\"\n";
+  }
+  ctp::SystemInfo::Setenv("CLIO_MAIN_SEGMENT_SIZE", "128m", 1);
+  REQUIRE(config->LoadYaml(cfg.string()));
+  config->ApplyEnvOverrides();
+  ctp::SystemInfo::Unsetenv("CLIO_MAIN_SEGMENT_SIZE");
+  REQUIRE(config->CalculateMainSegmentSize() ==
+          ctp::Unit<size_t>::Megabytes(128));
+
+  // Restore default-ish config for any later singleton users (LoadYaml
+  // resets to defaults first, so omitting the key restores auto).
+  {
+    std::ofstream f(cfg);
+    f << "runtime:\n  num_threads: 2\n";
+  }
+  (void)config->LoadYaml(cfg.string());
+  fs::remove(cfg);
+}
+
 SIMPLE_TEST_MAIN()
