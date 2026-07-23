@@ -731,12 +731,24 @@ void Worker::SuspendMe() {
                          : std::min(static_cast<int>(suspend_period_us),
                                     static_cast<int>(max_sleep));
 
-    // issue #807: announce to producing clients that we are about to park, so
-    // their SignalConsumerIfParked wakes us. Publish BEFORE the wait; a request
-    // that lands after this still SIGUSR1s us out of the Wait (or the max_sleep
-    // cap re-polls). Cleared immediately on wake so a send during processing
-    // does not waste a signal.
+    // issue #807: park protocol for the inbound SHM shard. The ORDER is
+    // load-bearing and must match the transport's documented rendezvous:
+    // publish "parked" BEFORE the final empty re-check, so it interlocks with a
+    // producer that does "reserve slot (tail++) THEN check consumer_parked_".
+    // The store(parked) and the load(tail, via ShardEmpty) form a Dekker
+    // StoreLoad pair — if a request landed after our earlier fast-path check, we
+    // now either observe its slot here (and skip the park) or it observes us
+    // parked (and signals). Doing the re-check BEFORE setting parked (as an
+    // earlier cut did) loses the wakeup: the producer pushes in the gap, sees
+    // parked==0, skips the signal, and we park anyway — bounded only by the
+    // 50ms max_sleep re-poll, which under the ARM weak-memory model fires
+    // constantly and crawled cr_cli_cfs_parallel_stress into its timeout (x86
+    // TSO mostly hid it).
     CLIO_IPC->SetShardParked(worker_id_, true);
+    if (!CLIO_IPC->ShardEmpty(worker_id_)) {
+      CLIO_IPC->SetShardParked(worker_id_, false);
+      return;  // a request arrived during/before the park setup — go drain it
+    }
     // Wait for signal using EventManager
     int nfds = event_manager_.Wait(timeout_us);
     CLIO_IPC->SetShardParked(worker_id_, false);
