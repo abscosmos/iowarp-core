@@ -3336,42 +3336,9 @@ void IpcManager::RecvShmClientThread() {
 #endif
 }
 
-void IpcManager::RecvShmServerThread(u32 shard) {
-#if CTP_IS_HOST
-  ctp::SystemInfo::SetCurrentThreadName("chi-shm-in-recv");
-  if (shard >= shm_in_servers_.size() || shm_in_servers_[shard] == nullptr) {
-    return;
-  }
-  ctp::lbm::ShmMpscTransport &ring = *shm_in_servers_[shard];
-  // Runtime-side analogue of the ZMQ ClientRecvThread. This thread is the
-  // inbound ring's single consumer, which is the whole reason the schedulers
-  // and Worker need no knowledge of it: there is no "which worker drains it"
-  // question to answer. IpcCpu2Cpu::RecvIn deserializes one task per call and
-  // pushes it onto a scheduler-chosen lane.
-  // Same rendezvous as the client drainer: our signalfd EventManager (which
-  // blocks SIGUSR1 on this thread) plus publishing our tid in the ring header
-  // so producing clients know whom to wake.
-  ctp::lbm::EventManager *em = &GetTls()->event_manager_;
-  ring.RegisterConsumer();
-  size_t idle_spins = 0;
-  while (shm_in_recv_running_.load(std::memory_order_acquire)) {
-    bool drained_any = false;
-    // Drain everything currently queued before parking, so a burst is ingested
-    // in one pass rather than one task per wakeup.
-    while (shm_in_recv_running_.load(std::memory_order_acquire) &&
-           IpcCpu2Cpu::RecvIn(this, shard)) {
-      drained_any = true;
-    }
-    if (drained_any) {
-      idle_spins = 0;
-    } else {
-      ShmDrainIdle(ring, em, idle_spins);
-    }
-  }
-  ring.UnregisterConsumer();
-  HLOG(kInfo, "[ShmServerRecvThread] shard {} shutting down", shard);
-#endif
-}
+// issue #807: RecvShmServerThread removed — workers drain shards inline
+// (Worker::DrainMyShard). No dedicated inbound drain thread exists.
+
 
 void IpcManager::StartShmServerRecvThread() {
 #if CTP_IS_HOST
@@ -3417,26 +3384,6 @@ void IpcManager::UnregisterShardConsumer(u32 worker_id) {
   shm_in_servers_[worker_id]->UnregisterConsumer();
 #else
   (void)worker_id;
-#endif
-}
-
-u32 IpcManager::DrainShard(u32 worker_id) {
-#if CTP_IS_HOST
-  if (!shm_in_server_ok_ || worker_id >= shm_in_servers_.size() ||
-      shm_in_servers_[worker_id] == nullptr) {
-    return 0;
-  }
-  // Bounded batch so a burst on one shard can't starve the worker's own lane /
-  // blocked-queue processing in the same poll iteration.
-  constexpr u32 kShardDrainBudget = 16;
-  u32 n = 0;
-  while (n < kShardDrainBudget && IpcCpu2Cpu::RecvIn(this, worker_id)) {
-    ++n;
-  }
-  return n;
-#else
-  (void)worker_id;
-  return 0;
 #endif
 }
 

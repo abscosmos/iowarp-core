@@ -938,7 +938,6 @@ class IpcManager {
    * scheduler needs to know the ring exists: this thread IS the ring's single
    * consumer.
    */
-  void RecvShmServerThread(u32 shard);  // #807: drains shm_in_servers_[shard]
 
   // issue #807: WORKER-DRIVEN inbound shard draining. Instead of dedicated drain
   // threads (which oversubscribe cores on a small box — the whole reason the
@@ -950,9 +949,9 @@ class IpcManager {
   // push does.
   void RegisterShardConsumer(u32 worker_id);    // publish worker tid on its ring
   void UnregisterShardConsumer(u32 worker_id);  // withdraw at worker exit
-  u32 DrainShard(u32 worker_id);                // drain owned ring (bounded)
   bool ShardEmpty(u32 worker_id) const;         // park-recheck
   void SetShardParked(u32 worker_id, bool parked);  // park protocol
+  // Worker w drains + executes its own shard inline — see Worker::DrainMyShard.
 
   /**
    * Start RecvShmServerThread. Called once from the admin ChiMod's Create,

@@ -11,35 +11,38 @@
 
 namespace clio::run {
 
-bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, u32 shard) {
-  // Drain ONE inbound shard ring (shm_in_servers_[shard], DONTWAIT) and enqueue
-  // any received external-client task onto the normal dispatch path. issue #807:
-  // there are now S shard rings, each with its own dedicated drain thread, so
-  // each ring still has exactly one consumer — the MPSC single-consumer contract
-  // holds per shard — and S clients-worth of deserialize+route runs on S cores.
+Future<Task> IpcCpu2Cpu::RecvIn(IpcManager *ipc, u32 shard) {
+  // Drain ONE task off inbound shard ring `shard` (DONTWAIT) and return it as a
+  // resolved Future for the CALLING WORKER to route + execute INLINE. issue #807:
+  // the ingesting worker executes the request itself (when it maps here) instead
+  // of pushing to a lane and SIGUSR1-waking a worker — that lane round-trip and
+  // per-request signal syscall were the bulk of the added latency vs the
+  // original inline design. Returns an empty Future (get()==nullptr) when the
+  // ring is empty. Each shard has exactly one consumer (worker `shard`), so the
+  // MPSC contract holds.
   if (!ipc->shm_in_server_ok_ || shard >= ipc->shm_in_servers_.size() ||
       ipc->shm_in_servers_[shard] == nullptr) {
-    return false;
+    return Future<Task>();
   }
   LoadTaskArchive archive;
   ctp::lbm::ClientInfo info =
       ipc->shm_in_servers_[shard]->Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
   if (info.rc != 0) {
-    return false;
+    return Future<Task>();
   }
   const auto &tis = archive.GetTaskInfos();
   if (tis.empty()) {
-    return false;
+    return Future<Task>();
   }
   const auto &ti = tis[0];
   auto container = CLIO_POOL_MANAGER->GetStaticContainer(ti.pool_id_).get();
   if (container == nullptr) {
-    return false;
+    return Future<Task>();
   }
   clio::run::shared_ptr<clio::run::Task> tp =
       container->AllocLoadTask(ti.method_id_, archive);
   if (tp.IsNull()) {
-    return false;
+    return Future<Task>();
   }
   tp->SetFlags(TASK_EXTERNAL_CLIENT);
   // The Future owns the FutureShm via shared_ptr; pushing it onto the lane
@@ -66,19 +69,8 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, u32 shard) {
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   f.GetTaskPtr()->BeginRunContext();
-  // issue #807: deposit on the DRAINING worker's own lane (shard k is drained by
-  // worker k), not a shared ingress lane 0. The worker that deserialized the
-  // task also routes it, so both halves parallelise across the pool instead of
-  // funnelling every shard's traffic through lane 0. RuntimeMapTask still
-  // re-routes from here if a different worker is a better fit. Bounded to the
-  // lane count defensively. Always signal: see ipc_cpu2cpu_impl.h for the
-  // enqueue/sleep race this closes.
-  u32 num_lanes = ipc->GetTaskQueue()->GetNumLanes();
-  LaneId lane_id = (num_lanes > 0) ? (shard % num_lanes) : 0;
-  auto &lane_ref = ipc->GetTaskQueue()->GetLane(lane_id, 0);
-  lane_ref.Push(f);
-  ipc->AwakenWorker(&lane_ref);
-  return true;
+  // Return the resolved future; the calling worker routes + executes it inline.
+  return f;
 }
 
 clio::run::shared_ptr<clio::run::Task> IpcCpu2Cpu::RecvIn(

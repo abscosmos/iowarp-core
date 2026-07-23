@@ -37,7 +37,10 @@ struct IpcCpu2Cpu {
    * scheduler involvement is needed to establish it.
    * @return true if a task was received and enqueued.
    */
-  static bool RecvIn(IpcManager *ipc, u32 shard);  // #807: drains shard ring
+  // #807: pop one task off shard ring `shard`, deserialize it, and return it as
+  // a resolved Future for the calling worker to route + execute INLINE. Empty
+  // Future (get()==nullptr) when the ring has nothing. No lane push, no wakeup.
+  static Future<Task> RecvIn(IpcManager *ipc, u32 shard);
 
   /** Deserialize task from SHM ring buffer on runtime side (inbound). */
   static clio::run::shared_ptr<clio::run::Task> RecvIn(

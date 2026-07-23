@@ -278,10 +278,9 @@ void Worker::Run() {
     task_did_work_ = false;  // Reset task-level work tracker
 
     // issue #807: drain THIS worker's inbound SHM shard ring (worker w owns
-    // shard w). Deserialize+route runs on the existing workers — oversubscribed
-    // — instead of on dedicated drain threads that would contend for cores. A
-    // no-op for workers that own no shard and for non-SHM runtimes.
-    if (CLIO_IPC->DrainShard(worker_id_) > 0) {
+    // shard w) and execute each request INLINE — no lane round-trip, no
+    // per-request wakeup. A no-op for workers that own no shard / non-SHM.
+    if (DrainMyShard() > 0) {
       did_work_ = true;
     }
     // issue #807: also drain any DEFERRED SHM responses (opt-in async send path)
@@ -530,6 +529,16 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     return true;
   }
 
+  // Bind + route + execute (shared with the inline SHM-ingest path).
+  RouteAndExec(future, lane);
+  return true;
+}
+
+void Worker::RouteAndExec(Future<Task> &future, TaskLane *lane) {
+  clio::run::shared_ptr<Task> task_full_ptr = future.GetTaskPtr();
+  if (task_full_ptr.IsNull()) {
+    return;
+  }
   // The RunContext (with its container resolved) was allocated by the ipc
   // receive/send site that introduced this task (Task::BeginRunContext). Bind it
   // to THIS worker/lane and record the future so subtask-completion events and
@@ -550,8 +559,35 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     ExecTask(task_full_ptr, is_started);
 #endif
   }
+}
 
-  return true;
+u32 Worker::DrainMyShard() {
+#if CTP_IS_HOST
+  // issue #807: pop requests off this worker's inbound SHM shard and execute
+  // each INLINE — bind, route, and (when it maps here, the common case for a
+  // quick local task) run it right here, then the response is sent inline. No
+  // lane push, no per-request AwakenWorker SIGUSR1: those were the bulk of the
+  // latency gap vs the original inline design. A task that maps elsewhere is
+  // enqueued by RouteTask as usual.
+  constexpr u32 kShardDrainBudget = 16;
+  TaskLane *my_lane = assigned_lane_.load(std::memory_order_acquire);
+  u32 n = 0;
+  while (n < kShardDrainBudget) {
+    Future<Task> f = IpcCpu2Cpu::RecvIn(CLIO_IPC, worker_id_);
+    if (f.get() == nullptr) {
+      break;  // shard empty
+    }
+    // Bind + route + execute. RuntimeMapTask decides whether this ingesting
+    // worker keeps the task (inline, the quick-local common case) or routes it
+    // to another worker (heavy tasks), so all placement policy stays in the
+    // scheduler.
+    RouteAndExec(f, my_lane);
+    ++n;
+  }
+  return n;
+#else
+  return 0;
+#endif
 }
 
 double Worker::GetSuspendPeriod() const {
