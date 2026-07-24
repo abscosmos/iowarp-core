@@ -103,6 +103,13 @@ add_executable(test_concurrent_same_blob
     test_concurrent_same_blob.cc
 )
 
+# Vectored PutBlob/GetBlob (#820): N regions in one task, one write-token
+# acquire. Asserts equivalence with N single puts, list-order overlap
+# resolution, and union-range allocation.
+add_executable(test_vectored_blob_io
+    test_vectored_blob_io.cc
+)
+
 # Parallel blob-metadata overlap stress: many threads race
 # PutBlob/GetBlob/DelBlob/GetBlobInfo over only 4 tags x 4 blobs (heavy
 # overlap). Success = no crashes, hangs, or leaks.
@@ -365,6 +372,18 @@ target_include_directories(test_concurrent_io_stress PRIVATE
 
 # Link test_concurrent_same_blob (#680 same-blob write race) - same deps.
 target_link_libraries(test_concurrent_same_blob
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# Link test_vectored_blob_io (#820 vectored blob I/O) - same deps.
+target_link_libraries(test_vectored_blob_io
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime

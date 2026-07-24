@@ -1432,14 +1432,47 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     ctp::ipc::ShmPtr<> blob_data = task->blob_data_;
     float blob_score = task->score_;
 
+    // Vectored put (issue #820): the task carries N regions instead of one.
+    // Everything from here to the data write treats the blob as if a single
+    // write covered the UNION of the segments — the extend/resize must cover
+    // every region, and the sparse-hole fill keys off the union's start — and
+    // only the data write itself fans back out per segment, under the one write
+    // token this whole body already holds. That is the entire point: N regions,
+    // one token acquire, one metadata mutation.
+    bool vectored = false;
+    if constexpr (TaskT::kSupportsVectored) {
+      vectored = !task->segments_.empty();
+      if (vectored) {
+        clio::run::u64 lo = ~static_cast<clio::run::u64>(0);
+        clio::run::u64 hi = 0;
+        for (size_t i = 0; i < task->segments_.size(); ++i) {
+          const auto &seg = task->segments_[i];
+          if (seg.size_ == 0) {
+            task->return_code_ = 2;
+            CLIO_CO_RETURN;
+          }
+          if (seg.data_.IsNull() && !task->context_.emulate_) {
+            task->return_code_ = 3;
+            CLIO_CO_RETURN;
+          }
+          if (seg.blob_off_ < lo) lo = seg.blob_off_;
+          if (seg.blob_off_ + seg.size_ > hi) hi = seg.blob_off_ + seg.size_;
+        }
+        offset = lo;
+        size = hi - lo;
+      }
+    }
+
     // Validate inputs
     if (size == 0) {
       task->return_code_ = 2;
       CLIO_CO_RETURN;
     }
     // Emulated puts (issue #747) skip the data write AND its wire transfer,
-    // so on a cross-node receiver blob_data_ is legitimately null.
-    if (blob_data.IsNull() && !task->context_.emulate_) {
+    // so on a cross-node receiver blob_data_ is legitimately null. A vectored
+    // task validated its per-segment buffers above and leaves blob_data_ null
+    // by construction, so it is exempt from this single-region check.
+    if (!vectored && blob_data.IsNull() && !task->context_.emulate_) {
       task->return_code_ = 3;
       CLIO_CO_RETURN;
     }
@@ -1608,13 +1641,45 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         }
       }
 
-      // Step 3: ModifyExistingData — write data to blocks
+      // Step 3: ModifyExistingData — write data to blocks.
       clio::run::u32 write_result = 0;
-      CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_, blob_data, size,
-                                  offset, write_result, hint_idx, hint_off));
-      if (write_result != 0) {
-        task->return_code_ = 20 + write_result;
-        CLIO_CO_RETURN;
+      if constexpr (TaskT::kSupportsVectored) {
+       if (vectored) {
+        // One region at a time, but all of them inside the single write-token
+        // acquire above (issue #820). IN LIST ORDER, which is what makes two
+        // segments covering the same bytes resolve last-writer-wins — the
+        // ordering guarantee the #680 token race does NOT provide when the same
+        // writes arrive as separate tasks racing for the token.
+        //
+        // hint_idx/hint_off stay valid for every segment: they are only set
+        // when the union offset is at/after old_blob_size (a pure append
+        // batch), in which case every segment starts at/after hint_off too, so
+        // the block-scan hint can never skip past a segment's blocks.
+        for (size_t i = 0; i < task->segments_.size(); ++i) {
+          const auto &seg = task->segments_[i];
+          CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_, seg.data_,
+                                      seg.size_, seg.blob_off_, write_result,
+                                      hint_idx, hint_off));
+          if (write_result != 0) {
+            task->return_code_ = 20 + write_result;
+            CLIO_CO_RETURN;
+          }
+        }
+       } else {
+        CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_, blob_data, size,
+                                    offset, write_result, hint_idx, hint_off));
+        if (write_result != 0) {
+          task->return_code_ = 20 + write_result;
+          CLIO_CO_RETURN;
+        }
+       }
+      } else {
+        CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_, blob_data, size,
+                                    offset, write_result, hint_idx, hint_off));
+        if (write_result != 0) {
+          task->return_code_ = 20 + write_result;
+          CLIO_CO_RETURN;
+        }
       }
     }
 

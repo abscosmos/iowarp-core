@@ -463,6 +463,56 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Vectored put (issue #820): write N regions of one blob in a SINGLE task.
+   *
+   * The runtime acquires the blob's write token once, sizes the blob to cover
+   * the union of the regions, and applies each region in list order — so N
+   * disjoint writes to one blob cost one token acquire and one metadata
+   * mutation instead of N of each, and two regions covering the same bytes
+   * resolve last-writer-wins (which N racing single-region tasks do not).
+   *
+   * Each segment keeps its own buffer, so callers never have to gather their
+   * payloads into one contiguous allocation. Node-local: the segment buffers
+   * are shared-memory pointers, so submit this to a local pool.
+   */
+  clio::run::Future<PutBlobTask> AsyncPutBlobVectored(
+      const TagId &tag_id,
+      const char *blob_name,
+      const std::vector<BlobSegment> &segments, float score = -1.0f,
+      const Context &context = Context(),
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    // offset/size/data stay zero-valued: segments_ is authoritative when set,
+    // and the runtime derives the union range from it.
+    auto task = ipc_manager->NewTask<PutBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+        blob_name, static_cast<clio::run::u64>(0), static_cast<clio::run::u64>(0),
+        ctp::ipc::ShmPtr<>::GetNull(), score, context, flags);
+    auto *t = task.get();
+    for (const auto &seg : segments) {
+      t->segments_.push_back(BlobSegment(seg.blob_off_, seg.size_, seg.data_));
+    }
+    t->submit_ts_ns_ =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    return ipc_manager->Send(task);
+  }
+
+  /** std::string overload */
+  clio::run::Future<PutBlobTask> AsyncPutBlobVectored(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      const std::vector<BlobSegment> &segments, float score = -1.0f,
+      const Context &context = Context(),
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    return AsyncPutBlobVectored(tag_id, blob_name.c_str(), segments, score,
+                                context, flags, pool_query);
+  }
+
+  /**
    * Asynchronous get blob - returns immediately
    * @param tag_id Tag ID
    * @param blob_name Name of the blob

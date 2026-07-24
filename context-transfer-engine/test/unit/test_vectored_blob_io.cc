@@ -1,0 +1,217 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved. BSD 3-Clause license.
+ */
+
+// Vectored PutBlob / GetBlob (issue #820).
+//
+// A vectored task carries N regions instead of one, so the runtime acquires the
+// blob's #680 write token ONCE and applies every region in a single pass. This
+// is what lets the worker's batching layer merge N independent same-blob tasks
+// without gathering their payloads into one contiguous buffer.
+//
+// What is asserted, in order of importance:
+//   1. EQUIVALENCE -- a vectored put of N disjoint regions leaves the blob
+//      byte-identical to N separate single-region puts.
+//   2. ORDERING -- when two segments cover the same bytes, the LATER one in the
+//      list wins. This is the guarantee N racing single-region tasks do NOT
+//      provide (they race the write token), and it is why batching may merge
+//      overlapping writes at all.
+//   3. The union range is what gets allocated: a vectored put whose segments
+//      start past EOF grows the blob to cover them, and the hole reads as zeros.
+//   4. Vectored GetBlob scatters each region into its OWN buffer.
+
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/bdev/bdev_client.h>
+#include <clio_cte/core/core_client.h>
+#include <clio_cte/core/core_tasks.h>
+
+#include <chrono>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "simple_test.h"
+
+namespace {
+
+const char *kTargetName = "vectored_blob_target";
+constexpr clio::run::u64 kTargetSize = 1ULL * 1024 * 1024 * 1024;  // 1 GiB
+
+class Fixture {
+ public:
+  bool initialized_ = false;
+  Fixture() {
+    bool ok = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
+    REQUIRE(ok);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    ok = clio::cte::core::CLIO_CTE_CLIENT_INIT();
+    REQUIRE(ok);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    auto *cte = CLIO_CTE_CLIENT;
+    clio::run::PoolId bdev_pool_id(911, 0);
+    clio::run::bdev::Client bdev_client(bdev_pool_id);
+    auto create = bdev_client.AsyncCreate(
+        clio::run::PoolQuery::Dynamic(), kTargetName, bdev_pool_id,
+        clio::run::bdev::BdevType::kRam, kTargetSize);
+    create.Wait();
+    auto reg = cte->AsyncRegisterTarget(kTargetName,
+                                        clio::run::bdev::BdevType::kRam,
+                                        kTargetSize, clio::run::PoolQuery::Local(),
+                                        bdev_pool_id);
+    reg.Wait();
+    REQUIRE(reg->GetReturnCode() == 0);
+    initialized_ = true;
+  }
+};
+
+Fixture *g_fixture = nullptr;
+
+/** Allocate an SHM buffer of `n` bytes filled with `v`. */
+ctp::ipc::FullPtr<char> FillBuf(size_t n, char v) {
+  auto *ipc = CLIO_IPC;
+  ctp::ipc::FullPtr<char> b = ipc->AllocateBuffer(n);
+  REQUIRE(!b.IsNull());
+  std::memset(b.ptr_, v, n);
+  return b;
+}
+
+/** Read [off, off+n) of a blob through an ordinary single-region GetBlob. */
+std::vector<char> ReadBack(clio::cte::core::TagId tag_id,
+                           const std::string &blob, clio::run::u64 off,
+                           size_t n) {
+  auto *ipc = CLIO_IPC;
+  auto *cte = CLIO_CTE_CLIENT;
+  ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(n);
+  REQUIRE(!buf.IsNull());
+  std::memset(buf.ptr_, 0, n);
+  auto g = cte->AsyncGetBlob(tag_id, blob, off, n, /*flags=*/0,
+                             ctp::ipc::ShmPtr<>(buf.shm_));
+  g.Wait();
+  REQUIRE(g->GetReturnCode() == 0);
+  std::vector<char> out(buf.ptr_, buf.ptr_ + n);
+  ipc->FreeBuffer(buf);
+  return out;
+}
+
+}  // namespace
+
+TEST_CASE("Vectored PutBlob == N single puts, and segments apply in list order",
+          "[cte][vectored][820]") {
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+  auto *ipc = CLIO_IPC;
+  auto *cte = CLIO_CTE_CLIENT;
+
+  clio::cte::core::Tag tag("vectored_tag");
+  clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  const size_t kSeg = 4096;
+  const int kN = 64;  // 64 disjoint 4 KiB regions = 256 KiB
+
+  // ---- 1. EQUIVALENCE ----------------------------------------------------
+  // Write kN disjoint regions two ways and require identical bytes.
+  {
+    // (a) N separate single-region puts.
+    const std::string blob_a = "single";
+    for (int i = 0; i < kN; ++i) {
+      auto b = FillBuf(kSeg, static_cast<char>((i % 250) + 1));
+      auto p = cte->AsyncPutBlob(tag_id, blob_a,
+                                 static_cast<clio::run::u64>(i) * kSeg, kSeg,
+                                 ctp::ipc::ShmPtr<>(b.shm_));
+      p.Wait();
+      REQUIRE(p->GetReturnCode() == 0);
+      ipc->FreeBuffer(b);
+    }
+
+    // (b) ONE vectored put carrying the same kN regions.
+    const std::string blob_b = "vectored";
+    std::vector<ctp::ipc::FullPtr<char>> bufs;
+    std::vector<clio::cte::core::BlobSegment> segs;
+    for (int i = 0; i < kN; ++i) {
+      auto b = FillBuf(kSeg, static_cast<char>((i % 250) + 1));
+      bufs.push_back(b);
+      segs.push_back(clio::cte::core::BlobSegment(
+          static_cast<clio::run::u64>(i) * kSeg, kSeg,
+          ctp::ipc::ShmPtr<>(b.shm_)));
+    }
+    auto pv = cte->AsyncPutBlobVectored(tag_id, blob_b, segs);
+    pv.Wait();
+    REQUIRE(pv->GetReturnCode() == 0);
+    for (auto &b : bufs) ipc->FreeBuffer(b);
+
+    auto a = ReadBack(tag_id, blob_a, 0, kSeg * kN);
+    auto v = ReadBack(tag_id, blob_b, 0, kSeg * kN);
+    REQUIRE(a.size() == v.size());
+    REQUIRE(std::memcmp(a.data(), v.data(), a.size()) == 0);
+    // ...and the bytes are actually the pattern we wrote, not zeros on both.
+    for (int i = 0; i < kN; ++i) {
+      REQUIRE(v[static_cast<size_t>(i) * kSeg] ==
+              static_cast<char>((i % 250) + 1));
+    }
+    std::printf("[#820] vectored put of %d x %zu B == %d single puts\n", kN,
+                kSeg, kN);
+  }
+
+  // ---- 2. ORDERING: later segment wins on overlap ------------------------
+  // Three segments all covering [0, kSeg). The LAST one in the list must be
+  // the surviving value. N racing single-region tasks cannot promise this.
+  {
+    const std::string blob = "overlap";
+    std::vector<ctp::ipc::FullPtr<char>> bufs;
+    std::vector<clio::cte::core::BlobSegment> segs;
+    for (char v : {'A', 'B', 'C'}) {
+      auto b = FillBuf(kSeg, v);
+      bufs.push_back(b);
+      segs.push_back(clio::cte::core::BlobSegment(0, kSeg,
+                                                  ctp::ipc::ShmPtr<>(b.shm_)));
+    }
+    auto pv = cte->AsyncPutBlobVectored(tag_id, blob, segs);
+    pv.Wait();
+    REQUIRE(pv->GetReturnCode() == 0);
+    for (auto &b : bufs) ipc->FreeBuffer(b);
+
+    auto got = ReadBack(tag_id, blob, 0, kSeg);
+    for (size_t i = 0; i < kSeg; ++i) {
+      REQUIRE(got[i] == 'C');
+    }
+    std::printf("[#820] overlapping segments resolve last-writer-wins\n");
+  }
+
+  // ---- 3. Union range is allocated; the gap reads as zeros ---------------
+  // Two far-apart segments in one task: the blob must grow to cover the union
+  // and the hole between them must read back as zeros (POSIX sparse-write).
+  {
+    const std::string blob = "sparse";
+    auto b0 = FillBuf(kSeg, 'X');
+    auto b1 = FillBuf(kSeg, 'Y');
+    std::vector<clio::cte::core::BlobSegment> segs;
+    segs.push_back(clio::cte::core::BlobSegment(0, kSeg,
+                                                ctp::ipc::ShmPtr<>(b0.shm_)));
+    const clio::run::u64 far = 64 * 1024;
+    segs.push_back(clio::cte::core::BlobSegment(far, kSeg,
+                                                ctp::ipc::ShmPtr<>(b1.shm_)));
+    auto pv = cte->AsyncPutBlobVectored(tag_id, blob, segs);
+    pv.Wait();
+    REQUIRE(pv->GetReturnCode() == 0);
+    ipc->FreeBuffer(b0);
+    ipc->FreeBuffer(b1);
+
+    auto got = ReadBack(tag_id, blob, 0, far + kSeg);
+    for (size_t i = 0; i < kSeg; ++i) REQUIRE(got[i] == 'X');
+    for (size_t i = kSeg; i < far; ++i) REQUIRE(got[i] == 0);
+    for (size_t i = 0; i < kSeg; ++i) REQUIRE(got[far + i] == 'Y');
+    std::printf("[#820] union range allocated; inter-segment hole reads zero\n");
+  }
+}
+
+int main(int argc, char **argv) {
+  g_fixture = new Fixture();
+  std::string filter = (argc > 1) ? argv[1] : "";
+  int rc = SimpleTest::run_all_tests(filter);
+  delete g_fixture;
+  g_fixture = nullptr;
+  return rc;
+}

@@ -1259,12 +1259,64 @@ struct GetOrCreateTagTask : public clio::run::Task {
 /**
  * PutBlob task - Store a blob with optional compression context
  */
+/**
+ * One region of a vectored PutBlob/GetBlob (issue #820).
+ *
+ * A vectored task carries N of these instead of a single (offset, size, data)
+ * triple, so the runtime can acquire the blob's #680 write token ONCE and apply
+ * every region in one pass. Each segment keeps its OWN buffer, which is what
+ * lets the worker's batching layer merge N independent tasks without gathering
+ * their payloads into one contiguous allocation — the members' buffers become
+ * the segments directly.
+ *
+ * The buffer is a shared-memory pointer, so segments are valid to any process
+ * on THIS node. A vectored task is therefore node-local in v1 (the batching
+ * layer only ever builds them for tasks that already routed ExecHere); a
+ * cross-node vectored submit would need one bulk transfer per segment and is
+ * not supported yet.
+ */
+struct BlobSegment {
+  clio::run::u64 blob_off_;  // offset of this region within the blob
+  clio::run::u64 size_;      // bytes in this region
+  ctp::ipc::ShmPtr<> data_;  // this region's own buffer (src for put, dst for get)
+
+  CTP_CROSS_FUN BlobSegment()
+      : blob_off_(0), size_(0), data_(ctp::ipc::ShmPtr<>::GetNull()) {}
+  CTP_CROSS_FUN BlobSegment(clio::run::u64 blob_off, clio::run::u64 size,
+                            ctp::ipc::ShmPtr<> data)
+      : blob_off_(blob_off), size_(size), data_(data) {}
+
+  template <typename Archive>
+  CTP_CROSS_FUN void serialize(Archive &ar) {
+    ar(blob_off_, size_, data_);
+  }
+};
+
 struct PutBlobTask : public clio::run::Task {
   IN TagId tag_id_;                    // Tag ID for blob grouping
   INOUT clio::run::priv::string blob_name_;  // Blob name (required)
   IN clio::run::u64 offset_;                 // Offset within blob
   IN clio::run::u64 size_;                   // Size of blob data
   IN ctp::ipc::ShmPtr<> blob_data_;        // Blob data (shared memory pointer)
+  /**
+   * Vectored regions (issue #820). EMPTY is the normal single-region case, in
+   * which (offset_, size_, blob_data_) above are authoritative — every existing
+   * caller and both emplace constructors leave this empty, so nothing changes
+   * for them. When non-empty this task is VECTORED: the regions below are
+   * authoritative and offset_/size_/blob_data_ are ignored.
+   *
+   * Segments are applied in LIST ORDER, so two segments covering the same bytes
+   * resolve last-writer-wins — which is the ordering guarantee the #680 token
+   * race does not provide when the same writes arrive as separate tasks.
+   */
+  IN clio::run::priv::vector<BlobSegment> segments_;
+
+  /** Compile-time capability: this task type carries `segments_`. The GPU POD
+   *  variant (PodPutBlobTask) sets this false and stays a plain POD — vectored
+   *  puts are a host-side batching feature and the device path never needs
+   *  them. PutBlobImpl is templated over both, so it guards with
+   *  `if constexpr (TaskT::kSupportsVectored)`. */
+  static constexpr bool kSupportsVectored = true;
   IN float score_;         // Score for placement: -1.0=unknown (use defaults),
                            // 0.0-1.0=explicit
   INOUT Context context_;  // Context for compression control and statistics
@@ -1298,6 +1350,7 @@ struct PutBlobTask : public clio::run::Task {
         offset_(0),
         size_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
+        segments_(CLIO_PRIV_ALLOC),
         score_(-1.0f),
         context_(),
         flags_(0),
@@ -1319,6 +1372,7 @@ struct PutBlobTask : public clio::run::Task {
         offset_(offset),
         size_(size),
         blob_data_(blob_data),
+        segments_(CLIO_PRIV_ALLOC),
         score_(score),
         context_(context),
         flags_(flags),
@@ -1346,6 +1400,7 @@ struct PutBlobTask : public clio::run::Task {
         offset_(offset),
         size_(size),
         blob_data_(blob_data),
+        segments_(CLIO_PRIV_ALLOC),
         score_(score),
         context_(context),
         flags_(flags),
@@ -1394,7 +1449,7 @@ struct PutBlobTask : public clio::run::Task {
     ar.PushPod(blob_name_.UsingSso());
     Task::SerializeIn(ar);
     ar(tag_id_, blob_name_, offset_, size_, blob_data_,
-       score_, context_, flags_, gpu_page_idx_, submit_ts_ns_);
+       score_, context_, flags_, gpu_page_idx_, submit_ts_ns_, segments_);
     ar.PopPod();
     // Emulated puts (issue #747) never write the payload, so don't ship it
     // over the wire either — the whole point is to not pay for the I/O.
@@ -1427,6 +1482,7 @@ struct PutBlobTask : public clio::run::Task {
   /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
   CTP_CROSS_FUN void FixupAfterCopy() {
     blob_name_.FixupSsoPointer();
+    segments_.FixupSvoPtr();
   }
 
   /**
@@ -1440,6 +1496,7 @@ struct PutBlobTask : public clio::run::Task {
     offset_ = other->offset_;
     size_ = other->size_;
     blob_data_ = other->blob_data_;
+    segments_ = other->segments_;
     score_ = other->score_;
     context_ = other->context_;
     flags_ = other->flags_;
@@ -1723,6 +1780,9 @@ using PodBlobName = clio::run::priv::fixed_string<32>;
  * PodPutBlob - fully-POD, GPU-compatible variant of PutBlobTask.
  */
 struct PodPutBlobTask : public clio::run::Task {
+  /** No `segments_`: vectored puts are a host-side batching feature and this
+   *  variant must stay a plain POD for the device path (issue #820). */
+  static constexpr bool kSupportsVectored = false;
   IN TagId tag_id_;
   INOUT PodBlobName blob_name_;
   IN clio::run::u64 offset_;
