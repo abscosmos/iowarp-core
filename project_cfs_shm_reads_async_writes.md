@@ -341,12 +341,25 @@ reports the EIO (`sync offset=33550336`). An application that never calls
 `fsync` and ignores `close`'s return learns nothing at all — which is the
 POSIX writeback bargain, not a clio-fs quirk.
 
-**Cost of the 64 MiB / 8192 window** (fio, 4 KiB, 64 MiB, fresh daemon per
-run, median of 3): 3121 IOPS vs 3630 for the old 8 MiB / 64 window — about 14%
-slower, with non-overlapping ranges (3080–3269 vs 3303–3831). At 64 KiB the
-two are indistinguishable (1750 vs 1872, ranges overlap). A deeper queue buys
-nothing while same-page writes serialize on the per-blob write token, and
-costs bookkeeping plus 64 MiB of pinned staging.
+**Cost of the 64 MiB / 8192 window: none that is measurable.** Nine paired
+runs (fio, 4 KiB, 64 MiB, fresh daemon per run, arms interleaved): median
+ratio new/old 1.03, the new window faster in 5 of 9, medians 1621 vs 1568
+IOPS. At 64 KiB the two are likewise indistinguishable.
+
+That is a correction. A first three-run batch gave 3121 vs 3630 with
+non-overlapping ranges, and this document briefly claimed a ~14% regression on
+the strength of it. It did not replicate. **Write throughput on a loaded host
+drifts far more than a three-run batch can see** — absolute numbers moved by
+3x across batches an hour apart (3630 → 1568 IOPS for the *same* configuration)
+— so a three-run A/B can separate cleanly and still be measuring the drift
+rather than the change. Pair the arms, run at least eight, and report the
+paired ratio; that is the same lesson as the fresh-vs-warmed-file confound
+above, in a different disguise.
+
+An intermediate arm ruled out the obvious mechanism: holding bytes at 64 MiB
+and varying only the task count (64 vs 8192) made the DEEPER queue faster, so
+the per-write cost is not the linear scan `WaitForPageOverlap` does over the
+in-flight queue. Worth knowing before anyone optimizes that scan on suspicion.
 
 ### How I measured this wrong, twice
 
