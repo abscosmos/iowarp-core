@@ -585,6 +585,8 @@ clio::run::shared_ptr<Task> Worker::RouteOnly(Future<Task> &future,
   return task_full_ptr;
 }
 
+
+
 namespace {
 /** issue #820: hands a container's merged tasks back to the worker. */
 class WorkerBatchSink : public BatchSink {
@@ -616,6 +618,7 @@ class WorkerBatchSink : public BatchSink {
     merged->task_id_ = CreateTaskId();
     merged->pool_query_ = PoolQuery::Local();
     merged->SetFlags(TASK_BATCH_MERGED);
+    size_t np = parents.size();
     if (!parents.empty()) {
       std::lock_guard<std::mutex> lk(mu_);
       pending_[merged->task_id_.unique_] = std::move(parents);
@@ -713,6 +716,16 @@ u32 Worker::BatchCollect(TaskLane *lane, u32 budget, bool from_lane) {
 
   // Then let each container collapse whatever it parked.
   if (!batch_groups_.empty()) {
+    // Clear the current-task slot FIRST. IpcCpu2Self::SendIn parents a
+    // self-sent task to whatever GetCurrentTask() returns, and by now that is
+    // a stale, already-finished passthrough task from the loop above. A merged
+    // task adopted by a dead parent has its completion routed into that
+    // parent's coroutine (SendOut resumes the parent rather than signalling
+    // normally), so nothing ever completes the merged task's own future or its
+    // parked parents -- every worker then idles and the client waits forever.
+    // That is the lost wakeup this phase was hanging on: no thread spinning, no
+    // futex held, everything asleep.
+    SetCurrentTask(clio::run::shared_ptr<Task>());
     WorkerBatchSink sink(
         [this](const clio::run::shared_ptr<Task> &t) {
           clio::run::shared_ptr<Task> copy = t;

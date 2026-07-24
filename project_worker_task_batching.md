@@ -127,9 +127,44 @@ Ruled out so far:
   **did not fix it** (reverted, since it was unverified and strictly less
   complete than the copy).
 
-The next step is to establish whether the merged task ever reaches a lane at all
-— instrumenting the enqueue side rather than the emit side — with a low-volume,
-single-writer log so stderr contention cannot masquerade as a stall again.
+### Root cause, as far as it is established: `Send` never returns
+
+Re-instrumented with a **lock-free** tracer (`write(2)` to an `O_APPEND` fd — one
+syscall, no userspace lock, unlike the `fprintf` that faked a stall earlier):
+
+```
+SMASH method=15 members=5     EMIT-ENTER parents=5
+SMASH method=15 members=55    EMIT-ENTER parents=55
+EMIT-SENT: 0
+```
+
+So the merge runs, real groups form (5 and 55 members), `Emit` is entered — and
+`CLIO_IPC->Send(merged)` **never returns**, with the calling thread asleep.
+
+That matches a hazard `IpcCpu2Self::SendIn` documents against itself: a self-send
+routes via `RouteTask(force_enqueue=true)` → `RouteLocal` → `dest_lane.Push()`,
+and *"when that lane fills, the WAIT_FOR_SPACE ring Push busy-spins forever — the
+worker never suspends, so it can never pop to make space (producer==consumer
+deadlock)"*. `RouteLocal` guards this by picking an alternate worker when the
+destination is the caller — but only `if (alt != nullptr)`.
+
+Emitting from inside the drain loop is exactly that shape: the worker is the
+consumer of the lane it may be asked to push onto, and under a 64-deep burst the
+lane is full. The one discrepancy to resolve is that the thread is *asleep*
+rather than spinning, so either the ring's wait sleeps, or the block is one level
+deeper than `Push`.
+
+**Fix direction (not yet implemented):** do not `Send` merged tasks from inside
+the drain loop. Either run the merged task inline on the current worker (it is
+already the right container), or hand it off through a path that cannot enqueue
+onto the lane being drained.
+
+Also applied while investigating (kept — correct on its own): the current-task
+slot is cleared before emitting. `IpcCpu2Self::SendIn` parents a self-sent task
+to `GetCurrentTask()`, which by then is a stale, already-finished passthrough
+task; a merged task adopted by a dead parent has its completion routed into that
+parent's coroutine. It did not resolve the hang, but leaving it unfixed would
+have been a second bug waiting behind the first.
 
 ### Why the end-to-end win is still not demonstrated
 
