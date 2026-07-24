@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace clio::cae {
 
@@ -197,6 +198,14 @@ bool CfsIo::AsyncWritesEnabled() {
   return v;
 }
 
+// The window is a BACK-PRESSURE bound, not an error condition: a writer that
+// reaches it blocks on the oldest outstanding write until it drains, and then
+// proceeds. Nothing here can make a write(2) fail.
+//
+// 64 MiB of staging comes out of the client's SHM allocator (256 MiB by
+// default, see IpcManager::IncreaseClientShm), so the two must be sized
+// together -- a window larger than the allocator would guarantee the
+// allocation failure that DoWrite has to drain its way out of.
 clio::run::u64 CfsIo::MaxInflightBytes() {
   static const clio::run::u64 v = [] {
     if (const char *e = std::getenv("CLIO_CFS_WRITE_WINDOW_BYTES")) {
@@ -204,11 +213,16 @@ clio::run::u64 CfsIo::MaxInflightBytes() {
       unsigned long long n = std::strtoull(e, &end, 10);
       if (end != e && n > 0) return static_cast<clio::run::u64>(n);
     }
-    return static_cast<clio::run::u64>(8ULL * 1024 * 1024);
+    return static_cast<clio::run::u64>(64ULL * 1024 * 1024);
   }();
   return v;
 }
 
+// 8192 tasks. At 4 KiB -- the granularity a POSIX application actually
+// writes at -- the count bound would otherwise bind long before the byte
+// bound (8192 x 4 KiB = 32 MiB, still under the 64 MiB window), so which of
+// the two limits a workload meets now depends on its write size rather than
+// on an arbitrarily small task count.
 size_t CfsIo::MaxInflightWrites() {
   static const size_t v = [] {
     if (const char *e = std::getenv("CLIO_CFS_WRITE_WINDOW_COUNT")) {
@@ -216,7 +230,7 @@ size_t CfsIo::MaxInflightWrites() {
       unsigned long long n = std::strtoull(e, &end, 10);
       if (end != e && n > 0) return static_cast<size_t>(n);
     }
-    return static_cast<size_t>(64);
+    return static_cast<size_t>(8192);
   }();
   return v;
 }
@@ -236,7 +250,7 @@ std::shared_ptr<PathWrites> CfsIo::PendingFor(const std::string &path,
   return pw;
 }
 
-int CfsIo::ReapAndBound(PathWrites *pw) {
+void CfsIo::ReapAndBound(PathWrites *pw) {
   auto *ipc = CLIO_IPC;
   std::lock_guard<std::mutex> g(pw->mu);
 
@@ -270,14 +284,51 @@ int CfsIo::ReapAndBound(PathWrites *pw) {
     pw->bytes -= p.size;
     pw->q.erase(pw->q.begin());
   }
-  return pw->sticky;
+  // No return value: a latched error belongs to fsync/close, and the caller
+  // (DoWrite) must not report or clear it.
 }
 
-int CfsIo::DrainPath(const std::string &path) {
-  auto pw = PendingFor(path, /*create=*/false);
-  if (!pw) {
-    return 0;
+ctp::ipc::FullPtr<char> CfsIo::AllocateStaging(const std::string &path,
+                                               size_t count) {
+  auto *ipc = CLIO_IPC;
+  ctp::ipc::FullPtr<char> shm = ipc->AllocateBuffer(count);
+  if (!shm.IsNull()) {
+    return shm;
   }
+
+  // The client's SHM allocator is out of room, and the most likely reason is
+  // this window: every queued write pins a staging buffer until it retires.
+  // Draining gives those buffers straight back, so the write that would have
+  // failed with ENOMEM waits instead and then proceeds -- the same trade the
+  // window bound already makes, just triggered by the allocator rather than
+  // by a count. Try this path first, then every other path's window, because
+  // a process writing many files spreads its staging across all of them.
+  if (auto pw = PendingFor(path, /*create=*/false)) {
+    DrainWindow(pw.get());
+    shm = ipc->AllocateBuffer(count);
+    if (!shm.IsNull()) {
+      return shm;
+    }
+  }
+
+  std::vector<std::shared_ptr<PathWrites>> all;
+  {
+    // Copy out under the map lock: DrainWindow waits on tasks, and pw_mu_ is
+    // never held across a Wait.
+    std::lock_guard<std::mutex> g(pw_mu_);
+    all.reserve(pending_writes_.size());
+    for (auto &kv : pending_writes_) {
+      all.push_back(kv.second);
+    }
+  }
+  for (auto &pw : all) {
+    DrainWindow(pw.get());
+  }
+  // Whatever is left is not ours to free -- the allocator is genuinely out.
+  return ipc->AllocateBuffer(count);
+}
+
+void CfsIo::DrainWindow(PathWrites *pw) {
   auto *ipc = CLIO_IPC;
   std::lock_guard<std::mutex> g(pw->mu);
   for (auto &p : pw->q) {
@@ -289,7 +340,33 @@ int CfsIo::DrainPath(const std::string &path) {
   }
   pw->q.clear();
   pw->bytes = 0;
-  // Report a latched error exactly once, to whoever asks first.
+}
+
+int CfsIo::DrainPath(const std::string &path) {
+  auto pw = PendingFor(path, /*create=*/false);
+  if (!pw) {
+    return 0;
+  }
+  DrainWindow(pw.get());
+  // PEEK, do not consume. Most callers here (stat, lseek(SEEK_END),
+  // ftruncate) drain only to see a coherent size and DISCARD this return
+  // value -- if draining also cleared the latch, an intervening stat(2) would
+  // silently eat the failure report that fsync/close owes the application.
+  // Now that write(2) never reports a latched error itself (see DoWrite),
+  // fsync and close are the only places it can surface, so nothing else may
+  // consume it.
+  std::lock_guard<std::mutex> g(pw->mu);
+  return pw->sticky;
+}
+
+int CfsIo::DrainPathAndConsume(const std::string &path) {
+  auto pw = PendingFor(path, /*create=*/false);
+  if (!pw) {
+    return 0;
+  }
+  DrainWindow(pw.get());
+  // Report a latched error exactly once, to the fsync/close that asks first.
+  std::lock_guard<std::mutex> g(pw->mu);
   int err = pw->sticky;
   pw->sticky = 0;
   return err;
@@ -382,7 +459,7 @@ ssize_t CfsIo::DoWrite(clio::run::u64 handle, const std::string &path,
     return 0;
   }
   auto *ipc = CLIO_IPC;
-  ctp::ipc::FullPtr<char> shm = ipc->AllocateBuffer(count);
+  ctp::ipc::FullPtr<char> shm = AllocateStaging(path, count);
   if (shm.IsNull()) {
     errno = ENOMEM;
     return -1;
@@ -436,19 +513,20 @@ ssize_t CfsIo::DoWrite(clio::run::u64 handle, const std::string &path,
     pw->bytes += count;
   }
   // Reap + enforce the window AFTER accounting, so this write is included in
-  // the bound rather than being the one that overshoots it.
-  int err = ReapAndBound(pw.get());
-  if (err != 0) {
-    // A previously queued write failed. Report it here -- POSIX writeback
-    // semantics: the error surfaces on a later write/fsync/close, not on the
-    // call that queued the doomed one (which had already returned success).
-    {
-      std::lock_guard<std::mutex> g(pw->mu);
-      pw->sticky = 0;
-    }
-    errno = err;
-    return -1;
-  }
+  // the bound rather than being the one that overshoots it. This can block --
+  // that is the back-pressure -- but it cannot fail.
+  ReapAndBound(pw.get());
+
+  // ALWAYS SUCCEED. A queued write that failed leaves its errno latched on
+  // the window for fsync/close to report; write(2) does not surface it, and
+  // does not consume it. The kernel page cache behaves the same way: the
+  // write(2) that hands bytes to writeback returns success, and a writeback
+  // failure is reported to fsync/close -- reporting it on an unrelated later
+  // write(2) would attribute the failure to bytes that are fine.
+  //
+  // The one thing this cannot do is make a failure disappear: if the tier is
+  // full, the application still learns about it, at the next fsync or close
+  // rather than at the write that happened to be in flight.
   return static_cast<ssize_t>(count);
 }
 
@@ -668,8 +746,10 @@ int CfsIo::Sync(int fd) {
     path = it->second.path;
   }
   // Wait for every queued write on this file and report a latched failure
-  // exactly once. Before #817 every write blocked, so this was a no-op.
-  int err = DrainPath(path);
+  // exactly once. Before #817 every write blocked, so this was a no-op; now
+  // that write(2) always succeeds, fsync and close are the ONLY places a
+  // queued write's failure can reach the application.
+  int err = DrainPathAndConsume(path);
   if (err != 0) {
     errno = err;
     return -1;
@@ -751,7 +831,7 @@ int CfsIo::Close(int fd) {
   // handle, and the runtime answers EBADF once it is gone (issue #817).
   // close(2) is also the last chance to report a latched write failure, which
   // is why its return code is not simply the Close task's.
-  int werr = DrainPath(path);
+  int werr = DrainPathAndConsume(path);
   ForgetIfIdle(path);
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncClose(handle);

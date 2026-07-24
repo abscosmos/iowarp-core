@@ -250,14 +250,16 @@ class CfsIo {
   bool client_ready_ = false;
 
   // ---- issue #817: async writes ------------------------------------------
-  // write(2) hands the bytes to the chimod and returns without waiting. The
-  // window below is what keeps that from turning a `dd` into unbounded
-  // staging-buffer growth: past the limit, submitting blocks on the oldest
-  // outstanding write until it drains. Overridable per deployment.
+  // write(2) hands the bytes to the chimod and returns without waiting, and
+  // ALWAYS SUCCEEDS: the window below is back-pressure, never a failure. Past
+  // the limit (64 MiB of staging, 8192 queued tasks) submitting blocks on the
+  // oldest outstanding write until it drains, which is what keeps a `dd` from
+  // growing staging buffers without bound. A queued write that fails latches
+  // its errno here for fsync/close to report. Overridable per deployment.
   std::mutex pw_mu_;  ///< guards pending_writes_ only, never held across a Wait
   std::unordered_map<std::string, std::shared_ptr<PathWrites>> pending_writes_;
 
-  /** Whether write(2) may return before the runtime has the bytes. Off by
+  /** Whether write(2) may return before the runtime has the bytes. ON by
    *  default -- see the definition for the measurement that decided it. */
   static bool AsyncWritesEnabled();
 
@@ -270,19 +272,35 @@ class CfsIo {
 
   /**
    * Retire finished writes from the front of the queue, then block until the
-   * window is under its bounds. Returns a latched errno (0 if all is well).
-   * Caller must NOT hold pw->mu.
+   * window is under its bounds. Blocks, never fails; a failed write's errno
+   * is latched on the window rather than returned. Caller must NOT hold
+   * pw->mu.
    */
-  int ReapAndBound(PathWrites *pw);
+  void ReapAndBound(PathWrites *pw);
+
+  /**
+   * A staging buffer for `count` bytes, draining write windows to get one
+   * rather than failing. Only a genuinely exhausted allocator returns null.
+   */
+  ctp::ipc::FullPtr<char> AllocateStaging(const std::string &path,
+                                          size_t count);
 
   /** Drop a path's window once it is drained and owes nobody an error, so a
    *  long-lived interceptor does not keep one entry per file ever written. */
   void ForgetIfIdle(const std::string &path);
 
+  /** Wait for every outstanding write on one window, freeing buffers and
+   *  latching any failure. Caller must NOT hold pw->mu. */
+  void DrainWindow(PathWrites *pw);
+
   /** Wait for every outstanding write on `path`, freeing buffers. Returns the
-   *  latched errno and clears it -- errors are reported exactly once, to the
-   *  fsync/close/write that observes them. */
+   *  latched errno WITHOUT clearing it: stat/lseek/ftruncate drain only to see
+   *  a coherent size, and must not consume the report owed to fsync/close. */
   int DrainPath(const std::string &path);
+
+  /** DrainPath, but consumes the latched errno -- for fsync and close, the
+   *  only two calls that report a queued write's failure. */
+  int DrainPathAndConsume(const std::string &path);
 
   /**
    * Wait for any outstanding write that touches the same PAGE as

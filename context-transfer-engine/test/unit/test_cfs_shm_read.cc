@@ -600,4 +600,79 @@ TEST_CASE("clio-fs SHM path under concurrent readers and writers",
   cfs_io->RemovePath(cpath);
 }
 
+/**
+ * write(2) always succeeds; a queued write's failure surfaces at fsync/close.
+ *
+ * Deliberately runs LAST: it writes until the tier refuses, and the space it
+ * consumes is not necessarily all returned, so anything after it in the same
+ * process would be running against a full target.
+ *
+ * The invariant asserted here does not depend on whether the tier actually
+ * fills within the cap -- write(2) returning the full count is required
+ * either way. What filling adds is the second half of the contract: the
+ * failure is not lost, and an intervening size query (which drains the write
+ * window) does not swallow it before fsync can report it.
+ */
+TEST_CASE("clio-fs writes always succeed, errors land on fsync/close",
+          "[cfs][shm][noleak]") {
+  REQUIRE(InitRuntime());
+  auto *cfs_io = CLIO_CTE_CFS;
+  REQUIRE(cfs_io != nullptr);
+
+  const std::string path = "clio::/tmp/clio_cfs_write_always_ok.dat";
+  cfs_io->RemovePath(path);
+  int fd = cfs_io->Open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  REQUIRE(fd >= 0);
+
+  // 4 KiB is the granularity a POSIX application actually writes at, and the
+  // one that amplifies worst against a RAM target (measured: ~100 MiB of
+  // logical 4 KiB writes fills a 2 GiB target), so it reaches the interesting
+  // case fastest.
+  const size_t kBuf = 4096;
+  const int kMaxWrites = 16384;      // 64 MiB, the full window's worth
+  const int kCheckEvery = 256;       // ~1 MiB
+  std::vector<char> buf(kBuf, 'w');
+
+  int writes = 0;
+  int failed_writes = 0;
+  int fsync_failed_after = -1;
+  for (int i = 0; i < kMaxWrites; ++i) {
+    ssize_t n = cfs_io->Write(fd, buf.data(), kBuf);
+    if (n != static_cast<ssize_t>(kBuf)) {
+      ++failed_writes;
+      break;
+    }
+    ++writes;
+    if ((i + 1) % kCheckEvery == 0) {
+      // A size query drains the window. It must NOT consume the latched
+      // error -- if it did, the fsync below would report success over a file
+      // whose bytes never landed.
+      REQUIRE(cfs_io->SizeFd(fd) >= 0);
+      if (cfs_io->Sync(fd) != 0) {
+        REQUIRE(errno == EIO);
+        fsync_failed_after = writes;
+        break;
+      }
+    }
+  }
+
+  // THE CONTRACT: no write(2) failed, whatever happened underneath.
+  REQUIRE(failed_writes == 0);
+  REQUIRE(writes > 0);
+
+  int close_rc = cfs_io->Close(fd);
+  if (fsync_failed_after >= 0) {
+    std::printf("[#817] %d x 4 KiB writes all returned success; the tier "
+                "refused at ~%.1f MiB and fsync reported it (close=%d)\n",
+                writes, writes * kBuf / (1024.0 * 1024.0), close_rc);
+  } else {
+    std::printf("[#817] %d x 4 KiB writes all returned success; tier absorbed "
+                "%.1f MiB without refusing (close=%d)\n",
+                writes, writes * kBuf / (1024.0 * 1024.0), close_rc);
+    REQUIRE(close_rc == 0);
+  }
+
+  cfs_io->RemovePath(path);
+}
+
 SIMPLE_TEST_MAIN()

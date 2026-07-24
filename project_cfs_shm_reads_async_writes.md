@@ -233,9 +233,10 @@ is mandatory), drop the wait:
 - `fsync`/`fdatasync`/`close` become real: drain, free buffers, surface errors.
 - **Sticky error latch.** A failed async write cannot set `errno` on the
   `write()` that queued it. Latch the error on the descriptor and report it
-  from the next `write()`/`fsync()`/`close()` — the same contract as kernel
-  page-cache writeback. Document it in `cfs_io.h` where the "writes are
-  synchronous" comment lives today.
+  from `fsync()`/`close()` — the same contract as kernel page-cache
+  writeback. (As built, `write()` is excluded from that list deliberately: see
+  the contract under "Async writes" below.) Document it in `cfs_io.h` where
+  the "writes are synchronous" comment lives today.
 - `O_SYNC`/`O_DSYNC` keep today's synchronous behaviour.
 - **RYOW.** Track dirty page ranges per descriptor; a read overlapping one
   takes the RPC path (ordered behind the queued write) or is served from the
@@ -312,12 +313,40 @@ The contract:
   descriptors on one file.
 - `stat` / `lseek(SEEK_END)` / `truncate` / `unlink` / `close` drain first, so a
   size query never reports less than a completed `write(2)` established.
-- **Errors latch** and surface on the next `write`/`fsync`/`close` — the caller
-  that queued the doomed write had already returned success. Kernel
-  page-cache writeback has the same contract.
-- **Bounded window** (8 MiB / 64 writes, env-overridable): past it, submitting
-  blocks on the oldest. Without it a `dd` grows staging buffers without bound.
-- `O_SYNC`/`O_DSYNC` still block.
+- **`write(2)` always succeeds.** A queued write that fails latches its errno
+  on the path's window; `write` neither reports nor consumes it. Kernel
+  page-cache writeback has the same contract: the call that hands bytes to
+  writeback returns success, and reporting the failure on some later
+  unrelated `write` would attribute it to bytes that are fine.
+- **Errors surface at `fsync`/`close`**, and only there — which makes those
+  two the *only* places a queued failure can reach the application. So the
+  drain that `stat`/`lseek(SEEK_END)`/`ftruncate` perform must PEEK at the
+  latch, never clear it; an intervening `stat(2)` silently eating the report
+  was a real bug this contract turned from unlikely into routine.
+- **Bounded window** (64 MiB / 8192 writes, env-overridable): past it,
+  submitting blocks on the oldest. Without it a `dd` grows staging buffers
+  without bound. The bound is back-pressure — it can make a write *wait*, but
+  never fail. Staging comes out of the client's 256 MiB SHM allocator, so the
+  two are sized together; if the allocator does refuse, `write` drains its own
+  windows to reclaim buffers and retries rather than returning `ENOMEM`.
+- `O_SYNC`/`O_DSYNC` still block **and still report**: that caller asked for
+  durability over latency, and answering "success" for a write that failed
+  would be the one case where always-succeed is simply wrong.
+
+**What always-succeed does not do is make failures go away.** A full tier
+still refuses the bytes; the application now learns at `fsync`/`close` instead
+of at a `write`. Measured on a 2 GiB RAM target with 4 KiB writes: every
+`write(2)` returns success through the point of refusal, and fio's `end_fsync`
+reports the EIO (`sync offset=33550336`). An application that never calls
+`fsync` and ignores `close`'s return learns nothing at all — which is the
+POSIX writeback bargain, not a clio-fs quirk.
+
+**Cost of the 64 MiB / 8192 window** (fio, 4 KiB, 64 MiB, fresh daemon per
+run, median of 3): 3121 IOPS vs 3630 for the old 8 MiB / 64 window — about 14%
+slower, with non-overlapping ranges (3080–3269 vs 3303–3831). At 64 KiB the
+two are indistinguishable (1750 vs 1872, ranges overlap). A deeper queue buys
+nothing while same-page writes serialize on the per-blob write token, and
+costs bookkeeping plus 64 MiB of pinned staging.
 
 ### How I measured this wrong, twice
 
