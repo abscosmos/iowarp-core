@@ -1526,6 +1526,19 @@ struct GetBlobTask : public clio::run::Task {
   IN ctp::ipc::ShmPtr<>
       blob_data_;  // Input buffer for blob data (shared memory pointer)
   /**
+   * Vectored regions (issue #820). EMPTY is the ordinary single-region case;
+   * non-empty makes this a vectored read, where each region is read straight
+   * into ITS OWN buffer. That is what lets the batching layer merge N reads of
+   * one blob without a post-hoc scatter copy: each member's destination buffer
+   * is a segment, so the runtime fills it directly.
+   *
+   * All segments are served from ONE block-layout snapshot, so a vectored read
+   * sees a single consistent view of the blob rather than N independent ones.
+   */
+  IN clio::run::priv::vector<BlobSegment> segments_;
+  /** @copydoc PutBlobTask::kSupportsVectored */
+  static constexpr bool kSupportsVectored = true;
+  /**
    * Optional page index appended to blob_name_ at handler time as
    * "_pi<gpu_page_idx_>". See PutBlobTask::gpu_page_idx_ for rationale.
    */
@@ -1538,6 +1551,7 @@ struct GetBlobTask : public clio::run::Task {
       : clio::run::Task(),
         tag_id_(TagId::GetNull()),
         blob_name_(CLIO_PRIV_ALLOC),
+        segments_(CLIO_PRIV_ALLOC),
         offset_(0),
         size_(0),
         flags_(0),
@@ -1557,6 +1571,7 @@ struct GetBlobTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetBlob),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        segments_(CLIO_PRIV_ALLOC),
         offset_(offset),
         size_(size),
         flags_(flags),
@@ -1612,6 +1627,7 @@ struct GetBlobTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetBlob),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        segments_(CLIO_PRIV_ALLOC),
         offset_(offset),
         size_(size),
         flags_(flags),
@@ -1632,6 +1648,7 @@ struct GetBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     ar.PushPod(blob_name_.UsingSso());
     Task::SerializeIn(ar);
+    ar(segments_);
     ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_,
        gpu_page_idx_, context_);
     ar.PopPod();
@@ -1660,6 +1677,7 @@ struct GetBlobTask : public clio::run::Task {
   /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
   CTP_CROSS_FUN void FixupAfterCopy() {
     blob_name_.FixupSsoPointer();
+    segments_.FixupSvoPtr();
   }
 
   /**
@@ -1674,6 +1692,7 @@ struct GetBlobTask : public clio::run::Task {
     size_ = other->size_;
     flags_ = other->flags_;
     blob_data_ = other->blob_data_;
+    segments_ = other->segments_;
     gpu_page_idx_ = other->gpu_page_idx_;
     context_ = other->context_;
   }
@@ -1906,6 +1925,9 @@ struct PodPutBlobTask : public clio::run::Task {
  * PodGetBlob - fully-POD, GPU-compatible variant of GetBlobTask.
  */
 struct PodGetBlobTask : public clio::run::Task {
+  /** No `segments_`: vectored reads are a host-side feature; this variant
+   *  stays a plain POD for the device path (issue #820). */
+  static constexpr bool kSupportsVectored = false;
   IN TagId tag_id_;
   IN PodBlobName blob_name_;
   IN clio::run::u64 offset_;

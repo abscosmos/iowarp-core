@@ -1835,6 +1835,30 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Suppress unused variable warning for flags - may be used in future
     (void)flags;
 
+    // Vectored get (issue #820): N regions, each read into its OWN buffer, all
+    // served from the single block snapshot taken below — so the whole read is
+    // one consistent view of the blob rather than N independent ones. `size`
+    // becomes the union extent purely for the validation and emulation paths.
+    bool vectored = false;
+    if constexpr (TaskT::kSupportsVectored) {
+      vectored = !task->segments_.empty();
+      if (vectored) {
+        clio::run::u64 lo = ~static_cast<clio::run::u64>(0);
+        clio::run::u64 hi = 0;
+        for (size_t i = 0; i < task->segments_.size(); ++i) {
+          const auto &seg = task->segments_[i];
+          if (seg.size_ == 0 || seg.data_.IsNull()) {
+            task->return_code_ = 1;
+            CLIO_CO_RETURN;
+          }
+          if (seg.blob_off_ < lo) lo = seg.blob_off_;
+          if (seg.blob_off_ + seg.size_ > hi) hi = seg.blob_off_ + seg.size_;
+        }
+        offset = lo;
+        size = hi - lo;
+      }
+    }
+
     // Validate input parameters
     if (size == 0) {
       task->return_code_ = 1;
@@ -1877,6 +1901,20 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     if (task->context_.emulate_) {
       task->context_.emulated_time_ns_ =
           EstimateIoTimeNs(blocks_snapshot, offset, size, /*is_write=*/false);
+    } else if (vectored) {
+      // Each region into its own buffer, off the one shared snapshot.
+      if constexpr (TaskT::kSupportsVectored) {
+        for (size_t i = 0; i < task->segments_.size(); ++i) {
+          const auto &seg = task->segments_[i];
+          clio::run::u32 read_result = 0;
+          CLIO_CO_AWAIT(ReadData(blocks_snapshot, seg.data_, seg.size_,
+                            seg.blob_off_, read_result));
+          if (read_result != 0) {
+            task->return_code_ = read_result;
+            CLIO_CO_RETURN;
+          }
+        }
+      }
     } else {
       clio::run::u32 read_result = 0;
       CLIO_CO_AWAIT(ReadData(blocks_snapshot, blob_data_ptr, size, offset,

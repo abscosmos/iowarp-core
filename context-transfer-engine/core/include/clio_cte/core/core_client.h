@@ -554,6 +554,47 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Vectored get (issue #820): read N regions of one blob in a SINGLE task,
+   * each region landing in its OWN buffer.
+   *
+   * All regions are served from one block-layout snapshot, so the whole read is
+   * a single consistent view of the blob rather than N independent ones. Because
+   * each segment names its own destination, a caller merging several readers'
+   * requests needs no scatter copy afterwards — the runtime fills each reader's
+   * buffer directly. Node-local (segment buffers are SHM pointers).
+   */
+  clio::run::Future<GetBlobTask> AsyncGetBlobVectored(
+      const TagId &tag_id,
+      const char *blob_name,
+      const std::vector<BlobSegment> &segments,
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        static_cast<clio::run::u64>(0), static_cast<clio::run::u64>(0), flags,
+        ctp::ipc::ShmPtr<>::GetNull(), context);
+    auto *t = task.get();
+    for (const auto &seg : segments) {
+      t->segments_.push_back(BlobSegment(seg.blob_off_, seg.size_, seg.data_));
+    }
+    return ipc_manager->Send(task);
+  }
+
+  /** std::string overload */
+  clio::run::Future<GetBlobTask> AsyncGetBlobVectored(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      const std::vector<BlobSegment> &segments,
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
+    return AsyncGetBlobVectored(tag_id, blob_name.c_str(), segments, flags,
+                                pool_query, context);
+  }
+
+  /**
    * Asynchronous reorganize blob - returns immediately
    * @param tag_id Tag ID
    * @param blob_name Name of the blob

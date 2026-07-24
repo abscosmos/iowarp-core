@@ -205,6 +205,46 @@ TEST_CASE("Vectored PutBlob == N single puts, and segments apply in list order",
     for (size_t i = 0; i < kSeg; ++i) REQUIRE(got[far + i] == 'Y');
     std::printf("[#820] union range allocated; inter-segment hole reads zero\n");
   }
+
+  // ---- 4. Vectored GET scatters into per-segment buffers -----------------
+  // Lay down a known pattern, then read it back as N regions in ONE task, each
+  // into its own buffer. Every buffer must hold exactly its own region — this
+  // is what removes the scatter copy from the batching layer.
+  {
+    const std::string blob = "vecget";
+    for (int i = 0; i < kN; ++i) {
+      auto b = FillBuf(kSeg, static_cast<char>((i % 250) + 1));
+      auto p = cte->AsyncPutBlob(tag_id, blob,
+                                 static_cast<clio::run::u64>(i) * kSeg, kSeg,
+                                 ctp::ipc::ShmPtr<>(b.shm_));
+      p.Wait();
+      REQUIRE(p->GetReturnCode() == 0);
+      ipc->FreeBuffer(b);
+    }
+
+    std::vector<ctp::ipc::FullPtr<char>> dst;
+    std::vector<clio::cte::core::BlobSegment> segs;
+    for (int i = 0; i < kN; ++i) {
+      auto b = FillBuf(kSeg, 0);
+      dst.push_back(b);
+      segs.push_back(clio::cte::core::BlobSegment(
+          static_cast<clio::run::u64>(i) * kSeg, kSeg,
+          ctp::ipc::ShmPtr<>(b.shm_)));
+    }
+    auto gv = cte->AsyncGetBlobVectored(tag_id, blob, segs);
+    gv.Wait();
+    REQUIRE(gv->GetReturnCode() == 0);
+
+    for (int i = 0; i < kN; ++i) {
+      const char want = static_cast<char>((i % 250) + 1);
+      for (size_t j = 0; j < kSeg; ++j) {
+        REQUIRE(dst[i].ptr_[j] == want);
+      }
+    }
+    for (auto &b : dst) ipc->FreeBuffer(b);
+    std::printf("[#820] vectored get scattered %d regions into own buffers\n",
+                kN);
+  }
 }
 
 int main(int argc, char **argv) {
