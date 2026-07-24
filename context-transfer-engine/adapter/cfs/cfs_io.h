@@ -303,15 +303,6 @@ class CfsIo {
   int DrainPathAndConsume(const std::string &path);
 
   /**
-   * Wait for any outstanding write that touches the same PAGE as
-   * [off, off+len), leaving writes to other pages in flight. Same-page
-   * concurrency does not pipeline -- it collides on the runtime's per-blob
-   * write token, whose contender busy-polls on a ~2 ms cadence.
-   */
-  void WaitForPageOverlap(PathWrites *pw, clio::run::u64 off,
-                          clio::run::u64 len);
-
-  /**
    * Drain if any outstanding write overlaps [off, off+len) -- the
    * read-your-own-writes rule. The runtime only makes a write visible (and
    * only mirrors the new size) when the task runs, so a read that raced it

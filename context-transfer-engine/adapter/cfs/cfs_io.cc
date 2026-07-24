@@ -388,34 +388,6 @@ void CfsIo::ForgetIfIdle(const std::string &path) {
   }
 }
 
-void CfsIo::WaitForPageOverlap(PathWrites *pw, clio::run::u64 off,
-                               clio::run::u64 len) {
-  const clio::run::u64 page = clio::cte::filesystem::kFsPageSize;
-  const clio::run::u64 first = off / page;
-  const clio::run::u64 last = (off + len - 1) / page;
-  auto *ipc = CLIO_IPC;
-  std::lock_guard<std::mutex> g(pw->mu);
-  size_t keep = 0;
-  for (size_t i = 0; i < pw->q.size(); ++i) {
-    PendingWrite &p = pw->q[i];
-    const clio::run::u64 pf = p.off / page;
-    const clio::run::u64 pl = (p.off + p.size - 1) / page;
-    if (pl < first || pf > last) {
-      // Different pages: leave it in flight, it cannot contend.
-      if (keep != i) pw->q[keep] = std::move(pw->q[i]);
-      ++keep;
-      continue;
-    }
-    p.fut.Wait();
-    if (p.fut->GetReturnCode() != 0 && pw->sticky == 0) {
-      pw->sticky = EIO;
-    }
-    ipc->FreeBuffer(p.buf);
-    pw->bytes -= p.size;
-  }
-  pw->q.resize(keep);
-}
-
 void CfsIo::DrainIfOverlap(const std::string &path, clio::run::u64 off,
                            clio::run::u64 len) {
   auto pw = PendingFor(path, /*create=*/false);
@@ -485,22 +457,20 @@ ssize_t CfsIo::DoWrite(clio::run::u64 handle, const std::string &path,
   }
 
   // Asynchronous: hand the task off and return. The bytes are already in
-  // shared memory and the chimod task is queued, so ordering against later
-  // operations on this file is the runtime's to keep.
-  auto pw = PendingFor(path, /*create=*/true);
-
-  // ONE OUTSTANDING WRITE PER PAGE. Two PutBlobs to the same page blob
-  // serialize on the runtime's per-blob write token (issue #680), and the
-  // contender does not block -- it busy-polls via `co_await yield()` on a
-  // ~2 ms cadence. So overlapping two writes to one page does not pipeline
-  // them, it adds milliseconds. Measured on 64 KiB sequential writes (16 to a
-  // page): unrestricted queuing was 1.7-3.3x SLOWER than blocking writes, and
-  // it got worse the deeper the window.
+  // shared memory and the chimod task is queued, so ALL ordering is the
+  // runtime's to keep -- the runtime processes a blob's tasks in submission
+  // order, so two writes to the same range, queued in call order, land in
+  // call order without the client arranging anything.
   //
-  // Waiting here keeps the concurrency exactly where the runtime can actually
-  // exploit it -- across DIFFERENT pages -- and makes same-page writes no
-  // worse than the synchronous path they replace.
-  WaitForPageOverlap(pw.get(), off, count);
+  // The client waits for NO write here. It used to wait for an in-flight
+  // write to the same page (#680's per-blob write-token contention), which
+  // made a sequential 4 KiB writer wait on its own previous write 256 times
+  // per 1 MiB page -- async writes behaving exactly like synchronous ones.
+  // Measured, 4 KiB, one batch: that page wait cost p50 371 us / 1298 IOPS
+  // where disjoint writes ran p50 4.8 us / 4367 IOPS. Waiting was never the
+  // client's job: submission order is preserved by the runtime, and 4.8 us is
+  // simply what queuing a write costs.
+  auto pw = PendingFor(path, /*create=*/true);
 
   {
     std::lock_guard<std::mutex> g(pw->mu);

@@ -358,8 +358,10 @@ above, in a different disguise.
 
 An intermediate arm ruled out the obvious mechanism: holding bytes at 64 MiB
 and varying only the task count (64 vs 8192) made the DEEPER queue faster, so
-the per-write cost is not the linear scan `WaitForPageOverlap` does over the
-in-flight queue. Worth knowing before anyone optimizes that scan on suspicion.
+the per-write cost was not the linear scan over the in-flight queue. (That scan
+lived in the since-removed page-serialization wait; see "The page-serialization
+was wrong" below.) Worth knowing before anyone optimizes a queue scan on
+suspicion.
 
 ### How I measured this wrong, twice
 
@@ -379,9 +381,30 @@ overlapping. Getting to that number took two corrections worth recording:
    changed nothing, which should have been the signal to re-examine the
    measurement rather than the mechanism.
 
-The per-page serialization was kept: it costs nothing on the sequential path
-and the contention it avoids is real, even if it was not what was being
-measured.
+### The page-serialization was wrong, and cost the whole async win
+
+The one-outstanding-write-per-page wait was kept anyway, on the argument that
+it "costs nothing on the sequential path." That was exactly backwards. A page
+is 1 MiB and the fs writes in 1 MiB pages, so a **sequential 4 KiB writer puts
+256 writes on one page** — every one of them waited for its predecessor, and
+async writes ran precisely as slow as synchronous ones. It was the sequential
+path it cost the most.
+
+Measured, 4 KiB, one batch: sequential (all one page) p50 **371 µs** / 1298
+IOPS against random (across pages) p50 **4.8 µs** / 4367 IOPS — a 77x latency
+gap from nothing but the wait.
+
+The wait is gone. **Write ordering is the runtime's**: it processes a blob's
+queued tasks in submission order, so two writes to the same range, queued in
+call order, land in call order with the client arranging nothing. So the
+client waits for no write at all — not even a same-range one — and a test
+(`overlapping-write ordering`) rewrites one 4 KiB range 512 times with many in
+flight and confirms the last value always wins, through both the RYOW read and
+a reopen. Result: sequential 4 KiB async p50 **371 µs → 7.2 µs**, and the
+overwrite+fsync case in the unit test went from ~13% over O_SYNC to **2.3x**.
+The lesson from correction #2 applies to its own fix: the mechanism (#680
+contention) was real, but building a client-side guard around it was solving a
+problem the runtime already owned.
 
 ## The SHM path off Linux
 
