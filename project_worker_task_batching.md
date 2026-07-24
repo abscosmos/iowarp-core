@@ -165,12 +165,22 @@ task belongs here by construction and never needs to enter a lane at all.
 
 With that, batching works and pays:
 
-| async burst, 256 x 4 KiB at one blob, 10 rounds | median | range |
-|---|---|---|
-| batching off | 12.01 / 12.54 ms | 11.69–15.86 |
-| **batching on** | **3.26 / 3.41 ms** | 2.75–4.28 |
+**Five paired runs** (async burst, 256 x 4 KiB outstanding at one blob, 10 rounds
+per run, medians; arms interleaved on the same binary so no rebuild or host
+drift sits between them):
 
-**~3.7x**, ranges non-overlapping, arms interleaved on the same binary.
+| pair | batching off | batching on | ratio |
+|---|---|---|---|
+| 1 | 12.01 ms | 3.26 ms | 3.68x |
+| 2 | 12.54 ms | 3.41 ms | 3.68x |
+| 3 | 12.91 ms | 3.73 ms | 3.46x |
+| 4 | 15.24 ms | 3.41 ms | 4.47x |
+| 5 | 12.27 ms | 3.27 ms | 3.75x |
+
+**Median ratio 3.68x, batching faster in 5/5**, and the two distributions do not
+overlap (off 12.0–15.2, on 3.3–3.7). Unlike the write-window measurements in
+#817, this one did not need pairing to survive — the effect is far larger than
+this box's drift.
 
 Also applied while investigating (kept — correct on its own): the current-task
 slot is cleared before emitting. `IpcCpu2Self::SendIn` parents a self-sent task
