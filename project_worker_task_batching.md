@@ -82,6 +82,25 @@ Measured A/B, async burst of 256 x 4 KiB outstanding at one blob, 10 rounds:
 No improvement, as expected: nothing merges. This is a negative result, recorded
 as such.
 
+### How far the hang was narrowed, and where tracing stopped working
+
+With `CLIO_BATCH_LANE=1` the merge path *does* run — traced groups of 2 and 61
+members, `NewCopyTask` succeeding, and every segment pushed
+("all 61 pushed"). The stall is downstream of that, inside `BatchSink::Emit`,
+between assigning the merged task's id and the `Send`.
+
+Finer localization then failed for an instructive reason: with per-statement
+`fprintf`+`fflush` from multiple worker threads, the trace stopped between two
+*adjacent* prints — which is not a logic hang but **stderr lock contention**,
+one worker blocking in `fprintf` while another holds the stream lock. Past that
+point the instrumentation was measuring itself. The remaining work needs the
+stuck process inspected directly (thread backtraces) rather than more printf
+tracing.
+
+What is established: the merge builds correctly, and the failure is in
+publishing the merged task / completing its parents — not in the vectored task
+shape, which is independently exercised and green.
+
 ### Why the end-to-end win is still not demonstrated
 
 Even at the right ingress, batching only pays when requests **co-arrive**: two
