@@ -38,6 +38,8 @@
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/ipc_manager.h"
+#include <clio_ctp/introspect/system_info.h>
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
@@ -63,15 +65,8 @@ namespace {
  * a config file should not take the runtime down, and the recognised suffixes
  * are checked here first.
  */
-bool ParseSegmentSizeNode(const YAML::Node &node, const char *key,
+bool ParseSegmentSizeText(const std::string &text, const char *key,
                           size_t &out) {
-  std::string text;
-  try {
-    text = node.as<std::string>();
-  } catch (const std::exception &) {
-    HLOG(kError, "Config: {} is not a scalar value; ignoring", key);
-    return false;
-  }
   if (text.empty()) {
     HLOG(kError, "Config: {} is empty; ignoring", key);
     return false;
@@ -120,6 +115,19 @@ bool ParseSegmentSizeNode(const YAML::Node &node, const char *key,
       (!suffix.empty() && suffix[0] == 'b') ? text.substr(0, i) : text;
   out = static_cast<size_t>(ctp::ConfigParse::ParseSize(for_parse));
   return true;
+}
+
+/** YAML wrapper over ParseSegmentSizeText — same semantics for config keys. */
+bool ParseSegmentSizeNode(const YAML::Node &node, const char *key,
+                          size_t &out) {
+  std::string text;
+  try {
+    text = node.as<std::string>();
+  } catch (const std::exception &) {
+    HLOG(kError, "Config: {} is not a scalar value; ignoring", key);
+    return false;
+  }
+  return ParseSegmentSizeText(text, key, out);
 }
 
 }  // namespace
@@ -212,6 +220,17 @@ void ConfigManager::ApplyEnvOverrides() {
     unsigned long n = std::strtoul(env, &end, 10);
     if (end != env) {
       shm_client_spin_us_ = static_cast<u32>(n);
+    }
+  }
+
+  // issue #727: CLIO_MAIN_SEGMENT_SIZE bounds the main task-data segment
+  // (byte count or size string, e.g. "512m"). Last word after any config
+  // file, so a deployment can cap the daemon's footprint without editing
+  // yaml; 0 restores the auto default.
+  if (const char *env = clio::run::env::GetCompat("MAIN_SEGMENT_SIZE")) {
+    size_t parsed = 0;
+    if (ParseSegmentSizeText(env, "CLIO_MAIN_SEGMENT_SIZE", parsed)) {
+      main_segment_size_ = parsed;
     }
   }
 }
@@ -435,6 +454,21 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
       }
     }
 
+    // Size of the main task-data segment (issue #727): FutureShm + task
+    // payload allocations (BuddyAllocator). Accepts a byte count or a size
+    // string ("512m", "1g"); 0 restores the auto default. Tunable because
+    // this segment dominates the daemon's commit charge on Windows and the
+    // shmem live-set exposure in memory-limited containers regardless of
+    // actual data volume — the previous flat 1 GiB could be several times
+    // an embedded deployment's whole budget.
+    if (runtime["main_segment_size"]) {
+      size_t parsed = 0;
+      if (ParseSegmentSizeNode(runtime["main_segment_size"],
+                               "main_segment_size", parsed)) {
+        main_segment_size_ = parsed;
+      }
+    }
+
     // Note: stack_size parameter removed (was never used)
     // Note: heartbeat_interval parsing removed (not used by runtime)
   }
@@ -576,14 +610,28 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
 }
 
 size_t ConfigManager::CalculateMainSegmentSize() const {
-  // If main_segment_size is explicitly set (non-zero), use it
+  // Explicit (yaml main_segment_size / CLIO_MAIN_SEGMENT_SIZE) wins verbatim.
   if (main_segment_size_ > 0) {
     return main_segment_size_;
   }
 
-  // Main segment holds task data (FutureShm, BuddyAllocator metadata) — no queues
-  // Use 1 GB default for task/data allocations
-  return ctp::Unit<size_t>::Gigabytes(1);
+  // 0 = auto. The main segment holds task data (FutureShm, BuddyAllocator
+  // metadata). Size it from the process's real memory budget — cgroup-aware,
+  // not host RAM (issue #727): a quarter of the budget, capped at the
+  // historical 1 GiB so real nodes see no change, floored at 64 MiB so
+  // task/FutureShm traffic keeps flowing on tiny budgets. When the budget is
+  // unknown, keep the historical flat default.
+  //
+  // Resolved here rather than at the creation site so that every reader of
+  // this value — GetMemorySegmentSize(kMainSegment) included — sees the size
+  // the segment will actually get, never a bare sentinel.
+  const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
+  size_t auto_size = ctp::Unit<size_t>::Gigabytes(1);
+  if (budget > 0) {
+    auto_size = std::min(auto_size,
+                         std::max(ctp::Unit<size_t>::Megabytes(64), budget / 4));
+  }
+  return auto_size;
 }
 
 size_t ConfigManager::CalculateMetadataSegmentSize() const {

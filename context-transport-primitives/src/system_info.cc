@@ -406,6 +406,48 @@ size_t SystemInfo::GetRamAvailable() {
 #endif
 }
 
+/**
+ * Memory limit imposed on this process by its cgroup, or 0 when unlimited or
+ * unreadable (cgroup v2 first, then v1).
+ */
+static size_t ReadCgroupMemoryLimit() {
+#ifdef __linux__
+  const char *paths[] = {"/sys/fs/cgroup/memory.max",
+                         "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
+  for (const char *path : paths) {
+    std::ifstream f(path);
+    if (!f.is_open()) {
+      continue;
+    }
+    std::string v;
+    if (!(f >> v)) {
+      continue;
+    }
+    if (v == "max") {
+      return 0;  // explicitly unlimited
+    }
+    try {
+      unsigned long long n = std::stoull(v);
+      // cgroup v1 reports a sentinel near SIZE_MAX when unlimited.
+      if (n > 0 && n < (1ULL << 62)) {
+        return static_cast<size_t>(n);
+      }
+    } catch (...) {
+    }
+  }
+#endif
+  return 0;
+}
+
+size_t SystemInfo::GetProcessMemoryBudget() {
+  size_t budget = GetRamCapacity();
+  size_t cgroup_limit = ReadCgroupMemoryLimit();
+  if (cgroup_limit > 0 && (budget == 0 || cgroup_limit < budget)) {
+    budget = cgroup_limit;
+  }
+  return budget;
+}
+
 CpuTimes SystemInfo::GetCpuTimes() {
   CpuTimes ct = {};
 #if CTP_ENABLE_PROCFS_SYSINFO
