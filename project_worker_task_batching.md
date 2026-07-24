@@ -53,6 +53,35 @@ dependents yet. Moving the phase to `DrainMyShard` and leaving the lane path
 exactly as it was fixed the hang outright — 8-writer same-blob went from hanging
 to passing, with the policy on.
 
+### Where batching has to happen, and why it is blocked there
+
+Correction to the section above: moving to the ingress **masked** the hang, it
+did not fix it.
+
+`RouteTask` sends every task for a blob to that blob's container — i.e. to ONE
+worker's lane. So the ingesting worker is usually *not* the executing worker: it
+receives a request, routes it onward, and never gets to merge it. The lane is
+the only place same-blob work converges, and therefore the only place a batch
+can form. Batching at the ingress is safe precisely because it never batches
+anything.
+
+Enabling lane batching (`CLIO_BATCH_LANE=1`) with the CTE policy on **hangs**
+again, on the async-burst benchmark. So the deferral hang is real, independent
+of the use-after-free already fixed, and it sits squarely on the only viable
+ingress. That is the blocker.
+
+Measured A/B, async burst of 256 x 4 KiB outstanding at one blob, 10 rounds:
+
+| | median | range |
+|---|---|---|
+| ingress batching, policy off | 12.28 ms | 11.65–12.47 |
+| ingress batching, policy on | 12.99 ms | 11.52–15.16 |
+| lane batching, policy off | 13.01 ms | 12.20–17.88 |
+| lane batching, policy on | **hangs** | — |
+
+No improvement, as expected: nothing merges. This is a negative result, recorded
+as such.
+
 ### Why the end-to-end win is still not demonstrated
 
 Even at the right ingress, batching only pays when requests **co-arrive**: two

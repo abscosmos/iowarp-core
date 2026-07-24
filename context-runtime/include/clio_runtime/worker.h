@@ -594,6 +594,13 @@ class Worker {
    */
   u32 BatchIngest(TaskLane *lane, u32 budget);
 
+  /** issue #820: same phase, sourced from the LANE (where same-blob tasks
+   *  converge). Experimental, CLIO_BATCH_LANE=1. */
+  u32 BatchLane(TaskLane *lane, u32 budget);
+
+  /** Shared body: collect from the lane or the shard, batch, execute. */
+  u32 BatchCollect(TaskLane *lane, u32 budget, bool from_lane);
+
   /** issue #820: whether the batching phase runs at all (CLIO_TASK_BATCHING=0
    *  restores the pre-batching dequeue loop verbatim). */
   static bool BatchingEnabled();

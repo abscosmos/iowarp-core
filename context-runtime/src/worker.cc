@@ -469,6 +469,25 @@ u32 Worker::ProcessNewTasks(TaskLane *lane) {
     return 0;
   }
 
+  // issue #820, experimental (CLIO_BATCH_LANE=1): batch on the LANE.
+  //
+  // This is where same-blob tasks actually converge -- RouteTask sends every
+  // task for a blob to that blob's container, i.e. to ONE worker's lane -- so
+  // it is the only place a batch of same-blob work can form. Batching at the
+  // SHM ingress cannot see it: the ingesting worker is usually not the
+  // executing one, so it routes the task onward and never gets to merge it.
+  //
+  // Off by default because deferring lane tasks is not yet proven safe: the
+  // lane also carries internal and re-routed work that other in-flight tasks
+  // may be synchronously waiting on.
+  static const bool lane_batch = [] {
+    const char *e = std::getenv("CLIO_BATCH_LANE");
+    return e != nullptr && !(std::string(e) == "0" || std::string(e) == "false");
+  }();
+  if (lane_batch && BatchingEnabled()) {
+    return BatchLane(lane, MAX_TASKS_PER_ITERATION * 4);
+  }
+
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
     if (ProcessNewTask(lane)) {
       tasks_processed++;
@@ -610,7 +629,15 @@ class WorkerBatchSink : public BatchSink {
 };
 }  // namespace
 
+u32 Worker::BatchLane(TaskLane *lane, u32 budget) {
+  return BatchCollect(lane, budget, /*from_lane=*/true);
+}
+
 u32 Worker::BatchIngest(TaskLane *lane, u32 budget) {
+  return BatchCollect(lane, budget, /*from_lane=*/false);
+}
+
+u32 Worker::BatchCollect(TaskLane *lane, u32 budget, bool from_lane) {
   // Bounded so batching can only ever amortize a backlog that already exists:
   // with an empty lane behind it a task forms a group of one and is emitted
   // unchanged, so the no-contention path pays nothing.
@@ -623,9 +650,16 @@ u32 Worker::BatchIngest(TaskLane *lane, u32 budget) {
   static thread_local u64 batch_seq = 0;
 
   while (popped < kBatchDequeue) {
-    Future<Task> future = IpcCpu2Cpu::RecvIn(CLIO_IPC, worker_id_);
-    if (future.get() == nullptr) {
-      break;  // shard empty
+    Future<Task> future;
+    if (from_lane) {
+      if (!lane->Pop(future)) {
+        break;  // lane empty
+      }
+    } else {
+      future = IpcCpu2Cpu::RecvIn(CLIO_IPC, worker_id_);
+      if (future.get() == nullptr) {
+        break;  // shard empty
+      }
     }
     ++popped;
     SetCurrentTask(clio::run::shared_ptr<Task>());

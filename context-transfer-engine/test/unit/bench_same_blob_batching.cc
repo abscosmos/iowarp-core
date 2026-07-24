@@ -162,6 +162,69 @@ TEST_CASE("Batching bench: many small writes at ONE blob", "[cte][bench][820]") 
   REQUIRE(errors.load() == 0);
 }
 
+TEST_CASE("Async burst at ONE blob (batching A/B)", "[cte][bench][820]") {
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+  auto *ipc = CLIO_IPC;
+  auto *cte = CLIO_CTE_CLIENT;
+
+  // The workload batching actually needs: MANY OUTSTANDING requests to one
+  // blob. A synchronous client has exactly one in flight per thread, so no
+  // worker ever sees two same-blob requests in a single shard drain and every
+  // batch group is a group of one. Here the submitter fires a whole burst
+  // before waiting on any of it, which is what #817's async writes produce
+  // (write(2) returns as soon as the bytes are staged).
+  const size_t kChunk = static_cast<size_t>(FromEnv("BATCH_BENCH_CHUNK", 4096));
+  const int kBurst = FromEnv("BATCH_BENCH_BURST", 256);
+  const int kRounds = FromEnv("BATCH_BENCH_ROUNDS", 10);
+
+  clio::cte::core::Tag tag("async_burst_tag");
+  clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  std::vector<ctp::ipc::FullPtr<char>> bufs;
+  for (int i = 0; i < kBurst; ++i) {
+    auto b = ipc->AllocateBuffer(kChunk);
+    REQUIRE(!b.IsNull());
+    std::memset(b.ptr_, 'a' + (i % 26), kChunk);
+    bufs.push_back(b);
+  }
+
+  std::vector<double> round_ms;
+  for (int r = 0; r < kRounds + 1; ++r) {  // round 0 warms the blob
+    const std::string blob = "burst_" + std::to_string(r);
+    // Warm: lay the blob down once so the timed pass is an overwrite, not a
+    // first-touch allocation.
+    for (int i = 0; i < kBurst; ++i) {
+      auto p = cte->AsyncPutBlob(tag_id, blob,
+                                 static_cast<clio::run::u64>(i) * kChunk, kChunk,
+                                 ctp::ipc::ShmPtr<>(bufs[i].shm_));
+      p.Wait();
+    }
+    double t0 = NowUs();
+    std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> futs;
+    futs.reserve(kBurst);
+    for (int i = 0; i < kBurst; ++i) {
+      futs.push_back(cte->AsyncPutBlob(tag_id, blob,
+                                       static_cast<clio::run::u64>(i) * kChunk,
+                                       kChunk,
+                                       ctp::ipc::ShmPtr<>(bufs[i].shm_)));
+    }
+    for (auto &f : futs) f.Wait();
+    double el = (NowUs() - t0) / 1000.0;
+    for (auto &f : futs) REQUIRE(f->GetReturnCode() == 0);
+    if (r > 0) round_ms.push_back(el);
+  }
+  for (auto &b : bufs) ipc->FreeBuffer(b);
+
+  std::sort(round_ms.begin(), round_ms.end());
+  const char *mode = std::getenv("CLIO_CTE_BATCHING");
+  std::printf(
+      "\n[#820 BURST] cte_batching=%s burst=%d x %zu B to ONE blob, %d rounds\n"
+      "[#820 BURST]   median=%.3f ms  min=%.3f  max=%.3f\n",
+      (mode == nullptr ? "off(default)" : mode), kBurst, kChunk, kRounds,
+      round_ms[round_ms.size() / 2], round_ms.front(), round_ms.back());
+}
+
 TEST_CASE("Vectored vs N single puts at ONE blob", "[cte][bench][820]") {
   REQUIRE(g_fixture != nullptr);
   REQUIRE(g_fixture->initialized_);
