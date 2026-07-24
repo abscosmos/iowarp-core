@@ -101,6 +101,36 @@ What is established: the merge builds correctly, and the failure is in
 publishing the merged task / completing its parents — not in the vectored task
 shape, which is independently exercised and green.
 
+### It is a LOST WAKEUP, not a deadlock
+
+Thread-state inspection of the wedged process (`/proc/<pid>/task/*/{stat,wchan}`,
+which works under `ptrace_scope=1` where `gdb -p` does not) settles the
+character of the bug:
+
+- **No thread is in state R.** Nothing is spinning.
+- **No thread is blocked on a futex.** So it is not a mutex deadlock.
+- Every thread is in `hrtimer_nanosleep` (workers in their adaptive idle sleep)
+  or `do_epoll_wait` (ZMQ I/O, peer/client receive).
+
+So the merged task is published and then simply never runs: every worker parks,
+the client waits on a future nobody will complete, and the system is quiescent.
+That is the signature of a task enqueued without its consumer being woken, or of
+a task that never reaches a lane at all.
+
+Ruled out so far:
+
+- **Not the enqueue path itself.** `RouteLocal` pushes and then unconditionally
+  `AwakenWorker`s, with a comment describing this exact lost-wakeup race.
+- **Not inherited lifecycle flags.** `BatchManager` clears them on its aggregate
+  because `NewCopyTask` carries `task_flags_` over; building the merged task
+  *fresh* from `NewTask` and copying only the identifying fields was tried and
+  **did not fix it** (reverted, since it was unverified and strictly less
+  complete than the copy).
+
+The next step is to establish whether the merged task ever reaches a lane at all
+— instrumenting the enqueue side rather than the emit side — with a low-volume,
+single-writer log so stderr contention cannot masquerade as a stall again.
+
 ### Why the end-to-end win is still not demonstrated
 
 Even at the right ingress, batching only pays when requests **co-arrive**: two
