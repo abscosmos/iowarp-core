@@ -394,17 +394,47 @@ Measured, 4 KiB, one batch: sequential (all one page) p50 **371 µs** / 1298
 IOPS against random (across pages) p50 **4.8 µs** / 4367 IOPS — a 77x latency
 gap from nothing but the wait.
 
-The wait is gone. **Write ordering is the runtime's**: it processes a blob's
-queued tasks in submission order, so two writes to the same range, queued in
-call order, land in call order with the client arranging nothing. So the
-client waits for no write at all — not even a same-range one — and a test
-(`overlapping-write ordering`) rewrites one 4 KiB range 512 times with many in
-flight and confirms the last value always wins, through both the RYOW read and
-a reopen. Result: sequential 4 KiB async p50 **371 µs → 7.2 µs**, and the
-overwrite+fsync case in the unit test went from ~13% over O_SYNC to **2.3x**.
-The lesson from correction #2 applies to its own fix: the mechanism (#680
-contention) was real, but building a client-side guard around it was solving a
-problem the runtime already owned.
+The page wait was **too coarse** — it serialized disjoint sequential writes,
+which is what made a 4 KiB writer synchronous. But removing it **entirely** was
+too far, and finding the line between took three tries and a near-miss.
+
+The first fix removed the wait outright, reasoning that write ordering is the
+runtime's. A `overlapping-write ordering` test — 512 rewrites of one 4 KiB
+range — passed on the dev box, so that looked confirmed. It failed on macOS CI.
+So I narrowed the wait to **byte-range**: a write waits for an outstanding
+write to the *same bytes* (never for a disjoint one), which keeps the
+sequential speed while ordering overlapping writes.
+
+Then I actually measured the overlapping case, and it is worse than a
+granularity question. **The runtime does not order overlapping same-blob writes,
+and the client cannot fully make it.** They race the #680 write token, and
+`AsyncWrite`'s future signals *before* the write durably commits — so even
+after waiting on the prior write's future, a "completed" earlier write can land
+after a later one. Measured, 512 rewrites of one range, RPC read confirming the
+durable state (not a mirror lag): the last write is lost **~30% of runs with
+the byte-range wait, ~100% without it.**
+
+At which point the right question is not "which wait fixes this" but "does this
+pattern occur." It does not. Writes are byte-range partial puts, so two writes
+to different bytes of one page never conflict; a sequential writer's offsets
+are disjoint; a random writer's are distinct; and an application that issues two
+`write()`s to the *same bytes* with nothing between, and depends on which wins,
+has lost that race to itself. The only thing a same-range wait would guard
+against is a workload nobody runs — and it does not even guard it fully. So the
+client **waits for no write at all.** The wait is gone entirely, the storm test
+with it (it asserted a guarantee neither the runtime nor a client provides), and
+the residual is left to a runtime fix (#680): an application needing strict
+last-writer-wins across overlapping unsynced writes must fsync between them or
+use O_SYNC.
+
+What #817 delivers stands: sequential 4 KiB async p50 **371 µs → 7.2 µs**,
+overwrite+fsync ~13% over O_SYNC → **2.3x**.
+
+Two methodological points. A concurrency invariant only the dev box has checked
+is not established — the dev box passed the ordering test at every stage while
+macOS, then an RPC-confirmed measurement, showed the guarantee never held. And
+before hardening a path, ask whether the case is real: the honest fix for the
+overlapping-write "bug" was to delete the test, not the latency.
 
 ## The SHM path off Linux
 

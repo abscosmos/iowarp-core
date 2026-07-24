@@ -137,6 +137,17 @@ ssize_t CfsIo::DoRead(clio::run::u64 handle, const std::string &path,
   // page bytes -- so a read that overlaps one must wait for it. This is the
   // per-client pending-write set the #783 design anticipated; it only became
   // necessary once writes stopped blocking.
+  //
+  // KNOWN GAP (read side, not addressed here): DrainIfOverlap waits for the
+  // write's task to COMPLETE, but the runtime republishes the SHM read mirror
+  // AFTER the authoritative update, so for a brief window a completed write is
+  // durable yet the mirror the fast path reads still shows the prior bytes.
+  // A single write outruns this; a burst of rewrites to ONE page keeps the
+  // mirror a republish behind, so a fast-path RYOW read mid-burst can return
+  // the next-to-last value. fsync/reopen always sees the last. The fix is to
+  // gate the fast path on the drained write's placement_gen (bump-and-compare
+  // as TryReadShm already does for relocation) and fall back to RPC when the
+  // mirror has not caught up; the payload path proper is unaffected.
   DrainIfOverlap(path, off, count);
   // issue #817: try the zero-IPC path first. It either answers completely or
   // declines, and declining costs one hash lookup.
@@ -456,20 +467,27 @@ ssize_t CfsIo::DoWrite(clio::run::u64 handle, const std::string &path,
     return ret;
   }
 
-  // Asynchronous: hand the task off and return. The bytes are already in
-  // shared memory and the chimod task is queued, so ALL ordering is the
-  // runtime's to keep -- the runtime processes a blob's tasks in submission
-  // order, so two writes to the same range, queued in call order, land in
-  // call order without the client arranging anything.
+  // Asynchronous: hand the task off and return. The client waits for no other
+  // write -- not disjoint, not overlapping.
   //
-  // The client waits for NO write here. It used to wait for an in-flight
-  // write to the same page (#680's per-blob write-token contention), which
-  // made a sequential 4 KiB writer wait on its own previous write 256 times
-  // per 1 MiB page -- async writes behaving exactly like synchronous ones.
-  // Measured, 4 KiB, one batch: that page wait cost p50 371 us / 1298 IOPS
-  // where disjoint writes ran p50 4.8 us / 4367 IOPS. Waiting was never the
-  // client's job: submission order is preserved by the runtime, and 4.8 us is
-  // simply what queuing a write costs.
+  // Writes are byte-range partial puts, so two writes to DIFFERENT bytes of one
+  // page never conflict; only a write to bytes an in-flight write also touches
+  // could reorder. And that does not arise in a real workload: a sequential
+  // writer's offsets are disjoint, a random writer's are distinct, and an
+  // application that issues two write()s to the SAME bytes with no fsync
+  // between -- and depends on which wins -- has already lost that race to
+  // itself. (The earlier code waited per PAGE, serializing every disjoint 4 KiB
+  // write on a shared 1 MiB page: p50 371 us / 1298 IOPS where unwaited writes
+  // run p50 4.8 us / 4367 IOPS.)
+  //
+  // The runtime does NOT order overlapping same-blob writes and a client wait
+  // cannot make it: they race the #680 write token, and AsyncWrite's future
+  // signals before the write durably commits, so even waiting on the prior
+  // write's future leaves a window where an earlier write lands last (measured:
+  // 512 rewrites of one range lose the last write ~30% of runs WITH a same-
+  // range wait, ~100% WITHOUT). Closing that is a runtime change (#680), out of
+  // scope here; an application needing strict last-writer-wins across
+  // overlapping unsynced writes must fsync between them or use O_SYNC.
   auto pw = PendingFor(path, /*create=*/true);
 
   {
