@@ -45,8 +45,10 @@
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
+#include "clio_runtime/batch_groups.h"
 #include "clio_runtime/container.h"
 #include "clio_runtime/pool_query.h"
 #include "clio_runtime/task.h"
@@ -568,6 +570,37 @@ class Worker {
    *  subtask wakeups (the popped lane, or this worker's own lane on ingest). */
   void RouteAndExec(Future<Task> &future, TaskLane *lane);
 
+  /** issue #807/#820: bind + route only. Returns the resolved task when it
+   *  should run HERE (so the caller may batch it before executing), null
+   *  otherwise (RouteTask already enqueued it elsewhere). */
+  clio::run::shared_ptr<Task> RouteOnly(Future<Task> &future, TaskLane *lane);
+
+  /**
+   * issue #820: the batching phase.
+   *
+   * Dequeue a bounded run of ready tasks, and give each one's container the
+   * chance to COALESCE it with its neighbours instead of running it now. Tasks
+   * the container declines run as-is, in arrival order, first; the merged tasks
+   * the container produces are submitted after.
+   *
+   * The dequeue bound is what keeps this honest: it can only ever batch what is
+   * ALREADY queued, so a lone task finds an empty lane behind it, forms a group
+   * of one, and is emitted unchanged. Batching therefore costs nothing when
+   * there is no backlog to amortize, and only engages under the contention it
+   * exists to remove.
+   *
+   * @return number of tasks dequeued
+   */
+  u32 BatchPhase(TaskLane *lane);
+
+  /** issue #820: whether the batching phase runs at all (CLIO_TASK_BATCHING=0
+   *  restores the pre-batching dequeue loop verbatim). */
+  static bool BatchingEnabled();
+
+  /** issue #820: complete the parents a merged task subsumed. Called from
+   *  EndTask when the finished task carries TASK_BATCH_MERGED. */
+  void CompleteBatchParents(clio::run::shared_ptr<Task> &merged);
+
   /** issue #807: drain this worker's inbound SHM shard, executing each request
    *  INLINE (no lane round-trip, no per-request wakeup). Returns count handled. */
   u32 DrainMyShard();
@@ -703,6 +736,22 @@ class Worker {
   static constexpr u32 NUM_PERIODIC_QUEUES = 4;
   static constexpr u32 PERIODIC_QUEUE_SIZE = 1024;
   std::queue<clio::run::shared_ptr<Task>> periodic_queues_[NUM_PERIODIC_QUEUES];
+
+  // ---- issue #820: worker-local task batching ----------------------------
+  // Reused across phases (cleared, never reallocated) so the batching path
+  // allocates nothing in steady state.
+  BatchGroups batch_groups_;
+  // Tasks their container declined to batch; they run as-is, in arrival order.
+  // A plain vector, not a queue: this is produced and consumed by THIS worker
+  // thread within one phase, so there is no handoff to synchronize.
+  std::vector<clio::run::shared_ptr<Task>> batch_passthrough_;
+  // merged task uid -> the parent tasks it completes. Only touched by this
+  // worker (the merged task is submitted Local and runs here), but EndTask can
+  // be reached from the monitor's rescue path, so it is mutex-guarded like
+  // BatchManager::pending_.
+  std::mutex batch_pending_mu_;
+  std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>>
+      batch_pending_;
 
   // Worker spawn time
   ctp::Timepoint spawn_time_;  // Time when worker was spawned

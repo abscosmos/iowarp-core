@@ -469,6 +469,14 @@ u32 Worker::ProcessNewTasks(TaskLane *lane) {
     return 0;
   }
 
+  // issue #820: one pass through the batching phase, which dequeues a bounded
+  // run and lets containers coalesce it. With no container opting in, every
+  // task is declined and executed in arrival order — the same work
+  // ProcessNewTask did, in the same order.
+  if (BatchingEnabled()) {
+    return BatchPhase(lane);
+  }
+
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
     if (ProcessNewTask(lane)) {
       tasks_processed++;
@@ -478,6 +486,19 @@ u32 Worker::ProcessNewTasks(TaskLane *lane) {
   }
 
   return tasks_processed;
+}
+
+bool Worker::BatchingEnabled() {
+  // issue #820. On by default; CLIO_TASK_BATCHING=0 restores the pre-batching
+  // dequeue loop verbatim, which is the escape hatch for bisecting a regression
+  // to this phase rather than to a container's policy.
+  static const bool v = [] {
+    if (const char *e = std::getenv("CLIO_TASK_BATCHING")) {
+      return !(std::string(e) == "0" || std::string(e) == "false");
+    }
+    return true;
+  }();
+  return v;
 }
 
 bool Worker::ProcessNewTask(TaskLane *lane) {
@@ -532,6 +553,197 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   // Bind + route + execute (shared with the inline SHM-ingest path).
   RouteAndExec(future, lane);
   return true;
+}
+
+clio::run::shared_ptr<Task> Worker::RouteOnly(Future<Task> &future,
+                                              TaskLane *lane) {
+  clio::run::shared_ptr<Task> task_full_ptr = future.GetTaskPtr();
+  if (task_full_ptr.IsNull()) {
+    return clio::run::shared_ptr<Task>();
+  }
+  task_full_ptr->SetRunWorkerId(worker_id_);
+  task_full_ptr->Lane() = lane;
+  task_full_ptr->SetEventQueue(event_queue_.load(std::memory_order_acquire));
+  task_full_ptr->RunFuture() = future;
+
+  RouteResult route_result = CLIO_IPC->RouteTask(future);
+  if (route_result != RouteResult::ExecHere) {
+    // RouteTask already enqueued it wherever it belongs.
+    return clio::run::shared_ptr<Task>();
+  }
+  return task_full_ptr;
+}
+
+namespace {
+/** issue #820: hands a container's merged tasks back to the worker. */
+class WorkerBatchSink : public BatchSink {
+ public:
+  using RunAsIs = std::function<void(const clio::run::shared_ptr<Task> &)>;
+
+  WorkerBatchSink(
+      RunAsIs run_as_is, std::mutex &mu,
+      std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>> &pending)
+      : run_as_is_(std::move(run_as_is)), mu_(mu), pending_(pending) {}
+
+  void Passthrough(const clio::run::shared_ptr<Task> &task) override {
+    if (task.IsNull()) {
+      return;
+    }
+    // Unchanged: it keeps the id, future and RunContext it was routed with.
+    run_as_is_(task);
+  }
+
+  void Emit(const clio::run::shared_ptr<Task> &merged,
+            std::vector<clio::run::shared_ptr<Task>> &&parents) override {
+    if (merged.IsNull()) {
+      return;
+    }
+    // Same construction the ManyToOne aggregate uses (BatchManager::
+    // BuildAndSubmit): a fresh id and a Local query, so the submit path gives
+    // this task its OWN RunContext and future rather than inheriting a
+    // parent's.
+    merged->task_id_ = CreateTaskId();
+    merged->pool_query_ = PoolQuery::Local();
+    merged->SetFlags(TASK_BATCH_MERGED);
+    if (!parents.empty()) {
+      std::lock_guard<std::mutex> lk(mu_);
+      pending_[merged->task_id_.unique_] = std::move(parents);
+    }
+    CLIO_IPC->Send(merged);
+  }
+
+ private:
+  RunAsIs run_as_is_;
+  std::mutex &mu_;
+  std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>> &pending_;
+};
+}  // namespace
+
+u32 Worker::BatchPhase(TaskLane *lane) {
+  // Bounded so batching can only ever amortize a backlog that already exists:
+  // with an empty lane behind it a task forms a group of one and is emitted
+  // unchanged, so the no-contention path pays nothing.
+  constexpr u32 kBatchDequeue = 64;
+  u32 popped = 0;
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  // Arrival order across the whole phase. Overlap resolution ("last writer
+  // wins") is only meaningful against submission order, so the worker stamps it
+  // here rather than letting a container infer it.
+  static thread_local u64 batch_seq = 0;
+
+  while (popped < kBatchDequeue) {
+    Future<Task> future;
+    if (!lane->Pop(future)) {
+      break;
+    }
+    ++popped;
+    SetCurrentTask(clio::run::shared_ptr<Task>());
+    Task *new_task = future.get();
+    if (new_task == nullptr) {
+      continue;
+    }
+    PoolId pool_id = new_task->pool_id_;
+    u32 method_id = new_task->method_;
+    auto container = pool_manager->GetStaticContainer(pool_id).get();
+    if (!container) {
+      HLOG(kError,
+           "Worker {}: cannot service pool_id={} method={}; container not found",
+           worker_id_, pool_id, method_id);
+      future.SetComplete();
+      continue;
+    }
+    clio::run::shared_ptr<Task> task_ptr = RouteOnly(future, lane);
+    if (task_ptr.IsNull()) {
+      continue;  // routed elsewhere, or undeserializable
+    }
+    // Offer it to the container's batching policy. The default declines, so a
+    // container that has not opted in behaves exactly as before.
+    if (container->BuildBatch(method_id, task_ptr, batch_groups_)) {
+      for (auto &kv : batch_groups_) {
+        if (!kv.second.empty() && kv.second.back().task.get() == task_ptr.get()) {
+          kv.second.back().seq = batch_seq++;
+          break;
+        }
+      }
+      continue;
+    }
+    batch_passthrough_.push_back(task_ptr);
+  }
+
+  // Declined tasks run first, in arrival order: they keep the semantics they
+  // had before batching existed, and a merged task then sees a settled world.
+  for (auto &t : batch_passthrough_) {
+    ExecTask(t, t->IsStarted());
+  }
+  batch_passthrough_.clear();
+
+  // Then let each container collapse whatever it parked.
+  if (!batch_groups_.empty()) {
+    WorkerBatchSink sink(
+        [this](const clio::run::shared_ptr<Task> &t) {
+          clio::run::shared_ptr<Task> copy = t;
+          ExecTask(copy, copy->IsStarted());
+        },
+        batch_pending_mu_, batch_pending_);
+    // Distinct pools present in the groups; each container picks out its own
+    // keys and must leave the map empty.
+    std::vector<PoolId> pools;
+    for (auto &kv : batch_groups_) {
+      bool seen = false;
+      for (const auto &p : pools) {
+        if (p == kv.first.pool_id) { seen = true; break; }
+      }
+      if (!seen) pools.push_back(kv.first.pool_id);
+    }
+    for (const auto &p : pools) {
+      auto container = pool_manager->GetStaticContainer(p).get();
+      if (container) {
+        container->SmashBatch(batch_groups_, sink);
+      }
+    }
+    // Anything a container left behind would otherwise never run: fail loudly
+    // rather than silently dropping a client's task.
+    if (!batch_groups_.empty()) {
+      for (auto &kv : batch_groups_) {
+        HLOG(kError,
+             "Worker {}: SmashBatch left {} task(s) parked for pool={} method={}"
+             " — completing them unbatched to avoid a hang",
+             worker_id_, kv.second.size(), kv.first.pool_id, kv.first.method);
+        for (auto &m : kv.second) {
+          ExecTask(m.task, m.task->IsStarted());
+        }
+      }
+      batch_groups_.clear();
+    }
+  }
+  return popped;
+}
+
+void Worker::CompleteBatchParents(clio::run::shared_ptr<Task> &merged) {
+  std::vector<clio::run::shared_ptr<Task>> parents;
+  {
+    std::lock_guard<std::mutex> lk(batch_pending_mu_);
+    auto it = batch_pending_.find(merged->task_id_.unique_);
+    if (it == batch_pending_.end()) {
+      return;
+    }
+    parents = std::move(it->second);
+    batch_pending_.erase(it);
+  }
+  u32 rc = merged->GetReturnCode();
+  ContainerId completer = merged->GetCompleter();
+  DynamicContainer container = merged->ExecContainer();
+  for (auto &parent : parents) {
+    // No payload copy-back: a merged task is built so that each parent's own
+    // output buffer is what the runtime already filled (that is what the
+    // vectored task shape in part A is for). Only the status has to travel.
+    parent->SetReturnCode(rc);
+    parent->SetCompleter(completer);
+    if (container.IsValid()) {
+      parent->ExecContainer() = container;
+    }
+    EndTask(parent, false);
+  }
 }
 
 void Worker::RouteAndExec(Future<Task> &future, TaskLane *lane) {
@@ -1012,6 +1224,19 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
     container->UpdateWork(task_ptr, -1);
     task_ptr->ClearFlags(TASK_DATA_OWNER);
     // Task is freed via RAII when the RunContext's shared_ptr owners drop.
+    break_self_cycle();
+    return;
+  }
+
+  // issue #820: a merged task from SmashBatch. Like the aggregate above it has
+  // no external waiter of its own — its job is to complete the PARENTS it
+  // subsumed, each of which does have one. The parents' payloads were already
+  // written by the merged task itself (a vectored put/get names each parent's
+  // own buffer), so only status travels.
+  if (task_ptr->task_flags_.Any(TASK_BATCH_MERGED)) {
+    CompleteBatchParents(task_ptr);
+    container->UpdateWork(task_ptr, -1);
+    task_ptr->ClearFlags(TASK_DATA_OWNER);
     break_self_cycle();
     return;
   }

@@ -42,6 +42,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "clio_runtime/batch_groups.h"
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/corwlock.h"
 #include "clio_runtime/pool_query.h"
@@ -574,6 +575,47 @@ class Container {
     (void)method;
     (void)agg_task;
     (void)member_task;
+  }
+
+  // ---- issue #820: worker-local task batching ----------------------------
+  //
+  // A worker may collect a bounded run of ready tasks and give a container the
+  // chance to COALESCE them before any of them executes: N independent tasks
+  // become a minimal set of merged tasks, each completing the parents it
+  // subsumed. This is not the ManyToOne collective in BatchManager (which
+  // reduces N inputs to 1 and broadcasts one result back); here the output is
+  // a *subset* of tasks and each carries a different parent set.
+  //
+  // Both hooks default to "not batchable" / "nothing to do", so a container
+  // that does not opt in behaves exactly as before.
+
+  /**
+   * Offer `task` to this container's batching policy.
+   *
+   * Return true to take ownership: the task has been parked in `groups` under
+   * whatever key the container chose, and the worker will NOT execute it now.
+   * Return false to decline, and the worker runs it as-is.
+   *
+   * @param method   the task's method id
+   * @param task     the candidate (already routed ExecHere, so it is local)
+   * @param groups   the worker's per-key parking area, reused across phases
+   */
+  virtual bool BuildBatch(u32 method, const clio::run::shared_ptr<Task> &task,
+                          BatchGroups &groups) {
+    (void)method;
+    (void)task;
+    (void)groups;
+    return false;
+  }
+
+  /**
+   * Collapse everything parked in `groups` into merged tasks and hand each to
+   * `sink`, naming the parent tasks it completes. Called once per phase after
+   * all BuildBatch offers. The container must leave `groups` empty.
+   */
+  virtual void SmashBatch(BatchGroups &groups, BatchSink &sink) {
+    (void)groups;
+    (void)sink;
   }
 
   // NOTE: There is no DelTask virtual. Tasks are clio::run::shared_ptr handles

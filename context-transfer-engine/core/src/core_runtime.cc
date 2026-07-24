@@ -4061,6 +4061,149 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
   }
 }
 
+// ---- issue #820: worker-local batching policy ---------------------------
+//
+// Group PutBlob/GetBlob tasks by the blob they target, then collapse each group
+// into ONE vectored task (see PutBlobTask::segments_). The filesystem stores
+// each 1 MiB page as one blob, so a sequential 4 KiB workload aims 256 tasks at
+// a single page-blob and each has to take that blob's #680 write token across
+// its whole body -- they drain single-file, which is the measured ~1 s tail.
+// Merged, they cost one token acquire and one bdev pass.
+
+namespace {
+/** Group identity: one group per (tag, blob). */
+clio::run::u64 BlobBatchKey(const TagId &tag_id, const std::string &blob_name) {
+  clio::run::u64 h = std::hash<std::string>()(blob_name);
+  h ^= std::hash<clio::run::u64>()(tag_id.major_) + 0x9e3779b97f4a7c15ULL +
+       (h << 6) + (h >> 2);
+  h ^= std::hash<clio::run::u64>()(tag_id.minor_) + 0x9e3779b97f4a7c15ULL +
+       (h << 6) + (h >> 2);
+  return h;
+}
+}  // namespace
+
+bool Runtime::BuildBatch(clio::run::u32 method,
+                         const clio::run::shared_ptr<clio::run::Task> &task,
+                         clio::run::BatchGroups &groups) {
+  // Only the two data-path methods, and only the plain positioned form. A task
+  // carrying anything the merge would have to reason about -- an existing
+  // segment list, a GPU page suffix, a wholesale-replace flag, or emulation --
+  // is declined and runs as it always did. Declining is always safe; merging
+  // the wrong thing is not.
+  if (method != Method::kPutBlob && method != Method::kGetBlob) {
+    return false;
+  }
+  TagId tag_id;
+  std::string blob_name;
+  if (method == Method::kPutBlob) {
+    auto *t = reinterpret_cast<PutBlobTask *>(task.get());
+    if (!t->segments_.empty() || t->gpu_page_idx_ != PutBlobTask::kNoPageIdx ||
+        (t->flags_ & kCtePutReplace) || t->context_.emulate_ ||
+        t->size_ == 0 || t->blob_data_.IsNull()) {
+      return false;
+    }
+    tag_id = t->tag_id_;
+    blob_name = t->blob_name_.str();
+  } else {
+    auto *t = reinterpret_cast<GetBlobTask *>(task.get());
+    if (!t->segments_.empty() || t->gpu_page_idx_ != GetBlobTask::kNoPageIdx ||
+        t->context_.emulate_ || t->size_ == 0 || t->blob_data_.IsNull()) {
+      return false;
+    }
+    tag_id = t->tag_id_;
+    blob_name = t->blob_name_.str();
+  }
+
+  clio::run::BatchKey key{task->pool_id_, method,
+                          BlobBatchKey(tag_id, blob_name)};
+  clio::run::BatchMember member;
+  member.task = task;
+  groups[key].push_back(member);
+  return true;
+}
+
+void Runtime::SmashBatch(clio::run::BatchGroups &groups,
+                         clio::run::BatchSink &sink) {
+  for (auto it = groups.begin(); it != groups.end();) {
+    const clio::run::BatchKey &key = it->first;
+    if (key.method != Method::kPutBlob && key.method != Method::kGetBlob) {
+      ++it;  // not ours (another container's group)
+      continue;
+    }
+    std::vector<clio::run::BatchMember> members = std::move(it->second);
+    it = groups.erase(it);
+    if (members.empty()) {
+      continue;
+    }
+    // A group of one has nothing to amortize: hand it back untouched rather
+    // than paying to wrap it in a vectored task. This is the no-backlog case,
+    // and it must cost nothing.
+    if (members.size() == 1) {
+      sink.Passthrough(members[0].task);
+      continue;
+    }
+
+    // Offset order, ties by ARRIVAL order. The runtime applies segments in list
+    // order, so this is what makes two writes to the same bytes resolve
+    // last-writer-wins -- the guarantee racing single-region tasks do not give.
+    std::sort(members.begin(), members.end(),
+              [&](const clio::run::BatchMember &a,
+                  const clio::run::BatchMember &b) {
+                clio::run::u64 ao, bo;
+                if (key.method == Method::kPutBlob) {
+                  ao = reinterpret_cast<PutBlobTask *>(a.task.get())->offset_;
+                  bo = reinterpret_cast<PutBlobTask *>(b.task.get())->offset_;
+                } else {
+                  ao = reinterpret_cast<GetBlobTask *>(a.task.get())->offset_;
+                  bo = reinterpret_cast<GetBlobTask *>(b.task.get())->offset_;
+                }
+                if (ao != bo) return ao < bo;
+                return a.seq < b.seq;
+              });
+
+    // Build the merged task as a copy of the first member, then replace its
+    // single region with every member's region as a segment. Each member keeps
+    // its OWN buffer -- no gather for writes, and for reads the runtime fills
+    // each member's destination directly, so completion needs no scatter.
+    clio::run::shared_ptr<clio::run::Task> merged =
+        NewCopyTask(key.method, members[0].task, /*deep=*/true);
+    if (merged.IsNull()) {
+      // Could not merge: run them individually rather than dropping them.
+      for (auto &m : members) {
+        sink.Passthrough(m.task);
+      }
+      continue;
+    }
+    std::vector<clio::run::shared_ptr<clio::run::Task>> parents;
+    parents.reserve(members.size());
+    if (key.method == Method::kPutBlob) {
+      auto *mt = reinterpret_cast<PutBlobTask *>(merged.get());
+      mt->segments_.clear();
+      for (auto &m : members) {
+        auto *s = reinterpret_cast<PutBlobTask *>(m.task.get());
+        mt->segments_.push_back(BlobSegment(s->offset_, s->size_, s->blob_data_));
+        parents.push_back(m.task);
+      }
+      mt->offset_ = 0;
+      mt->size_ = 0;
+      mt->blob_data_ = ctp::ipc::ShmPtr<>::GetNull();
+    } else {
+      auto *mt = reinterpret_cast<GetBlobTask *>(merged.get());
+      mt->segments_.clear();
+      for (auto &m : members) {
+        auto *s = reinterpret_cast<GetBlobTask *>(m.task.get());
+        mt->segments_.push_back(BlobSegment(s->offset_, s->size_, s->blob_data_));
+        parents.push_back(m.task);
+      }
+      mt->offset_ = 0;
+      mt->size_ = 0;
+      mt->blob_data_ = ctp::ipc::ShmPtr<>::GetNull();
+    }
+    sink.Emit(merged, std::move(parents));
+  }
+}
+
+
 // Helper methods for lock index calculation
 size_t Runtime::GetTargetLockIndex(const clio::run::PoolId &target_id) const {
   // Use hash of target_id to distribute locks evenly

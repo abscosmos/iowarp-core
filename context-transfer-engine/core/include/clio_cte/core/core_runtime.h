@@ -288,6 +288,22 @@ public:
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 
+  /**
+   * Worker-local batching policy (issue #820).
+   *
+   * PutBlob/GetBlob tasks aimed at the SAME blob are parked together and then
+   * collapsed into one vectored task per blob. This is the whole point of the
+   * feature: the filesystem stores each 1 MiB page as one blob, so a sequential
+   * 4 KiB workload sends 256 tasks at one page-blob and every one of them has to
+   * take that blob's #680 write token across its entire body. Merged, they cost
+   * one token acquire and one bdev pass.
+   */
+  bool BuildBatch(clio::run::u32 method,
+                  const clio::run::shared_ptr<clio::run::Task> &task,
+                  clio::run::BatchGroups &groups) override;
+  void SmashBatch(clio::run::BatchGroups &groups,
+                  clio::run::BatchSink &sink) override;
+
   // Container virtual method implementations (defined in autogen/core_lib_exec.cc)
   void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
                 clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
