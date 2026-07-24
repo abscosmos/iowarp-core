@@ -520,3 +520,33 @@ coalescing must happen where the same-blob traffic actually converges — most
 directly by having the **cfs adapter or filesystem chimod emit a vectored PutBlob
 (part A's API) per page** instead of N single-region ones. Part A is exactly the
 primitive that path needs; part B is the wrong layer for the POSIX workload.
+
+## 11. Related: block-fragmentation moved from CTE to the bdev allocator
+
+While in this code, a coupled cleanup that belongs to the same "make the write
+path efficient" goal. The CTE's `ExtendBlob` used to cap every physical block at
+64 KB, so a large logical write became many small blocks — a workaround for the
+bdev free list being bucketed by size category (a 1 MiB ask never sees freed
+64 KB blocks, so under churn the bump-only heap climbs to capacity and writes
+EIO; xfstests 074/521/522). That is the allocator's job, not the CTE's.
+
+Now: `StandardBlockAllocator::AllocateBlocks` assembles a large request from
+several smaller freed extents (`AllocateAnyUpTo`, physical-footprint accounting)
+before touching the heap; `AllocateFromTarget` returns every block, not just the
+first; `ExtendBlob` requests the whole extent and distributes the logical bytes
+across the returned physical blocks. The 64 KB cap is gone — a fresh 1 MiB blob
+is **one** 1 MiB block (verified), not 16.
+
+Decisive regression test `test_bdev_fragmentation`: fill a tier to capacity with
+8 KiB blobs, delete them, then allocate 1 MiB blobs that can only come from the
+freed extents — **0/20 (EIO) without the fix, 20/20 with it**.
+
+**fio impact (4 KiB): none, and for a precise reason.** The cap only ever fired
+for writes LARGER than 64 KB; a `bs=4k` write extends the page-blob by 4 KB, well
+under the cap, so the block count per page is identical old and new (256 × 4 KiB
+per 1 MiB page). Measured on the combined tree, 4 KiB seq write is ~13–15K IOPS
+warm, unchanged. Where it helps is large writes (a 1 MiB write is 1 block, not
+16 — a 16× shorter #680 token hold and 16× fewer allocations) and churn
+correctness. The 4 KiB fio tail (p99.9 ~80 ms, max ~300 ms) is the #680
+write-token contention, which neither this nor worker batching addresses at the
+POSIX ingress — see §10's conclusion (vectored PutBlob per page from the adapter).
