@@ -31,12 +31,46 @@ one bdev pass instead of 256.
   `SmashBatch` container virtuals (default decline/no-op), `TASK_BATCH_MERGED`
   parent fan-out. Verified behaviour-neutral: with the CTE policy off the full
   suite passes, including 8-writer same-blob stress.
-- **B2/B3 CTE policy — implemented, DEFAULT OFF (`CLIO_CTE_BATCHING=1` to
-  enable).** Parking CTE tasks still hangs `test_concurrent_same_blob` at >=8
-  concurrent writers, and the cause is not yet understood. Shipping it on by
-  default would trade a latency win for a hang.
-- **B4 — the measurement above covers the mechanism; the end-to-end fio tail
-  comparison waits on B2 being safe to enable.**
+- **B2/B3 CTE policy — implemented, no longer hangs, DEFAULT OFF pending a
+  workload that actually exercises it (`CLIO_CTE_BATCHING=1` to enable).**
+  `test_concurrent_same_blob` (8 writers), `test_cte_parallel_overlap_stress`
+  and `test_vectored_blob_io` all pass with it on.
+- **B4 — the 26x measurement above covers the mechanism. The end-to-end win is
+  NOT yet demonstrated, for the reason in "the ingress" below.**
+
+### The batching was wired to the wrong ingress
+
+The lane-based phase never saw a single hot-path task. Under the #807 SHM
+transport a client's PutBlob/GetBlob is delivered to its worker's **shard ring**
+and executed inline in `DrainMyShard` — it never enters the lane. Instrumented
+under an 8-writer same-blob load: **zero tasks parked, zero merges**, while the
+lane carried only occasional internal work.
+
+That also explains the hang. The lane carries internal and re-routed tasks that
+other in-flight work may be synchronously waiting on, so *deferring* one until
+the end of the phase can deadlock. Freshly ingested client requests have no such
+dependents yet. Moving the phase to `DrainMyShard` and leaving the lane path
+exactly as it was fixed the hang outright — 8-writer same-blob went from hanging
+to passing, with the policy on.
+
+### Why the end-to-end win is still not demonstrated
+
+Even at the right ingress, batching only pays when requests **co-arrive**: two
+same-blob requests must land in one worker's shard within one drain window. A
+synchronous client has exactly ONE outstanding request per thread, and threads
+spread across shards, so a worker sees one task at a time and every group is a
+group of one (measured: still zero merges at 8 threads).
+
+The contention is unquestionably there — same run, 8 writers at one blob:
+mean 2.72 ms, p50 277 µs, **p99 38.7 ms, p99.9 101.6 ms, max 118.9 ms**. That
+tail is the #680 token. But collapsing it needs a *bursty* submitter, which is
+exactly what #817's async writes produce (write(2) returns once staged, so many
+requests are in flight at once). Until this branch is combined with that path,
+the batching policy is a correct no-op on this workload.
+
+**So the honest split:** the vectored task shape is the win and it is proven
+(26x). The batching layer that would feed it automatically is built, safe, and
+in the right place, but needs an async/bursty client to have anything to merge.
 
 ### Bugs found while building this
 

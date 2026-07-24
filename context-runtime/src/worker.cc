@@ -469,14 +469,6 @@ u32 Worker::ProcessNewTasks(TaskLane *lane) {
     return 0;
   }
 
-  // issue #820: one pass through the batching phase, which dequeues a bounded
-  // run and lets containers coalesce it. With no container opting in, every
-  // task is declined and executed in arrival order — the same work
-  // ProcessNewTask did, in the same order.
-  if (BatchingEnabled()) {
-    return BatchPhase(lane);
-  }
-
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
     if (ProcessNewTask(lane)) {
       tasks_processed++;
@@ -618,11 +610,11 @@ class WorkerBatchSink : public BatchSink {
 };
 }  // namespace
 
-u32 Worker::BatchPhase(TaskLane *lane) {
+u32 Worker::BatchIngest(TaskLane *lane, u32 budget) {
   // Bounded so batching can only ever amortize a backlog that already exists:
   // with an empty lane behind it a task forms a group of one and is emitted
   // unchanged, so the no-contention path pays nothing.
-  constexpr u32 kBatchDequeue = 64;
+  const u32 kBatchDequeue = budget;
   u32 popped = 0;
   auto *pool_manager = CLIO_POOL_MANAGER;
   // Arrival order across the whole phase. Overlap resolution ("last writer
@@ -631,9 +623,9 @@ u32 Worker::BatchPhase(TaskLane *lane) {
   static thread_local u64 batch_seq = 0;
 
   while (popped < kBatchDequeue) {
-    Future<Task> future;
-    if (!lane->Pop(future)) {
-      break;
+    Future<Task> future = IpcCpu2Cpu::RecvIn(CLIO_IPC, worker_id_);
+    if (future.get() == nullptr) {
+      break;  // shard empty
     }
     ++popped;
     SetCurrentTask(clio::run::shared_ptr<Task>());
@@ -789,22 +781,32 @@ u32 Worker::DrainMyShard() {
   // lane push, no per-request AwakenWorker SIGUSR1: those were the bulk of the
   // latency gap vs the original inline design. A task that maps elsewhere is
   // enqueued by RouteTask as usual.
+  // issue #820: THIS is where client tasks actually arrive. Under the #807 SHM
+  // transport a client's PutBlob/GetBlob is delivered to its worker's shard
+  // ring and executed inline here -- it never enters the lane. Batching wired
+  // to the lane therefore never saw the hot path at all (measured: zero tasks
+  // parked under an 8-writer same-blob load). So the batch phase hooks the
+  // ingress, and the lane path is left exactly as it was.
+  //
+  // Deferring a LANE task is also unsafe in a way deferring an ingress task is
+  // not: the lane carries internal and re-routed work that other in-flight
+  // tasks may be synchronously waiting on, so holding one back can deadlock.
+  // Freshly ingested client requests have no such dependents yet.
   constexpr u32 kShardDrainBudget = 16;
   TaskLane *my_lane = assigned_lane_.load(std::memory_order_acquire);
-  u32 n = 0;
-  while (n < kShardDrainBudget) {
-    Future<Task> f = IpcCpu2Cpu::RecvIn(CLIO_IPC, worker_id_);
-    if (f.get() == nullptr) {
-      break;  // shard empty
+  if (!BatchingEnabled()) {
+    u32 n = 0;
+    while (n < kShardDrainBudget) {
+      Future<Task> f = IpcCpu2Cpu::RecvIn(CLIO_IPC, worker_id_);
+      if (f.get() == nullptr) {
+        break;
+      }
+      RouteAndExec(f, my_lane);
+      ++n;
     }
-    // Bind + route + execute. RuntimeMapTask decides whether this ingesting
-    // worker keeps the task (inline, the quick-local common case) or routes it
-    // to another worker (heavy tasks), so all placement policy stays in the
-    // scheduler.
-    RouteAndExec(f, my_lane);
-    ++n;
+    return n;
   }
-  return n;
+  return BatchIngest(my_lane, kShardDrainBudget);
 #else
   return 0;
 #endif

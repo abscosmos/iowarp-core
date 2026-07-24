@@ -576,9 +576,10 @@ class Worker {
   clio::run::shared_ptr<Task> RouteOnly(Future<Task> &future, TaskLane *lane);
 
   /**
-   * issue #820: the batching phase.
+   * issue #820: the batching phase, over the SHM INGRESS.
    *
-   * Dequeue a bounded run of ready tasks, and give each one's container the
+   * Take a bounded run of freshly arrived client requests, and give each one's
+   * container the
    * chance to COALESCE it with its neighbours instead of running it now. Tasks
    * the container declines run as-is, in arrival order, first; the merged tasks
    * the container produces are submitted after.
@@ -591,7 +592,7 @@ class Worker {
    *
    * @return number of tasks dequeued
    */
-  u32 BatchPhase(TaskLane *lane);
+  u32 BatchIngest(TaskLane *lane, u32 budget);
 
   /** issue #820: whether the batching phase runs at all (CLIO_TASK_BATCHING=0
    *  restores the pre-batching dequeue loop verbatim). */
