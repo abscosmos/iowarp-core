@@ -1,9 +1,50 @@
-# Worker-local task batching (issue #820)
+# Vectored PutBlob/GetBlob + worker-local task batching (issue #820)
 
 Status: **DESIGN** — no code yet. Branch `820-worker-task-batching` off `origin/dev` @ 04ebc438.
 
+Two coupled pieces:
+
+- **A. Vectored PutBlob/GetBlob** — a scatter-gather segment list on the task, so
+  one task acquires the blob write token once and applies N disjoint regions in a
+  single pass. Independently useful as a client API, and it is the shape the
+  batching layer produces.
+- **B. Worker-local batching** — coalesce many same-blob tasks into the minimal
+  set of **vectored** tasks before they hit the runtime.
+
+A lands first (independently testable/mergeable); B builds on it.
+
 Companion to #817 (async writes, which surfaced the tail) and #680 (the per-blob
 write-token contention this sidesteps).
+
+## 0. Vectored PutBlob/GetBlob (part A)
+
+Today `PutBlobTask` carries one region: `offset_`, `size_`, `blob_data_`
+(`core_tasks.h:1303`). Give it a segment list instead:
+
+```cpp
+struct BlobSegment { u64 offset; ShmPtr<> data; u64 size; };
+IN priv::vector<BlobSegment> segments_;   // empty => use the legacy single-region fields
+```
+
+The single-region ctor stays (fills a 1-segment view), so every existing caller
+is unchanged. `PutBlobImpl`/`GetBlobImpl` change from "one region under the token"
+to "**all segments under one token**":
+
+1. Acquire the blob write token once.
+2. Extend/resize to cover `[min segment offset, max segment end)` — one metadata
+   mutation pass.
+3. For each segment in **list order**, `ModifyExistingData` (PutBlob) or read into
+   `segment.data` (GetBlob). List order gives **last-writer-wins** on overlap —
+   the very ordering the #680 token race currently gets wrong (#817 write notes).
+4. Release.
+
+`SaveTask`/`LoadTask` serialize the vector; the merged tasks batching produces run
+locally (`ExecHere`) so they don't round-trip, but the fields must serialize for
+the client-API use and for cross-node vectored submits.
+
+Net: N disjoint same-blob writes = **one** token acquire and **one** bdev pass,
+with no contiguous gather buffer and no post-hoc scatter — each parent's `ShmPtr`
+is a segment, and GetBlob reads straight into each parent's buffer.
 
 ## 1. Why
 
@@ -138,31 +179,31 @@ the task is an ordinary positioned op (no compression transform, no GPU page
 suffix in v1 — those decline to passthrough). Group key = `hash(tag_id,
 blob_name)`.
 
-`SmashBatch`, per group:
+`SmashBatch`, per group, emits **vectored** tasks (part A):
 
 1. **Sort** members by `(tag_id, blob_name, offset)`, ties broken by **submission
    order** (a monotonic seq the worker stamps at `BuildBatch` time). Submission
    order is what makes overlap resolution correct.
-2. **Merge** into runs of contiguous/overlapping ranges → the minimal set of
-   output tasks. Two members merge when `off_i + size_i >= off_{i+1}` (adjacent or
-   overlapping) on the same blob.
-   - **PutBlob:** allocate one contiguous staging buffer spanning
-     `[min_off, max_end)`; copy each member's data in at its offset. **Overlaps
-     resolve by submission order** — the later writer's bytes land last, which is
-     the correct last-writer-wins the #680 token race currently gets *wrong*.
-     Holes inside a run (gap between two non-adjacent-but-mergeable members) are
-     not created — a gap ends the run and starts a new output task, so we never
-     invent bytes.
-   - **GetBlob:** one read over `[min_off, max_end)`; on completion scatter each
-     parent's `[off_i, off_i+size_i)` sub-range out of the merged buffer.
-3. Each output task's parent set = the members it covers; each parent's
-   `out_slice` = its offset/size within the merged buffer.
+2. **Build one vectored task per blob**: each member becomes a segment
+   `{offset, data, size}` in the task's `segments_`, in sorted+submission order.
+   Adjacent members (`off_i + size_i == off_{i+1}`, same `ShmPtr` contiguous) MAY
+   be fused into one segment to minimize count; disjoint members stay as separate
+   segments in the **same** task. No contiguous gather buffer — the parents' own
+   `ShmPtr`s are the segments. (A blob with more members than a segment cap splits
+   into >1 vectored task.)
+   - **PutBlob:** the runtime applies segments in list order → overlaps
+     last-writer-wins.
+   - **GetBlob:** the runtime reads each segment straight into that segment's
+     `ShmPtr` = the parent's buffer, so completion needs **no scatter copy**.
+3. Each vectored task's parent set = the members whose segments it carries; the
+   completion fan-out sets rc/`bytes` per parent (GetBlob bytes already landed in
+   the parent buffer).
 4. Emit via `sink`.
 
-Net for the 4 KiB sequential case: 256 same-page PutBlobs → **1** PutBlob spanning
-the 1 MiB page. One token acquire, one bdev write. The tail's root cause is gone,
-and the merge also fixes the overlap-ordering correctness gap #680 leaves open
-(see #817's write notes).
+Net for the 4 KiB sequential case: 256 same-page PutBlobs → **1 vectored PutBlob**
+with 256 segments (or fewer, fused) over the 1 MiB page. One token acquire, one
+bdev pass. The tail's root cause is gone, and applying segments in submission
+order fixes the overlap-ordering gap #680 leaves open (#817 write notes).
 
 ## 6. Data structures to add
 
@@ -177,10 +218,10 @@ and the merge also fixes the overlap-ordering correctness gap #680 leaves open
 
 ## 7. Open questions / hazards
 
-1. **Staging-buffer gather cost (PutBlob).** Merging needs the members' bytes
-   contiguous. v1 gathers into one buffer (a memcpy per member — the same copy
-   cfs_io already does once). A later v2 could give PutBlob a scatter-list
-   `(offset, ShmPtr, size)[]` to avoid the extra copy; out of scope for v1.
+1. **~~Staging-buffer gather cost~~ — removed by vectored tasks (part A).** The
+   merged task carries the parents' `ShmPtr`s directly as segments, so there is no
+   contiguous gather and no extra memcpy. The remaining cost is the segment vector
+   itself (a few dozen bytes per member).
 2. **Partial failure.** If the merged bdev transfer half-fails, how granular is
    the error to parents? v1: all covered parents get the merged rc (conservative).
    Only matters if the bdev can report partial byte counts; note and defer.
@@ -203,11 +244,13 @@ and the merge also fixes the overlap-ordering correctness gap #680 leaves open
 
 | Phase | Deliverable |
 |---|---|
-| 0 | Worker batch phase + `BatchGroups`/passthrough SPSC, `Container::BuildBatch`/`SmashBatch` default no-ops. **No behavior change** — every container passes through. |
-| 1 | Parent-completion side table + `TASK_BATCH_MERGED` fan-out in `EndTask` (unit-tested with a trivial echo container). |
-| 2 | CTE `PutBlob` policy: sort/merge/gather + scatter completion. Correctness first (overlap = last-writer-wins), then the fio tail measurement. |
-| 3 | CTE `GetBlob` policy: merge + scatter-read, RYOW respected. |
-| 4 | Bench + tail: the 4 KiB seq write max-stall should collapse from ~1 s toward the 1-MiB-write floor; verify p99.9 and mean, not just p50. |
+| A1 | **Vectored PutBlob**: `segments_` on the task, `PutBlobImpl` applies all segments under one token, Save/Load serialize the vector, single-region ctor unchanged. Unit test: one vectored task vs N single writes, same result; overlap = last-writer-wins. Independently mergeable. |
+| A2 | **Vectored GetBlob**: segment reads into per-segment `ShmPtr`. |
+| B0 | Worker batch phase + `BatchGroups`/passthrough SPSC, `Container::BuildBatch`/`SmashBatch` default no-ops. **No behavior change** — every container passes through. |
+| B1 | Parent-completion side table + `TASK_BATCH_MERGED` fan-out in `EndTask` (trivial echo container). |
+| B2 | CTE `BuildBatch`/`SmashBatch` for PutBlob → emits vectored PutBlob. Correctness first, then the fio tail measurement. |
+| B3 | CTE GetBlob batching → vectored GetBlob, RYOW respected. |
+| B4 | Bench + tail: the 4 KiB seq write max-stall should collapse from ~1 s toward the 1-MiB-write floor; verify p99.9 and mean, not just p50. |
 
 ## 9. Success criteria
 
