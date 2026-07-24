@@ -1,6 +1,8 @@
 # Vectored PutBlob/GetBlob + worker-local task batching (issue #820)
 
-Status: **A IMPLEMENTED + MEASURED; B implemented but OPT-IN pending a hang.**
+Status: **A and B IMPLEMENTED AND MEASURED.** Batching is opt-in
+(`CLIO_BATCH_LANE=1 CLIO_CTE_BATCHING=1`) pending broader soak, but it works and
+delivers ~3.7x end to end; the vectored task shape underneath is 26–28x.
 Branch `820-worker-task-batching` off `origin/dev` @ 04ebc438.
 
 ## Result so far
@@ -154,10 +156,21 @@ lane is full. The one discrepancy to resolve is that the thread is *asleep*
 rather than spinning, so either the ring's wait sleeps, or the block is one level
 deeper than `Push`.
 
-**Fix direction (not yet implemented):** do not `Send` merged tasks from inside
-the drain loop. Either run the merged task inline on the current worker (it is
-already the right container), or hand it off through a path that cannot enqueue
-onto the lane being drained.
+**FIXED.** Merged tasks are no longer `Send`-ed. The sink runs them **inline on
+the current worker**: it gives the merged task its own `Future` + `RunContext`
+(it has no client waiter of its own — its job is to complete the parents it
+subsumed) and calls `ExecTask` directly. That is also simply correct, not just a
+workaround: every member routed to this container on this worker, so the merged
+task belongs here by construction and never needs to enter a lane at all.
+
+With that, batching works and pays:
+
+| async burst, 256 x 4 KiB at one blob, 10 rounds | median | range |
+|---|---|---|
+| batching off | 12.01 / 12.54 ms | 11.69–15.86 |
+| **batching on** | **3.26 / 3.41 ms** | 2.75–4.28 |
+
+**~3.7x**, ranges non-overlapping, arms interleaved on the same binary.
 
 Also applied while investigating (kept — correct on its own): the current-task
 slot is cleared before emitting. `IpcCpu2Self::SendIn` parents a self-sent task

@@ -594,9 +594,12 @@ class WorkerBatchSink : public BatchSink {
   using RunAsIs = std::function<void(const clio::run::shared_ptr<Task> &)>;
 
   WorkerBatchSink(
-      RunAsIs run_as_is, std::mutex &mu,
+      RunAsIs run_as_is, RunAsIs run_merged, std::mutex &mu,
       std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>> &pending)
-      : run_as_is_(std::move(run_as_is)), mu_(mu), pending_(pending) {}
+      : run_as_is_(std::move(run_as_is)),
+        run_merged_(std::move(run_merged)),
+        mu_(mu),
+        pending_(pending) {}
 
   void Passthrough(const clio::run::shared_ptr<Task> &task) override {
     if (task.IsNull()) {
@@ -611,22 +614,33 @@ class WorkerBatchSink : public BatchSink {
     if (merged.IsNull()) {
       return;
     }
-    // Same construction the ManyToOne aggregate uses (BatchManager::
-    // BuildAndSubmit): a fresh id and a Local query, so the submit path gives
-    // this task its OWN RunContext and future rather than inheriting a
-    // parent's.
+    // A fresh id and a Local query, so this task gets its OWN RunContext and
+    // future rather than inheriting a member's.
     merged->task_id_ = CreateTaskId();
     merged->pool_query_ = PoolQuery::Local();
     merged->SetFlags(TASK_BATCH_MERGED);
-    size_t np = parents.size();
     if (!parents.empty()) {
       std::lock_guard<std::mutex> lk(mu_);
       pending_[merged->task_id_.unique_] = std::move(parents);
     }
+    // Run it HERE rather than CLIO_IPC->Send().
+    //
+    // Send() self-sends, which routes with force_enqueue and pushes onto a
+    // worker lane. Called from inside the drain loop that consumes that very
+    // lane, under a deep burst the lane is full and the push waits for space
+    // only this thread could make -- the producer==consumer deadlock
+    // IpcCpu2Self::SendIn warns about in its own comment. Measured: Send never
+    // returned, every thread asleep, nothing spinning.
+    //
+    // Running inline is also simply correct: every member routed to this
+    // container on this worker, so the merged task belongs here by
+    // construction and never needs to enter a lane at all.
+    run_merged_(merged);
   }
 
  private:
   RunAsIs run_as_is_;
+  RunAsIs run_merged_;
   std::mutex &mu_;
   std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>> &pending_;
 };
@@ -730,6 +744,23 @@ u32 Worker::BatchCollect(TaskLane *lane, u32 budget, bool from_lane) {
         [this](const clio::run::shared_ptr<Task> &t) {
           clio::run::shared_ptr<Task> copy = t;
           ExecTask(copy, copy->IsStarted());
+        },
+        [this, lane](const clio::run::shared_ptr<Task> &m) {
+          // Give the merged task its OWN future + RunContext -- it has no
+          // client waiter of its own; its job is to complete the parents it
+          // subsumed -- then bind and run it on this worker.
+          clio::run::shared_ptr<Task> t = m;
+          Future<Task> f(t->pool_id_, t->method_, t);
+          {
+            auto fs = f.GetFutureShm();
+            fs->origin_ = ClientOrigin::kClientShm;
+          }
+          t->BeginRunContext();
+          t->SetRunWorkerId(worker_id_);
+          t->Lane() = lane;
+          t->SetEventQueue(event_queue_.load(std::memory_order_acquire));
+          t->RunFuture() = f;
+          ExecTask(t, /*is_started=*/false);
         },
         batch_pending_mu_, batch_pending_);
     // Distinct pools present in the groups; each container picks out its own
