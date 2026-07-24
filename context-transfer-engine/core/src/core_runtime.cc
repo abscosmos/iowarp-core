@@ -4093,6 +4093,22 @@ bool Runtime::BuildBatch(clio::run::u32 method,
   if (method != Method::kPutBlob && method != Method::kGetBlob) {
     return false;
   }
+  // OFF BY DEFAULT (issue #820). The worker's batching phase and this policy
+  // are both implemented and the merge itself is proven by
+  // test_vectored_blob_io, but parking CTE tasks still hangs
+  // test_concurrent_same_blob at >=8 concurrent writers and the cause is not
+  // yet understood. Shipping it on by default would trade a latency win for a
+  // hang, so it stays opt-in (CLIO_CTE_BATCHING=1) until that is root-caused.
+  // The vectored task shape (part A) is unconditional and independently useful.
+  static const bool policy_on = [] {
+    if (const char *e = std::getenv("CLIO_CTE_BATCHING")) {
+      return !(std::string(e) == "0" || std::string(e) == "false");
+    }
+    return false;
+  }();
+  if (!policy_on) {
+    return false;
+  }
   TagId tag_id;
   std::string blob_name;
   if (method == Method::kPutBlob) {
@@ -4125,7 +4141,10 @@ bool Runtime::BuildBatch(clio::run::u32 method,
 void Runtime::SmashBatch(clio::run::BatchGroups &groups,
                          clio::run::BatchSink &sink) {
   for (auto it = groups.begin(); it != groups.end();) {
-    const clio::run::BatchKey &key = it->first;
+    // BY VALUE, not by reference: the erase below destroys the map node, and
+    // every use of the key after that point (the method checks, the sort
+    // comparator, the merged-task construction) would be reading freed memory.
+    const clio::run::BatchKey key = it->first;
     if (key.method != Method::kPutBlob && key.method != Method::kGetBlob) {
       ++it;  // not ours (another container's group)
       continue;

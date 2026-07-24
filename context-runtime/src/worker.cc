@@ -609,7 +609,6 @@ class WorkerBatchSink : public BatchSink {
       std::lock_guard<std::mutex> lk(mu_);
       pending_[merged->task_id_.unique_] = std::move(parents);
     }
-    CLIO_IPC->Send(merged);
   }
 
  private:
@@ -655,6 +654,15 @@ u32 Worker::BatchPhase(TaskLane *lane) {
     clio::run::shared_ptr<Task> task_ptr = RouteOnly(future, lane);
     if (task_ptr.IsNull()) {
       continue;  // routed elsewhere, or undeserializable
+    }
+    // A task that has already STARTED is not a candidate: it is a coroutine
+    // parked mid-execution and re-queued to resume (ContinueBlockedTasks
+    // pushes those back onto the lane). It must resume, not be folded into a
+    // fresh merged task -- doing that abandons its in-flight state and its
+    // waiter never completes. Offer only never-started tasks.
+    if (task_ptr->IsStarted()) {
+      batch_passthrough_.push_back(task_ptr);
+      continue;
     }
     // Offer it to the container's batching policy. The default declines, so a
     // container that has not opted in behaves exactly as before.

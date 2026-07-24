@@ -110,6 +110,12 @@ add_executable(test_vectored_blob_io
     test_vectored_blob_io.cc
 )
 
+# Batching benchmark (#820): many small writes at ONE blob, A/B'd on the same
+# binary via CLIO_TASK_BATCHING.
+add_executable(bench_same_blob_batching
+    bench_same_blob_batching.cc
+)
+
 # Parallel blob-metadata overlap stress: many threads race
 # PutBlob/GetBlob/DelBlob/GetBlobInfo over only 4 tags x 4 blobs (heavy
 # overlap). Success = no crashes, hangs, or leaks.
@@ -384,6 +390,18 @@ target_link_libraries(test_concurrent_same_blob
 
 # Link test_vectored_blob_io (#820 vectored blob I/O) - same deps.
 target_link_libraries(test_vectored_blob_io
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# Link bench_same_blob_batching (#820) - same deps.
+target_link_libraries(bench_same_blob_batching
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime

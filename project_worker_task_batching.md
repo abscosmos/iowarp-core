@@ -1,6 +1,63 @@
 # Vectored PutBlob/GetBlob + worker-local task batching (issue #820)
 
-Status: **DESIGN** — no code yet. Branch `820-worker-task-batching` off `origin/dev` @ 04ebc438.
+Status: **A IMPLEMENTED + MEASURED; B implemented but OPT-IN pending a hang.**
+Branch `820-worker-task-batching` off `origin/dev` @ 04ebc438.
+
+## Result so far
+
+**Vectored PutBlob is a 26x win on the case this issue is about.** Same bytes,
+same blob, no batching phase and no concurrency involved — only the task shape
+(`bench_same_blob_batching`, 256 x 4 KiB to one blob, 20 rounds, medians, both
+arms warmed):
+
+| | median | range |
+|---|---|---|
+| 256 single PutBlobs | 37.86 ms | 34.41–41.43 |
+| **1 vectored PutBlob** | **1.46 ms** | 1.22–2.87 |
+
+**25.97x**, with non-overlapping ranges. That is the #680 write token being
+acquired once instead of 256 times, one metadata mutation instead of 256, and
+one bdev pass instead of 256.
+
+### Status by part
+
+- **A1 vectored PutBlob — done.** `segments_` on the task, `PutBlobImpl` applies
+  all segments under one token acquire. `test_vectored_blob_io` asserts
+  equivalence with N single puts, list-order overlap resolution
+  (last-writer-wins), and union-range allocation with a zero-filled hole.
+- **A2 vectored GetBlob — done.** Each region read into its own buffer off one
+  block snapshot. Tested.
+- **B0/B1 worker batch phase — done.** `Worker::BatchPhase`, `BuildBatch`/
+  `SmashBatch` container virtuals (default decline/no-op), `TASK_BATCH_MERGED`
+  parent fan-out. Verified behaviour-neutral: with the CTE policy off the full
+  suite passes, including 8-writer same-blob stress.
+- **B2/B3 CTE policy — implemented, DEFAULT OFF (`CLIO_CTE_BATCHING=1` to
+  enable).** Parking CTE tasks still hangs `test_concurrent_same_blob` at >=8
+  concurrent writers, and the cause is not yet understood. Shipping it on by
+  default would trade a latency win for a hang.
+- **B4 — the measurement above covers the mechanism; the end-to-end fio tail
+  comparison waits on B2 being safe to enable.**
+
+### Bugs found while building this
+
+1. **Emit vs Passthrough.** Routing a group of ONE through the merged-task path
+   reassigned the task's id — but its client future was already bound to the old
+   id, so the client hung forever. A parked original must run *unchanged*
+   (`BatchSink::Passthrough`); only a freshly built synthetic task may be
+   `Emit`ted.
+2. **Dangling group key.** `SmashBatch` held `const BatchKey &key = it->first`
+   and then `groups.erase(it)` — every later use of `key` (the method checks,
+   the sort comparator, the merged-task construction) read freed memory. It
+   showed up as "park method=15, smash method=25": the same group reporting two
+   different methods, so the merge took the wrong branch. Copy the key by value.
+3. **Started tasks are not candidates.** A task popped off the lane may be a
+   coroutine resuming mid-execution (`ContinueBlockedTasks` re-queues those).
+   Folding one into a fresh merged task abandons its in-flight state and strands
+   its waiter. Only never-started tasks are offered.
+
+The remaining hang is B2-specific and reproduces only with the CTE policy on and
+>=8 concurrent writers to one blob; the phase itself is clean at the same
+concurrency.
 
 Two coupled pieces:
 
