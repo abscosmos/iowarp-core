@@ -1285,6 +1285,70 @@ set_tests_properties(cfs_shm_read PROPERTIES
     LABELS "unit;cte;cfs;msan_skip")
 endif()  # UNIX
 
+# Private-memory AsyncGetBlob (issue #823). UNIX-only because the "separate"
+# configuration forks a real clio_run daemon (RuntimeServer / unistd.h), the
+# same shape the cfs_shm_read test uses. The two ctest entries below run the
+# SAME binary in the two runtime configurations the issue calls for: inline
+# (co-located runtime -> direct write into private memory) and separate (pure
+# client -> SHM staging + PostWait copy).
+if(UNIX)
+add_executable(test_getblob_priv
+    test_getblob_priv.cc
+)
+
+target_include_directories(test_getblob_priv PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_compile_definitions(test_getblob_priv PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
+target_link_libraries(test_getblob_priv
+    clio_cte_core_client
+    # Config helpers used by the client live in the runtime library; keep it
+    # after the client on the link line (see the cfs_shm_read note above).
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# The co-located (inline) runtime dlopens the chimods from CLIO_REPO_PATH; the
+# separate configuration forks clio_run. Both need the runtime modules built.
+add_dependencies(test_getblob_priv
+    clio_run
+    clio_cte_core_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+
+set(_getblob_priv_env
+    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
+if(APPLE)
+  string(APPEND _getblob_priv_env ";CLIO_IPC_MODE=ipc")
+endif()
+
+# Inline: this process starts the runtime co-located (direct-write path).
+add_test(NAME cte_getblob_priv_inline
+    COMMAND test_getblob_priv
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cte_getblob_priv_inline PROPERTIES
+    ENVIRONMENT "${_getblob_priv_env}"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 120
+    LABELS "unit;core;cte;msan_skip")
+
+# Separate: forks a real daemon and attaches as a pure client (staging path).
+add_test(NAME cte_getblob_priv_separate
+    COMMAND test_getblob_priv
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cte_getblob_priv_separate PROPERTIES
+    ENVIRONMENT "${_getblob_priv_env};CLIO_GETBLOB_PRIV_MODE=separate"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 180
+    LABELS "unit;core;cte;msan_skip")
+endif()  # UNIX
+
 add_executable(test_cte_gpu_metadata_cache
     test_cte_gpu_metadata_cache.cc
 )

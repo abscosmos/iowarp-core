@@ -560,6 +560,85 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Private-memory AsyncGetBlob (issue #823): read a blob region straight into
+   * a caller-owned PRIVATE buffer (char*), instead of making the caller
+   * hand-manage a shared-memory buffer (allocate → pass ShmPtr → copy out →
+   * free) as the ShmPtr overload above requires.
+   *
+   * Three paths, fastest first:
+   *  - Shared-cache hit: the bytes are copied out of the RAM bdev's shared
+   *    segment with ZERO IPC and an already-satisfied (empty) Future is
+   *    returned, so Wait() returns immediately. Same fast path the synchronous
+   *    Tag::GetBlob(char*) uses.
+   *  - Runtime (co-located) mode: the daemon shares this address space, so the
+   *    private pointer is wrapped as a null-allocator ShmPtr — IpcManager::
+   *    ToFullPtr resolves such a pointer's offset AS the absolute address — and
+   *    the bdev read lands DIRECTLY in the caller's buffer. No staging buffer,
+   *    no copy, and NOT TASK_DATA_OWNER (the buffer is the caller's, not ours).
+   *  - Client mode: the daemon cannot reach private memory, so the read is
+   *    staged through a freshly allocated SHM buffer. The task is marked
+   *    TASK_DATA_OWNER (its destructor frees the staging buffer on DelTask) and
+   *    GetBlobTask::PostWait() copies the staged bytes into the caller's buffer
+   *    when the read completes.
+   *
+   * @return A Future over the read. On the cache-hit path the Future is EMPTY
+   *         (Wait() succeeds immediately; do not dereference it). On the other
+   *         paths the task is readable after Wait() (GetReturnCode()==0 on
+   *         success). An empty Future is also returned if SHM staging could not
+   *         be allocated in client mode.
+   */
+  clio::run::Future<GetBlobTask> AsyncGetBlob(
+      const TagId &tag_id, const std::string &blob_name,
+      clio::run::u64 offset, clio::run::u64 size, clio::run::u32 flags,
+      char *priv_data,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    // Fastest path: node-local RAM-resident blob → copy straight out of shared
+    // memory. A miss (not cached / not direct-readable / placement moved) falls
+    // through to a real task, so this is only ever faster, never wrong.
+    if (priv_data != nullptr && size > 0 && HasShmCache() &&
+        TryReadBlobShm(tag_id, blob_name, priv_data, size, offset)) {
+      return clio::run::Future<GetBlobTask>();
+    }
+
+    if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      // Co-located daemon: write directly into the private buffer. The null
+      // AllocatorId marks the offset as an absolute process address.
+      ctp::ipc::ShmPtr<> raw = ctp::ipc::ShmPtr<>::FromRaw(priv_data);
+      auto task = ipc_manager->NewTask<GetBlobTask>(
+          clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+          offset, size, flags, raw, context);
+      return ipc_manager->Send(task);
+    }
+
+    // Client: stage through an SHM buffer; PostWait() copies it into priv_data
+    // and ~GetBlobTask (TASK_DATA_OWNER) frees the staging buffer.
+    ctp::ipc::FullPtr<char> staging = ipc_manager->AllocateBuffer(size);
+    if (staging.IsNull()) {
+      return clio::run::Future<GetBlobTask>();
+    }
+    auto task = ipc_manager->NewTask<GetBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, flags, ctp::ipc::ShmPtr<>(staging.shm_), context);
+    auto *t = task.get();
+    // priv_dest_/priv_src_ are NOT serialized, so they stay on this client
+    // instance (the daemon's copy default-constructs them to null).
+    t->priv_dest_ = priv_data;
+    t->priv_src_ = staging.ptr_;
+    auto fut = ipc_manager->Send(task);
+    // Mark ownership only AFTER Send has serialized the task: Task::SerializeIn
+    // ships task_flags_, so setting TASK_DATA_OWNER earlier would hand the flag
+    // to the daemon, whose task shares the very same physical SHM buffer on the
+    // local path — and it would free the client's buffer out from under us.
+    // Set client-side, this instance's ~GetBlobTask frees the staging buffer
+    // when the Future (task) is destroyed. Same object the Future retains.
+    t->SetFlags(TASK_DATA_OWNER);
+    return fut;
+  }
+
+  /**
    * Vectored get (issue #820): read N regions of one blob in a SINGLE task,
    * each region landing in its OWN buffer.
    *
