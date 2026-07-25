@@ -219,6 +219,25 @@ void Tag::GetBlob(const std::string &blob_name, char *data, size_t data_size, si
   ipc_manager->FreeBuffer(shm_fullptr);
 }
 
+clio::run::Future<GetBlobTask> Tag::AsyncGetBlob(const std::string &blob_name,
+                                                 char *data, size_t data_size,
+                                                 size_t off) {
+  // Validate input parameters
+  if (data_size == 0) {
+    throw std::invalid_argument("data_size must be specified for AsyncGetBlob");
+  }
+  if (data == nullptr) {
+    throw std::invalid_argument("data buffer must be pre-allocated by caller");
+  }
+
+  // issue #823: read straight into the caller's PRIVATE buffer. The client
+  // picks the fastest of shared-cache / runtime-direct / client-staging; the
+  // returned Future is empty on a cache hit and readable otherwise.
+  auto *cte_client = CLIO_CTE_CLIENT;
+  return cte_client->AsyncGetBlob(tag_id_, blob_name, off, data_size,
+                                  /*flags=*/0, data);
+}
+
 void Tag::GetBlob(const std::string &blob_name, ctp::ipc::ShmPtr<> data, size_t data_size, size_t off) {
   // Validate input parameters
   if (data_size == 0) {

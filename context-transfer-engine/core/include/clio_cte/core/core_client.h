@@ -1414,6 +1414,26 @@ class Tag {
                size_t data_size, size_t off = 0);
 
   /**
+   * Asynchronous private-memory GetBlob (issue #823): read a blob region
+   * straight into a caller-owned PRIVATE buffer (char*, e.g. heap/stack), with
+   * no manual shared-memory management. Delegates to
+   * CoreClient::AsyncGetBlob(char*) — see there for the three paths (shared
+   * cache / runtime-direct / client-staging).
+   *
+   * @param blob_name Name of the blob to retrieve
+   * @param data Output PRIVATE buffer (pre-allocated by caller, >= data_size)
+   * @param data_size Size of data to retrieve (must be > 0)
+   * @param off Offset within blob (default 0)
+   * @return Future over the read. On the shared-cache path the Future is EMPTY
+   *         (Wait() returns immediately; do not dereference it); otherwise the
+   *         task is readable after Wait() (GetReturnCode()==0 on success). The
+   *         buffer holds the bytes once Wait() returns.
+   */
+  clio::run::Future<GetBlobTask> AsyncGetBlob(const std::string &blob_name,
+                                              char *data, size_t data_size,
+                                              size_t off = 0);
+
+  /**
    * Get blob score
    * @param blob_name Name of the blob
    * @return Blob score (0.0-1.0)
