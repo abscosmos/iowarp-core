@@ -519,6 +519,95 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Private-memory AsyncPutBlob (issue #830): write a blob region straight from
+   * a caller-owned PRIVATE buffer (const char*), instead of making the caller
+   * hand-manage a shared-memory buffer (allocate → copy in → pass ShmPtr →
+   * free) as the ShmPtr overload above requires. This is the write-side analog
+   * of the private-memory AsyncGetBlob (issue #823).
+   *
+   * Two paths, fastest first:
+   *  - Runtime (co-located) mode: the daemon shares this address space, so the
+   *    private pointer is wrapped as a null-allocator ShmPtr — IpcManager::
+   *    ToFullPtr resolves such a pointer's offset AS the absolute address — and
+   *    the bdev write reads DIRECTLY from the caller's buffer. No staging
+   *    buffer, no copy, and NOT TASK_DATA_OWNER (the buffer is the caller's).
+   *  - Client mode: the daemon cannot reach private memory, so the write is
+   *    staged through a freshly allocated SHM buffer — the private bytes are
+   *    copied in ONCE, then the task carries that buffer. The task is marked
+   *    TASK_DATA_OWNER so ~PutBlobTask frees the staging buffer once the write
+   *    completes (i.e. after the caller's Wait() returns).
+   *
+   * The issue #830 client-mode zero-IPC fast path (write straight into the
+   * cached blob, skipping the task entirely) is deliberately NOT taken here: a
+   * token-less direct write to the RAM bdev segment can race the DataOrganizer
+   * relocating the blob — it frees/reuses those blocks under the per-blob write
+   * token a pure client cannot hold, so the write would corrupt whichever blob
+   * next owns them. Unlike the read fast path, a placement_gen recheck can
+   * DETECT that race but not UNDO the write. Making it safe needs a
+   * client-visible pin/lease against reorganization; left as a follow-up.
+   *
+   * @return A Future over the put; readable after Wait() (GetReturnCode()==0 on
+   *         success). An empty Future is returned only if SHM staging could not
+   *         be allocated in client mode.
+   */
+  clio::run::Future<PutBlobTask> AsyncPutBlob(
+      const TagId &tag_id, const std::string &blob_name,
+      clio::run::u64 offset, clio::run::u64 size, const char *priv_data,
+      float score = -1.0f, const Context &context = Context(),
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    // A zero-length put carries no payload; route it through the ShmPtr overload
+    // with a null buffer so the two modes below never see size 0.
+    if (size == 0 || priv_data == nullptr) {
+      return AsyncPutBlob(tag_id, blob_name.c_str(), offset, size,
+                          ctp::ipc::ShmPtr<>::GetNull(), score, context, flags,
+                          pool_query);
+    }
+
+    if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      // Co-located daemon: read directly from the private buffer. The null
+      // AllocatorId marks the offset as an absolute process address, so the
+      // bdev write pulls the source bytes straight out of `priv_data`.
+      ctp::ipc::ShmPtr<> raw =
+          ctp::ipc::ShmPtr<>::FromRaw(const_cast<char *>(priv_data));
+      auto task = ipc_manager->NewTask<PutBlobTask>(
+          clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+          offset, size, raw, score, context, flags);
+      task.get()->submit_ts_ns_ =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+      return ipc_manager->Send(task);
+    }
+
+    // Client: stage through an SHM buffer, copying the private bytes in ONCE.
+    ctp::ipc::FullPtr<char> staging = ipc_manager->AllocateBuffer(size);
+    if (staging.IsNull()) {
+      return clio::run::Future<PutBlobTask>();
+    }
+    std::memcpy(staging.ptr_, priv_data, size);
+    auto task = ipc_manager->NewTask<PutBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, ctp::ipc::ShmPtr<>(staging.shm_), score, context, flags);
+    auto *t = task.get();
+    t->submit_ts_ns_ =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    auto fut = ipc_manager->Send(task);
+    // Mark ownership only AFTER Send has serialized the task: Task::SerializeIn
+    // ships task_flags_, so setting TASK_DATA_OWNER earlier would hand the flag
+    // to the daemon, whose task shares the very same physical SHM buffer on the
+    // local path — and it would free the client's buffer out from under us.
+    // Set client-side, this instance's ~PutBlobTask frees the staging buffer
+    // when the Future (task) is destroyed, after the write has completed.
+    t->SetFlags(TASK_DATA_OWNER);
+    return fut;
+  }
+
+  /**
    * Asynchronous get blob - returns immediately
    * @param tag_id Tag ID
    * @param blob_name Name of the blob

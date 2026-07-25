@@ -321,6 +321,83 @@ TEST_CASE("Private GetBlob shared-cache fast path is correct", "[cte][823]") {
   }
 }
 
+// Private-memory AsyncPutBlob (issue #830): write a blob region straight from a
+// caller-owned PRIVATE buffer (heap/stack, never SHM), then read it back and
+// verify. Exercises the runtime-mode no-copy path (inline fixture) and the
+// client-mode SHM-staging + TASK_DATA_OWNER path (separate fixture) depending on
+// the configuration the fixture chose — the same split the GetBlob cases cover.
+TEST_CASE("PutBlob from private memory round-trips", "[cte][830]") {
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+  auto *cte = CLIO_CTE_CLIENT;
+
+  clio::cte::core::Tag tag("putblob_priv_tag");
+  clio::cte::core::TagId tag_id = tag.GetTagId();
+  const std::string blob = "priv_put_blob";
+  const size_t kN = 64 * 1024;
+
+  // Source is genuine private memory (heap), never an SHM buffer.
+  std::vector<char> src(kN);
+  for (size_t i = 0; i < kN; ++i) src[i] = PatternByte(i);
+
+  auto p = cte->AsyncPutBlob(tag_id, blob, 0, kN, src.data());
+  p.Wait();
+  REQUIRE(p->GetReturnCode() == 0);
+
+  // Read the whole blob back into a private buffer and compare byte-for-byte.
+  std::vector<char> got(kN, 0);
+  auto g = cte->AsyncGetBlob(tag_id, blob, 0, kN, /*flags=*/0, got.data());
+  g.Wait();  // Empty (cache-hit) future Wait()s to true; otherwise task rc==0.
+  for (size_t i = 0; i < kN; ++i) {
+    REQUIRE(got[i] == PatternByte(i));
+  }
+}
+
+// Offset/partial private-memory puts must land at the right place without
+// disturbing neighbouring bytes, and a repeated overwrite of the same region
+// (the workload issue #830 targets) must read back last-writer-wins.
+TEST_CASE("Private PutBlob offset + repeated overwrite", "[cte][830]") {
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+  auto *cte = CLIO_CTE_CLIENT;
+
+  clio::cte::core::Tag tag("putblob_priv_ovw_tag");
+  clio::cte::core::TagId tag_id = tag.GetTagId();
+  const std::string blob = "priv_ovw_blob";
+  const size_t kN = 32 * 1024;
+
+  // Lay down a base pattern from private memory.
+  std::vector<char> base(kN);
+  for (size_t i = 0; i < kN; ++i) base[i] = PatternByte(i);
+  auto p0 = cte->AsyncPutBlob(tag_id, blob, 0, kN, base.data());
+  p0.Wait();
+  REQUIRE(p0->GetReturnCode() == 0);
+
+  // Overwrite an interior sub-range several times; the last write must win.
+  const size_t kOff = 4096, kLen = 8192;
+  for (int iter = 0; iter < 8; ++iter) {
+    std::vector<char> patch(kLen);
+    for (size_t i = 0; i < kLen; ++i) {
+      patch[i] = PatternByte(kOff + i + 100 + iter);
+    }
+    auto p = cte->AsyncPutBlob(tag_id, blob, kOff, kLen, patch.data());
+    p.Wait();
+    REQUIRE(p->GetReturnCode() == 0);
+  }
+
+  // Read the whole blob: [kOff, kOff+kLen) reflects the final overwrite (iter 7),
+  // everything else keeps the base pattern.
+  std::vector<char> got(kN, 0);
+  auto g = cte->AsyncGetBlob(tag_id, blob, 0, kN, 0, got.data());
+  g.Wait();
+  for (size_t i = 0; i < kN; ++i) {
+    char expect = (i >= kOff && i < kOff + kLen)
+                      ? PatternByte(i + 100 + 7)
+                      : PatternByte(i);
+    REQUIRE(got[i] == expect);
+  }
+}
+
 int main(int argc, char **argv) {
   static Fixture fixture;
   g_fixture = &fixture;
