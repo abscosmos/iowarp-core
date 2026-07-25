@@ -424,6 +424,36 @@ TEST_CASE("Tag private PutBlob/GetBlob round-trips", "[cte][830]") {
   }
 }
 
+// Guard/edge branches of the private PutBlob (issue #830): a zero-length put
+// routes through the ShmPtr overload (no staging), and a null buffer with a
+// positive size is rejected. Covers the fast-exit + validation paths the
+// happy-path round-trips above never reach.
+TEST_CASE("Private PutBlob guards: zero-length + null buffer", "[cte][830]") {
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+  auto *cte = CLIO_CTE_CLIENT;
+
+  clio::cte::core::Tag tag("putblob_priv_guard_tag");
+  clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  // size==0 hits the guard that routes to the ShmPtr overload with a null
+  // buffer: it must complete without error or crash.
+  char dummy = 'x';
+  auto p = cte->AsyncPutBlob(tag_id, "zero_blob", /*offset=*/0, /*size=*/0,
+                             &dummy);
+  REQUIRE_NOTHROW(p.Wait());
+
+  // Tag::AsyncPutBlob rejects a null buffer paired with a positive size.
+  bool threw = false;
+  try {
+    (void)tag.AsyncPutBlob("null_blob", static_cast<const char *>(nullptr),
+                           /*data_size=*/16);
+  } catch (const std::invalid_argument &) {
+    threw = true;
+  }
+  REQUIRE(threw);
+}
+
 int main(int argc, char **argv) {
   static Fixture fixture;
   g_fixture = &fixture;
