@@ -398,6 +398,32 @@ TEST_CASE("Private PutBlob offset + repeated overwrite", "[cte][830]") {
   }
 }
 
+// Tag-level private blob I/O (issue #830 + #823): Tag::PutBlob(const char*) now
+// routes through the private-memory write path, and Tag::GetBlob(char*) through
+// the private-memory read path -- this is exactly what the Python PutBlob/
+// GetBlob bindings call. Round-trip a blob entirely through the Tag API.
+TEST_CASE("Tag private PutBlob/GetBlob round-trips", "[cte][830]") {
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+
+  clio::cte::core::Tag tag("tag_priv_putget_tag");
+  const std::string blob = "tag_priv_blob";
+  const size_t kN = 48 * 1024;
+
+  std::vector<char> src(kN);
+  for (size_t i = 0; i < kN; ++i) src[i] = PatternByte(i + 7);
+
+  // Blocking Tag::PutBlob(const char*) -> #830 private path (throws on failure).
+  tag.PutBlob(blob, src.data(), kN, /*off=*/0);
+
+  // Blocking Tag::GetBlob(char*) -> #823 private path.
+  std::vector<char> got(kN, 0);
+  tag.GetBlob(blob, got.data(), kN, /*off=*/0);
+  for (size_t i = 0; i < kN; ++i) {
+    REQUIRE(got[i] == PatternByte(i + 7));
+  }
+}
+
 int main(int argc, char **argv) {
   static Fixture fixture;
   g_fixture = &fixture;

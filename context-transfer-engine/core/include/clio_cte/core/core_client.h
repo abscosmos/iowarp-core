@@ -1477,6 +1477,30 @@ class Tag {
                                         const Context &context = Context());
 
   /**
+   * Asynchronous private-memory PutBlob (issue #830): write a blob region
+   * straight from a caller-owned PRIVATE buffer (const char*, e.g. heap/stack),
+   * with no manual shared-memory management. Write-side analog of the #823
+   * private GetBlob; delegates to CoreClient::AsyncPutBlob(const char*) — see
+   * there for the two paths (runtime-direct no-copy / client-staging with
+   * TASK_DATA_OWNER).
+   *
+   * @param blob_name Name of the blob to write
+   * @param data Source PRIVATE buffer (must stay valid until Wait() returns)
+   * @param data_size Number of bytes to write
+   * @param off Offset within blob (default 0)
+   * @param score Blob score for placement (default -1.0 = auto)
+   * @param context Compression context (default empty)
+   * @return Future over the write; readable after Wait() (GetReturnCode()==0 on
+   *         success). An empty Future is returned only if client-mode SHM
+   *         staging could not be allocated.
+   */
+  clio::run::Future<PutBlobTask> AsyncPutBlob(const std::string &blob_name,
+                                              const char *data,
+                                              size_t data_size, size_t off = 0,
+                                              float score = -1.0f,
+                                              const Context &context = Context());
+
+  /**
    * GetBlob - Allocates shared memory, retrieves blob data, copies to output
    * buffer
    * @param blob_name Name of the blob to retrieve

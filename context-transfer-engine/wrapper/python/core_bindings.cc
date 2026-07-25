@@ -292,12 +292,16 @@ NB_MODULE(clio_cte_core_ext, m) {
       .def("PutBlob",
            [](clio::cte::core::Tag &self, const std::string &blob_name,
               nb::bytes data, size_t off) {
-             // Use nb::bytes to accept bytes from Python
-             // c_str() returns const char*, size() returns size
+             // Use nb::bytes to accept arbitrary binary from Python. The bytes'
+             // buffer IS private memory, so this writes straight from it via the
+             // private-memory path (issue #830): no manual SHM allocate/copy/
+             // free, and a zero-copy write in runtime (co-located) mode.
+             // Tag::PutBlob(const char*) blocks and throws on a non-zero rc.
              self.PutBlob(blob_name, data.c_str(), data.size(), off);
            },
            "blob_name"_a, "data"_a, "off"_a = 0,
-           "Put blob data. Automatically allocates shared memory and copies data. "
+           "Put blob data from a private buffer (issue #830): no manual shared "
+           "memory management, and a zero-copy write in runtime mode. "
            "Args: blob_name (str), data (bytes), off (int, optional)")
       .def("GetBlob",
            [](clio::cte::core::Tag &self, const std::string &blob_name,
