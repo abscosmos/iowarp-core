@@ -307,12 +307,25 @@ NB_MODULE(clio_cte_core_ext, m) {
              // binary, and nanobind decodes a returned std::string as UTF-8,
              // which raises UnicodeDecodeError on any non-text payload. This
              // also mirrors PutBlob, which already accepts nb::bytes.
+             //
+             // The std::string's buffer IS private memory, so this reads
+             // straight into it via the private-memory path (issue #823): no
+             // manual SHM allocate/copy/free, and a zero-IPC copy when the blob
+             // is in the shared cache.
              std::string result(data_size, '\0');
-             self.GetBlob(blob_name, result.data(), data_size, off);
+             auto fut =
+                 self.AsyncGetBlob(blob_name, result.data(), data_size, off);
+             fut.Wait();
+             // Empty (cache-hit) future -> already succeeded, do not deref.
+             // Non-empty (miss) future -> the task carries the return code.
+             if (fut.get() != nullptr && fut.get()->GetReturnCode() != 0) {
+               throw std::runtime_error("GetBlob operation failed");
+             }
              return nb::bytes(result.data(), result.size());
            },
            "blob_name"_a, "data_size"_a, "off"_a = 0,
-           "Get blob data. Automatically allocates shared memory and copies data. "
+           "Get blob data into a private buffer (issue #823): no manual shared "
+           "memory management, and a zero-IPC copy on a shared-cache hit. "
            "Args: blob_name (str), data_size (int), off (int, optional). "
            "Returns: bytes containing the raw blob data")
       .def("GetBlobScore", &clio::cte::core::Tag::GetBlobScore,
