@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstring>
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/autogen/core_methods.h>
@@ -1587,6 +1588,29 @@ struct GetBlobTask : public clio::run::Task {
   IN clio::run::u32 gpu_page_idx_;
   INOUT Context context_;  // Emulation control + modeled time (issue #747)
 
+  /**
+   * Private-memory destination for the client-mode fast path (issue #823).
+   *
+   * Both are HOST-ONLY process pointers and are deliberately NOT serialized
+   * (they are absent from SerializeIn/SerializeOut) — a raw address is
+   * meaningless in the daemon's address space, and adding them here does not
+   * change the wire layout. They matter only on the client instance the
+   * Future retains.
+   *
+   * When a private-memory AsyncGetBlob runs in CLIENT mode it must stage the
+   * read through a shared-memory buffer (the daemon cannot reach the caller's
+   * private buffer). `priv_src_` is the client-local address of that SHM
+   * staging buffer (also referenced as blob_data_ in offset form) and
+   * `priv_dest_` is the caller's private buffer. PostWait() copies size_ bytes
+   * src→dest once the read completes; TASK_DATA_OWNER then frees the staging
+   * buffer when the task is destroyed. Left null on every other path (runtime
+   * mode writes straight into the private buffer via a null-allocator ShmPtr,
+   * and every pre-existing caller passes SHM buffers), so PostWait() is a
+   * no-op for them.
+   */
+  char *priv_dest_ = nullptr;  // caller's private buffer (copy target)
+  char *priv_src_ = nullptr;   // client-local addr of the SHM staging buffer
+
   // SHM constructor
   CTP_CROSS_FUN GetBlobTask()
       : clio::run::Task(),
@@ -1652,6 +1676,23 @@ struct GetBlobTask : public clio::run::Task {
       if (ipc_manager) {
         ipc_manager->FreeBuffer(blob_data_.template Cast<char>());
       }
+    }
+#endif
+  }
+
+  /**
+   * Post-completion hook (issue #823): deliver a client-mode private-memory
+   * read into the caller's buffer. Called by Future::Wait() after the read
+   * completes and before the task is reaped. A no-op unless both private
+   * pointers were set (only CoreClient::AsyncGetBlob(char*)'s client-mode path
+   * sets them), so it never disturbs the SHM/runtime-direct/vectored callers.
+   * The staging buffer itself is freed by ~GetBlobTask via TASK_DATA_OWNER.
+   */
+  void PostWait() {
+#if !CTP_IS_DEVICE_PASS
+    if (priv_dest_ != nullptr && priv_src_ != nullptr && size_ > 0 &&
+        GetReturnCode() == 0) {
+      std::memcpy(priv_dest_, priv_src_, size_);
     }
 #endif
   }
