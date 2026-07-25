@@ -111,17 +111,12 @@ class Fixture {
     }
   }
 
-  /** Inline: this process IS the runtime. Register a RAM target by hand. */
-  bool InitInline() {
-    if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
-      return false;
-    }
-    std::this_thread::sleep_for(300ms);
-    if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
-      return false;
-    }
-    std::this_thread::sleep_for(200ms);
-
+  /** Register a RAM target into the pool CLIO_CTE_CLIENT actually talks to
+   *  (the default clio_cte_core pool). Shared by the inline and separate
+   *  fixtures so both place the target where the client's PutBlobs look for it.
+   *  In separate mode the bdev create + RegisterTarget are serviced by the
+   *  daemon just as they are in-process inline. */
+  static bool RegisterRamTarget() {
     auto *cte = CLIO_CTE_CLIENT;
     clio::run::PoolId bdev_pool_id(915, 0);
     clio::run::bdev::Client bdev_client(bdev_pool_id);
@@ -136,9 +131,23 @@ class Fixture {
                                         clio::run::PoolQuery::Local(),
                                         bdev_pool_id);
     reg.Wait();
-    if (reg->GetReturnCode() != 0) return false;
+    return reg->GetReturnCode() == 0;
+  }
+
+  /** Inline: this process IS the runtime. Register a RAM target by hand. */
+  bool InitInline() {
+    if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
+      return false;
+    }
+    std::this_thread::sleep_for(300ms);
+    if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
+      return false;
+    }
+    std::this_thread::sleep_for(200ms);
+
+    if (!RegisterRamTarget()) return false;
     // Best-effort: attach the SHM metadata cache so the zero-IPC path can run.
-    (void)cte->AttachShmCache();
+    (void)CLIO_CTE_CLIENT->AttachShmCache();
     return true;
   }
 
@@ -180,6 +189,25 @@ class Fixture {
       return false;
     }
     if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
+      return false;
+    }
+    // Register the RAM target into the pool this client actually uses.
+    //
+    // The compose above brings up the separate daemon, but its `storage:`
+    // section registers targets into the COMPOSED pool (getblob_priv_cte, id
+    // 515.0), whereas CLIO_CTE_CLIENT talks to the default CTE pool
+    // (clio_cte_core, id 512.0) that CLIO_CTE_CLIENT_INIT creates. Those are
+    // different containers with independent target lists, so the client's
+    // PutBlobs would find no placement target -- ExtendBlob reports "no
+    // targets" (error_code 1) and the setup put fails with rc 11. On a fast
+    // native host the ids happened to line up so it passed; on a slow /
+    // CPU-constrained host (the deps-cpu CI container under the Boost fiber
+    // backend) they did not, so the test failed deterministically there.
+    //
+    // Registering through the client (exactly as InitInline does) puts the
+    // target where the client looks for it, on every platform. The daemon
+    // services the bdev create + RegisterTarget the same way it would inline.
+    if (!RegisterRamTarget()) {
       return false;
     }
     (void)CLIO_CTE_CLIENT->AttachShmCache();
