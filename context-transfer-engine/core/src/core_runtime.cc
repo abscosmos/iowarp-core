@@ -1585,7 +1585,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // suspends at one of those co_awaits. The guard releases the token on EVERY
     // exit below (normal completion, early CLIO_CO_RETURN, or a thrown
     // exception).
-    static constexpr double kBlobWriteLockPollUs = 2050.0;  // ~50us effective throttle (worker periodic ready-check has a 2000us tolerance); avoids the busy-poll hot-spin
+    static constexpr double kBlobWriteLockPollUs = 10.0;  // #680 token re-check. Small on purpose: a loser is parked ONLY during active same-blob write contention, where a fast hand-off beats the CPU saved by sleeping. 10us lands in the worker's fastest periodic bucket (Queue[0], scanned every ~4 loop iters) AND caps GetSuspendPeriod's idle suspend, so a freed token is re-grabbed in single-digit us instead of the old ~2ms idle-suspend worst case. GetSuspendPeriod returns -1 the instant the queue drains, so there is no idle spin; the only cost is some CPU while heavily contended -- acceptable on the write hot path.
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
     while (!blob_info_ptr->TryLockWrite(lock_tok)) {
       CLIO_CO_AWAIT(clio::run::yield(kBlobWriteLockPollUs));
@@ -2363,7 +2363,7 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
     // while a PutBlob iterates blocks_ across a co_await is a use-after-free.
     // The local shared_ptr keeps this BlobInfo alive past the map erase below,
     // so releasing the token in the guard destructor stays valid.
-    static constexpr double kBlobWriteLockPollUs = 2050.0;  // ~50us effective throttle (worker periodic ready-check has a 2000us tolerance); avoids the busy-poll hot-spin
+    static constexpr double kBlobWriteLockPollUs = 10.0;  // #680 token re-check. Small on purpose: a loser is parked ONLY during active same-blob write contention, where a fast hand-off beats the CPU saved by sleeping. 10us lands in the worker's fastest periodic bucket (Queue[0], scanned every ~4 loop iters) AND caps GetSuspendPeriod's idle suspend, so a freed token is re-grabbed in single-digit us instead of the old ~2ms idle-suspend worst case. GetSuspendPeriod returns -1 the instant the queue drains, so there is no idle spin; the only cost is some CPU while heavily contended -- acceptable on the write hot path.
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
     while (!blob_info_ptr->TryLockWrite(lock_tok)) {
       CLIO_CO_AWAIT(clio::run::yield(kBlobWriteLockPollUs));
@@ -2577,7 +2577,7 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     // truncate and a write racing on blocks_ across the ResizeBlob co_await
     // corrupt the block layout. Busy-poll the token (lost-wakeup-proof — see
     // PutBlobImpl); the guard releases it on every exit path.
-    static constexpr double kBlobWriteLockPollUs = 2050.0;  // ~50us effective throttle (worker periodic ready-check has a 2000us tolerance); avoids the busy-poll hot-spin
+    static constexpr double kBlobWriteLockPollUs = 10.0;  // #680 token re-check. Small on purpose: a loser is parked ONLY during active same-blob write contention, where a fast hand-off beats the CPU saved by sleeping. 10us lands in the worker's fastest periodic bucket (Queue[0], scanned every ~4 loop iters) AND caps GetSuspendPeriod's idle suspend, so a freed token is re-grabbed in single-digit us instead of the old ~2ms idle-suspend worst case. GetSuspendPeriod returns -1 the instant the queue drains, so there is no idle spin; the only cost is some CPU while heavily contended -- acceptable on the write hot path.
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
     while (!blob_info_ptr->TryLockWrite(lock_tok)) {
       CLIO_CO_AWAIT(clio::run::yield(kBlobWriteLockPollUs));
