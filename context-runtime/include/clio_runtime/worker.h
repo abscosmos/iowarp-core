@@ -753,13 +753,14 @@ class Worker {
   // A plain vector, not a queue: this is produced and consumed by THIS worker
   // thread within one phase, so there is no handoff to synchronize.
   std::vector<clio::run::shared_ptr<Task>> batch_passthrough_;
-  // merged task uid -> the parent tasks it completes. Only touched by this
-  // worker (the merged task is submitted Local and runs here), but EndTask can
-  // be reached from the monitor's rescue path, so it is mutex-guarded like
-  // BatchManager::pending_.
-  std::mutex batch_pending_mu_;
-  std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>>
-      batch_pending_;
+  // issue #820/#822: the "merged uid -> parent tasks" registry is PROCESS-GLOBAL
+  // (see worker.cc BatchPendingRegistry), NOT a per-worker member. A merged task
+  // is an I/O task: it suspends on the bdev put/get and its continuation resumes
+  // on WHATEVER worker the scheduler picks, which is frequently not the worker
+  // that emitted it. A per-worker map made the completing worker miss the entry
+  // and orphan the parents (client Wait() hangs forever). The global registry
+  // also uses a global-unique key because CreateTaskId().unique_ is only unique
+  // within one worker thread (thread-local counter), so two workers collide.
 
   // Worker spawn time
   ctp::Timepoint spawn_time_;  // Time when worker was spawned
