@@ -1372,18 +1372,30 @@ clio::run::TaskResume Runtime::Readlink(clio::run::shared_ptr<ReadlinkTask> &tas
     std::string _key = XattrKey(tidvar);                                     \
     auto *_ipc = CLIO_IPC;                                                   \
     clio::run::u64 _len = _payload.size();                                   \
-    ctp::ipc::FullPtr<char> _buf = _ipc->AllocateBuffer(_len ? _len : 1);    \
-    if (_buf.IsNull()) { task->return_code_ = EIO; CLIO_CO_RETURN; }         \
-    if (_len) { std::memcpy(_buf.ptr_, _payload.data(), _len); }             \
-    auto _p = cte_.AsyncPutBlob(xattr_tag_id_, _key, 0, _len,                \
-                                _buf.shm_.template Cast<void>(), -1.0f,       \
-                                clio::cte::core::Context(),                   \
-                                clio::cte::core::kCtePutReplace,              \
-                                clio::run::PoolQuery::Dynamic());            \
-    CLIO_CO_AWAIT(_p);                                                       \
-    bool _ok = (_p->GetReturnCode() == 0);                                   \
-    _ipc->FreeBuffer(_buf);                                                  \
-    if (!_ok) { task->return_code_ = EIO; CLIO_CO_RETURN; }                  \
+    if (_len == 0) {                                                         \
+      /* No xattrs remain (removed the LAST one): DELETE the backing blob    \
+       * rather than PutBlob a zero-size payload. A size-0 kCtePutReplace    \
+       * put fails on this path -> EIO, which broke removal of the last      \
+       * xattr (xfstests generic/020). An absent blob is the correct         \
+       * representation of "no xattrs"; a missing blob on delete is fine. */ \
+      auto _d = cte_.AsyncDelBlob(xattr_tag_id_, _key,                       \
+                                  clio::run::PoolQuery::Dynamic());          \
+      CLIO_CO_AWAIT(_d);                                                     \
+      task->return_code_ = 0;                                               \
+    } else {                                                                 \
+      ctp::ipc::FullPtr<char> _buf = _ipc->AllocateBuffer(_len);             \
+      if (_buf.IsNull()) { task->return_code_ = EIO; CLIO_CO_RETURN; }       \
+      std::memcpy(_buf.ptr_, _payload.data(), _len);                         \
+      auto _p = cte_.AsyncPutBlob(xattr_tag_id_, _key, 0, _len,              \
+                                  _buf.shm_.template Cast<void>(), -1.0f,     \
+                                  clio::cte::core::Context(),                 \
+                                  clio::cte::core::kCtePutReplace,            \
+                                  clio::run::PoolQuery::Dynamic());          \
+      CLIO_CO_AWAIT(_p);                                                     \
+      bool _ok = (_p->GetReturnCode() == 0);                                 \
+      _ipc->FreeBuffer(_buf);                                                \
+      if (!_ok) { task->return_code_ = EIO; CLIO_CO_RETURN; }                \
+    }                                                                        \
   }
 
 clio::run::TaskResume Runtime::Setxattr(clio::run::shared_ptr<SetxattrTask> &task) {
