@@ -433,7 +433,64 @@ NB_MODULE(clio_cte_core_ext, m) {
            return pf;
          },
          "tag_regex"_a, "blob_regex"_a, "max_blobs"_a = 0, "pool_query"_a,
-         "Asynchronously query blobs. .result() -> list[(tag, blob)].");
+         "Asynchronously query blobs. .result() -> list[(tag, blob)].")
+     .def("AsyncSemanticSearch",
+         [](clio::cte::core::Client &self, const std::string &tag_regex,
+            const std::string &blob_regex, const std::string &query_text,
+            uint32_t k, const clio::run::PoolQuery &pool_query) {
+           auto fut = self.AsyncSemanticSearch(tag_regex, blob_regex,
+                                               query_text, k, pool_query);
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           pf.extract_ = [](clio::run::Future<clio::run::Task> &f) {
+             return nb::cast(
+                 f.Cast<clio::cte::core::SemanticSearchTask>().get()->results_);
+           };
+           return pf;
+         },
+         "tag_regex"_a, "blob_regex"_a, "query_text"_a, "k"_a = 10,
+         "pool_query"_a,
+         "Asynchronously BM25 keyword search. "
+         ".result() -> list[SemanticSearchResult].")
+     .def("AsyncTemporalSearch",
+         [](clio::cte::core::Client &self, const std::string &tag_regex,
+            const std::string &blob_regex, uint64_t time_begin,
+            uint64_t time_end, uint32_t max_entries,
+            const clio::run::PoolQuery &pool_query) {
+           auto fut = self.AsyncTemporalSearch(tag_regex, blob_regex,
+                                               time_begin, time_end,
+                                               max_entries, pool_query);
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           pf.extract_ = [](clio::run::Future<clio::run::Task> &f) {
+             return nb::cast(
+                 f.Cast<clio::cte::core::TemporalSearchTask>().get()->results_);
+           };
+           return pf;
+         },
+         "tag_regex"_a, "blob_regex"_a, "time_begin"_a = uint64_t{0},
+         "time_end"_a = uint64_t{0}, "max_entries"_a = uint32_t{0},
+         "pool_query"_a,
+         "Asynchronously search by last-modified time. "
+         ".result() -> list[TemporalSearchResult].")
+     .def("AsyncPollTelemetryLog",
+         [](clio::cte::core::Client &self,
+            std::uint64_t minimum_logical_time) {
+           auto fut = self.AsyncPollTelemetryLog(minimum_logical_time);
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           pf.extract_ = [](clio::run::Future<clio::run::Task> &f) {
+             auto t = f.Cast<clio::cte::core::PollTelemetryLogTask>();
+             std::vector<clio::cte::core::CteTelemetry> out;
+             for (size_t i = 0; i < t.get()->entries_.size(); ++i)
+               out.push_back(t.get()->entries_[i]);
+             return nb::cast(out);
+           };
+           return pf;
+         },
+         "minimum_logical_time"_a,
+         "Asynchronously poll the telemetry log. "
+         ".result() -> list[CteTelemetry].");
 
   // Bind Tag wrapper class - provides convenient API for tag operations
   // This class wraps tag operations and provides automatic memory management

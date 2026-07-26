@@ -119,6 +119,20 @@ def run_test(cte) -> int:
     assert df.wait() == 0, "AsyncDelBlob returned non-zero"
     print("OK async delete")
 
+    # --- list-result futures (query / telemetry) --------------------------
+    tq = client.AsyncTagQuery(".*", 0, cte.PoolQuery.Local())
+    tags = tq.result()
+    assert isinstance(tags, list), f"AsyncTagQuery result not a list: {type(tags).__name__}"
+    assert "async_tag" in tags, f"expected tag missing from {tags}"
+
+    bq = client.AsyncBlobQuery(".*", ".*", 0, cte.PoolQuery.Local())
+    pairs = bq.result()
+    assert isinstance(pairs, list), "AsyncBlobQuery result not a list"
+
+    tel = client.AsyncPollTelemetryLog(0)
+    assert isinstance(tel.result(), list), "AsyncPollTelemetryLog result not a list"
+    print("OK async list-result futures (tag/blob query, telemetry)")
+
     return 0
 
 
