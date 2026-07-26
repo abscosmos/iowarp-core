@@ -105,6 +105,25 @@ namespace {
 
 constexpr const char *kTagRefPrefix = "$tagid{";
 
+// #680 per-blob write-token re-check period (microseconds). Default 10us: a
+// loser is parked ONLY during active same-blob write contention, where a fast
+// hand-off beats the CPU saved by sleeping. 10us lands in the worker's fastest
+// periodic bucket (Queue[0]) and caps GetSuspendPeriod's idle suspend, so a
+// freed token is re-grabbed in single-digit us instead of the old ~2ms
+// idle-suspend worst case. Overridable via CLIO_WRITE_TOKEN_POLL_US for tuning
+// / A-B measurement (read once; do NOT put on a hot path uncached).
+inline double BlobWriteLockPollUs() {
+  static const double v = [] {
+    if (const char *e = std::getenv("CLIO_WRITE_TOKEN_POLL_US")) {
+      char *end = nullptr;
+      double d = std::strtod(e, &end);
+      if (end != e && d > 0.0) return d;
+    }
+    return 10.0;
+  }();
+  return v;
+}
+
 // Escape regex metacharacters so `s` matches itself literally. Used to build
 // exact/prefix patterns for the tag search index (#598).
 std::string EscapeRegexLiteral(const std::string &s) {
@@ -1585,10 +1604,11 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // suspends at one of those co_awaits. The guard releases the token on EVERY
     // exit below (normal completion, early CLIO_CO_RETURN, or a thrown
     // exception).
-    static constexpr double kBlobWriteLockPollUs = 10.0;  // #680 token re-check. Small on purpose: a loser is parked ONLY during active same-blob write contention, where a fast hand-off beats the CPU saved by sleeping. 10us lands in the worker's fastest periodic bucket (Queue[0], scanned every ~4 loop iters) AND caps GetSuspendPeriod's idle suspend, so a freed token is re-grabbed in single-digit us instead of the old ~2ms idle-suspend worst case. GetSuspendPeriod returns -1 the instant the queue drains, so there is no idle spin; the only cost is some CPU while heavily contended -- acceptable on the write hot path.
+    // #680 write-token re-check period; see BlobWriteLockPollUs() (default 10us,
+    // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
     while (!blob_info_ptr->TryLockWrite(lock_tok)) {
-      CLIO_CO_AWAIT(clio::run::yield(kBlobWriteLockPollUs));
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
 
@@ -2363,10 +2383,11 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
     // while a PutBlob iterates blocks_ across a co_await is a use-after-free.
     // The local shared_ptr keeps this BlobInfo alive past the map erase below,
     // so releasing the token in the guard destructor stays valid.
-    static constexpr double kBlobWriteLockPollUs = 10.0;  // #680 token re-check. Small on purpose: a loser is parked ONLY during active same-blob write contention, where a fast hand-off beats the CPU saved by sleeping. 10us lands in the worker's fastest periodic bucket (Queue[0], scanned every ~4 loop iters) AND caps GetSuspendPeriod's idle suspend, so a freed token is re-grabbed in single-digit us instead of the old ~2ms idle-suspend worst case. GetSuspendPeriod returns -1 the instant the queue drains, so there is no idle spin; the only cost is some CPU while heavily contended -- acceptable on the write hot path.
+    // #680 write-token re-check period; see BlobWriteLockPollUs() (default 10us,
+    // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
     while (!blob_info_ptr->TryLockWrite(lock_tok)) {
-      CLIO_CO_AWAIT(clio::run::yield(kBlobWriteLockPollUs));
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
 
@@ -2577,10 +2598,11 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     // truncate and a write racing on blocks_ across the ResizeBlob co_await
     // corrupt the block layout. Busy-poll the token (lost-wakeup-proof — see
     // PutBlobImpl); the guard releases it on every exit path.
-    static constexpr double kBlobWriteLockPollUs = 10.0;  // #680 token re-check. Small on purpose: a loser is parked ONLY during active same-blob write contention, where a fast hand-off beats the CPU saved by sleeping. 10us lands in the worker's fastest periodic bucket (Queue[0], scanned every ~4 loop iters) AND caps GetSuspendPeriod's idle suspend, so a freed token is re-grabbed in single-digit us instead of the old ~2ms idle-suspend worst case. GetSuspendPeriod returns -1 the instant the queue drains, so there is no idle spin; the only cost is some CPU while heavily contended -- acceptable on the write hot path.
+    // #680 write-token re-check period; see BlobWriteLockPollUs() (default 10us,
+    // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
     while (!blob_info_ptr->TryLockWrite(lock_tok)) {
-      CLIO_CO_AWAIT(clio::run::yield(kBlobWriteLockPollUs));
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
 
@@ -4282,13 +4304,17 @@ bool Runtime::BuildBatch(clio::run::u32 method,
   if (method != Method::kPutBlob && method != Method::kGetBlob) {
     return false;
   }
-  // OFF BY DEFAULT (issue #820). The worker's batching phase and this policy
-  // are both implemented and the merge itself is proven by
-  // test_vectored_blob_io, but parking CTE tasks still hangs
-  // test_concurrent_same_blob at >=8 concurrent writers and the cause is not
-  // yet understood. Shipping it on by default would trade a latency win for a
-  // hang, so it stays opt-in (CLIO_CTE_BATCHING=1) until that is root-caused.
-  // The vectored task shape (part A) is unconditional and independently useful.
+  // Opt-in via CLIO_CTE_BATCHING=1 (issue #820). The merge itself is proven by
+  // test_vectored_blob_io. The concurrent-writer hang that previously kept this
+  // off ("parks CTE tasks, hangs test_concurrent_same_blob at >=8 writers") was
+  // ROOT-CAUSED and FIXED in a84449e1 (the batch parent-registry was per-worker
+  // + keyed by a thread-local uid, so a merged task that resumed on a different
+  // worker never completed its parents -- a lost wakeup, not a deadlock). With
+  // that fix test_concurrent_same_blob passes 20+ consecutive runs at 8/16/32
+  // concurrent writers with both this policy and CLIO_BATCH_LANE on. It stays
+  // opt-in only because CLIO_BATCH_LANE -- the lane phase that actually converges
+  // same-blob work -- is still being validated for tasks another in-flight task
+  // synchronously awaits; enabling this alone (shard-ingress batching) is safe.
   static const bool policy_on = [] {
     if (const char *e = std::getenv("CLIO_CTE_BATCHING")) {
       return !(std::string(e) == "0" || std::string(e) == "false");

@@ -485,7 +485,18 @@ u32 Worker::ProcessNewTasks(TaskLane *lane) {
     return e != nullptr && !(std::string(e) == "0" || std::string(e) == "false");
   }();
   if (lane_batch && BatchingEnabled()) {
-    return BatchLane(lane, MAX_TASKS_PER_ITERATION * 4);
+    // issue #820: size the batch to the CURRENT lane depth so a deep backlog
+    // (e.g. a burst of same-blob writes that RouteTask funneled onto this one
+    // lane) collapses in a SINGLE merged task instead of being chopped at a
+    // fixed budget. Size() is a single-consumer snapshot -- this worker is the
+    // only consumer of its lane (mpsc), so it can only UNDER-read when a
+    // producer enqueues concurrently, and those late arrivals simply batch on
+    // the next iteration; it never over-reads. Floor at the previous fixed
+    // budget so a shallow lane never batches LESS than before, and the natural
+    // ceiling is the ring's capacity (Size() cannot exceed it).
+    const u32 depth = static_cast<u32>(lane->Size());
+    const u32 batch_budget = std::max(depth, MAX_TASKS_PER_ITERATION * 4);
+    return BatchLane(lane, batch_budget);
   }
 
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
