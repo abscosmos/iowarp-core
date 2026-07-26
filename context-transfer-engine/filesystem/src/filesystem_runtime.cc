@@ -428,9 +428,12 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   clio::run::u64 file_size = fi->size_.load();
 
   auto *ipc = CLIO_IPC;
-  // Read directly into the task's payload — GetBlob copies into the ShmPtr we
-  // hand it, so point it at the right sub-region of data_ each page instead of
-  // staging through a freshly-allocated buffer.
+  // Read directly into the task's payload via the PRIVATE-memory GetBlob path
+  // (issue #823): we hand CTE the raw sub-region pointer, which in runtime mode
+  // (cfs and CTE share this daemon's address space) is wrapped as a
+  // null-allocator ShmPtr so the bdev read lands DIRECTLY in the payload — no
+  // staging buffer, no copy — and it additionally takes the zero-IPC SHM-cache
+  // fast path when the page is RAM-resident. `dst` is the payload base.
   ctp::ipc::ShmPtr<char> data_base = task->data_.template Cast<char>();
   char *dst = ipc->ToFullPtr<char>(data_base).ptr_;
 
@@ -458,8 +461,7 @@ clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
     clio::run::u64 page_off = cur % kFsPageSize;
     clio::run::u64 to_read = std::min(kFsPageSize - page_off, want - done);
     auto g = cte_.AsyncGetBlob(tag_id, PageName(cur), page_off, to_read,
-                               /*flags*/ 0u,
-                               (data_base + done).template Cast<void>(),
+                               /*flags*/ 0u, dst + done,
                                clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(g);
     // A miss/short read just leaves the pre-zeroed bytes as zeros (a hole is
@@ -482,10 +484,14 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   }
   clio::cte::core::TagId tag_id = fi->tag_id_;
 
-  // Write straight out of the task's payload — PutBlob reads from the ShmPtr we
-  // pass, so hand it the right sub-region of data_ per page rather than copying
-  // into a freshly-allocated staging buffer first.
+  // Write straight out of the task's payload via the PRIVATE-memory PutBlob path
+  // (issue #830): hand CTE the raw sub-region pointer, which in runtime mode
+  // (cfs and CTE co-located in this daemon) is wrapped as a null-allocator
+  // ShmPtr so the bdev write reads DIRECTLY from the payload — no staging
+  // buffer, no copy. `src` is the payload base.
+  auto *ipc = CLIO_IPC;
   ctp::ipc::ShmPtr<char> data_base = task->data_.template Cast<char>();
+  const char *src = ipc->ToFullPtr<char>(data_base).ptr_;
 
   clio::run::u64 want = task->size_;
   clio::run::u64 done = 0;
@@ -500,7 +506,7 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
     // per-blob write token — the dominant clio-fs write-latency tail.
     static constexpr clio::run::u64 kFsPreallocBytes = 64ull * 1024;
     auto p = cte_.AsyncPutBlob(tag_id, PageName(cur), page_off, to_write,
-                               (data_base + done).template Cast<void>(),
+                               src + done,
                                /*score*/ -1.0f,
                                clio::cte::core::Context::Preallocate(
                                    kFsPreallocBytes),
