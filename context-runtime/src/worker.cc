@@ -500,14 +500,22 @@ u32 Worker::ProcessNewTasks(TaskLane *lane) {
 }
 
 bool Worker::BatchingEnabled() {
-  // issue #820. On by default; CLIO_TASK_BATCHING=0 restores the pre-batching
-  // dequeue loop verbatim, which is the escape hatch for bisecting a regression
-  // to this phase rather than to a container's policy.
+  // issue #820. OFF by default (opt-in via CLIO_TASK_BATCHING=1).
+  //
+  // The worker batch phase only pays off when a CONTAINER opts into merging via
+  // its BuildBatch policy — and every such policy is itself off by default (CTE
+  // core's is gated on CLIO_CTE_BATCHING and even documents an unresolved
+  // same-blob hang). With no container batching, the batch phase merges nothing:
+  // every task just takes the RouteOnly + deferred-passthrough drain instead of
+  // the plain RouteAndExec one, for zero benefit. That alternate drain HANGS the
+  // xattr-storm workload in xfstests generic/020 (regression vs main, which has
+  // no batch phase). So the phase must default to the SAME opt-in as the merge
+  // policies it serves: enabling it standalone buys nothing and only adds risk.
   static const bool v = [] {
     if (const char *e = std::getenv("CLIO_TASK_BATCHING")) {
-      return !(std::string(e) == "0" || std::string(e) == "false");
+      return (std::string(e) == "1" || std::string(e) == "true");
     }
-    return true;
+    return false;
   }();
   return v;
 }
