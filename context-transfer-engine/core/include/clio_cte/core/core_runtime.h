@@ -164,6 +164,9 @@ public:
   clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
   /** Reorganize single blob (Method::kReorganizeBlob) - update score. */
   clio::run::TaskResume ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task);
+  /** Evict lowest-score blobs off a tier until a byte budget is reclaimed
+   *  (Method::kEvict). Broadcast; each shard reports its share. */
+  clio::run::TaskResume Evict(clio::run::shared_ptr<EvictTask> &task);
 
   /**
    * Rescore-and-move one blob without spawning a ReorganizeBlobTask (issue

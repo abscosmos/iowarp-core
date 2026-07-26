@@ -74,6 +74,11 @@ add_executable(test_reorganize_blob
     test_reorganize_blob.cc
 )
 
+# Score-driven capacity eviction (Method::kEvict) API tests
+add_executable(test_evict
+    test_evict.cc
+)
+
 # Internal data organizer (issue #738): factory/frecency-score/config units
 # plus the end-to-end periodic DynamicReorganize promote/demote flow.
 add_executable(test_data_organizer
@@ -321,6 +326,18 @@ target_link_libraries(test_blob_block_reuse
 
 # Link test_reorganize_blob - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_reorganize_blob
+    clio_cte_core_runtime         # CTE core runtime library
+    clio_cte_core_client          # CTE core client library
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
+    ctp::cxx                    # ClioCtp library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+# Link test_evict - using simple_test.h framework (NOT Catch2)
+target_link_libraries(test_evict
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
     clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
@@ -815,6 +832,18 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
+# Add score-driven eviction tests (Method::kEvict)
+add_test(NAME cte_evict
+    COMMAND test_evict)
+
+set_tests_properties(
+    cte_evict
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;evict;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
 # Add data organizer tests (issue #738)
 # NOTE: like the reorganize tests, the cases share global fixture state
 # (blobs put in one case are checked/cleaned in later cases), so they run
@@ -1058,7 +1087,7 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # Install Targets
 # ------------------------------------------------------------------------------
-set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob test_data_organizer test_io_emulation)
+set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob test_evict test_data_organizer test_io_emulation)
 # (The legacy test_cte_gpu_coroutine / test_gpu_core / test_gpu_create targets
 # and their ctest registrations were removed along with the GPU runtime. CTE
 # GPU coverage now lives in test_cte_devmem_putget (cte_devmem_putget_cuda).)

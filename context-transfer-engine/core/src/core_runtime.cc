@@ -891,6 +891,7 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
     case Method::kGetContainedBlobs:
     case Method::kTagQuery:
     case Method::kBlobQuery:
+    case Method::kEvict:
       return clio::run::PoolQuery::Broadcast();
 
     default:
@@ -2434,6 +2435,113 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::Evict(clio::run::shared_ptr<EvictTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  const float min_tier_score = task->min_tier_score_;
+  const clio::run::u64 target_bytes = task->bytes_;
+  task->bytes_evicted_ = 0;
+  task->blobs_evicted_ = 0;
+
+  // 1. Which registered targets qualify as "the tier to evict from"? Any target
+  //    whose score is at least min_tier_score. Snapshot their PoolIds under the
+  //    target read lock (tiny list — a linear membership test below is cheaper
+  //    than hashing PoolId).
+  std::vector<clio::run::PoolId> qualifying_targets;
+  {
+    clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+    registered_targets_.for_each(
+        [&](const clio::run::PoolId &pool_id, const TargetInfo &info) {
+          if (info.target_score_ >= min_tier_score) {
+            qualifying_targets.push_back(pool_id);
+          }
+        });
+  }
+  if (qualifying_targets.empty() || target_bytes == 0) {
+    CLIO_CO_RETURN;  // nothing to evict from / no budget
+  }
+  auto on_qualifying_target = [&](const clio::run::PoolId &pid) {
+    for (const auto &t : qualifying_targets) {
+      if (t == pid) return true;
+    }
+    return false;
+  };
+
+  // 2. Rank this shard's blobs that occupy a qualifying tier by their own score
+  //    (ascending) so the cheapest-to-lose data is evicted first. evict_bytes is
+  //    the PHYSICAL footprint (capacity_) this blob holds on qualifying targets,
+  //    which is what gets returned to the tier's remaining_space_.
+  struct Candidate {
+    float score;
+    clio::run::u64 evict_bytes;
+    TagId tag_id;
+    std::string blob_name;
+  };
+  std::vector<Candidate> candidates;
+  tag_blob_name_to_info_.for_each(
+      [&](const std::string &composite_key,
+          const std::shared_ptr<BlobInfo> &blob_info_sp) {
+        const BlobInfo &blob_info = *blob_info_sp;
+        clio::run::u64 evict_bytes = 0;
+        for (const auto &block : blob_info.blocks_) {
+          if (on_qualifying_target(block.bdev_client_.pool_id_)) {
+            evict_bytes += block.capacity_;
+          }
+        }
+        if (evict_bytes == 0) {
+          return;
+        }
+        const size_t first_sep = composite_key.find('.');
+        const size_t second_sep =
+            (first_sep == std::string::npos)
+                ? std::string::npos
+                : composite_key.find('.', first_sep + 1);
+        if (first_sep == std::string::npos ||
+            second_sep == std::string::npos) {
+          return;
+        }
+        TagId blob_tag_id(
+            static_cast<clio::run::u32>(
+                std::stoul(composite_key.substr(0, first_sep))),
+            static_cast<clio::run::u32>(std::stoul(composite_key.substr(
+                first_sep + 1, second_sep - first_sep - 1))));
+        candidates.push_back(Candidate{blob_info.score_, evict_bytes,
+                                       blob_tag_id,
+                                       composite_key.substr(second_sep + 1)});
+      },
+      ctp::priv::ForEachLock::kShared);
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const Candidate &a, const Candidate &b) {
+              return a.score < b.score;
+            });
+
+  // 3. Evict lowest-score-first until the byte budget is met. Reuse the DelBlob
+  //    path (frees blocks back to the tier + removes metadata + WAL/telemetry);
+  //    each of these blobs hashes to THIS container, so AsyncDelBlob routes back
+  //    here. Await serially so bytes_evicted_ reflects only confirmed frees and
+  //    we can stop as soon as the budget is satisfied.
+  for (const auto &c : candidates) {
+    if (task->bytes_evicted_ >= target_bytes) {
+      break;
+    }
+    auto del = client_.AsyncDelBlob(c.tag_id, c.blob_name);
+    CLIO_CO_AWAIT(del);
+    if (del->return_code_ == 0) {
+      task->bytes_evicted_ += c.evict_bytes;
+      task->blobs_evicted_ += 1;
+    } else {
+      HLOG(kWarning, "Evict: DelBlob failed for {}, skipping", c.blob_name);
+    }
+  }
+
+  HLOG(kDebug,
+       "Evict: min_tier_score={} budget={} -> evicted {} bytes across {} blobs",
+       min_tier_score, target_bytes, task->bytes_evicted_,
+       task->blobs_evicted_);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

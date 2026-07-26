@@ -869,6 +869,27 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Asynchronously evict data off a tier by score until a byte budget is met.
+   * Frees the lowest-score blobs residing on any target whose score is at least
+   * min_tier_score, cheapest-first, until at least bytes of physical capacity
+   * has been reclaimed (or no candidates remain). Broadcast across all
+   * containers; the returned task's bytes_evicted_/blobs_evicted_ are the
+   * tier-wide totals.
+   * @param min_tier_score Only evict blobs on targets with score >= this
+   *                       (0.0 = any tier)
+   * @param bytes Reclaim at least this many bytes from the tier
+   */
+  clio::run::Future<EvictTask> AsyncEvict(
+      float min_tier_score, clio::run::u64 bytes,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<EvictTask>(clio::run::CreateTaskId(),
+                                                pool_id_, pool_query,
+                                                min_tier_score, bytes);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronously truncate a blob to an exact logical size (grow/shrink).
    * @param tag_id Tag the blob belongs to
    * @param blob_name Blob to resize

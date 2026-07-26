@@ -1861,6 +1861,83 @@ struct ReorganizeBlobTask : public clio::run::Task {
   }
 };
 
+/**
+ * EvictTask - score-driven capacity reclamation.
+ *
+ * Frees the lowest-score blobs that occupy a tier until a byte budget is met.
+ * A "tier to evict from" is named by min_tier_score_: any registered target
+ * whose target_score_ >= min_tier_score_ qualifies (so 0.0 means "any tier",
+ * a high value means "only the fast/expensive tiers"). Blobs are ranked by
+ * their own score_ ascending and evicted (blocks freed, metadata removed)
+ * cheapest-first until bytes_ of physical capacity has been reclaimed from
+ * qualifying targets, or no candidates remain.
+ *
+ * Broadcast op: each container evicts from its own metadata shard and reports
+ * its share; AggregateOut sums bytes_evicted_/blobs_evicted_ across shards.
+ */
+struct EvictTask : public clio::run::Task {
+  IN float min_tier_score_;   // Only evict blobs on targets with score >= this
+  IN clio::run::u64 bytes_;   // Reclaim at least this many bytes from the tier
+  OUT clio::run::u64 bytes_evicted_;  // Physical bytes actually reclaimed
+  OUT clio::run::u64 blobs_evicted_;  // Number of blobs evicted
+
+  // SHM constructor
+  EvictTask()
+      : clio::run::Task(),
+        min_tier_score_(0.0f),
+        bytes_(0),
+        bytes_evicted_(0),
+        blobs_evicted_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit EvictTask(const clio::run::TaskId &task_id,
+                                   const clio::run::PoolId &pool_id,
+                                   const clio::run::PoolQuery &pool_query,
+                                   float min_tier_score, clio::run::u64 bytes)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kEvict),
+        min_tier_score_(min_tier_score),
+        bytes_(bytes),
+        bytes_evicted_(0),
+        blobs_evicted_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kEvict;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(min_tier_score_, bytes_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(bytes_evicted_, blobs_evicted_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<EvictTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    min_tier_score_ = other->min_tier_score_;
+    bytes_ = other->bytes_;
+    bytes_evicted_ = other->bytes_evicted_;
+    blobs_evicted_ = other->blobs_evicted_;
+  }
+
+  /**
+   * Broadcast aggregation: SUM the per-shard eviction totals rather than
+   * overwrite, so the client sees the tier-wide bytes/blobs reclaimed.
+   */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<EvictTask>();
+    bytes_evicted_ += other->bytes_evicted_;
+    blobs_evicted_ += other->blobs_evicted_;
+  }
+};
+
 // ===========================================================================
 // Fully-POD, GPU-compatible blob tasks (issue #556).
 //

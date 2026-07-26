@@ -56,7 +56,11 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodReorganizeBlob = 45;
 // Periodic internal data-organizer driver (issue #738)
 GLOBAL_CROSS_CONST clio::run::u32 kDynamicReorganize = 46;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 47;
+// Score-driven capacity eviction: free the lowest-score blobs off a tier
+// (targets with score >= min) until a byte budget is reclaimed.
+GLOBAL_CROSS_CONST clio::run::u32 kEvict = 47;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 48;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -97,6 +101,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[44] = "PodGetBlob";
     v[45] = "PodReorganizeBlob";
     v[46] = "DynamicReorganize";
+    v[47] = "Evict";
     return v;
   }();
   return names;
