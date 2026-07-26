@@ -31,6 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <functional>
+
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/pair.h>
@@ -45,6 +47,40 @@
 
 namespace nb = nanobind;
 using namespace nb::literals;
+
+namespace {
+// Python-facing handle for an in-flight CTE task (async client APIs).
+//
+// Type-erased over the concrete task: it holds a Future<Task>, so Task's
+// virtual destructor frees the concrete task AND its owned buffers (e.g. a
+// PutBlob's TASK_DATA_OWNER staging buffer) when the last Future reference
+// drops. `extract_` produces the Python return value once the task completes;
+// any host buffer the task reads from / writes into is kept alive by being
+// captured inside `extract_`, so it outlives the async operation for exactly as
+// long as this handle does.
+struct PyCteFuture {
+  clio::run::Future<clio::run::Task> fut_;
+  std::function<nb::object(clio::run::Future<clio::run::Task> &)> extract_;
+
+  // Block until the task completes, then return its code (0 = success). An
+  // empty (cache-hit / already-satisfied) future reports 0. max_sec < 0 waits
+  // forever; 0 polls once.
+  int Wait(float max_sec) {
+    fut_.Wait(max_sec);
+    return fut_.IsNull() ? 0 : static_cast<int>(fut_.get()->GetReturnCode());
+  }
+
+  // Non-blocking completion poll.
+  bool Done() { return fut_.IsNull() || fut_.IsComplete(); }
+
+  // Block, then produce the operation's Python result: bytes for GetBlob, a
+  // list for queries, None for status-only ops.
+  nb::object Result() {
+    fut_.Wait();
+    return extract_ ? extract_(fut_) : nb::none();
+  }
+};
+}  // namespace
 
 NB_MODULE(clio_cte_core_ext, m) {
   m.doc() = "Python bindings for WRP CTE Core";
@@ -152,6 +188,19 @@ NB_MODULE(clio_cte_core_ext, m) {
 
   // Bind Client class with async API methods wrapped for synchronous Python use
   // Note: All methods use lambda wrappers to call async methods and wait for completion
+  // Async handle returned by every Client.Async*() method. Wait for the task,
+  // poll it, or fetch its result — while overlapping other work in between.
+  nb::class_<PyCteFuture>(m, "Future")
+      .def("wait", &PyCteFuture::Wait, "max_sec"_a = -1.0f,
+           "Block until the task completes; returns the task return code "
+           "(0 = success). max_sec < 0 waits forever, 0 polls once.")
+      .def("done", &PyCteFuture::Done,
+           "Non-blocking: True if the task has completed.")
+      .def("result", &PyCteFuture::Result,
+           "Block until done, then return the operation's result: bytes for "
+           "AsyncGetBlob, a list for the Async*Query/Search ops, None for "
+           "status-only ops (put/del/reorganize/register).");
+
   nb::class_<clio::cte::core::Client>(m, "Client")
       .def(nb::init<>())
       .def(nb::init<const clio::run::PoolId &>())
@@ -278,7 +327,113 @@ NB_MODULE(clio_cte_core_ext, m) {
            return task->return_code_ == 0;
          },
          "tag_id"_a, "blob_name"_a,
-         "Delete a blob from a tag. Returns True on success, False otherwise");
+         "Delete a blob from a tag. Returns True on success, False otherwise")
+     // ---- Async client APIs -------------------------------------------------
+     // Each returns a Future you can overlap other work against: submit N of
+     // them, then .wait()/.result() later. The private-memory paths (#823/#830)
+     // are used so no manual shared-memory management is needed from Python.
+     .def("AsyncPutBlob",
+         [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
+            const std::string &blob_name, nb::bytes data, size_t off) {
+           // #830 private put. Retain `data` so runtime-mode (co-located,
+           // zero-copy) reads stay valid until wait(); client mode stages a
+           // TASK_DATA_OWNER copy that the task frees on destruction.
+           auto fut = self.AsyncPutBlob(tag_id, blob_name, off, data.size(),
+                                        data.c_str());
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           pf.extract_ = [data](clio::run::Future<clio::run::Task> &) {
+             return nb::none();  // status-only; the capture keeps `data` alive
+           };
+           return pf;
+         },
+         "tag_id"_a, "blob_name"_a, "data"_a, "off"_a = 0,
+         "Asynchronously put blob data from a private buffer (issue #830). "
+         "Returns a Future; .wait() -> return code (0 = success).")
+     .def("AsyncGetBlob",
+         [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
+            const std::string &blob_name, size_t data_size, size_t off) {
+           // #823 private get: read straight into a retained heap buffer;
+           // .result() returns it as bytes once complete.
+           auto buf = std::make_shared<std::string>(data_size, '\0');
+           auto fut = self.AsyncGetBlob(tag_id, blob_name, off, data_size,
+                                        /*flags=*/0, buf->data());
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           pf.extract_ = [buf](clio::run::Future<clio::run::Task> &) {
+             return nb::bytes(buf->data(), buf->size());
+           };
+           return pf;
+         },
+         "tag_id"_a, "blob_name"_a, "data_size"_a, "off"_a = 0,
+         "Asynchronously get blob data into a private buffer (issue #823). "
+         "Returns a Future; .result() -> bytes.")
+     .def("AsyncDelBlob",
+         [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
+            const std::string &blob_name) {
+           auto fut = self.AsyncDelBlob(tag_id, blob_name);
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           return pf;
+         },
+         "tag_id"_a, "blob_name"_a,
+         "Asynchronously delete a blob. Returns a Future; .wait() -> rc.")
+     .def("AsyncReorganizeBlob",
+         [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
+            const std::string &blob_name, float new_score) {
+           auto fut = self.AsyncReorganizeBlob(tag_id, blob_name, new_score);
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           return pf;
+         },
+         "tag_id"_a, "blob_name"_a, "new_score"_a,
+         "Asynchronously reorganize a blob. Returns a Future; .wait() -> rc.")
+     .def("AsyncRegisterTarget",
+         [](clio::cte::core::Client &self, const std::string &target_name,
+            clio::run::bdev::BdevType bdev_type, uint64_t total_size) {
+           auto fut = self.AsyncRegisterTarget(target_name, bdev_type,
+                                               total_size);
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           return pf;
+         },
+         "target_name"_a, "bdev_type"_a, "total_size"_a,
+         "Asynchronously register a storage target. .wait() -> rc.")
+     .def("AsyncTagQuery",
+         [](clio::cte::core::Client &self, const std::string &tag_regex,
+            uint32_t max_tags, const clio::run::PoolQuery &pool_query) {
+           auto fut = self.AsyncTagQuery(tag_regex, max_tags, pool_query);
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           pf.extract_ = [](clio::run::Future<clio::run::Task> &f) {
+             return nb::cast(
+                 f.Cast<clio::cte::core::TagQueryTask>().get()->results_);
+           };
+           return pf;
+         },
+         "tag_regex"_a, "max_tags"_a = 0, "pool_query"_a,
+         "Asynchronously query tags by regex. .result() -> list[str].")
+     .def("AsyncBlobQuery",
+         [](clio::cte::core::Client &self, const std::string &tag_regex,
+            const std::string &blob_regex, uint32_t max_blobs,
+            const clio::run::PoolQuery &pool_query) {
+           auto fut = self.AsyncBlobQuery(tag_regex, blob_regex, max_blobs,
+                                          pool_query);
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           pf.extract_ = [](clio::run::Future<clio::run::Task> &f) {
+             auto t = f.Cast<clio::cte::core::BlobQueryTask>();
+             std::vector<std::pair<std::string, std::string>> out;
+             size_t n = std::min(t.get()->tag_names_.size(),
+                                 t.get()->blob_names_.size());
+             for (size_t i = 0; i < n; ++i)
+               out.emplace_back(t.get()->tag_names_[i], t.get()->blob_names_[i]);
+             return nb::cast(out);
+           };
+           return pf;
+         },
+         "tag_regex"_a, "blob_regex"_a, "max_blobs"_a = 0, "pool_query"_a,
+         "Asynchronously query blobs. .result() -> list[(tag, blob)].");
 
   // Bind Tag wrapper class - provides convenient API for tag operations
   // This class wraps tag operations and provides automatic memory management
