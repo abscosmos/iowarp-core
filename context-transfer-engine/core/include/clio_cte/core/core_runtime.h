@@ -639,7 +639,8 @@ private:
    */
   clio::run::TaskResume ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset, clio::run::u64 size,
                              float blob_score, clio::run::u32 &error_code,
-                             int min_persistence_level = 0);
+                             int min_persistence_level = 0,
+                             clio::run::u64 preallocate = 0);
 
   /**
    * Resize a blob to exactly new_size: grow (allocate appended blocks via

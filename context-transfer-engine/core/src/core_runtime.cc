@@ -1621,7 +1621,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     } else {
       CLIO_CO_AWAIT(ExtendBlob(*blob_info_ptr, offset, size, blob_score,
                           alloc_result,
-                          task->context_.min_persistence_level_));
+                          task->context_.min_persistence_level_,
+                          task->context_.preallocate_));
     }
     if (alloc_result != 0) {
       task->return_code_ = 10 + alloc_result;
@@ -4405,7 +4406,8 @@ std::shared_ptr<BlobInfo> Runtime::CreateNewBlob(const std::string &blob_name,
 clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset,
                                     clio::run::u64 size, float blob_score,
                                     clio::run::u32 &error_code,
-                                    int min_persistence_level) {
+                                    int min_persistence_level,
+                                    clio::run::u64 preallocate) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -4547,11 +4549,20 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
     // block at 64 KB so the bdev could always answer with one contiguous block
     // -- an anti-fragmentation policy that did not belong in the CTE.
     constexpr clio::run::u64 kAppendSlab = 4096;  // bdev slab granularity
-    clio::run::u64 req =
+    // Bytes the blob's SIZE must grow by from this target.
+    clio::run::u64 logical_need =
         std::min(remaining_to_allocate, target_info_copy.remaining_space_);
-    if (req == 0) {
+    if (logical_need == 0) {
       continue;
     }
+    // PHYSICAL to request: at least the logical need, but PREALLOCATE up to the
+    // caller's hint (clio-fs asks for 64 KiB per PutBlob) so subsequent small
+    // appends fill the last block's spare capacity_ in place instead of each
+    // triggering a fresh allocation (and its bdev sub-task) under the write
+    // token. The extra physical becomes spare capacity on the last block; only
+    // `logical_need` bytes are published as size_. Capped by remaining_space_.
+    clio::run::u64 req = std::min(std::max(logical_need, preallocate),
+                                  target_info_copy.remaining_space_);
     std::vector<clio::run::bdev::Block> out_blocks;
     bool alloc_success = false;
     CLIO_CO_AWAIT(AllocateFromTarget(target_info_copy, req, out_blocks,
@@ -4560,15 +4571,16 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
       continue;  // this target can't satisfy req; outer loop tries the next
     }
 
-    // Distribute the logical request `req` across the physical blocks the bdev
-    // returned. Each block's size_ is its PHYSICAL footprint (what it occupies
-    // and what capacity_ must credit on free); the blob covers up to that many
-    // logical bytes with it, so `req` logical bytes span the blocks with only
-    // the last one carrying spare capacity. No co_await in this loop, so
-    // total_size_cache_ advances atomically with blocks_ wrt other tasks on
-    // this worker.
+    // Distribute only `logical_need` logical bytes across the physical blocks
+    // the bdev returned. Each block's size_ is its logical coverage and its
+    // capacity_ is the PHYSICAL footprint (what it occupies and what free()
+    // credits); when req > logical_need (preallocation) the trailing physical
+    // is left as spare capacity_ on the last block(s) that received data — the
+    // spare-capacity fast path above then consumes it on later appends with no
+    // new allocation. No co_await in this loop, so total_size_cache_ advances
+    // atomically with blocks_ wrt other tasks on this worker.
     clio::run::u64 physical_sum = 0;
-    clio::run::u64 need = req;
+    clio::run::u64 need = logical_need;
     for (const auto &b : out_blocks) {
       const clio::run::u64 physical = b.size_;  // footprint
       const clio::run::u64 logical = std::min(physical, need);
@@ -4581,7 +4593,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
       need -= logical;
     }
     blob_info.BumpPlacementGen();  // #817: block layout changed
-    remaining_to_allocate -= req;  // sum of logical == req
+    remaining_to_allocate -= (logical_need - need);  // logical actually placed
     (void)kAppendSlab;
 
     // Debit the CANONICAL target's remaining_space_ by the physical bytes taken

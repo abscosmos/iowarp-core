@@ -494,9 +494,16 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   while (done < want) {
     clio::run::u64 page_off = cur % kFsPageSize;
     clio::run::u64 to_write = std::min(kFsPageSize - page_off, want - done);
+    // Preallocate 64 KiB of blob capacity per write so a run of small appends
+    // to the same page fills the last block's spare capacity in place instead
+    // of each one triggering a fresh allocation (and bdev sub-task) under the
+    // per-blob write token — the dominant clio-fs write-latency tail.
+    static constexpr clio::run::u64 kFsPreallocBytes = 64ull * 1024;
     auto p = cte_.AsyncPutBlob(tag_id, PageName(cur), page_off, to_write,
                                (data_base + done).template Cast<void>(),
-                               /*score*/ -1.0f, clio::cte::core::Context(),
+                               /*score*/ -1.0f,
+                               clio::cte::core::Context::Preallocate(
+                                   kFsPreallocBytes),
                                /*flags*/ 0u, clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(p);
     if (p->GetReturnCode() != 0) { ok = false; break; }
