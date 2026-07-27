@@ -754,7 +754,7 @@ void IpcManager::SetNumSchedQueues(u32 num_sched_queues) {
   HLOG(kInfo, "IpcManager: Updated num_sched_queues to {}", num_sched_queues);
 }
 
-void IpcManager::AwakenWorker(TaskLane *lane) {
+void IpcManager::AwakenWorker(TaskLane *lane, bool force) {
   if (!lane) {
     // No lane to target — wake every worker so a task parked with no resolvable
     // owning lane is still re-checked (lost-wakeup safety net).
@@ -763,23 +763,24 @@ void IpcManager::AwakenWorker(TaskLane *lane) {
     return;
   }
 
-  // ALWAYS send SIGUSR1, never skip on active_=true. Past attempts to
-  // gate this on the park-flag tripped a lost-wakeup race at scale (4n
-  // 256m FPP) where the producer observed active_=true, skipped the
-  // signal, and the worker then stored active_=false and entered
-  // epoll_pwait2 before noticing the just-pushed task. The
-  // post-store-recheck handshake in Worker::SuspendMe is supposed to
-  // catch this but doesn't fire reliably under heavy multi-tier
-  // scheduling pressure. Skipping the tgkill saved a syscall; the
-  // observed cost was hangs that never recovered. The extra signal is
-  // absorbed harmlessly by signalfd — at worst the worker wakes one
-  // extra time and re-checks its (empty) queue. Worth it.
-
+  // Signal ONLY a PARKED worker. The caller has already pushed to `lane` (or to
+  // the event queue whose owner runs on this lane); the seq_cst fence here plus
+  // Worker::SuspendMe's seq_cst SetActive(false)+fence form a Dekker StoreLoad,
+  // so a running worker that we skip is GUARANTEED to observe the just-pushed
+  // task in its post-park re-check and not park. That closes the lost-wakeup the
+  // earlier gated attempt hit; and even a hypothetical residual miss self-heals
+  // within the worker's max_sleep cap (<=50ms) rather than hanging forever (that
+  // cap did not exist when the earlier attempt was reverted). On small requests
+  // this removes the per-op tgkill that made SHM lose to Redis's pipelined TCP.
   int tid = lane->GetTid();
   if (tid > 0) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!force && lane->IsActive()) {
+      return;  // worker is polling; it will drain this task without a wake
+    }
     int runtime_pid = runtime_pid_ ? runtime_pid_ : ctp::SystemInfo::GetPid();
 
-    // Send SIGUSR1 to the worker thread in the runtime process
+    // Send SIGUSR1 to the (parked) worker thread in the runtime process
     int result = ctp::lbm::EventManager::Signal(runtime_pid, tid);
     if (result != 0) {
       HLOG(kError,
@@ -2356,7 +2357,10 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
         break;
     }
     if (wake_lane) {
-      AwakenWorker(wake_lane);
+      // force=true: this push went to a net_queue_ priority lane, which is NOT
+      // in the net worker's SuspendMe re-check set — the parked-skip handshake
+      // is unpaired here, so the signal must be unconditional (see AwakenWorker).
+      AwakenWorker(wake_lane, /*force=*/true);
     }
     HLOG(kDebug,
          "[TRACE768] t={} EnqueueNetTask prio={} was_empty={} wake_lane={} "
@@ -3346,6 +3350,14 @@ bool IpcManager::DrainShmResponses() {
     return false;
   }
   bool any = false;
+  // The waiter that drains a response inline (RecvOut spin path) is THIS thread;
+  // it will observe IsComplete on its next spin and needs no wake. Signalling it
+  // is a wasted SYS_tgkill per response — and on a single pipelining thread that
+  // is one syscall PER OP that never amortizes with depth (the whole reason CTE
+  // pipelining lagged Redis, whose 64 replies cost ~1 read). Skip the self-wake;
+  // still signal OTHER (possibly parked) waiters whose responses we demux.
+  const int my_pid = static_cast<int>(ctp::SystemInfo::GetPid());
+  const int my_tid = static_cast<int>(ctp::SystemInfo::GetTid());
   while (true) {
     // Cheap check before allocating: a spinning waiter calls this every
     // iteration, so allocating a LoadTaskArchive only to hit EAGAIN on an empty
@@ -3383,7 +3395,9 @@ bool IpcManager::DrainShmResponses() {
     std::atomic_thread_fence(std::memory_order_release);
     task->SetNewData();
     task->SetComplete();
-    if (task->WaiterPid() != 0) {
+    if (task->WaiterPid() != 0 &&
+        !(static_cast<int>(task->WaiterPid()) == my_pid &&
+          static_cast<int>(task->WaiterTid()) == my_tid)) {
       ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
                                      static_cast<int>(task->WaiterTid()));
     }
