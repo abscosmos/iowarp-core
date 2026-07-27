@@ -469,6 +469,145 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Vectored put (issue #820): write N regions of one blob in a SINGLE task.
+   *
+   * The runtime acquires the blob's write token once, sizes the blob to cover
+   * the union of the regions, and applies each region in list order — so N
+   * disjoint writes to one blob cost one token acquire and one metadata
+   * mutation instead of N of each, and two regions covering the same bytes
+   * resolve last-writer-wins (which N racing single-region tasks do not).
+   *
+   * Each segment keeps its own buffer, so callers never have to gather their
+   * payloads into one contiguous allocation. Node-local: the segment buffers
+   * are shared-memory pointers, so submit this to a local pool.
+   */
+  clio::run::Future<PutBlobTask> AsyncPutBlobVectored(
+      const TagId &tag_id,
+      const char *blob_name,
+      const std::vector<BlobSegment> &segments, float score = -1.0f,
+      const Context &context = Context(),
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    // offset/size/data stay zero-valued: segments_ is authoritative when set,
+    // and the runtime derives the union range from it.
+    auto task = ipc_manager->NewTask<PutBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+        blob_name, static_cast<clio::run::u64>(0), static_cast<clio::run::u64>(0),
+        ctp::ipc::ShmPtr<>::GetNull(), score, context, flags);
+    auto *t = task.get();
+    for (const auto &seg : segments) {
+      t->segments_.push_back(BlobSegment(seg.blob_off_, seg.size_, seg.data_));
+    }
+    t->submit_ts_ns_ =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    return ipc_manager->Send(task);
+  }
+
+  /** std::string overload */
+  clio::run::Future<PutBlobTask> AsyncPutBlobVectored(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      const std::vector<BlobSegment> &segments, float score = -1.0f,
+      const Context &context = Context(),
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    return AsyncPutBlobVectored(tag_id, blob_name.c_str(), segments, score,
+                                context, flags, pool_query);
+  }
+
+  /**
+   * Private-memory AsyncPutBlob (issue #830): write a blob region straight from
+   * a caller-owned PRIVATE buffer (const char*), instead of making the caller
+   * hand-manage a shared-memory buffer (allocate → copy in → pass ShmPtr →
+   * free) as the ShmPtr overload above requires. This is the write-side analog
+   * of the private-memory AsyncGetBlob (issue #823).
+   *
+   * Two paths, fastest first:
+   *  - Runtime (co-located) mode: the daemon shares this address space, so the
+   *    private pointer is wrapped as a null-allocator ShmPtr — IpcManager::
+   *    ToFullPtr resolves such a pointer's offset AS the absolute address — and
+   *    the bdev write reads DIRECTLY from the caller's buffer. No staging
+   *    buffer, no copy, and NOT TASK_DATA_OWNER (the buffer is the caller's).
+   *  - Client mode: the daemon cannot reach private memory, so the write is
+   *    staged through a freshly allocated SHM buffer — the private bytes are
+   *    copied in ONCE, then the task carries that buffer. The task is marked
+   *    TASK_DATA_OWNER so ~PutBlobTask frees the staging buffer once the write
+   *    completes (i.e. after the caller's Wait() returns).
+   *
+   * The issue #830 client-mode zero-IPC fast path (write straight into the
+   * cached blob, skipping the task entirely) is deliberately NOT taken here: a
+   * token-less direct write to the RAM bdev segment can race the DataOrganizer
+   * relocating the blob — it frees/reuses those blocks under the per-blob write
+   * token a pure client cannot hold, so the write would corrupt whichever blob
+   * next owns them. Unlike the read fast path, a placement_gen recheck can
+   * DETECT that race but not UNDO the write. Making it safe needs a
+   * client-visible pin/lease against reorganization; left as a follow-up.
+   *
+   * @return A Future over the put; readable after Wait() (GetReturnCode()==0 on
+   *         success). An empty Future is returned only if SHM staging could not
+   *         be allocated in client mode.
+   */
+  clio::run::Future<PutBlobTask> AsyncPutBlob(
+      const TagId &tag_id, const std::string &blob_name,
+      clio::run::u64 offset, clio::run::u64 size, const char *priv_data,
+      float score = -1.0f, const Context &context = Context(),
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    // A zero-length put carries no payload; route it through the ShmPtr overload
+    // with a null buffer so the two modes below never see size 0.
+    if (size == 0 || priv_data == nullptr) {
+      return AsyncPutBlob(tag_id, blob_name.c_str(), offset, size,
+                          ctp::ipc::ShmPtr<>::GetNull(), score, context, flags,
+                          pool_query);
+    }
+
+    if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      // Co-located daemon: read directly from the private buffer. The null
+      // AllocatorId marks the offset as an absolute process address, so the
+      // bdev write pulls the source bytes straight out of `priv_data`.
+      ctp::ipc::ShmPtr<> raw =
+          ctp::ipc::ShmPtr<>::FromRaw(const_cast<char *>(priv_data));
+      auto task = ipc_manager->NewTask<PutBlobTask>(
+          clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+          offset, size, raw, score, context, flags);
+      task.get()->submit_ts_ns_ =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
+      return ipc_manager->Send(task);
+    }
+
+    // Client: stage through an SHM buffer, copying the private bytes in ONCE.
+    ctp::ipc::FullPtr<char> staging = ipc_manager->AllocateBuffer(size);
+    if (staging.IsNull()) {
+      return clio::run::Future<PutBlobTask>();
+    }
+    std::memcpy(staging.ptr_, priv_data, size);
+    auto task = ipc_manager->NewTask<PutBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, ctp::ipc::ShmPtr<>(staging.shm_), score, context, flags);
+    auto *t = task.get();
+    t->submit_ts_ns_ =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    auto fut = ipc_manager->Send(task);
+    // Mark ownership only AFTER Send has serialized the task: Task::SerializeIn
+    // ships task_flags_, so setting TASK_DATA_OWNER earlier would hand the flag
+    // to the daemon, whose task shares the very same physical SHM buffer on the
+    // local path — and it would free the client's buffer out from under us.
+    // Set client-side, this instance's ~PutBlobTask frees the staging buffer
+    // when the Future (task) is destroyed, after the write has completed.
+    t->SetFlags(TASK_DATA_OWNER);
+    return fut;
+  }
+
+  /**
    * Asynchronous get blob - returns immediately
    * @param tag_id Tag ID
    * @param blob_name Name of the blob
@@ -507,6 +646,126 @@ class Client : public clio::run::ContainerClient {
       const Context &context = Context()) {
     return AsyncGetBlob(tag_id, blob_name.c_str(), offset, size,
                         flags, blob_data, pool_query, context);
+  }
+
+  /**
+   * Private-memory AsyncGetBlob (issue #823): read a blob region straight into
+   * a caller-owned PRIVATE buffer (char*), instead of making the caller
+   * hand-manage a shared-memory buffer (allocate → pass ShmPtr → copy out →
+   * free) as the ShmPtr overload above requires.
+   *
+   * Three paths, fastest first:
+   *  - Shared-cache hit: the bytes are copied out of the RAM bdev's shared
+   *    segment with ZERO IPC and an already-satisfied (empty) Future is
+   *    returned, so Wait() returns immediately. Same fast path the synchronous
+   *    Tag::GetBlob(char*) uses.
+   *  - Runtime (co-located) mode: the daemon shares this address space, so the
+   *    private pointer is wrapped as a null-allocator ShmPtr — IpcManager::
+   *    ToFullPtr resolves such a pointer's offset AS the absolute address — and
+   *    the bdev read lands DIRECTLY in the caller's buffer. No staging buffer,
+   *    no copy, and NOT TASK_DATA_OWNER (the buffer is the caller's, not ours).
+   *  - Client mode: the daemon cannot reach private memory, so the read is
+   *    staged through a freshly allocated SHM buffer. The task is marked
+   *    TASK_DATA_OWNER (its destructor frees the staging buffer on DelTask) and
+   *    GetBlobTask::PostWait() copies the staged bytes into the caller's buffer
+   *    when the read completes.
+   *
+   * @return A Future over the read. On the cache-hit path the Future is EMPTY
+   *         (Wait() succeeds immediately; do not dereference it). On the other
+   *         paths the task is readable after Wait() (GetReturnCode()==0 on
+   *         success). An empty Future is also returned if SHM staging could not
+   *         be allocated in client mode.
+   */
+  clio::run::Future<GetBlobTask> AsyncGetBlob(
+      const TagId &tag_id, const std::string &blob_name,
+      clio::run::u64 offset, clio::run::u64 size, clio::run::u32 flags,
+      char *priv_data,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    // Fastest path: node-local RAM-resident blob → copy straight out of shared
+    // memory. A miss (not cached / not direct-readable / placement moved) falls
+    // through to a real task, so this is only ever faster, never wrong.
+    if (priv_data != nullptr && size > 0 && HasShmCache() &&
+        TryReadBlobShm(tag_id, blob_name, priv_data, size, offset)) {
+      return clio::run::Future<GetBlobTask>();
+    }
+
+    if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      // Co-located daemon: write directly into the private buffer. The null
+      // AllocatorId marks the offset as an absolute process address.
+      ctp::ipc::ShmPtr<> raw = ctp::ipc::ShmPtr<>::FromRaw(priv_data);
+      auto task = ipc_manager->NewTask<GetBlobTask>(
+          clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+          offset, size, flags, raw, context);
+      return ipc_manager->Send(task);
+    }
+
+    // Client: stage through an SHM buffer; PostWait() copies it into priv_data
+    // and ~GetBlobTask (TASK_DATA_OWNER) frees the staging buffer.
+    ctp::ipc::FullPtr<char> staging = ipc_manager->AllocateBuffer(size);
+    if (staging.IsNull()) {
+      return clio::run::Future<GetBlobTask>();
+    }
+    auto task = ipc_manager->NewTask<GetBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, flags, ctp::ipc::ShmPtr<>(staging.shm_), context);
+    auto *t = task.get();
+    // priv_dest_/priv_src_ are NOT serialized, so they stay on this client
+    // instance (the daemon's copy default-constructs them to null).
+    t->priv_dest_ = priv_data;
+    t->priv_src_ = staging.ptr_;
+    auto fut = ipc_manager->Send(task);
+    // Mark ownership only AFTER Send has serialized the task: Task::SerializeIn
+    // ships task_flags_, so setting TASK_DATA_OWNER earlier would hand the flag
+    // to the daemon, whose task shares the very same physical SHM buffer on the
+    // local path — and it would free the client's buffer out from under us.
+    // Set client-side, this instance's ~GetBlobTask frees the staging buffer
+    // when the Future (task) is destroyed. Same object the Future retains.
+    t->SetFlags(TASK_DATA_OWNER);
+    return fut;
+  }
+
+  /**
+   * Vectored get (issue #820): read N regions of one blob in a SINGLE task,
+   * each region landing in its OWN buffer.
+   *
+   * All regions are served from one block-layout snapshot, so the whole read is
+   * a single consistent view of the blob rather than N independent ones. Because
+   * each segment names its own destination, a caller merging several readers'
+   * requests needs no scatter copy afterwards — the runtime fills each reader's
+   * buffer directly. Node-local (segment buffers are SHM pointers).
+   */
+  clio::run::Future<GetBlobTask> AsyncGetBlobVectored(
+      const TagId &tag_id,
+      const char *blob_name,
+      const std::vector<BlobSegment> &segments,
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        static_cast<clio::run::u64>(0), static_cast<clio::run::u64>(0), flags,
+        ctp::ipc::ShmPtr<>::GetNull(), context);
+    auto *t = task.get();
+    for (const auto &seg : segments) {
+      t->segments_.push_back(BlobSegment(seg.blob_off_, seg.size_, seg.data_));
+    }
+    return ipc_manager->Send(task);
+  }
+
+  /** std::string overload */
+  clio::run::Future<GetBlobTask> AsyncGetBlobVectored(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      const std::vector<BlobSegment> &segments,
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
+    return AsyncGetBlobVectored(tag_id, blob_name.c_str(), segments, flags,
+                                pool_query, context);
   }
 
   /**
@@ -606,6 +865,27 @@ class Client : public clio::run::ContainerClient {
                                                   pool_query,
                                                   tag_id, blob_name);
 
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Asynchronously evict data off a tier by score until a byte budget is met.
+   * Frees the lowest-score blobs residing on any target whose score is at least
+   * min_tier_score, cheapest-first, until at least bytes of physical capacity
+   * has been reclaimed (or no candidates remain). Broadcast across all
+   * containers; the returned task's bytes_evicted_/blobs_evicted_ are the
+   * tier-wide totals.
+   * @param min_tier_score Only evict blobs on targets with score >= this
+   *                       (0.0 = any tier)
+   * @param bytes Reclaim at least this many bytes from the tier
+   */
+  clio::run::Future<EvictTask> AsyncEvict(
+      float min_tier_score, clio::run::u64 bytes,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<EvictTask>(clio::run::CreateTaskId(),
+                                                pool_id_, pool_query,
+                                                min_tier_score, bytes);
     return ipc_manager->Send(task);
   }
 
@@ -1218,6 +1498,30 @@ class Tag {
                                         const Context &context = Context());
 
   /**
+   * Asynchronous private-memory PutBlob (issue #830): write a blob region
+   * straight from a caller-owned PRIVATE buffer (const char*, e.g. heap/stack),
+   * with no manual shared-memory management. Write-side analog of the #823
+   * private GetBlob; delegates to CoreClient::AsyncPutBlob(const char*) — see
+   * there for the two paths (runtime-direct no-copy / client-staging with
+   * TASK_DATA_OWNER).
+   *
+   * @param blob_name Name of the blob to write
+   * @param data Source PRIVATE buffer (must stay valid until Wait() returns)
+   * @param data_size Number of bytes to write
+   * @param off Offset within blob (default 0)
+   * @param score Blob score for placement (default -1.0 = auto)
+   * @param context Compression context (default empty)
+   * @return Future over the write; readable after Wait() (GetReturnCode()==0 on
+   *         success). An empty Future is returned only if client-mode SHM
+   *         staging could not be allocated.
+   */
+  clio::run::Future<PutBlobTask> AsyncPutBlob(const std::string &blob_name,
+                                              const char *data,
+                                              size_t data_size, size_t off = 0,
+                                              float score = -1.0f,
+                                              const Context &context = Context());
+
+  /**
    * GetBlob - Allocates shared memory, retrieves blob data, copies to output
    * buffer
    * @param blob_name Name of the blob to retrieve
@@ -1242,6 +1546,26 @@ class Tag {
    */
   void GetBlob(const std::string &blob_name, ctp::ipc::ShmPtr<> data,
                size_t data_size, size_t off = 0);
+
+  /**
+   * Asynchronous private-memory GetBlob (issue #823): read a blob region
+   * straight into a caller-owned PRIVATE buffer (char*, e.g. heap/stack), with
+   * no manual shared-memory management. Delegates to
+   * CoreClient::AsyncGetBlob(char*) — see there for the three paths (shared
+   * cache / runtime-direct / client-staging).
+   *
+   * @param blob_name Name of the blob to retrieve
+   * @param data Output PRIVATE buffer (pre-allocated by caller, >= data_size)
+   * @param data_size Size of data to retrieve (must be > 0)
+   * @param off Offset within blob (default 0)
+   * @return Future over the read. On the shared-cache path the Future is EMPTY
+   *         (Wait() returns immediately; do not dereference it); otherwise the
+   *         task is readable after Wait() (GetReturnCode()==0 on success). The
+   *         buffer holds the bytes once Wait() returns.
+   */
+  clio::run::Future<GetBlobTask> AsyncGetBlob(const std::string &blob_name,
+                                              char *data, size_t data_size,
+                                              size_t off = 0);
 
   /**
    * Get blob score

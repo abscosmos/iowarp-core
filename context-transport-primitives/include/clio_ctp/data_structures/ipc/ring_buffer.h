@@ -48,6 +48,10 @@ using pid_t = int;
 #include "clio_ctp/types/atomic.h"
 #include "clio_ctp/types/bitfield.h"
 
+#if CTP_IS_HOST
+#include <thread>  // std::this_thread::yield in the WAIT_FOR_SPACE back-pressure spin
+#endif
+
 namespace ctp::ipc {
 
 /**
@@ -510,10 +514,28 @@ class ring_buffer : public ShmContainer<AllocT> {
     // queue.size()
     if constexpr (WaitForSpace) {
       size_t size = tail - head + 1;
+#if CTP_IS_HOST
+      unsigned spin_ct = 0;
+#endif
       while (size >= queue.size()) {
         // Use load_device() for cross-SM L2 visibility (see PopDevice comment)
         head = head_.load_device();
         size = tail - head + 1;
+#if CTP_IS_HOST
+        // The ring is FULL. On a CPU this loop must not hard-spin: this producer
+        // may be a worker thread and the consumer that has to drain the ring may
+        // be the only OTHER runnable thread on a 2-CPU box. A tight spin here
+        // monopolizes the core and STARVES that consumer -- the producer==consumer
+        // starvation (#822 queue-depth) behind the embedded-FUSE 2-CPU xfstests
+        // hangs (generic/020 et al.), where a worker shows as R-state spinning in
+        // userspace with an empty kernel stack. Spin a little for the fast-drain
+        // case, then cede the OS thread so the consumer runs. Semantics are
+        // unchanged (we still wait for space); we only stop hogging the core.
+        // Device code keeps the hard spin -- GPU lanes do not oversubscribe a CPU.
+        if ((++spin_ct & 0x3Fu) == 0) {
+          std::this_thread::yield();
+        }
+#endif
       }
     } else if constexpr (ErrorOnNoSpace) {
       size_t size = tail - head + 1;

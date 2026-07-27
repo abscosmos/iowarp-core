@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstring>
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/autogen/core_methods.h>
@@ -1300,12 +1301,64 @@ struct GetOrCreateTagTask : public clio::run::Task {
 /**
  * PutBlob task - Store a blob with optional compression context
  */
+/**
+ * One region of a vectored PutBlob/GetBlob (issue #820).
+ *
+ * A vectored task carries N of these instead of a single (offset, size, data)
+ * triple, so the runtime can acquire the blob's #680 write token ONCE and apply
+ * every region in one pass. Each segment keeps its OWN buffer, which is what
+ * lets the worker's batching layer merge N independent tasks without gathering
+ * their payloads into one contiguous allocation — the members' buffers become
+ * the segments directly.
+ *
+ * The buffer is a shared-memory pointer, so segments are valid to any process
+ * on THIS node. A vectored task is therefore node-local in v1 (the batching
+ * layer only ever builds them for tasks that already routed ExecHere); a
+ * cross-node vectored submit would need one bulk transfer per segment and is
+ * not supported yet.
+ */
+struct BlobSegment {
+  clio::run::u64 blob_off_;  // offset of this region within the blob
+  clio::run::u64 size_;      // bytes in this region
+  ctp::ipc::ShmPtr<> data_;  // this region's own buffer (src for put, dst for get)
+
+  CTP_CROSS_FUN BlobSegment()
+      : blob_off_(0), size_(0), data_(ctp::ipc::ShmPtr<>::GetNull()) {}
+  CTP_CROSS_FUN BlobSegment(clio::run::u64 blob_off, clio::run::u64 size,
+                            ctp::ipc::ShmPtr<> data)
+      : blob_off_(blob_off), size_(size), data_(data) {}
+
+  template <typename Archive>
+  CTP_CROSS_FUN void serialize(Archive &ar) {
+    ar(blob_off_, size_, data_);
+  }
+};
+
 struct PutBlobTask : public clio::run::Task {
   IN TagId tag_id_;                    // Tag ID for blob grouping
   INOUT clio::run::priv::string blob_name_;  // Blob name (required)
   IN clio::run::u64 offset_;                 // Offset within blob
   IN clio::run::u64 size_;                   // Size of blob data
   IN ctp::ipc::ShmPtr<> blob_data_;        // Blob data (shared memory pointer)
+  /**
+   * Vectored regions (issue #820). EMPTY is the normal single-region case, in
+   * which (offset_, size_, blob_data_) above are authoritative — every existing
+   * caller and both emplace constructors leave this empty, so nothing changes
+   * for them. When non-empty this task is VECTORED: the regions below are
+   * authoritative and offset_/size_/blob_data_ are ignored.
+   *
+   * Segments are applied in LIST ORDER, so two segments covering the same bytes
+   * resolve last-writer-wins — which is the ordering guarantee the #680 token
+   * race does not provide when the same writes arrive as separate tasks.
+   */
+  IN clio::run::priv::vector<BlobSegment> segments_;
+
+  /** Compile-time capability: this task type carries `segments_`. The GPU POD
+   *  variant (PodPutBlobTask) sets this false and stays a plain POD — vectored
+   *  puts are a host-side batching feature and the device path never needs
+   *  them. PutBlobImpl is templated over both, so it guards with
+   *  `if constexpr (TaskT::kSupportsVectored)`. */
+  static constexpr bool kSupportsVectored = true;
   IN float score_;         // Score for placement: -1.0=unknown (use defaults),
                            // 0.0-1.0=explicit
   INOUT Context context_;  // Context for compression control and statistics
@@ -1339,6 +1392,7 @@ struct PutBlobTask : public clio::run::Task {
         offset_(0),
         size_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
+        segments_(CLIO_PRIV_ALLOC),
         score_(-1.0f),
         context_(),
         flags_(0),
@@ -1360,6 +1414,7 @@ struct PutBlobTask : public clio::run::Task {
         offset_(offset),
         size_(size),
         blob_data_(blob_data),
+        segments_(CLIO_PRIV_ALLOC),
         score_(score),
         context_(context),
         flags_(flags),
@@ -1387,6 +1442,7 @@ struct PutBlobTask : public clio::run::Task {
         offset_(offset),
         size_(size),
         blob_data_(blob_data),
+        segments_(CLIO_PRIV_ALLOC),
         score_(score),
         context_(context),
         flags_(flags),
@@ -1435,7 +1491,7 @@ struct PutBlobTask : public clio::run::Task {
     ar.PushPod(blob_name_.UsingSso());
     Task::SerializeIn(ar);
     ar(tag_id_, blob_name_, offset_, size_, blob_data_,
-       score_, context_, flags_, gpu_page_idx_, submit_ts_ns_);
+       score_, context_, flags_, gpu_page_idx_, submit_ts_ns_, segments_);
     ar.PopPod();
     // Emulated puts (issue #747) never write the payload, so don't ship it
     // over the wire either — the whole point is to not pay for the I/O.
@@ -1468,6 +1524,7 @@ struct PutBlobTask : public clio::run::Task {
   /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
   CTP_CROSS_FUN void FixupAfterCopy() {
     blob_name_.FixupSsoPointer();
+    segments_.FixupSvoPtr();
   }
 
   /**
@@ -1481,6 +1538,7 @@ struct PutBlobTask : public clio::run::Task {
     offset_ = other->offset_;
     size_ = other->size_;
     blob_data_ = other->blob_data_;
+    segments_ = other->segments_;
     score_ = other->score_;
     context_ = other->context_;
     flags_ = other->flags_;
@@ -1510,6 +1568,19 @@ struct GetBlobTask : public clio::run::Task {
   IN ctp::ipc::ShmPtr<>
       blob_data_;  // Input buffer for blob data (shared memory pointer)
   /**
+   * Vectored regions (issue #820). EMPTY is the ordinary single-region case;
+   * non-empty makes this a vectored read, where each region is read straight
+   * into ITS OWN buffer. That is what lets the batching layer merge N reads of
+   * one blob without a post-hoc scatter copy: each member's destination buffer
+   * is a segment, so the runtime fills it directly.
+   *
+   * All segments are served from ONE block-layout snapshot, so a vectored read
+   * sees a single consistent view of the blob rather than N independent ones.
+   */
+  IN clio::run::priv::vector<BlobSegment> segments_;
+  /** @copydoc PutBlobTask::kSupportsVectored */
+  static constexpr bool kSupportsVectored = true;
+  /**
    * Optional page index appended to blob_name_ at handler time as
    * "_pi<gpu_page_idx_>". See PutBlobTask::gpu_page_idx_ for rationale.
    */
@@ -1517,11 +1588,35 @@ struct GetBlobTask : public clio::run::Task {
   IN clio::run::u32 gpu_page_idx_;
   INOUT Context context_;  // Emulation control + modeled time (issue #747)
 
+  /**
+   * Private-memory destination for the client-mode fast path (issue #823).
+   *
+   * Both are HOST-ONLY process pointers and are deliberately NOT serialized
+   * (they are absent from SerializeIn/SerializeOut) — a raw address is
+   * meaningless in the daemon's address space, and adding them here does not
+   * change the wire layout. They matter only on the client instance the
+   * Future retains.
+   *
+   * When a private-memory AsyncGetBlob runs in CLIENT mode it must stage the
+   * read through a shared-memory buffer (the daemon cannot reach the caller's
+   * private buffer). `priv_src_` is the client-local address of that SHM
+   * staging buffer (also referenced as blob_data_ in offset form) and
+   * `priv_dest_` is the caller's private buffer. PostWait() copies size_ bytes
+   * src→dest once the read completes; TASK_DATA_OWNER then frees the staging
+   * buffer when the task is destroyed. Left null on every other path (runtime
+   * mode writes straight into the private buffer via a null-allocator ShmPtr,
+   * and every pre-existing caller passes SHM buffers), so PostWait() is a
+   * no-op for them.
+   */
+  char *priv_dest_ = nullptr;  // caller's private buffer (copy target)
+  char *priv_src_ = nullptr;   // client-local addr of the SHM staging buffer
+
   // SHM constructor
   CTP_CROSS_FUN GetBlobTask()
       : clio::run::Task(),
         tag_id_(TagId::GetNull()),
         blob_name_(CLIO_PRIV_ALLOC),
+        segments_(CLIO_PRIV_ALLOC),
         offset_(0),
         size_(0),
         flags_(0),
@@ -1541,6 +1636,7 @@ struct GetBlobTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetBlob),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        segments_(CLIO_PRIV_ALLOC),
         offset_(offset),
         size_(size),
         flags_(flags),
@@ -1584,6 +1680,23 @@ struct GetBlobTask : public clio::run::Task {
 #endif
   }
 
+  /**
+   * Post-completion hook (issue #823): deliver a client-mode private-memory
+   * read into the caller's buffer. Called by Future::Wait() after the read
+   * completes and before the task is reaped. A no-op unless both private
+   * pointers were set (only CoreClient::AsyncGetBlob(char*)'s client-mode path
+   * sets them), so it never disturbs the SHM/runtime-direct/vectored callers.
+   * The staging buffer itself is freed by ~GetBlobTask via TASK_DATA_OWNER.
+   */
+  void PostWait() {
+#if !CTP_IS_DEVICE_PASS
+    if (priv_dest_ != nullptr && priv_src_ != nullptr && size_ > 0 &&
+        GetReturnCode() == 0) {
+      std::memcpy(priv_dest_, priv_src_, size_);
+    }
+#endif
+  }
+
   // GPU-compatible emplace constructor (const char* instead of std::string)
   CTP_CROSS_FUN explicit GetBlobTask(const clio::run::TaskId &task_id,
                                       const clio::run::PoolId &pool_id,
@@ -1596,6 +1709,7 @@ struct GetBlobTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetBlob),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        segments_(CLIO_PRIV_ALLOC),
         offset_(offset),
         size_(size),
         flags_(flags),
@@ -1616,6 +1730,7 @@ struct GetBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     ar.PushPod(blob_name_.UsingSso());
     Task::SerializeIn(ar);
+    ar(segments_);
     ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_,
        gpu_page_idx_, context_);
     ar.PopPod();
@@ -1644,6 +1759,7 @@ struct GetBlobTask : public clio::run::Task {
   /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
   CTP_CROSS_FUN void FixupAfterCopy() {
     blob_name_.FixupSsoPointer();
+    segments_.FixupSvoPtr();
   }
 
   /**
@@ -1658,6 +1774,7 @@ struct GetBlobTask : public clio::run::Task {
     size_ = other->size_;
     flags_ = other->flags_;
     blob_data_ = other->blob_data_;
+    segments_ = other->segments_;
     gpu_page_idx_ = other->gpu_page_idx_;
     context_ = other->context_;
   }
@@ -1744,6 +1861,83 @@ struct ReorganizeBlobTask : public clio::run::Task {
   }
 };
 
+/**
+ * EvictTask - score-driven capacity reclamation.
+ *
+ * Frees the lowest-score blobs that occupy a tier until a byte budget is met.
+ * A "tier to evict from" is named by min_tier_score_: any registered target
+ * whose target_score_ >= min_tier_score_ qualifies (so 0.0 means "any tier",
+ * a high value means "only the fast/expensive tiers"). Blobs are ranked by
+ * their own score_ ascending and evicted (blocks freed, metadata removed)
+ * cheapest-first until bytes_ of physical capacity has been reclaimed from
+ * qualifying targets, or no candidates remain.
+ *
+ * Broadcast op: each container evicts from its own metadata shard and reports
+ * its share; AggregateOut sums bytes_evicted_/blobs_evicted_ across shards.
+ */
+struct EvictTask : public clio::run::Task {
+  IN float min_tier_score_;   // Only evict blobs on targets with score >= this
+  IN clio::run::u64 bytes_;   // Reclaim at least this many bytes from the tier
+  OUT clio::run::u64 bytes_evicted_;  // Physical bytes actually reclaimed
+  OUT clio::run::u64 blobs_evicted_;  // Number of blobs evicted
+
+  // SHM constructor
+  EvictTask()
+      : clio::run::Task(),
+        min_tier_score_(0.0f),
+        bytes_(0),
+        bytes_evicted_(0),
+        blobs_evicted_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit EvictTask(const clio::run::TaskId &task_id,
+                                   const clio::run::PoolId &pool_id,
+                                   const clio::run::PoolQuery &pool_query,
+                                   float min_tier_score, clio::run::u64 bytes)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kEvict),
+        min_tier_score_(min_tier_score),
+        bytes_(bytes),
+        bytes_evicted_(0),
+        blobs_evicted_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kEvict;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(min_tier_score_, bytes_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(bytes_evicted_, blobs_evicted_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<EvictTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    min_tier_score_ = other->min_tier_score_;
+    bytes_ = other->bytes_;
+    bytes_evicted_ = other->bytes_evicted_;
+    blobs_evicted_ = other->blobs_evicted_;
+  }
+
+  /**
+   * Broadcast aggregation: SUM the per-shard eviction totals rather than
+   * overwrite, so the client sees the tier-wide bytes/blobs reclaimed.
+   */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<EvictTask>();
+    bytes_evicted_ += other->bytes_evicted_;
+    blobs_evicted_ += other->blobs_evicted_;
+  }
+};
+
 // ===========================================================================
 // Fully-POD, GPU-compatible blob tasks (issue #556).
 //
@@ -1764,6 +1958,9 @@ using PodBlobName = clio::run::priv::fixed_string<32>;
  * PodPutBlob - fully-POD, GPU-compatible variant of PutBlobTask.
  */
 struct PodPutBlobTask : public clio::run::Task {
+  /** No `segments_`: vectored puts are a host-side batching feature and this
+   *  variant must stay a plain POD for the device path (issue #820). */
+  static constexpr bool kSupportsVectored = false;
   IN TagId tag_id_;
   INOUT PodBlobName blob_name_;
   IN clio::run::u64 offset_;
@@ -1887,6 +2084,9 @@ struct PodPutBlobTask : public clio::run::Task {
  * PodGetBlob - fully-POD, GPU-compatible variant of GetBlobTask.
  */
 struct PodGetBlobTask : public clio::run::Task {
+  /** No `segments_`: vectored reads are a host-side feature; this variant
+   *  stays a plain POD for the device path (issue #820). */
+  static constexpr bool kSupportsVectored = false;
   IN TagId tag_id_;
   IN PodBlobName blob_name_;
   IN clio::run::u64 offset_;

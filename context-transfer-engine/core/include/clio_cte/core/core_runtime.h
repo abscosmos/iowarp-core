@@ -164,6 +164,9 @@ public:
   clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
   /** Reorganize single blob (Method::kReorganizeBlob) - update score. */
   clio::run::TaskResume ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task);
+  /** Evict lowest-score blobs off a tier until a byte budget is reclaimed
+   *  (Method::kEvict). Broadcast; each shard reports its share. */
+  clio::run::TaskResume Evict(clio::run::shared_ptr<EvictTask> &task);
 
   /**
    * Rescore-and-move one blob without spawning a ReorganizeBlobTask (issue
@@ -287,6 +290,22 @@ public:
    * traffic instead of going to dedicated I/O workers.
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
+
+  /**
+   * Worker-local batching policy (issue #820).
+   *
+   * PutBlob/GetBlob tasks aimed at the SAME blob are parked together and then
+   * collapsed into one vectored task per blob. This is the whole point of the
+   * feature: the filesystem stores each 1 MiB page as one blob, so a sequential
+   * 4 KiB workload sends 256 tasks at one page-blob and every one of them has to
+   * take that blob's #680 write token across its entire body. Merged, they cost
+   * one token acquire and one bdev pass.
+   */
+  bool BuildBatch(clio::run::u32 method,
+                  const clio::run::shared_ptr<clio::run::Task> &task,
+                  clio::run::BatchGroups &groups) override;
+  void SmashBatch(clio::run::BatchGroups &groups,
+                  clio::run::BatchSink &sink) override;
 
   // Container virtual method implementations (defined in autogen/core_lib_exec.cc)
   void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
@@ -568,8 +587,9 @@ private:
    * @param success Output parameter: true if allocation succeeded, false otherwise
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume AllocateFromTarget(TargetInfo &target_info, clio::run::u64 size,
-                                     clio::run::u64 &allocated_offset, bool &success);
+  clio::run::TaskResume AllocateFromTarget(
+      TargetInfo &target_info, clio::run::u64 size,
+      std::vector<clio::run::bdev::Block> &out_blocks, bool &success);
 
   /**
    * Free all blocks from a blob back to their respective targets
@@ -622,7 +642,8 @@ private:
    */
   clio::run::TaskResume ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset, clio::run::u64 size,
                              float blob_score, clio::run::u32 &error_code,
-                             int min_persistence_level = 0);
+                             int min_persistence_level = 0,
+                             clio::run::u64 preallocate = 0);
 
   /**
    * Resize a blob to exactly new_size: grow (allocate appended blocks via

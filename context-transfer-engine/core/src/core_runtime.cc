@@ -105,6 +105,25 @@ namespace {
 
 constexpr const char *kTagRefPrefix = "$tagid{";
 
+// #680 per-blob write-token re-check period (microseconds). Default 10us: a
+// loser is parked ONLY during active same-blob write contention, where a fast
+// hand-off beats the CPU saved by sleeping. 10us lands in the worker's fastest
+// periodic bucket (Queue[0]) and caps GetSuspendPeriod's idle suspend, so a
+// freed token is re-grabbed in single-digit us instead of the old ~2ms
+// idle-suspend worst case. Overridable via CLIO_WRITE_TOKEN_POLL_US for tuning
+// / A-B measurement (read once; do NOT put on a hot path uncached).
+inline double BlobWriteLockPollUs() {
+  static const double v = [] {
+    if (const char *e = std::getenv("CLIO_WRITE_TOKEN_POLL_US")) {
+      char *end = nullptr;
+      double d = std::strtod(e, &end);
+      if (end != e && d > 0.0) return d;
+    }
+    return 10.0;
+  }();
+  return v;
+}
+
 // Escape regex metacharacters so `s` matches itself literally. Used to build
 // exact/prefix patterns for the tag search index (#598).
 std::string EscapeRegexLiteral(const std::string &s) {
@@ -891,6 +910,7 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
     case Method::kGetContainedBlobs:
     case Method::kTagQuery:
     case Method::kBlobQuery:
+    case Method::kEvict:
       return clio::run::PoolQuery::Broadcast();
 
     default:
@@ -1497,14 +1517,47 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     ctp::ipc::ShmPtr<> blob_data = task->blob_data_;
     float blob_score = task->score_;
 
+    // Vectored put (issue #820): the task carries N regions instead of one.
+    // Everything from here to the data write treats the blob as if a single
+    // write covered the UNION of the segments — the extend/resize must cover
+    // every region, and the sparse-hole fill keys off the union's start — and
+    // only the data write itself fans back out per segment, under the one write
+    // token this whole body already holds. That is the entire point: N regions,
+    // one token acquire, one metadata mutation.
+    bool vectored = false;
+    if constexpr (TaskT::kSupportsVectored) {
+      vectored = !task->segments_.empty();
+      if (vectored) {
+        clio::run::u64 lo = ~static_cast<clio::run::u64>(0);
+        clio::run::u64 hi = 0;
+        for (size_t i = 0; i < task->segments_.size(); ++i) {
+          const auto &seg = task->segments_[i];
+          if (seg.size_ == 0) {
+            task->return_code_ = 2;
+            CLIO_CO_RETURN;
+          }
+          if (seg.data_.IsNull() && !task->context_.emulate_) {
+            task->return_code_ = 3;
+            CLIO_CO_RETURN;
+          }
+          if (seg.blob_off_ < lo) lo = seg.blob_off_;
+          if (seg.blob_off_ + seg.size_ > hi) hi = seg.blob_off_ + seg.size_;
+        }
+        offset = lo;
+        size = hi - lo;
+      }
+    }
+
     // Validate inputs
     if (size == 0) {
       task->return_code_ = 2;
       CLIO_CO_RETURN;
     }
     // Emulated puts (issue #747) skip the data write AND its wire transfer,
-    // so on a cross-node receiver blob_data_ is legitimately null.
-    if (blob_data.IsNull() && !task->context_.emulate_) {
+    // so on a cross-node receiver blob_data_ is legitimately null. A vectored
+    // task validated its per-segment buffers above and leaves blob_data_ null
+    // by construction, so it is exempt from this single-region check.
+    if (!vectored && blob_data.IsNull() && !task->context_.emulate_) {
       task->return_code_ = 3;
       CLIO_CO_RETURN;
     }
@@ -1551,10 +1604,20 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // suspends at one of those co_awaits. The guard releases the token on EVERY
     // exit below (normal completion, early CLIO_CO_RETURN, or a thrown
     // exception).
-    static constexpr double kBlobWriteLockPollUs = 2050.0;  // ~50us effective throttle (worker periodic ready-check has a 2000us tolerance); avoids the busy-poll hot-spin
+    // #680 write-token re-check period; see BlobWriteLockPollUs() (default 10us,
+    // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
+    clio::run::u64 _tok_spin = 0;  // [HANGWATCH-TOK] stuck-holder probe (#822)
     while (!blob_info_ptr->TryLockWrite(lock_tok)) {
-      CLIO_CO_AWAIT(clio::run::yield(kBlobWriteLockPollUs));
+      if ((++_tok_spin % 20000) == 0) {
+        ctp::ipc::atomic_ref<clio::run::u64> _own(blob_info_ptr->write_owner_);
+        HLOG(kError,
+             "[HANGWATCH-TOK] PutBlob spinning on write token blob='{}' "
+             "owner_tok={} my_tok={} spins={}",
+             task->blob_name_.str(),
+             _own.load(std::memory_order_relaxed), lock_tok, _tok_spin);
+      }
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
 
@@ -1588,7 +1651,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     } else {
       CLIO_CO_AWAIT(ExtendBlob(*blob_info_ptr, offset, size, blob_score,
                           alloc_result,
-                          task->context_.min_persistence_level_));
+                          task->context_.min_persistence_level_,
+                          task->context_.preallocate_));
     }
     if (alloc_result != 0) {
       task->return_code_ = 10 + alloc_result;
@@ -1673,13 +1737,45 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         }
       }
 
-      // Step 3: ModifyExistingData — write data to blocks
+      // Step 3: ModifyExistingData — write data to blocks.
       clio::run::u32 write_result = 0;
-      CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_, blob_data, size,
-                                  offset, write_result, hint_idx, hint_off));
-      if (write_result != 0) {
-        task->return_code_ = 20 + write_result;
-        CLIO_CO_RETURN;
+      if constexpr (TaskT::kSupportsVectored) {
+       if (vectored) {
+        // One region at a time, but all of them inside the single write-token
+        // acquire above (issue #820). IN LIST ORDER, which is what makes two
+        // segments covering the same bytes resolve last-writer-wins — the
+        // ordering guarantee the #680 token race does NOT provide when the same
+        // writes arrive as separate tasks racing for the token.
+        //
+        // hint_idx/hint_off stay valid for every segment: they are only set
+        // when the union offset is at/after old_blob_size (a pure append
+        // batch), in which case every segment starts at/after hint_off too, so
+        // the block-scan hint can never skip past a segment's blocks.
+        for (size_t i = 0; i < task->segments_.size(); ++i) {
+          const auto &seg = task->segments_[i];
+          CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_, seg.data_,
+                                      seg.size_, seg.blob_off_, write_result,
+                                      hint_idx, hint_off));
+          if (write_result != 0) {
+            task->return_code_ = 20 + write_result;
+            CLIO_CO_RETURN;
+          }
+        }
+       } else {
+        CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_, blob_data, size,
+                                    offset, write_result, hint_idx, hint_off));
+        if (write_result != 0) {
+          task->return_code_ = 20 + write_result;
+          CLIO_CO_RETURN;
+        }
+       }
+      } else {
+        CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_, blob_data, size,
+                                    offset, write_result, hint_idx, hint_off));
+        if (write_result != 0) {
+          task->return_code_ = 20 + write_result;
+          CLIO_CO_RETURN;
+        }
       }
     }
 
@@ -1835,6 +1931,30 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Suppress unused variable warning for flags - may be used in future
     (void)flags;
 
+    // Vectored get (issue #820): N regions, each read into its OWN buffer, all
+    // served from the single block snapshot taken below — so the whole read is
+    // one consistent view of the blob rather than N independent ones. `size`
+    // becomes the union extent purely for the validation and emulation paths.
+    bool vectored = false;
+    if constexpr (TaskT::kSupportsVectored) {
+      vectored = !task->segments_.empty();
+      if (vectored) {
+        clio::run::u64 lo = ~static_cast<clio::run::u64>(0);
+        clio::run::u64 hi = 0;
+        for (size_t i = 0; i < task->segments_.size(); ++i) {
+          const auto &seg = task->segments_[i];
+          if (seg.size_ == 0 || seg.data_.IsNull()) {
+            task->return_code_ = 1;
+            CLIO_CO_RETURN;
+          }
+          if (seg.blob_off_ < lo) lo = seg.blob_off_;
+          if (seg.blob_off_ + seg.size_ > hi) hi = seg.blob_off_ + seg.size_;
+        }
+        offset = lo;
+        size = hi - lo;
+      }
+    }
+
     // Validate input parameters
     if (size == 0) {
       task->return_code_ = 1;
@@ -1877,6 +1997,20 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     if (task->context_.emulate_) {
       task->context_.emulated_time_ns_ =
           EstimateIoTimeNs(blocks_snapshot, offset, size, /*is_write=*/false);
+    } else if (vectored) {
+      // Each region into its own buffer, off the one shared snapshot.
+      if constexpr (TaskT::kSupportsVectored) {
+        for (size_t i = 0; i < task->segments_.size(); ++i) {
+          const auto &seg = task->segments_[i];
+          clio::run::u32 read_result = 0;
+          CLIO_CO_AWAIT(ReadData(blocks_snapshot, seg.data_, seg.size_,
+                            seg.blob_off_, read_result));
+          if (read_result != 0) {
+            task->return_code_ = read_result;
+            CLIO_CO_RETURN;
+          }
+        }
+      }
     } else {
       clio::run::u32 read_result = 0;
       CLIO_CO_AWAIT(ReadData(blocks_snapshot, blob_data_ptr, size, offset,
@@ -2258,10 +2392,11 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
     // while a PutBlob iterates blocks_ across a co_await is a use-after-free.
     // The local shared_ptr keeps this BlobInfo alive past the map erase below,
     // so releasing the token in the guard destructor stays valid.
-    static constexpr double kBlobWriteLockPollUs = 2050.0;  // ~50us effective throttle (worker periodic ready-check has a 2000us tolerance); avoids the busy-poll hot-spin
+    // #680 write-token re-check period; see BlobWriteLockPollUs() (default 10us,
+    // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
     while (!blob_info_ptr->TryLockWrite(lock_tok)) {
-      CLIO_CO_AWAIT(clio::run::yield(kBlobWriteLockPollUs));
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
 
@@ -2334,6 +2469,113 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::Evict(clio::run::shared_ptr<EvictTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  const float min_tier_score = task->min_tier_score_;
+  const clio::run::u64 target_bytes = task->bytes_;
+  task->bytes_evicted_ = 0;
+  task->blobs_evicted_ = 0;
+
+  // 1. Which registered targets qualify as "the tier to evict from"? Any target
+  //    whose score is at least min_tier_score. Snapshot their PoolIds under the
+  //    target read lock (tiny list — a linear membership test below is cheaper
+  //    than hashing PoolId).
+  std::vector<clio::run::PoolId> qualifying_targets;
+  {
+    clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+    registered_targets_.for_each(
+        [&](const clio::run::PoolId &pool_id, const TargetInfo &info) {
+          if (info.target_score_ >= min_tier_score) {
+            qualifying_targets.push_back(pool_id);
+          }
+        });
+  }
+  if (qualifying_targets.empty() || target_bytes == 0) {
+    CLIO_CO_RETURN;  // nothing to evict from / no budget
+  }
+  auto on_qualifying_target = [&](const clio::run::PoolId &pid) {
+    for (const auto &t : qualifying_targets) {
+      if (t == pid) return true;
+    }
+    return false;
+  };
+
+  // 2. Rank this shard's blobs that occupy a qualifying tier by their own score
+  //    (ascending) so the cheapest-to-lose data is evicted first. evict_bytes is
+  //    the PHYSICAL footprint (capacity_) this blob holds on qualifying targets,
+  //    which is what gets returned to the tier's remaining_space_.
+  struct Candidate {
+    float score;
+    clio::run::u64 evict_bytes;
+    TagId tag_id;
+    std::string blob_name;
+  };
+  std::vector<Candidate> candidates;
+  tag_blob_name_to_info_.for_each(
+      [&](const std::string &composite_key,
+          const std::shared_ptr<BlobInfo> &blob_info_sp) {
+        const BlobInfo &blob_info = *blob_info_sp;
+        clio::run::u64 evict_bytes = 0;
+        for (const auto &block : blob_info.blocks_) {
+          if (on_qualifying_target(block.bdev_client_.pool_id_)) {
+            evict_bytes += block.capacity_;
+          }
+        }
+        if (evict_bytes == 0) {
+          return;
+        }
+        const size_t first_sep = composite_key.find('.');
+        const size_t second_sep =
+            (first_sep == std::string::npos)
+                ? std::string::npos
+                : composite_key.find('.', first_sep + 1);
+        if (first_sep == std::string::npos ||
+            second_sep == std::string::npos) {
+          return;
+        }
+        TagId blob_tag_id(
+            static_cast<clio::run::u32>(
+                std::stoul(composite_key.substr(0, first_sep))),
+            static_cast<clio::run::u32>(std::stoul(composite_key.substr(
+                first_sep + 1, second_sep - first_sep - 1))));
+        candidates.push_back(Candidate{blob_info.score_, evict_bytes,
+                                       blob_tag_id,
+                                       composite_key.substr(second_sep + 1)});
+      },
+      ctp::priv::ForEachLock::kShared);
+
+  std::sort(candidates.begin(), candidates.end(),
+            [](const Candidate &a, const Candidate &b) {
+              return a.score < b.score;
+            });
+
+  // 3. Evict lowest-score-first until the byte budget is met. Reuse the DelBlob
+  //    path (frees blocks back to the tier + removes metadata + WAL/telemetry);
+  //    each of these blobs hashes to THIS container, so AsyncDelBlob routes back
+  //    here. Await serially so bytes_evicted_ reflects only confirmed frees and
+  //    we can stop as soon as the budget is satisfied.
+  for (const auto &c : candidates) {
+    if (task->bytes_evicted_ >= target_bytes) {
+      break;
+    }
+    auto del = client_.AsyncDelBlob(c.tag_id, c.blob_name);
+    CLIO_CO_AWAIT(del);
+    if (del->return_code_ == 0) {
+      task->bytes_evicted_ += c.evict_bytes;
+      task->blobs_evicted_ += 1;
+    } else {
+      HLOG(kWarning, "Evict: DelBlob failed for {}, skipping", c.blob_name);
+    }
+  }
+
+  HLOG(kDebug,
+       "Evict: min_tier_score={} budget={} -> evicted {} bytes across {} blobs",
+       min_tier_score, target_bytes, task->bytes_evicted_,
+       task->blobs_evicted_);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
@@ -2365,10 +2607,11 @@ clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTa
     // truncate and a write racing on blocks_ across the ResizeBlob co_await
     // corrupt the block layout. Busy-poll the token (lost-wakeup-proof — see
     // PutBlobImpl); the guard releases it on every exit path.
-    static constexpr double kBlobWriteLockPollUs = 2050.0;  // ~50us effective throttle (worker periodic ready-check has a 2000us tolerance); avoids the busy-poll hot-spin
+    // #680 write-token re-check period; see BlobWriteLockPollUs() (default 10us,
+    // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
     while (!blob_info_ptr->TryLockWrite(lock_tok)) {
-      CLIO_CO_AWAIT(clio::run::yield(kBlobWriteLockPollUs));
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
 
@@ -4038,6 +4281,172 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
   }
 }
 
+// ---- issue #820: worker-local batching policy ---------------------------
+//
+// Group PutBlob/GetBlob tasks by the blob they target, then collapse each group
+// into ONE vectored task (see PutBlobTask::segments_). The filesystem stores
+// each 1 MiB page as one blob, so a sequential 4 KiB workload aims 256 tasks at
+// a single page-blob and each has to take that blob's #680 write token across
+// its whole body -- they drain single-file, which is the measured ~1 s tail.
+// Merged, they cost one token acquire and one bdev pass.
+
+namespace {
+/** Group identity: one group per (tag, blob). */
+clio::run::u64 BlobBatchKey(const TagId &tag_id, const std::string &blob_name) {
+  clio::run::u64 h = std::hash<std::string>()(blob_name);
+  h ^= std::hash<clio::run::u64>()(tag_id.major_) + 0x9e3779b97f4a7c15ULL +
+       (h << 6) + (h >> 2);
+  h ^= std::hash<clio::run::u64>()(tag_id.minor_) + 0x9e3779b97f4a7c15ULL +
+       (h << 6) + (h >> 2);
+  return h;
+}
+}  // namespace
+
+bool Runtime::BuildBatch(clio::run::u32 method,
+                         const clio::run::shared_ptr<clio::run::Task> &task,
+                         clio::run::BatchGroups &groups) {
+  // Only the two data-path methods, and only the plain positioned form. A task
+  // carrying anything the merge would have to reason about -- an existing
+  // segment list, a GPU page suffix, a wholesale-replace flag, or emulation --
+  // is declined and runs as it always did. Declining is always safe; merging
+  // the wrong thing is not.
+  if (method != Method::kPutBlob && method != Method::kGetBlob) {
+    return false;
+  }
+  // Opt-in via CLIO_CTE_BATCHING=1 (issue #820). The merge itself is proven by
+  // test_vectored_blob_io. The concurrent-writer hang that previously kept this
+  // off ("parks CTE tasks, hangs test_concurrent_same_blob at >=8 writers") was
+  // ROOT-CAUSED and FIXED in a84449e1 (the batch parent-registry was per-worker
+  // + keyed by a thread-local uid, so a merged task that resumed on a different
+  // worker never completed its parents -- a lost wakeup, not a deadlock). With
+  // that fix test_concurrent_same_blob passes 20+ consecutive runs at 8/16/32
+  // concurrent writers with both this policy and CLIO_BATCH_LANE on. It stays
+  // opt-in only because CLIO_BATCH_LANE -- the lane phase that actually converges
+  // same-blob work -- is still being validated for tasks another in-flight task
+  // synchronously awaits; enabling this alone (shard-ingress batching) is safe.
+  static const bool policy_on = [] {
+    if (const char *e = std::getenv("CLIO_CTE_BATCHING")) {
+      return !(std::string(e) == "0" || std::string(e) == "false");
+    }
+    return false;
+  }();
+  if (!policy_on) {
+    return false;
+  }
+  TagId tag_id;
+  std::string blob_name;
+  if (method == Method::kPutBlob) {
+    auto *t = reinterpret_cast<PutBlobTask *>(task.get());
+    if (!t->segments_.empty() || t->gpu_page_idx_ != PutBlobTask::kNoPageIdx ||
+        (t->flags_ & kCtePutReplace) || t->context_.emulate_ ||
+        t->size_ == 0 || t->blob_data_.IsNull()) {
+      return false;
+    }
+    tag_id = t->tag_id_;
+    blob_name = t->blob_name_.str();
+  } else {
+    auto *t = reinterpret_cast<GetBlobTask *>(task.get());
+    if (!t->segments_.empty() || t->gpu_page_idx_ != GetBlobTask::kNoPageIdx ||
+        t->context_.emulate_ || t->size_ == 0 || t->blob_data_.IsNull()) {
+      return false;
+    }
+    tag_id = t->tag_id_;
+    blob_name = t->blob_name_.str();
+  }
+
+  clio::run::BatchKey key{task->pool_id_, method,
+                          BlobBatchKey(tag_id, blob_name)};
+  clio::run::BatchMember member;
+  member.task = task;
+  groups[key].push_back(member);
+  return true;
+}
+
+void Runtime::SmashBatch(clio::run::BatchGroups &groups,
+                         clio::run::BatchSink &sink) {
+  for (auto it = groups.begin(); it != groups.end();) {
+    // BY VALUE, not by reference: the erase below destroys the map node, and
+    // every use of the key after that point (the method checks, the sort
+    // comparator, the merged-task construction) would be reading freed memory.
+    const clio::run::BatchKey key = it->first;
+    if (key.method != Method::kPutBlob && key.method != Method::kGetBlob) {
+      ++it;  // not ours (another container's group)
+      continue;
+    }
+    std::vector<clio::run::BatchMember> members = std::move(it->second);
+    it = groups.erase(it);
+    if (members.empty()) {
+      continue;
+    }
+    // A group of one has nothing to amortize: hand it back untouched rather
+    // than paying to wrap it in a vectored task. This is the no-backlog case,
+    // and it must cost nothing.
+    if (members.size() == 1) {
+      sink.Passthrough(members[0].task);
+      continue;
+    }
+
+    // Offset order, ties by ARRIVAL order. The runtime applies segments in list
+    // order, so this is what makes two writes to the same bytes resolve
+    // last-writer-wins -- the guarantee racing single-region tasks do not give.
+    std::sort(members.begin(), members.end(),
+              [&](const clio::run::BatchMember &a,
+                  const clio::run::BatchMember &b) {
+                clio::run::u64 ao, bo;
+                if (key.method == Method::kPutBlob) {
+                  ao = reinterpret_cast<PutBlobTask *>(a.task.get())->offset_;
+                  bo = reinterpret_cast<PutBlobTask *>(b.task.get())->offset_;
+                } else {
+                  ao = reinterpret_cast<GetBlobTask *>(a.task.get())->offset_;
+                  bo = reinterpret_cast<GetBlobTask *>(b.task.get())->offset_;
+                }
+                if (ao != bo) return ao < bo;
+                return a.seq < b.seq;
+              });
+
+    // Build the merged task as a copy of the first member, then replace its
+    // single region with every member's region as a segment. Each member keeps
+    // its OWN buffer -- no gather for writes, and for reads the runtime fills
+    // each member's destination directly, so completion needs no scatter.
+    clio::run::shared_ptr<clio::run::Task> merged =
+        NewCopyTask(key.method, members[0].task, /*deep=*/true);
+    if (merged.IsNull()) {
+      // Could not merge: run them individually rather than dropping them.
+      for (auto &m : members) {
+        sink.Passthrough(m.task);
+      }
+      continue;
+    }
+    std::vector<clio::run::shared_ptr<clio::run::Task>> parents;
+    parents.reserve(members.size());
+    if (key.method == Method::kPutBlob) {
+      auto *mt = reinterpret_cast<PutBlobTask *>(merged.get());
+      mt->segments_.clear();
+      for (auto &m : members) {
+        auto *s = reinterpret_cast<PutBlobTask *>(m.task.get());
+        mt->segments_.push_back(BlobSegment(s->offset_, s->size_, s->blob_data_));
+        parents.push_back(m.task);
+      }
+      mt->offset_ = 0;
+      mt->size_ = 0;
+      mt->blob_data_ = ctp::ipc::ShmPtr<>::GetNull();
+    } else {
+      auto *mt = reinterpret_cast<GetBlobTask *>(merged.get());
+      mt->segments_.clear();
+      for (auto &m : members) {
+        auto *s = reinterpret_cast<GetBlobTask *>(m.task.get());
+        mt->segments_.push_back(BlobSegment(s->offset_, s->size_, s->blob_data_));
+        parents.push_back(m.task);
+      }
+      mt->offset_ = 0;
+      mt->size_ = 0;
+      mt->blob_data_ = ctp::ipc::ShmPtr<>::GetNull();
+    }
+    sink.Emit(merged, std::move(parents));
+  }
+}
+
+
 // Helper methods for lock index calculation
 size_t Runtime::GetTargetLockIndex(const clio::run::PoolId &target_id) const {
   // Use hash of target_id to distribute locks evenly
@@ -4140,7 +4549,8 @@ std::shared_ptr<BlobInfo> Runtime::CreateNewBlob(const std::string &blob_name,
 clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset,
                                     clio::run::u64 size, float blob_score,
                                     clio::run::u32 &error_code,
-                                    int min_persistence_level) {
+                                    int min_persistence_level,
+                                    clio::run::u64 preallocate) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -4274,71 +4684,74 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
       continue;
     }
 
-    // Back a large logical extension with MULTIPLE small physical blocks by
-    // capping each block at kMaxBlockChunk. Under long-soak churn the bdev free
-    // pool fragments into sub-request-size extents (measured: ~4640 extents,
-    // largest ~324 KB) while a single-block extension request is 0.5-1 MB, so
-    // one large contiguous block can NEVER be reused and the bump-only Heap
-    // watermark climbs to the tier capacity → write EIO (074/521/522). Small
-    // blocks match the fragmented pool and reuse freed space. The blob stores
-    // blocks_ as a vector and read/write iterate them, so multi-block extents
-    // are transparent to the data path. AllocateFromTarget decrements the copy's
-    // remaining_space_ by reference, so the loop condition drains naturally.
-    constexpr clio::run::u64 kMaxBlockChunk = 65536;  // 64 KB
-    constexpr clio::run::u64 kAppendSlab = 4096;      // bdev slab granularity
-    while (remaining_to_allocate > 0 && target_info_copy.remaining_space_ > 0) {
-      // Logical bytes this block carries.
-      clio::run::u64 logical =
-          std::min(std::min(remaining_to_allocate,
-                            target_info_copy.remaining_space_),
-                   kMaxBlockChunk);
-      // Physical bytes to request: round the logical UP to a whole slab so a
-      // small append leaves reusable spare capacity for the next append (the
-      // spare-fill path above). The request stays <=64 KB-ish, so the
-      // small-block anti-fragmentation property 074/521/522 rely on holds. If
-      // rounding up would exceed the target's free space, take exactly logical.
-      clio::run::u64 physical =
-          ((logical + kAppendSlab - 1) / kAppendSlab) * kAppendSlab;
-      if (physical > target_info_copy.remaining_space_) {
-        physical = logical;
-      }
+    // Ask the bdev for the whole extent this target can cover, in ONE request.
+    // Fragmentation across reused free blocks is the allocator's job now
+    // (issue #820): it returns however many physical blocks it took, and the
+    // blob's blocks_ vector carries those multi-block extents transparently to
+    // read/write. This is what used to be worked around here by capping every
+    // block at 64 KB so the bdev could always answer with one contiguous block
+    // -- an anti-fragmentation policy that did not belong in the CTE.
+    constexpr clio::run::u64 kAppendSlab = 4096;  // bdev slab granularity
+    // Bytes the blob's SIZE must grow by from this target.
+    clio::run::u64 logical_need =
+        std::min(remaining_to_allocate, target_info_copy.remaining_space_);
+    if (logical_need == 0) {
+      continue;
+    }
+    // PHYSICAL to request: at least the logical need, but PREALLOCATE up to the
+    // caller's hint (clio-fs asks for 64 KiB per PutBlob) so subsequent small
+    // appends fill the last block's spare capacity_ in place instead of each
+    // triggering a fresh allocation (and its bdev sub-task) under the write
+    // token. The extra physical becomes spare capacity on the last block; only
+    // `logical_need` bytes are published as size_. Capped by remaining_space_.
+    clio::run::u64 req = std::min(std::max(logical_need, preallocate),
+                                  target_info_copy.remaining_space_);
+    std::vector<clio::run::bdev::Block> out_blocks;
+    bool alloc_success = false;
+    CLIO_CO_AWAIT(AllocateFromTarget(target_info_copy, req, out_blocks,
+                                alloc_success));
+    if (!alloc_success || out_blocks.empty()) {
+      continue;  // this target can't satisfy req; outer loop tries the next
+    }
 
-      clio::run::u64 allocated_offset;
-      bool alloc_success = false;
-      CLIO_CO_AWAIT(AllocateFromTarget(target_info_copy, physical,
-                                  allocated_offset, alloc_success));
-      if (!alloc_success) {
-        break;  // this target can't satisfy more; outer loop tries the next
-      }
-
-      // size_ = logical used, capacity_ = physical slab (>= logical).
+    // Distribute only `logical_need` logical bytes across the physical blocks
+    // the bdev returned. Each block's size_ is its logical coverage and its
+    // capacity_ is the PHYSICAL footprint (what it occupies and what free()
+    // credits); when req > logical_need (preallocation) the trailing physical
+    // is left as spare capacity_ on the last block(s) that received data — the
+    // spare-capacity fast path above then consumes it on later appends with no
+    // new allocation. No co_await in this loop, so total_size_cache_ advances
+    // atomically with blocks_ wrt other tasks on this worker.
+    clio::run::u64 physical_sum = 0;
+    clio::run::u64 need = logical_need;
+    for (const auto &b : out_blocks) {
+      const clio::run::u64 physical = b.size_;  // footprint
+      const clio::run::u64 logical = std::min(physical, need);
       BlobBlock new_block(target_info_copy.bdev_client_,
-                          target_info_copy.target_query_, allocated_offset,
-                          logical, physical);
+                          target_info_copy.target_query_, b.offset_, logical,
+                          physical);
       blob_info.blocks_.push_back(new_block);
-      // Advance the O(1) size cache in the SAME co_await-free step as the
-      // push_back (the debit lock + next AllocateFromTarget below both co_await),
-      // so a concurrent reader never sees grown blocks_ with a stale cache.
       blob_info.total_size_cache_ += logical;
-      blob_info.BumpPlacementGen();  // #817: block layout changed
+      physical_sum += physical;
+      need -= logical;
+    }
+    blob_info.BumpPlacementGen();  // #817: block layout changed
+    remaining_to_allocate -= (logical_need - need);  // logical actually placed
+    (void)kAppendSlab;
 
-      // Debit the CANONICAL target's remaining_space_ by the PHYSICAL bytes
-      // taken (mirror of FreeAllBlobBlocks' capacity_ credit); AllocateFromTarget
-      // only touched the copy.
-      {
-        clio::run::ScopedCoRwReadLock read_lock(target_lock_);
-        TargetInfo *ti = registered_targets_.find(selected_target_id);
-        if (ti != nullptr) {
-          ctp::ipc::atomic_ref<clio::run::u64> rs(ti->remaining_space_);
-          clio::run::u64 cur = rs.load(std::memory_order_relaxed);
-          while (!rs.compare_exchange_weak(
-              cur, (cur > physical) ? cur - physical : 0,
-              std::memory_order_relaxed)) {
-          }
+    // Debit the CANONICAL target's remaining_space_ by the physical bytes taken
+    // (mirror of FreeAllBlobBlocks' capacity_ credit).
+    {
+      clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+      TargetInfo *ti = registered_targets_.find(selected_target_id);
+      if (ti != nullptr) {
+        ctp::ipc::atomic_ref<clio::run::u64> rs(ti->remaining_space_);
+        clio::run::u64 cur = rs.load(std::memory_order_relaxed);
+        while (!rs.compare_exchange_weak(
+            cur, (cur > physical_sum) ? cur - physical_sum : 0,
+            std::memory_order_relaxed)) {
         }
       }
-
-      remaining_to_allocate -= logical;
     }
   }
 
@@ -4755,10 +5168,9 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
 
 // Block management helper functions
 
-clio::run::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
-                                            clio::run::u64 size,
-                                            clio::run::u64 &allocated_offset,
-                                            bool &success) {
+clio::run::TaskResume Runtime::AllocateFromTarget(
+    TargetInfo &target_info, clio::run::u64 size,
+    std::vector<clio::run::bdev::Block> &out_blocks, bool &success) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -4809,29 +5221,22 @@ clio::run::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
          "alloc_task->blocks_.size()={}, return_code={}",
          alloc_task->blocks_.size(), alloc_task->return_code_.load());
 
-    std::vector<clio::run::bdev::Block> allocated_blocks;
-    for (size_t i = 0; i < alloc_task->blocks_.size(); ++i) {
-      allocated_blocks.push_back(alloc_task->blocks_[i]);
-    }
-
-    // Check if we got any blocks
-    if (allocated_blocks.empty()) {
-      HLOG(kDebug, "AllocateFromTarget: FAILED - allocated_blocks is empty");
+    // Return EVERY block the bdev handed back, not just the first. The
+    // allocator may fragment one logical request across several reused physical
+    // blocks (issue #820) -- taking only blocks_[0] silently dropped the rest,
+    // which is why ExtendBlob had to cap requests at 64 KB so the bdev could
+    // always answer with a single block.
+    out_blocks.clear();
+    if (alloc_task->blocks_.empty()) {
+      HLOG(kDebug, "AllocateFromTarget: FAILED - no blocks");
       success = false;
       CLIO_CO_RETURN;
     }
-
-    // Use the first block (for single allocation case)
-    clio::run::bdev::Block allocated_block = allocated_blocks[0];
-    allocated_offset = allocated_block.offset_;
-
-    // Update remaining space
-    target_info.remaining_space_ -= size;
-    // HLOG(kInfo,
-    //       "Allocated from target {}: offset={}, size={} remaining_space={}",
-    //       target_info.target_name_, allocated_offset, size,
-    //       target_info.remaining_space_);
-
+    for (size_t i = 0; i < alloc_task->blocks_.size(); ++i) {
+      out_blocks.push_back(alloc_task->blocks_[i]);
+    }
+    // Canonical remaining_space_ accounting is the caller's (ExtendBlob debits
+    // it by the physical bytes taken); this only fills out_blocks.
     success = true;
     CLIO_CO_RETURN;
   } catch (const std::exception &e) {

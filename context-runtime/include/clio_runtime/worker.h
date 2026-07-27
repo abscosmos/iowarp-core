@@ -45,8 +45,10 @@
 #include <mutex>
 #include <queue>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
+#include "clio_runtime/batch_groups.h"
 #include "clio_runtime/container.h"
 #include "clio_runtime/pool_query.h"
 #include "clio_runtime/task.h"
@@ -568,6 +570,45 @@ class Worker {
    *  subtask wakeups (the popped lane, or this worker's own lane on ingest). */
   void RouteAndExec(Future<Task> &future, TaskLane *lane);
 
+  /** issue #807/#820: bind + route only. Returns the resolved task when it
+   *  should run HERE (so the caller may batch it before executing), null
+   *  otherwise (RouteTask already enqueued it elsewhere). */
+  clio::run::shared_ptr<Task> RouteOnly(Future<Task> &future, TaskLane *lane);
+
+  /**
+   * issue #820: the batching phase, over the SHM INGRESS.
+   *
+   * Take a bounded run of freshly arrived client requests, and give each one's
+   * container the
+   * chance to COALESCE it with its neighbours instead of running it now. Tasks
+   * the container declines run as-is, in arrival order, first; the merged tasks
+   * the container produces are submitted after.
+   *
+   * The dequeue bound is what keeps this honest: it can only ever batch what is
+   * ALREADY queued, so a lone task finds an empty lane behind it, forms a group
+   * of one, and is emitted unchanged. Batching therefore costs nothing when
+   * there is no backlog to amortize, and only engages under the contention it
+   * exists to remove.
+   *
+   * @return number of tasks dequeued
+   */
+  u32 BatchIngest(TaskLane *lane, u32 budget);
+
+  /** issue #820: same phase, sourced from the LANE (where same-blob tasks
+   *  converge). Experimental, CLIO_BATCH_LANE=1. */
+  u32 BatchLane(TaskLane *lane, u32 budget);
+
+  /** Shared body: collect from the lane or the shard, batch, execute. */
+  u32 BatchCollect(TaskLane *lane, u32 budget, bool from_lane);
+
+  /** issue #820: whether the batching phase runs at all (CLIO_TASK_BATCHING=0
+   *  restores the pre-batching dequeue loop verbatim). */
+  static bool BatchingEnabled();
+
+  /** issue #820: complete the parents a merged task subsumed. Called from
+   *  EndTask when the finished task carries TASK_BATCH_MERGED. */
+  void CompleteBatchParents(clio::run::shared_ptr<Task> &merged);
+
   /** issue #807: drain this worker's inbound SHM shard, executing each request
    *  INLINE (no lane round-trip, no per-request wakeup). Returns count handled. */
   u32 DrainMyShard();
@@ -703,6 +744,23 @@ class Worker {
   static constexpr u32 NUM_PERIODIC_QUEUES = 4;
   static constexpr u32 PERIODIC_QUEUE_SIZE = 1024;
   std::queue<clio::run::shared_ptr<Task>> periodic_queues_[NUM_PERIODIC_QUEUES];
+
+  // ---- issue #820: worker-local task batching ----------------------------
+  // Reused across phases (cleared, never reallocated) so the batching path
+  // allocates nothing in steady state.
+  BatchGroups batch_groups_;
+  // Tasks their container declined to batch; they run as-is, in arrival order.
+  // A plain vector, not a queue: this is produced and consumed by THIS worker
+  // thread within one phase, so there is no handoff to synchronize.
+  std::vector<clio::run::shared_ptr<Task>> batch_passthrough_;
+  // issue #820/#822: the "merged uid -> parent tasks" registry is PROCESS-GLOBAL
+  // (see worker.cc BatchPendingRegistry), NOT a per-worker member. A merged task
+  // is an I/O task: it suspends on the bdev put/get and its continuation resumes
+  // on WHATEVER worker the scheduler picks, which is frequently not the worker
+  // that emitted it. A per-worker map made the completing worker miss the entry
+  // and orphan the parents (client Wait() hangs forever). The global registry
+  // also uses a global-unique key because CreateTaskId().unique_ is only unique
+  // within one worker thread (thread-local counter), so two workers collide.
 
   // Worker spawn time
   ctp::Timepoint spawn_time_;  // Time when worker was spawned
