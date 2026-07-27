@@ -698,6 +698,52 @@ void DefaultScheduler::LoadBalance() {
              st.num_retry_tasks_);
       }
     }
+
+    // [HANGWATCH] Pure no-forward-progress watchdog (diagnostic). The wedged-
+    // shape alarm above only fires when live==0 or EVERY live worker is stalled-
+    // in-one-task; it misses the busy-spin / lost-completion class (workers look
+    // "live" and are not counted as stalled) that is exactly the embedded-FUSE
+    // 2-CPU hang (generic/020). This fires purely on "no real task completed for
+    // a while while work is outstanding" and dumps race-safe per-worker state
+    // (stats snapshot + atomic reads only; no GetCurrentTask() shared_ptr race)
+    // so a CI hang is diagnosable from the log. Runs on the monitor thread,
+    // which the spinning workers cannot fully starve.
+    {
+      static u64 wd_last_processed = ~0ull;
+      static double wd_last_us = 0.0;
+      static bool wd_alarmed = false;
+      if (wd_last_processed == ~0ull) {
+        wd_last_processed = processed;
+        wd_last_us = now_us;
+      }
+      if (processed != wd_last_processed || outstanding == 0) {
+        wd_last_processed = processed;
+        wd_last_us = now_us;
+        wd_alarmed = false;
+      } else if (!wd_alarmed && outstanding > 0 &&
+                 (now_us - wd_last_us) > 12.0 * 1e6) {
+        wd_alarmed = true;
+        HLOG(kError,
+             "[HANGWATCH] no task completed in 12s: outstanding={} processed={} "
+             "live={} live_stalled={}. Per-worker:",
+             outstanding, processed, live, live_stalled);
+        for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
+          Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
+          if (w == nullptr) continue;
+          TaskLane *ln = w->GetLane();
+          WorkerStats st = w->GetWorkerStats();
+          HLOG(kError,
+               "[HANGWATCH]  w{} exec={} stalled={} lane_size={} queued={} "
+               "blocked={} periodic={} retry={} done={}",
+               w->GetId(), w->IsExecuting(),
+               w->IsStalled(now_us, kStallThresholdSec),
+               ln ? static_cast<long>(ln->Size()) : -1L,
+               st.num_queued_tasks_, st.num_blocked_tasks_,
+               st.num_periodic_tasks_, st.num_retry_tasks_,
+               st.num_tasks_processed_);
+        }
+      }
+    }
   }
 
   u32 stalled = 0;
