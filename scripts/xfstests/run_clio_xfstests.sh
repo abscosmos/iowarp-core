@@ -152,9 +152,12 @@ for t in "${LIST[@]}"; do
   # would silently admit a scratch/hardware-requiring test into the CI gate
   # where it tests nothing. "Not run:" is the authoritative signal.
   if [ "${rc}" -eq 124 ]; then echo "${t}: HANG"; hang=$((hang+1)); failed_list="${failed_list} ${t}(hang)"
-    echo "--- [${t}] clio runtime hang diagnosis (HANGWATCH/#781/#785) ---"
-    grep -aE "HANGWATCH|#781 PDF|#785|DEADLOCK|STALLED|no task completed" \
-      "${CLIO_FUSE_RT_LOG:-/tmp/clio_fuse_rt.log}" | tail -n 80 || true
+    RTLOG="${CLIO_FUSE_RT_LOG:-/tmp/clio_fuse_rt.log}"
+    echo "--- [${t}] clio runtime hang diagnosis (rtlog_lines=$(wc -l < "${RTLOG}" 2>/dev/null || echo NA)) ---"
+    echo "  [HANGWATCH/#781/#785 markers]:"
+    grep -aE "HANGWATCH|#781|#785|DEADLOCK|STALLED" "${RTLOG}" 2>/dev/null | tail -n 60 || true
+    echo "  [raw rtlog tail 30]:"
+    tail -n 30 "${RTLOG}" 2>/dev/null | sed 's/^/    /' || true
     echo "--- end [${t}] runtime diagnosis ---"
   elif echo "${out}" | grep -q "^Not run:"; then echo "${t}: notrun"; notrun=$((notrun+1))
   elif echo "${out}" | grep -q "^Passed all"; then echo "${t}: pass"; pass=$((pass+1))

@@ -712,6 +712,16 @@ void DefaultScheduler::LoadBalance() {
       static u64 wd_last_processed = ~0ull;
       static double wd_last_us = 0.0;
       static bool wd_alarmed = false;
+      // Heartbeat every ~2s while work is outstanding: a CI hang log then shows
+      // whether `processed` is advancing (watchdog resets, never alarms) or truly
+      // frozen (should alarm). This is the signal that tells us WHY the 12s dump
+      // did or did not fire.
+      static u64 hb_tick = 0;
+      if (outstanding > 0 && (++hb_tick % 4 == 0)) {
+        HLOG(kError,
+             "[HANGWATCH-HB] processed={} outstanding={} live={} live_stalled={}",
+             processed, outstanding, live, live_stalled);
+      }
       if (wd_last_processed == ~0ull) {
         wd_last_processed = processed;
         wd_last_us = now_us;
