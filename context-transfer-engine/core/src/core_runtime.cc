@@ -1607,7 +1607,16 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // #680 write-token re-check period; see BlobWriteLockPollUs() (default 10us,
     // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
+    clio::run::u64 _tok_spin = 0;  // [HANGWATCH-TOK] stuck-holder probe (#822)
     while (!blob_info_ptr->TryLockWrite(lock_tok)) {
+      if ((++_tok_spin % 20000) == 0) {
+        ctp::ipc::atomic_ref<clio::run::u64> _own(blob_info_ptr->write_owner_);
+        HLOG(kError,
+             "[HANGWATCH-TOK] PutBlob spinning on write token blob='{}' "
+             "owner_tok={} my_tok={} spins={}",
+             task->blob_name_.str(),
+             _own.load(std::memory_order_relaxed), lock_tok, _tok_spin);
+      }
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
