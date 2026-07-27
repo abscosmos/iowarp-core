@@ -1,0 +1,1379 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "clio_llm/lmcache/lmcache_store.h"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <new>
+#include <stdexcept>
+#include <utility>
+
+#include "clio_ctp/util/logging.h"
+#include "clio_runtime/manager.h"
+
+namespace clio_llm::lmcache {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+constexpr char kRecordMagic[8] = {'C', 'L', 'I', 'O', 'K', 'V', '1', '\0'};
+constexpr std::uint32_t kRecordVersion = 1;
+constexpr std::size_t kRecordHeaderSize = 24;
+constexpr float kWaitTimeoutSec = 30.0f;
+
+/**
+ * Wait for a CTE future with the LMCache operation timeout.
+ *
+ * A timeout does not cancel the underlying CTE task. Callers that own a shared
+ * memory buffer must therefore propagate the exception without freeing that
+ * buffer, because the task may still access it.
+ *
+ * @tparam FutureT CTE future type.
+ * @param future Future to wait for.
+ * @param operation Human-readable operation name used in diagnostics.
+ * @throws std::runtime_error when the future does not complete in time.
+ */
+template <typename FutureT>
+void WaitForFuture(FutureT *future, const char *operation) {
+  if (future->Wait(kWaitTimeoutSec)) {
+    return;
+  }
+  HLOG(kError, "LMCacheStore::{} timed out after {} ms", operation,
+       static_cast<int>(kWaitTimeoutSec * 1000.0f));
+  throw std::runtime_error(std::string("LMCacheStore::") + operation +
+                           " timed out after 30000 ms");
+}
+
+/**
+ * Return whether opt-in LMCache CTE profiling is enabled.
+ *
+ * @return True when CLIO_LMCACHE_PROFILE is set to a non-zero value.
+ */
+bool ProfileEnabled() {
+  const char *value = std::getenv("CLIO_LMCACHE_PROFILE");
+  return value != nullptr && std::string(value) != "0";
+}
+
+/**
+ * Convert a steady-clock duration to milliseconds.
+ *
+ * @param duration Duration to convert.
+ * @return Duration in milliseconds.
+ */
+double ToMs(Clock::duration duration) {
+  return std::chrono::duration<double, std::milli>(duration).count();
+}
+
+struct BatchProfile {
+  Clock::time_point start = Clock::now();
+  Clock::duration alloc = Clock::duration::zero();
+  Clock::duration copy_in = Clock::duration::zero();
+  Clock::duration submit = Clock::duration::zero();
+  Clock::duration wait = Clock::duration::zero();
+  Clock::duration copy_out = Clock::duration::zero();
+  Clock::duration free = Clock::duration::zero();
+  std::size_t requested = 0;
+  std::size_t submitted = 0;
+  std::size_t succeeded = 0;
+  std::uint64_t bytes = 0;
+};
+
+/**
+ * Emit a one-line LMCacheStore batch profile summary.
+ *
+ * @param operation Operation name.
+ * @param profile Aggregated profile data.
+ * @param max_inflight Window size used by this call.
+ */
+void LogBatchProfile(const char *operation, const BatchProfile &profile,
+                     std::size_t max_inflight) {
+  const double total_ms = ToMs(Clock::now() - profile.start);
+  HLOG(kInfo,
+       "CLIO_LMCACHE_PROFILE cxx op={} requested={} submitted={} succeeded={} "
+       "bytes={} max_inflight={} total_ms={:.3f} alloc_ms={:.3f} "
+       "copy_in_ms={:.3f} submit_ms={:.3f} wait_ms={:.3f} "
+       "copy_out_ms={:.3f} free_ms={:.3f}",
+       operation, profile.requested, profile.submitted, profile.succeeded,
+       profile.bytes, max_inflight, total_ms, ToMs(profile.alloc),
+       ToMs(profile.copy_in), ToMs(profile.submit), ToMs(profile.wait),
+       ToMs(profile.copy_out), ToMs(profile.free));
+}
+
+/**
+ * Lowercase an ASCII string.
+ *
+ * @param value ASCII string to normalize.
+ * @return Lowercase string.
+ */
+std::string LowerAscii(std::string value) {
+  std::transform(
+      value.begin(), value.end(), value.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return value;
+}
+
+/**
+ * Normalize a user-provided inflight limit.
+ *
+ * @param max_inflight Requested maximum in-flight operation count.
+ * @return At least one in-flight slot.
+ */
+std::size_t NormalizeMaxInflight(std::size_t max_inflight) {
+  return std::max<std::size_t>(max_inflight, 1);
+}
+
+/**
+ * Determine whether CTE may safely dereference process-local pointers.
+ *
+ * Requiring a single-host runtime conservatively ensures that CTE cannot
+ * forward the pointer to a remote bdev after accepting the local task.
+ *
+ * @param pool_query Routing query used for the CTE operation.
+ * @return True for an in-process, local, single-host runtime.
+ */
+bool CanUseDirectPointers(const clio::run::PoolQuery &pool_query) {
+  auto *runtime_manager = CLIO_RUNTIME_MANAGER;
+  auto *ipc_manager = CLIO_IPC;
+  return runtime_manager != nullptr && ipc_manager != nullptr &&
+         runtime_manager->IsRuntime() && pool_query.IsLocalMode() &&
+         ipc_manager->GetNumHosts() == 1;
+}
+
+/**
+ * Write a big-endian unsigned 32-bit integer.
+ *
+ * @param value Integer value to write.
+ * @param destination Destination byte pointer.
+ */
+void WriteBigEndian32(std::uint32_t value, char *destination) {
+  destination[0] = static_cast<char>((value >> 24) & 0xff);
+  destination[1] = static_cast<char>((value >> 16) & 0xff);
+  destination[2] = static_cast<char>((value >> 8) & 0xff);
+  destination[3] = static_cast<char>(value & 0xff);
+}
+
+/**
+ * Write a big-endian unsigned 64-bit integer.
+ *
+ * @param value Integer value to write.
+ * @param destination Destination byte pointer.
+ */
+void WriteBigEndian64(std::uint64_t value, char *destination) {
+  destination[0] = static_cast<char>((value >> 56) & 0xff);
+  destination[1] = static_cast<char>((value >> 48) & 0xff);
+  destination[2] = static_cast<char>((value >> 40) & 0xff);
+  destination[3] = static_cast<char>((value >> 32) & 0xff);
+  destination[4] = static_cast<char>((value >> 24) & 0xff);
+  destination[5] = static_cast<char>((value >> 16) & 0xff);
+  destination[6] = static_cast<char>((value >> 8) & 0xff);
+  destination[7] = static_cast<char>(value & 0xff);
+}
+
+/**
+ * Read a big-endian unsigned 32-bit integer.
+ *
+ * @param source Source byte pointer.
+ * @return Parsed integer value.
+ */
+std::uint32_t ReadBigEndian32(const char *source) {
+  return (static_cast<std::uint32_t>(
+              static_cast<unsigned char>(source[0]))
+          << 24) |
+         (static_cast<std::uint32_t>(
+              static_cast<unsigned char>(source[1]))
+          << 16) |
+         (static_cast<std::uint32_t>(
+              static_cast<unsigned char>(source[2]))
+          << 8) |
+         static_cast<std::uint32_t>(static_cast<unsigned char>(source[3]));
+}
+
+/**
+ * Read a big-endian unsigned 64-bit integer.
+ *
+ * @param source Source byte pointer.
+ * @return Parsed integer value.
+ */
+std::uint64_t ReadBigEndian64(const char *source) {
+  std::uint64_t value = 0;
+  for (std::size_t i = 0; i < 8; ++i) {
+    value = (value << 8) |
+            static_cast<std::uint64_t>(static_cast<unsigned char>(source[i]));
+  }
+  return value;
+}
+
+/**
+ * Compute the full LMCache record size, rejecting overflow.
+ *
+ * @param metadata_size Metadata JSON size in bytes.
+ * @param payload_size Payload size in bytes.
+ * @return Full record size, or nullopt when it cannot be represented.
+ */
+std::optional<std::size_t> ComputeRecordSize(std::size_t metadata_size,
+                                             std::size_t payload_size) {
+  if (metadata_size > std::numeric_limits<std::uint32_t>::max()) {
+    return std::nullopt;
+  }
+  const std::size_t max_size = std::numeric_limits<std::size_t>::max();
+  if (metadata_size > max_size - kRecordHeaderSize ||
+      payload_size > max_size - kRecordHeaderSize - metadata_size) {
+    return std::nullopt;
+  }
+  return kRecordHeaderSize + metadata_size + payload_size;
+}
+
+/**
+ * Encode the fixed CLIOKV1 record header.
+ *
+ * @param metadata_size Metadata JSON size in bytes.
+ * @param payload_size Payload size in bytes.
+ * @param destination Destination buffer with kRecordHeaderSize capacity.
+ */
+void WriteRecordHeader(std::size_t metadata_size, std::size_t payload_size,
+                       char *destination) {
+  std::memcpy(destination, kRecordMagic, sizeof(kRecordMagic));
+  WriteBigEndian32(kRecordVersion, destination + 8);
+  WriteBigEndian32(static_cast<std::uint32_t>(metadata_size), destination + 12);
+  WriteBigEndian64(static_cast<std::uint64_t>(payload_size), destination + 16);
+}
+
+/**
+ * Assemble a CLIOKV1 record into a caller-provided buffer.
+ *
+ * @param metadata Metadata JSON bytes.
+ * @param payload Payload bytes.
+ * @param payload_size Payload size in bytes.
+ * @param destination Destination buffer with full record capacity.
+ */
+void WriteRecord(std::string_view metadata, const void *payload,
+                 std::size_t payload_size, char *destination) {
+  WriteRecordHeader(metadata.size(), payload_size, destination);
+  std::memcpy(destination + kRecordHeaderSize, metadata.data(),
+              metadata.size());
+  std::memcpy(destination + kRecordHeaderSize + metadata.size(), payload,
+              payload_size);
+}
+
+/**
+ * Parse the fixed CLIOKV1 record header.
+ *
+ * @param header Header bytes with kRecordHeaderSize capacity.
+ * @return Parsed record info with metadata offset implied, or nullopt.
+ */
+std::optional<LMCacheStore::RecordInfo> ParseRecordHeader(
+    const char *header) {
+  if (std::memcmp(header, kRecordMagic, sizeof(kRecordMagic)) != 0) {
+    return std::nullopt;
+  }
+  if (ReadBigEndian32(header + 8) != kRecordVersion) {
+    return std::nullopt;
+  }
+  const std::uint32_t metadata_size = ReadBigEndian32(header + 12);
+  const std::uint64_t payload_size = ReadBigEndian64(header + 16);
+  LMCacheStore::RecordInfo info;
+  info.payload_offset = kRecordHeaderSize + metadata_size;
+  info.payload_size = payload_size;
+  return info;
+}
+
+struct PutInFlight {
+  std::size_t index;
+  ctp::ipc::FullPtr<char> buffer;
+  clio::run::Future<clio::cte::core::PutBlobTask> future;
+};
+
+struct SizeInFlight {
+  std::size_t index;
+  clio::run::Future<clio::cte::core::GetBlobSizeTask> future;
+};
+
+struct GetInFlight {
+  std::size_t index;
+  std::uint64_t size;
+  ctp::ipc::FullPtr<char> buffer;
+  clio::run::Future<clio::cte::core::GetBlobTask> future;
+};
+
+struct DirectPutInFlight {
+  std::size_t index;
+  std::unique_ptr<std::array<char, kRecordHeaderSize>> header;
+  clio::run::Future<clio::cte::core::PutBlobTask> future;
+};
+
+struct DirectGetInFlight {
+  std::size_t index;
+  clio::run::Future<clio::cte::core::GetBlobTask> future;
+};
+
+/**
+ * Build direct-pointer segments for one CLIOKV1 record.
+ *
+ * @param header Stable header storage retained until task completion.
+ * @param metadata Stable caller-owned metadata bytes.
+ * @param payload Stable caller-owned payload bytes.
+ * @param payload_size Payload size in bytes.
+ * @return Header, metadata, and payload segments in record order.
+ */
+std::vector<clio::cte::core::BlobSegment> MakeDirectRecordSegments(
+    std::array<char, kRecordHeaderSize> *header, const std::string &metadata,
+    const void *payload, std::size_t payload_size) {
+  ctp::ipc::FullPtr<char> header_ptr(header->data());
+  ctp::ipc::FullPtr<char> metadata_ptr(const_cast<char *>(metadata.data()));
+  ctp::ipc::FullPtr<char> payload_ptr(
+      const_cast<char *>(static_cast<const char *>(payload)));
+  std::vector<clio::cte::core::BlobSegment> segments;
+  segments.reserve(3);
+  segments.emplace_back(0, kRecordHeaderSize,
+                        ctp::ipc::ShmPtr<>(header_ptr.shm_));
+  segments.emplace_back(kRecordHeaderSize, metadata.size(),
+                        ctp::ipc::ShmPtr<>(metadata_ptr.shm_));
+  segments.emplace_back(kRecordHeaderSize + metadata.size(), payload_size,
+                        ctp::ipc::ShmPtr<>(payload_ptr.shm_));
+  return segments;
+}
+
+/**
+ * Wait for pending put operations and release their shm payload buffers.
+ *
+ * @param window Pending put futures and buffers.
+ * @param results Per-item status output.
+ */
+void DrainPutWindow(std::vector<PutInFlight> *window,
+                    std::vector<bool> *results, BatchProfile *profile) {
+  auto *ipc_manager = CLIO_IPC;
+  for (auto &item : *window) {
+    auto begin = Clock::now();
+    WaitForFuture(&item.future, "PutBlob");
+    if (profile != nullptr) {
+      profile->wait += Clock::now() - begin;
+    }
+    (*results)[item.index] = item.future->GetReturnCode() == 0;
+    if (profile != nullptr && (*results)[item.index]) {
+      ++profile->succeeded;
+    }
+    begin = Clock::now();
+    ipc_manager->FreeBuffer(item.buffer);
+    if (profile != nullptr) {
+      profile->free += Clock::now() - begin;
+    }
+  }
+  window->clear();
+}
+
+/**
+ * Wait for pending size operations.
+ *
+ * @param window Pending size futures.
+ * @param results Per-item size output.
+ */
+void DrainSizeWindow(std::vector<SizeInFlight> *window,
+                     std::vector<std::optional<std::uint64_t>> *results,
+                     BatchProfile *profile) {
+  for (auto &item : *window) {
+    auto begin = Clock::now();
+    WaitForFuture(&item.future, "GetBlobSize");
+    if (profile != nullptr) {
+      profile->wait += Clock::now() - begin;
+    }
+    if (item.future->GetReturnCode() == 0) {
+      (*results)[item.index] = static_cast<std::uint64_t>(item.future->size_);
+      if (profile != nullptr) {
+        ++profile->succeeded;
+      }
+    }
+  }
+  window->clear();
+}
+
+/**
+ * Wait for pending get operations, copy completed buffers, and free shm.
+ *
+ * @param window Pending get futures and buffers.
+ * @param destinations Caller-owned destinations.
+ * @param results Per-item status output.
+ */
+void DrainGetIntoWindow(std::vector<GetInFlight> *window,
+                        const std::vector<void *> &destinations,
+                        std::vector<bool> *results, BatchProfile *profile) {
+  auto *ipc_manager = CLIO_IPC;
+  for (auto &item : *window) {
+    auto begin = Clock::now();
+    WaitForFuture(&item.future, "GetBlob");
+    if (profile != nullptr) {
+      profile->wait += Clock::now() - begin;
+    }
+    if (item.future->GetReturnCode() == 0) {
+      begin = Clock::now();
+      std::memcpy(destinations[item.index], item.buffer.ptr_, item.size);
+      if (profile != nullptr) {
+        profile->copy_out += Clock::now() - begin;
+      }
+      (*results)[item.index] = true;
+      if (profile != nullptr) {
+        ++profile->succeeded;
+      }
+    }
+    begin = Clock::now();
+    ipc_manager->FreeBuffer(item.buffer);
+    if (profile != nullptr) {
+      profile->free += Clock::now() - begin;
+    }
+  }
+  window->clear();
+}
+
+/**
+ * Wait for pending get operations, materialize vectors, and free shm.
+ *
+ * @param window Pending get futures and buffers.
+ * @param results Per-item byte-vector output.
+ */
+void DrainGetWindow(
+    std::vector<GetInFlight> *window,
+    std::vector<std::optional<std::vector<std::uint8_t>>> *results,
+    BatchProfile *profile) {
+  auto *ipc_manager = CLIO_IPC;
+  for (auto &item : *window) {
+    auto begin = Clock::now();
+    WaitForFuture(&item.future, "GetBlob");
+    if (profile != nullptr) {
+      profile->wait += Clock::now() - begin;
+    }
+    if (item.future->GetReturnCode() == 0) {
+      std::vector<std::uint8_t> bytes(item.size);
+      begin = Clock::now();
+      std::memcpy(bytes.data(), item.buffer.ptr_, item.size);
+      if (profile != nullptr) {
+        profile->copy_out += Clock::now() - begin;
+      }
+      (*results)[item.index] = std::move(bytes);
+      if (profile != nullptr) {
+        ++profile->succeeded;
+      }
+    }
+    begin = Clock::now();
+    ipc_manager->FreeBuffer(item.buffer);
+    if (profile != nullptr) {
+      profile->free += Clock::now() - begin;
+    }
+  }
+  window->clear();
+}
+
+/**
+ * Wait without a timeout for direct put operations before releasing headers.
+ *
+ * @param window Pending direct put futures and stable header storage.
+ * @param results Per-item status output.
+ * @param profile Optional batch profile accumulator.
+ */
+void DrainDirectPutWindow(std::vector<DirectPutInFlight> *window,
+                          std::vector<bool> *results, BatchProfile *profile) {
+  for (auto &item : *window) {
+    const auto begin = Clock::now();
+    const bool completed = item.future.Wait();
+    if (profile != nullptr) {
+      profile->wait += Clock::now() - begin;
+    }
+    (*results)[item.index] = completed && item.future->GetReturnCode() == 0;
+    if (profile != nullptr && (*results)[item.index]) {
+      ++profile->succeeded;
+    }
+  }
+  window->clear();
+}
+
+/**
+ * Wait without a timeout for direct gets before caller buffers may be released.
+ *
+ * @param window Pending direct get futures.
+ * @param results Per-item status output.
+ * @param profile Optional batch profile accumulator.
+ */
+void DrainDirectGetWindow(std::vector<DirectGetInFlight> *window,
+                          std::vector<bool> *results, BatchProfile *profile) {
+  for (auto &item : *window) {
+    const auto begin = Clock::now();
+    const bool completed = item.future.Wait();
+    if (profile != nullptr) {
+      profile->wait += Clock::now() - begin;
+    }
+    (*results)[item.index] = completed && item.future->GetReturnCode() == 0;
+    if (profile != nullptr && (*results)[item.index]) {
+      ++profile->succeeded;
+    }
+  }
+  window->clear();
+}
+
+/**
+ * Store CLIOKV1 records from process-local buffers without payload staging.
+ *
+ * @param tag_id Destination CTE tag.
+ * @param blob_names CTE blob names.
+ * @param metadata_jsons Stable caller-owned metadata bytes.
+ * @param payloads Stable caller-owned payload buffers.
+ * @param payload_sizes Payload sizes in bytes.
+ * @param max_inflight Maximum direct tasks submitted before waiting.
+ * @return Per-blob committed write status.
+ */
+std::vector<bool> PutManyRecordsDirect(
+    const clio::cte::core::TagId &tag_id,
+    const std::vector<std::string> &blob_names,
+    const std::vector<std::string> &metadata_jsons,
+    const std::vector<const void *> &payloads,
+    const std::vector<std::size_t> &payload_sizes, std::size_t max_inflight) {
+  std::vector<bool> results(blob_names.size(), false);
+  max_inflight = NormalizeMaxInflight(max_inflight);
+  const bool profile_enabled = ProfileEnabled();
+  BatchProfile profile;
+  profile.requested = blob_names.size();
+  std::vector<DirectPutInFlight> window;
+  window.reserve(max_inflight);
+  auto *cte_client = CLIO_CTE_CLIENT;
+
+  try {
+    for (std::size_t i = 0; i < blob_names.size(); ++i) {
+      if (blob_names[i].empty() || metadata_jsons[i].empty() ||
+          payloads[i] == nullptr || payload_sizes[i] == 0) {
+        continue;
+      }
+      const auto record_size =
+          ComputeRecordSize(metadata_jsons[i].size(), payload_sizes[i]);
+      if (!record_size.has_value()) {
+        continue;
+      }
+      auto header = std::make_unique<std::array<char, kRecordHeaderSize>>();
+      WriteRecordHeader(metadata_jsons[i].size(), payload_sizes[i],
+                        header->data());
+      auto segments = MakeDirectRecordSegments(header.get(), metadata_jsons[i],
+                                               payloads[i], payload_sizes[i]);
+      const auto begin = Clock::now();
+      auto future = cte_client->AsyncPutBlobVectored(
+          tag_id, blob_names[i], segments, 1.0f, clio::cte::core::Context(), 0,
+          clio::run::PoolQuery::Local());
+      if (profile_enabled) {
+        profile.submit += Clock::now() - begin;
+        profile.bytes += *record_size;
+        ++profile.submitted;
+      }
+      window.push_back({i, std::move(header), std::move(future)});
+      if (window.size() >= max_inflight) {
+        DrainDirectPutWindow(&window, &results,
+                             profile_enabled ? &profile : nullptr);
+      }
+    }
+    DrainDirectPutWindow(&window, &results,
+                         profile_enabled ? &profile : nullptr);
+  } catch (...) {
+    DrainDirectPutWindow(&window, &results, nullptr);
+    throw;
+  }
+  if (profile_enabled) {
+    LogBatchProfile("PutManyRecordsDirect", profile, max_inflight);
+  }
+  return results;
+}
+
+/**
+ * Fetch blob ranges directly into process-local caller buffers.
+ *
+ * @param tag_id Source CTE tag.
+ * @param blob_names CTE blob names.
+ * @param offsets Per-blob byte offsets.
+ * @param sizes Per-blob read sizes in bytes.
+ * @param destinations Stable writable caller buffers.
+ * @param destination_sizes Destination capacities in bytes.
+ * @param max_inflight Maximum direct tasks submitted before waiting.
+ * @return Per-blob read status.
+ */
+std::vector<bool> GetManyRangesIntoDirect(
+    const clio::cte::core::TagId &tag_id,
+    const std::vector<std::string> &blob_names,
+    const std::vector<std::uint64_t> &offsets,
+    const std::vector<std::uint64_t> &sizes,
+    const std::vector<void *> &destinations,
+    const std::vector<std::size_t> &destination_sizes,
+    std::size_t max_inflight) {
+  std::vector<bool> results(blob_names.size(), false);
+  max_inflight = NormalizeMaxInflight(max_inflight);
+  const bool profile_enabled = ProfileEnabled();
+  BatchProfile profile;
+  profile.requested = blob_names.size();
+  std::vector<DirectGetInFlight> window;
+  window.reserve(max_inflight);
+  auto *cte_client = CLIO_CTE_CLIENT;
+
+  try {
+    for (std::size_t i = 0; i < blob_names.size(); ++i) {
+      if (blob_names[i].empty() || destinations[i] == nullptr ||
+          sizes[i] == 0 || sizes[i] > destination_sizes[i]) {
+        continue;
+      }
+      ctp::ipc::FullPtr<char> destination(static_cast<char *>(destinations[i]));
+      ctp::ipc::ShmPtr<> destination_shm(destination.shm_);
+      const auto begin = Clock::now();
+      auto future = cte_client->AsyncGetBlob(
+          tag_id, blob_names[i], offsets[i], sizes[i], 0, destination_shm,
+          clio::run::PoolQuery::Local(), clio::cte::core::Context());
+      if (profile_enabled) {
+        profile.submit += Clock::now() - begin;
+        profile.bytes += sizes[i];
+        ++profile.submitted;
+      }
+      window.push_back({i, std::move(future)});
+      if (window.size() >= max_inflight) {
+        DrainDirectGetWindow(&window, &results,
+                             profile_enabled ? &profile : nullptr);
+      }
+    }
+    DrainDirectGetWindow(&window, &results,
+                         profile_enabled ? &profile : nullptr);
+  } catch (...) {
+    DrainDirectGetWindow(&window, &results, nullptr);
+    throw;
+  }
+  if (profile_enabled) {
+    LogBatchProfile("GetManyRangesIntoDirect", profile, max_inflight);
+  }
+  return results;
+}
+
+}  // namespace
+
+bool LMCacheStore::DirectReadEnabledFromEnv() {
+  const char *value = std::getenv("CLIO_LMCACHE_DIRECT_READ");
+  if (value == nullptr) {
+    return false;
+  }
+  const std::string normalized = LowerAscii(value);
+  return normalized == "1" || normalized == "true";
+}
+
+LMCacheStore::~LMCacheStore() { Close(); }
+
+LMCacheStore::LMCacheStore(LMCacheStore &&other) noexcept {
+  *this = std::move(other);
+}
+
+LMCacheStore &LMCacheStore::operator=(LMCacheStore &&other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+  Close();
+  ready_ = other.ready_;
+  tag_name_ = std::move(other.tag_name_);
+  tag_id_ = other.tag_id_;
+  pool_query_ = other.pool_query_;
+  direct_read_enabled_ = other.direct_read_enabled_;
+  other.ready_ = false;
+  other.direct_read_enabled_ = false;
+  return *this;
+}
+
+bool LMCacheStore::Init(const std::string &config_path,
+                        const std::string &tag_name,
+                        const std::string &pool_query_mode) {
+  if (ready_) {
+    return true;
+  }
+
+  direct_read_enabled_ = DirectReadEnabledFromEnv();
+  try {
+    pool_query_ = ParsePoolQueryMode(pool_query_mode);
+    if (!clio::cte::core::CLIO_CTE_CLIENT_INIT(config_path, pool_query_)) {
+      HLOG(kError, "LMCacheStore: CLIO_CTE_CLIENT_INIT failed");
+      return false;
+    }
+
+    auto *cte_client = CLIO_CTE_CLIENT;
+    auto task = cte_client->AsyncGetOrCreateTag(
+        tag_name, clio::cte::core::TagId::GetNull(), pool_query_);
+    WaitForFuture(&task, "GetOrCreateTag");
+    if (task->GetReturnCode() != 0) {
+      HLOG(kError, "LMCacheStore: GetOrCreateTag failed tag={} rc={}", tag_name,
+           task->GetReturnCode());
+      return false;
+    }
+
+    tag_name_ = tag_name;
+    tag_id_ = task->tag_id_;
+    ready_ = true;
+    return true;
+  } catch (const std::exception &e) {
+    HLOG(kError, "LMCacheStore: Init failed: {}", e.what());
+    ready_ = false;
+    return false;
+  }
+}
+
+bool LMCacheStore::PutBytes(const std::string &blob_name,
+                            std::string_view data) {
+  if (!ready_ || blob_name.empty() || data.empty()) {
+    return false;
+  }
+
+  auto *ipc_manager = CLIO_IPC;
+  ctp::ipc::FullPtr<char> shm_fullptr =
+      ipc_manager->AllocateBuffer(data.size());
+  if (shm_fullptr.IsNull()) {
+    return false;
+  }
+
+  std::memcpy(shm_fullptr.ptr_, data.data(), data.size());
+  ctp::ipc::ShmPtr<> shm_ptr(shm_fullptr.shm_);
+
+  auto *cte_client = CLIO_CTE_CLIENT;
+  auto task = cte_client->AsyncPutBlob(
+      tag_id_, blob_name, 0, data.size(), shm_ptr, 1.0f,
+      clio::cte::core::Context(), 0, pool_query_);
+  WaitForFuture(&task, "PutBlob");
+  const bool ok = task->GetReturnCode() == 0;
+  ipc_manager->FreeBuffer(shm_fullptr);
+  return ok;
+}
+
+std::vector<bool> LMCacheStore::PutMany(
+    const std::vector<std::string> &blob_names,
+    const std::vector<std::string> &payloads, std::size_t max_inflight) {
+  std::vector<bool> results(blob_names.size(), false);
+  if (!ready_ || blob_names.size() != payloads.size()) {
+    return results;
+  }
+
+  max_inflight = NormalizeMaxInflight(max_inflight);
+  const bool profile_enabled = ProfileEnabled();
+  BatchProfile profile;
+  profile.requested = blob_names.size();
+  std::vector<PutInFlight> window;
+  window.reserve(max_inflight);
+  auto *ipc_manager = CLIO_IPC;
+  auto *cte_client = CLIO_CTE_CLIENT;
+
+  for (std::size_t i = 0; i < blob_names.size(); ++i) {
+    if (blob_names[i].empty() || payloads[i].empty()) {
+      continue;
+    }
+
+    auto begin = Clock::now();
+    ctp::ipc::FullPtr<char> buffer =
+        ipc_manager->AllocateBuffer(payloads[i].size());
+    if (profile_enabled) {
+      profile.alloc += Clock::now() - begin;
+    }
+    if (buffer.IsNull()) {
+      DrainPutWindow(&window, &results,
+                     profile_enabled ? &profile : nullptr);
+      HLOG(kError,
+           "LMCacheStore::PutMany failed to allocate {} bytes for item {}",
+           payloads[i].size(), i);
+      throw std::bad_alloc();
+    }
+
+    begin = Clock::now();
+    std::memcpy(buffer.ptr_, payloads[i].data(), payloads[i].size());
+    if (profile_enabled) {
+      profile.copy_in += Clock::now() - begin;
+    }
+    ctp::ipc::ShmPtr<> shm_ptr(buffer.shm_);
+    begin = Clock::now();
+    auto future = cte_client->AsyncPutBlob(
+        tag_id_, blob_names[i], 0, payloads[i].size(), shm_ptr, 1.0f,
+        clio::cte::core::Context(), 0, pool_query_);
+    if (profile_enabled) {
+      profile.submit += Clock::now() - begin;
+      profile.bytes += payloads[i].size();
+      ++profile.submitted;
+    }
+    window.push_back({i, buffer, future});
+
+    if (window.size() >= max_inflight) {
+      DrainPutWindow(&window, &results, profile_enabled ? &profile : nullptr);
+    }
+  }
+
+  DrainPutWindow(&window, &results, profile_enabled ? &profile : nullptr);
+  if (profile_enabled) {
+    LogBatchProfile("PutMany", profile, max_inflight);
+  }
+  return results;
+}
+
+std::vector<bool> LMCacheStore::PutManyRecords(
+    const std::vector<std::string> &blob_names,
+    const std::vector<std::string> &metadata_jsons,
+    const std::vector<const void *> &payloads,
+    const std::vector<std::size_t> &payload_sizes, std::size_t max_inflight) {
+  std::vector<bool> results(blob_names.size(), false);
+  if (!ready_ || metadata_jsons.size() != blob_names.size() ||
+      payloads.size() != blob_names.size() ||
+      payload_sizes.size() != blob_names.size()) {
+    return results;
+  }
+  if (CanUseDirectPointers(pool_query_)) {
+    return PutManyRecordsDirect(tag_id_, blob_names, metadata_jsons, payloads,
+                                payload_sizes, max_inflight);
+  }
+
+  max_inflight = NormalizeMaxInflight(max_inflight);
+  const bool profile_enabled = ProfileEnabled();
+  BatchProfile profile;
+  profile.requested = blob_names.size();
+  std::vector<PutInFlight> window;
+  window.reserve(max_inflight);
+  auto *ipc_manager = CLIO_IPC;
+  auto *cte_client = CLIO_CTE_CLIENT;
+
+  for (std::size_t i = 0; i < blob_names.size(); ++i) {
+    if (blob_names[i].empty() || metadata_jsons[i].empty() ||
+        payloads[i] == nullptr || payload_sizes[i] == 0) {
+      continue;
+    }
+
+    const auto record_size =
+        ComputeRecordSize(metadata_jsons[i].size(), payload_sizes[i]);
+    if (!record_size.has_value()) {
+      continue;
+    }
+
+    auto begin = Clock::now();
+    ctp::ipc::FullPtr<char> buffer = ipc_manager->AllocateBuffer(*record_size);
+    if (profile_enabled) {
+      profile.alloc += Clock::now() - begin;
+    }
+    if (buffer.IsNull()) {
+      DrainPutWindow(&window, &results,
+                     profile_enabled ? &profile : nullptr);
+      HLOG(kError,
+           "LMCacheStore::PutManyRecords failed to allocate {} bytes for "
+           "item {} blob={}",
+           *record_size, i, blob_names[i]);
+      throw std::bad_alloc();
+    }
+
+    begin = Clock::now();
+    WriteRecord(metadata_jsons[i], payloads[i], payload_sizes[i], buffer.ptr_);
+    if (profile_enabled) {
+      profile.copy_in += Clock::now() - begin;
+    }
+    ctp::ipc::ShmPtr<> shm_ptr(buffer.shm_);
+    begin = Clock::now();
+    auto future = cte_client->AsyncPutBlob(
+        tag_id_, blob_names[i], 0, *record_size, shm_ptr, 1.0f,
+        clio::cte::core::Context(), 0, pool_query_);
+    if (profile_enabled) {
+      profile.submit += Clock::now() - begin;
+      profile.bytes += *record_size;
+      ++profile.submitted;
+    }
+    window.push_back({i, buffer, future});
+
+    if (window.size() >= max_inflight) {
+      DrainPutWindow(&window, &results, profile_enabled ? &profile : nullptr);
+    }
+  }
+
+  DrainPutWindow(&window, &results, profile_enabled ? &profile : nullptr);
+  if (profile_enabled) {
+    LogBatchProfile("PutManyRecords", profile, max_inflight);
+  }
+  return results;
+}
+
+std::optional<std::vector<std::uint8_t>> LMCacheStore::GetBytes(
+    const std::string &blob_name) {
+  const std::optional<std::uint64_t> blob_size = Size(blob_name);
+  if (!blob_size.has_value() || *blob_size == 0) {
+    return std::nullopt;
+  }
+
+  auto *ipc_manager = CLIO_IPC;
+  ctp::ipc::FullPtr<char> shm_fullptr = ipc_manager->AllocateBuffer(*blob_size);
+  if (shm_fullptr.IsNull()) {
+    return std::nullopt;
+  }
+
+  ctp::ipc::ShmPtr<> shm_ptr(shm_fullptr.shm_);
+  auto *cte_client = CLIO_CTE_CLIENT;
+  auto task = cte_client->AsyncGetBlob(tag_id_, blob_name, 0, *blob_size, 0,
+                                       shm_ptr, pool_query_);
+  WaitForFuture(&task, "GetBlob");
+
+  if (task->GetReturnCode() != 0) {
+    ipc_manager->FreeBuffer(shm_fullptr);
+    return std::nullopt;
+  }
+
+  std::vector<std::uint8_t> result(*blob_size);
+  std::memcpy(result.data(), shm_fullptr.ptr_, result.size());
+  ipc_manager->FreeBuffer(shm_fullptr);
+  return result;
+}
+
+std::vector<std::optional<std::vector<std::uint8_t>>> LMCacheStore::GetMany(
+    const std::vector<std::string> &blob_names, std::size_t max_inflight) {
+  std::vector<std::optional<std::vector<std::uint8_t>>> results(
+      blob_names.size());
+  if (!ready_) {
+    return results;
+  }
+
+  max_inflight = NormalizeMaxInflight(max_inflight);
+  const bool profile_enabled = ProfileEnabled();
+  BatchProfile profile;
+  profile.requested = blob_names.size();
+  const auto sizes = SizeMany(blob_names, max_inflight);
+  std::vector<GetInFlight> window;
+  window.reserve(max_inflight);
+  auto *ipc_manager = CLIO_IPC;
+  auto *cte_client = CLIO_CTE_CLIENT;
+
+  for (std::size_t i = 0; i < blob_names.size(); ++i) {
+    if (blob_names[i].empty() || !sizes[i].has_value() || *sizes[i] == 0) {
+      continue;
+    }
+
+    auto begin = Clock::now();
+    ctp::ipc::FullPtr<char> buffer = ipc_manager->AllocateBuffer(*sizes[i]);
+    if (profile_enabled) {
+      profile.alloc += Clock::now() - begin;
+    }
+    if (buffer.IsNull()) {
+      continue;
+    }
+
+    ctp::ipc::ShmPtr<> shm_ptr(buffer.shm_);
+    begin = Clock::now();
+    auto future = cte_client->AsyncGetBlob(tag_id_, blob_names[i], 0, *sizes[i],
+                                           0, shm_ptr, pool_query_);
+    if (profile_enabled) {
+      profile.submit += Clock::now() - begin;
+      profile.bytes += *sizes[i];
+      ++profile.submitted;
+    }
+    window.push_back({i, *sizes[i], buffer, future});
+
+    if (window.size() >= max_inflight) {
+      DrainGetWindow(&window, &results, profile_enabled ? &profile : nullptr);
+    }
+  }
+
+  DrainGetWindow(&window, &results, profile_enabled ? &profile : nullptr);
+  if (profile_enabled) {
+    LogBatchProfile("GetMany", profile, max_inflight);
+  }
+  return results;
+}
+
+bool LMCacheStore::GetBytesInto(const std::string &blob_name, void *destination,
+                                std::size_t destination_size,
+                                std::optional<std::uint64_t> known_blob_size) {
+  if (destination == nullptr) {
+    return false;
+  }
+
+  const std::optional<std::uint64_t> blob_size =
+      known_blob_size.has_value() ? known_blob_size : Size(blob_name);
+  if (!blob_size.has_value() || *blob_size == 0 ||
+      *blob_size > destination_size) {
+    return false;
+  }
+
+  auto *ipc_manager = CLIO_IPC;
+  ctp::ipc::FullPtr<char> shm_fullptr = ipc_manager->AllocateBuffer(*blob_size);
+  if (shm_fullptr.IsNull()) {
+    return false;
+  }
+
+  ctp::ipc::ShmPtr<> shm_ptr(shm_fullptr.shm_);
+  auto *cte_client = CLIO_CTE_CLIENT;
+  auto task = cte_client->AsyncGetBlob(tag_id_, blob_name, 0, *blob_size, 0,
+                                       shm_ptr, pool_query_);
+  WaitForFuture(&task, "GetBlob");
+
+  if (task->GetReturnCode() != 0) {
+    ipc_manager->FreeBuffer(shm_fullptr);
+    return false;
+  }
+
+  std::memcpy(destination, shm_fullptr.ptr_, *blob_size);
+  ipc_manager->FreeBuffer(shm_fullptr);
+  return true;
+}
+
+std::vector<bool> LMCacheStore::GetManyInto(
+    const std::vector<std::string> &blob_names,
+    const std::vector<void *> &destinations,
+    const std::vector<std::size_t> &destination_sizes,
+    const std::vector<std::optional<std::uint64_t>> &known_blob_sizes,
+    std::size_t max_inflight) {
+  std::vector<bool> results(blob_names.size(), false);
+  if (!ready_ || destinations.size() != blob_names.size() ||
+      destination_sizes.size() != blob_names.size()) {
+    return results;
+  }
+  if (!known_blob_sizes.empty() &&
+      known_blob_sizes.size() != blob_names.size()) {
+    return results;
+  }
+
+  max_inflight = NormalizeMaxInflight(max_inflight);
+  const bool profile_enabled = ProfileEnabled();
+  BatchProfile profile;
+  profile.requested = blob_names.size();
+  const std::vector<std::optional<std::uint64_t>> sizes =
+      known_blob_sizes.empty() ? SizeMany(blob_names, max_inflight)
+                               : known_blob_sizes;
+  std::vector<GetInFlight> window;
+  window.reserve(max_inflight);
+  auto *ipc_manager = CLIO_IPC;
+  auto *cte_client = CLIO_CTE_CLIENT;
+
+  for (std::size_t i = 0; i < blob_names.size(); ++i) {
+    if (blob_names[i].empty() || destinations[i] == nullptr ||
+        !sizes[i].has_value() || *sizes[i] == 0 ||
+        *sizes[i] > destination_sizes[i]) {
+      continue;
+    }
+
+    auto begin = Clock::now();
+    ctp::ipc::FullPtr<char> buffer = ipc_manager->AllocateBuffer(*sizes[i]);
+    if (profile_enabled) {
+      profile.alloc += Clock::now() - begin;
+    }
+    if (buffer.IsNull()) {
+      continue;
+    }
+
+    ctp::ipc::ShmPtr<> shm_ptr(buffer.shm_);
+    begin = Clock::now();
+    auto future = cte_client->AsyncGetBlob(tag_id_, blob_names[i], 0, *sizes[i],
+                                           0, shm_ptr, pool_query_);
+    if (profile_enabled) {
+      profile.submit += Clock::now() - begin;
+      profile.bytes += *sizes[i];
+      ++profile.submitted;
+    }
+    window.push_back({i, *sizes[i], buffer, future});
+
+    if (window.size() >= max_inflight) {
+      DrainGetIntoWindow(&window, destinations, &results,
+                         profile_enabled ? &profile : nullptr);
+    }
+  }
+
+  DrainGetIntoWindow(&window, destinations, &results,
+                     profile_enabled ? &profile : nullptr);
+  if (profile_enabled) {
+    LogBatchProfile("GetManyInto", profile, max_inflight);
+  }
+  return results;
+}
+
+std::vector<bool> LMCacheStore::GetManyRangesInto(
+    const std::vector<std::string> &blob_names,
+    const std::vector<std::uint64_t> &offsets,
+    const std::vector<std::uint64_t> &sizes,
+    const std::vector<void *> &destinations,
+    const std::vector<std::size_t> &destination_sizes,
+    std::size_t max_inflight) {
+  std::vector<bool> results(blob_names.size(), false);
+  if (!ready_ || offsets.size() != blob_names.size() ||
+      sizes.size() != blob_names.size() ||
+      destinations.size() != blob_names.size() ||
+      destination_sizes.size() != blob_names.size()) {
+    return results;
+  }
+  if (direct_read_enabled_ && CanUseDirectPointers(pool_query_)) {
+    return GetManyRangesIntoDirect(tag_id_, blob_names, offsets, sizes,
+                                   destinations, destination_sizes,
+                                   max_inflight);
+  }
+
+  max_inflight = NormalizeMaxInflight(max_inflight);
+  const bool profile_enabled = ProfileEnabled();
+  BatchProfile profile;
+  profile.requested = blob_names.size();
+  std::vector<GetInFlight> window;
+  window.reserve(max_inflight);
+  auto *ipc_manager = CLIO_IPC;
+  auto *cte_client = CLIO_CTE_CLIENT;
+
+  for (std::size_t i = 0; i < blob_names.size(); ++i) {
+    if (blob_names[i].empty() || destinations[i] == nullptr || sizes[i] == 0 ||
+        sizes[i] > destination_sizes[i]) {
+      continue;
+    }
+
+    auto begin = Clock::now();
+    ctp::ipc::FullPtr<char> buffer = ipc_manager->AllocateBuffer(sizes[i]);
+    if (profile_enabled) {
+      profile.alloc += Clock::now() - begin;
+    }
+    if (buffer.IsNull()) {
+      continue;
+    }
+
+    ctp::ipc::ShmPtr<> shm_ptr(buffer.shm_);
+    begin = Clock::now();
+    auto future = cte_client->AsyncGetBlob(tag_id_, blob_names[i], offsets[i],
+                                           sizes[i], 0, shm_ptr, pool_query_);
+    if (profile_enabled) {
+      profile.submit += Clock::now() - begin;
+      profile.bytes += sizes[i];
+      ++profile.submitted;
+    }
+    window.push_back({i, sizes[i], buffer, future});
+
+    if (window.size() >= max_inflight) {
+      DrainGetIntoWindow(&window, destinations, &results,
+                         profile_enabled ? &profile : nullptr);
+    }
+  }
+
+  DrainGetIntoWindow(&window, destinations, &results,
+                     profile_enabled ? &profile : nullptr);
+  if (profile_enabled) {
+    LogBatchProfile("GetManyRangesInto", profile, max_inflight);
+  }
+  return results;
+}
+
+std::vector<std::optional<LMCacheStore::RecordInfo>>
+LMCacheStore::ReadRecordInfos(const std::vector<std::string> &blob_names,
+                              std::size_t max_inflight) {
+  std::vector<std::optional<RecordInfo>> results(blob_names.size());
+  if (!ready_) {
+    return results;
+  }
+
+  max_inflight = NormalizeMaxInflight(max_inflight);
+  const bool profile_enabled = ProfileEnabled();
+  BatchProfile profile;
+  profile.requested = blob_names.size();
+  auto begin = Clock::now();
+  std::vector<std::array<char, kRecordHeaderSize>> headers(blob_names.size());
+  std::vector<void *> header_destinations;
+  std::vector<std::size_t> header_destination_sizes;
+  std::vector<std::uint64_t> header_offsets(blob_names.size(), 0);
+  std::vector<std::uint64_t> header_sizes(blob_names.size(),
+                                          kRecordHeaderSize);
+  header_destinations.reserve(blob_names.size());
+  header_destination_sizes.reserve(blob_names.size());
+  for (auto &header : headers) {
+    header_destinations.push_back(header.data());
+    header_destination_sizes.push_back(header.size());
+  }
+  if (profile_enabled) {
+    profile.alloc += Clock::now() - begin;
+  }
+
+  begin = Clock::now();
+  const auto header_statuses =
+      GetManyRangesInto(blob_names, header_offsets, header_sizes,
+                        header_destinations, header_destination_sizes,
+                        max_inflight);
+  if (profile_enabled) {
+    profile.wait += Clock::now() - begin;
+  }
+
+  std::vector<std::string> metadata_buffers(blob_names.size());
+  std::vector<std::string> metadata_names;
+  std::vector<void *> metadata_destinations;
+  std::vector<std::size_t> metadata_destination_sizes;
+  std::vector<std::uint64_t> metadata_offsets;
+  std::vector<std::uint64_t> metadata_sizes;
+  std::vector<std::size_t> metadata_indexes;
+
+  begin = Clock::now();
+  for (std::size_t i = 0; i < blob_names.size(); ++i) {
+    if (!header_statuses[i]) {
+      continue;
+    }
+    auto info = ParseRecordHeader(headers[i].data());
+    if (!info.has_value() || info->payload_offset < kRecordHeaderSize) {
+      continue;
+    }
+    const std::uint64_t metadata_size = info->payload_offset - kRecordHeaderSize;
+    if (metadata_size == 0 ||
+        metadata_size > std::numeric_limits<std::size_t>::max()) {
+      continue;
+    }
+    metadata_buffers[i].resize(static_cast<std::size_t>(metadata_size));
+    metadata_names.push_back(blob_names[i]);
+    metadata_destinations.push_back(metadata_buffers[i].data());
+    metadata_destination_sizes.push_back(metadata_buffers[i].size());
+    metadata_offsets.push_back(kRecordHeaderSize);
+    metadata_sizes.push_back(metadata_size);
+    metadata_indexes.push_back(i);
+    results[i] = *info;
+  }
+  if (profile_enabled) {
+    profile.copy_out += Clock::now() - begin;
+  }
+
+  begin = Clock::now();
+  const auto metadata_statuses = GetManyRangesInto(
+      metadata_names, metadata_offsets, metadata_sizes, metadata_destinations,
+      metadata_destination_sizes, max_inflight);
+  if (profile_enabled) {
+    profile.wait += Clock::now() - begin;
+  }
+
+  begin = Clock::now();
+  for (std::size_t i = 0; i < metadata_indexes.size(); ++i) {
+    const std::size_t result_index = metadata_indexes[i];
+    if (!metadata_statuses[i] || !results[result_index].has_value()) {
+      results[result_index] = std::nullopt;
+      continue;
+    }
+    results[result_index]->metadata_json = std::move(
+        metadata_buffers[result_index]);
+    ++profile.succeeded;
+    profile.bytes += results[result_index]->metadata_json.size();
+  }
+  if (profile_enabled) {
+    profile.copy_out += Clock::now() - begin;
+    LogBatchProfile("ReadRecordInfos", profile, max_inflight);
+  }
+  return results;
+}
+
+bool LMCacheStore::Exists(const std::string &blob_name) {
+  return Size(blob_name).has_value();
+}
+
+std::vector<bool> LMCacheStore::ExistsMany(
+    const std::vector<std::string> &blob_names, std::size_t max_inflight) {
+  const auto sizes = SizeMany(blob_names, max_inflight);
+  std::vector<bool> results(blob_names.size(), false);
+  for (std::size_t i = 0; i < sizes.size(); ++i) {
+    results[i] = sizes[i].has_value();
+  }
+  return results;
+}
+
+std::optional<std::uint64_t> LMCacheStore::Size(const std::string &blob_name) {
+  if (!ready_ || blob_name.empty()) {
+    return std::nullopt;
+  }
+
+  auto *cte_client = CLIO_CTE_CLIENT;
+  auto task = cte_client->AsyncGetBlobSize(tag_id_, blob_name, pool_query_);
+  WaitForFuture(&task, "GetBlobSize");
+  if (task->GetReturnCode() != 0) {
+    return std::nullopt;
+  }
+  return static_cast<std::uint64_t>(task->size_);
+}
+
+std::vector<std::optional<std::uint64_t>> LMCacheStore::SizeMany(
+    const std::vector<std::string> &blob_names, std::size_t max_inflight) {
+  std::vector<std::optional<std::uint64_t>> results(blob_names.size());
+  if (!ready_) {
+    return results;
+  }
+
+  max_inflight = NormalizeMaxInflight(max_inflight);
+  const bool profile_enabled = ProfileEnabled();
+  BatchProfile profile;
+  profile.requested = blob_names.size();
+  std::vector<SizeInFlight> window;
+  window.reserve(max_inflight);
+  auto *cte_client = CLIO_CTE_CLIENT;
+
+  for (std::size_t i = 0; i < blob_names.size(); ++i) {
+    if (blob_names[i].empty()) {
+      continue;
+    }
+
+    auto begin = Clock::now();
+    auto future =
+        cte_client->AsyncGetBlobSize(tag_id_, blob_names[i], pool_query_);
+    if (profile_enabled) {
+      profile.submit += Clock::now() - begin;
+      ++profile.submitted;
+    }
+    window.push_back({i, future});
+
+    if (window.size() >= max_inflight) {
+      DrainSizeWindow(&window, &results, profile_enabled ? &profile : nullptr);
+    }
+  }
+
+  DrainSizeWindow(&window, &results, profile_enabled ? &profile : nullptr);
+  if (profile_enabled) {
+    LogBatchProfile("SizeMany", profile, max_inflight);
+  }
+  return results;
+}
+
+bool LMCacheStore::Delete(const std::string &blob_name) {
+  if (!ready_ || blob_name.empty()) {
+    return false;
+  }
+
+  auto *cte_client = CLIO_CTE_CLIENT;
+  auto task = cte_client->AsyncDelBlob(tag_id_, blob_name, pool_query_);
+  WaitForFuture(&task, "DeleteBlob");
+  return task->GetReturnCode() == 0;
+}
+
+void LMCacheStore::Close() {
+  ready_ = false;
+  direct_read_enabled_ = false;
+  tag_id_ = clio::cte::core::TagId();
+  pool_query_ = clio::run::PoolQuery::Local();
+}
+
+clio::run::PoolQuery LMCacheStore::ParsePoolQueryMode(const std::string &mode) {
+  const std::string lower_mode = LowerAscii(mode);
+  if (lower_mode == "dynamic") {
+    return clio::run::PoolQuery::Dynamic();
+  }
+  if (lower_mode == "broadcast") {
+    return clio::run::PoolQuery::Broadcast();
+  }
+  return clio::run::PoolQuery::Local();
+}
+
+}  // namespace clio_llm::lmcache

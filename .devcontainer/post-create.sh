@@ -30,6 +30,13 @@ if [ -f /tmp/host-claude.json ] && [ -s /tmp/host-claude.json ]; then
     sudo chown "${DEVUSER}:${DEVUSER}" "${HOME_DIR}/.claude.json"
 fi
 
+# Copy host Codex config into container
+if [ -d /tmp/host-codex ] && [ "$(ls -A /tmp/host-codex)" ]; then
+    sudo cp -r /tmp/host-codex "${HOME_DIR}/.codex"
+    sudo chown -R "${DEVUSER}:${DEVUSER}" "${HOME_DIR}/.codex"
+fi
+
+
 # Fix docker socket permissions (dynamic GID match)
 "$(dirname "$0")/post-start.sh"
 

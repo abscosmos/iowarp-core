@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.20)
+
+add_executable(test_iowarp_lmcache_store test_lmcache_store.cc)
+target_link_libraries(test_iowarp_lmcache_store PRIVATE
+    clio_llm_lmcache
+    Catch2::Catch2WithMain
+)
+add_test(NAME test_iowarp_lmcache_store COMMAND test_iowarp_lmcache_store)
+
+if(CLIO_CORE_ENABLE_PYTHON AND TARGET clio_cte_lmcache_ext)
+    add_test(
+        NAME python_lmcache_store_bytes_test
+        COMMAND ${Python_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_lmcache_store.py
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:clio_cte_lmcache_ext>
+    )
+    set_tests_properties(
+        python_lmcache_store_bytes_test
+        PROPERTIES
+        LABELS "python;bindings;lmcache"
+        TIMEOUT 120
+        DEPENDS clio_cte_lmcache_ext
+    )
+endif()
