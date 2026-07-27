@@ -635,6 +635,7 @@ void DefaultScheduler::LoadBalance() {
     u64 outstanding = 0;
     u32 live = 0;       // workers executing something
     u32 live_stalled = 0;  // ...of which are stuck past the stall threshold
+    u64 ob_queued = 0, ob_blocked = 0, ob_retry = 0, ob_periodic = 0;
     for (size_t i = 0; i < work_orch_->GetWorkerCount(); ++i) {
       Worker *w = work_orch_->GetWorker(static_cast<u32>(i));
       if (w == nullptr) continue;
@@ -644,6 +645,10 @@ void DefaultScheduler::LoadBalance() {
         if (w->IsStalled(now_us, kStallThresholdSec)) ++live_stalled;
       }
       WorkerStats st = w->GetWorkerStats();
+      ob_queued += st.num_queued_tasks_;
+      ob_blocked += st.num_blocked_tasks_;
+      ob_retry += st.num_retry_tasks_;
+      ob_periodic += st.num_periodic_tasks_;
       outstanding += st.num_queued_tasks_ + st.num_blocked_tasks_ +
                      st.num_retry_tasks_;
     }
@@ -719,8 +724,10 @@ void DefaultScheduler::LoadBalance() {
       static u64 hb_tick = 0;
       if (outstanding > 0 && (++hb_tick % 4 == 0)) {
         HLOG(kError,
-             "[HANGWATCH-HB] processed={} outstanding={} live={} live_stalled={}",
-             processed, outstanding, live, live_stalled);
+             "[HANGWATCH-HB] processed={} outstanding={} (queued={} blocked={} "
+             "retry={} periodic={}) live={} live_stalled={}",
+             processed, outstanding, ob_queued, ob_blocked, ob_retry,
+             ob_periodic, live, live_stalled);
       }
       if (wd_last_processed == ~0ull) {
         wd_last_processed = processed;
