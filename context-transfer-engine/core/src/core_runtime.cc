@@ -387,6 +387,13 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
   // Carries the block-layout generation to the client, which compares it
   // before and after copying a payload (issue #817).
   out->placement_gen_ = info.placement_gen_;
+  // Carry the authoritative transform state across verbatim (issue #818),
+  // plus the flag-word mirror so a client that only looks at flags_ refuses
+  // too.
+  out->transform_flags_ = info.transform_flags_;
+  if (info.IsTransformed()) {
+    out->flags_ |= kShmBlobTransformed;
+  }
 
   size_t n = info.blocks_.size();
   if (n > kMaxInlineBlocks) {
@@ -406,7 +413,12 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
   // by the first block that fails to qualify -- the default must be "refuse",
   // so an unknown target can never be mistaken for a readable one. Blocks past
   // the cached prefix are not inspected and are never read from.
-  bool all_direct = (n > 0);
+  //
+  // A transformed blob is excluded up front regardless of placement: its bytes
+  // are a codec's output, so copying them out would succeed and return the
+  // wrong thing (issue #818). The client falls back to RPC, which is the only
+  // path that knows how to undo the transform.
+  bool all_direct = (n > 0) && !info.IsTransformed();
 
   for (size_t i = 0; i < n; ++i) {
     const BlobBlock &b = info.blocks_[i];
@@ -1779,9 +1791,36 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
     }
 
-#if CTP_ENABLE_COMPRESS
-    // Update compression metadata
+    // Record whether the bytes we just stored are still the caller's bytes
+    // (issue #818). The producer that rewrote them tells us; we never infer it
+    // from compress_lib_, which reports the codec *requested* and is wrong in
+    // both directions. Unconditionally compiled so a build with compression
+    // off cannot silently claim an untransformed blob.
     Context &context = task->context_;
+    if (context.transform_flags_ != kBlobTransformNone) {
+      const clio::run::u32 before = blob_info_ptr->transform_flags_;
+      blob_info_ptr->MarkTransformed(context.transform_flags_);
+      if (blob_info_ptr->transform_flags_ != before &&
+          !blob_txn_logs_.empty()) {
+        // Persist the mark. Without this the bit is only in the metadata log,
+        // which is written on flush -- so a crash between the put and the next
+        // flush would replay this blob from the transaction log alone and
+        // resurrect it as untransformed, i.e. direct-readable codec bytes.
+        // Logged only on an actual transition, so a stream of puts to an
+        // already-marked blob costs nothing.
+        clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+        TxnSetBlobTransform txn;
+        txn.tag_major_ = tag_id.major_;
+        txn.tag_minor_ = tag_id.minor_;
+        txn.blob_name_ = blob_name;
+        txn.transform_flags_ = blob_info_ptr->transform_flags_;
+        blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(
+            TxnType::kSetBlobTransform, txn);
+      }
+    }
+
+#if CTP_ENABLE_COMPRESS
+    // Update compression metadata (provenance/telemetry; see BlobInfo).
     blob_info_ptr->compress_lib_ = context.compress_lib_;
     blob_info_ptr->compress_preset_ = context.compress_preset_;
     blob_info_ptr->trace_key_ = context.trace_key_;
@@ -1975,6 +2014,12 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       task->return_code_ = 1;
       CLIO_CO_RETURN;
     }
+
+    // OUT: report the blob's transform state so every Get caller -- scalar,
+    // POD, and vectored all route through this Impl -- can detect that the
+    // bytes it is about to receive are not the producer's bytes (issue #818;
+    // GetBlob returns STORED bytes and does not undo transforms).
+    task->context_.transform_flags_ = blob_info_ptr->transform_flags_;
 
     // Use the pre-provided data pointer from the task
     ctp::ipc::ShmPtr<> blob_data_ptr = task->blob_data_;
@@ -3652,14 +3697,20 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
       task->entries_flushed_++;
     });
 
-    // Write BlobInfo entries (entry_type 1)
+    // Write BlobInfo entries (entry_type 2; see below)
     tag_blob_name_to_info_.for_each([&](const std::string &key,
                                         const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
-      uint8_t entry_type = 1;
+      // Entry type 2 == blob record carrying transform_flags_ (issue #818).
+      // A NEW type rather than an extra field on type 1, because this log has
+      // no version header: an old reader given an appended field would parse it
+      // as block data and silently reconstruct garbage placement, whereas an
+      // unknown entry type stops the restore loudly.
+      uint8_t entry_type = 2;
       uint32_t key_len = static_cast<uint32_t>(key.size());
       uint32_t blob_name_len =
           static_cast<uint32_t>(blob_info.blob_name_.size());
       float score = blob_info.score_;
+      uint32_t transform_flags = blob_info.transform_flags_;
       int32_t compress_lib = blob_info.compress_lib_;
       int32_t compress_preset = blob_info.compress_preset_;
       clio::run::u64 trace_key = blob_info.trace_key_;
@@ -3673,6 +3724,8 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
                 sizeof(blob_name_len));
       ofs.write(blob_info.blob_name_.data(), blob_name_len);
       ofs.write(reinterpret_cast<const char *>(&score), sizeof(score));
+      ofs.write(reinterpret_cast<const char *>(&transform_flags),
+                sizeof(transform_flags));
       ofs.write(reinterpret_cast<const char *>(&compress_lib),
                 sizeof(compress_lib));
       ofs.write(reinterpret_cast<const char *>(&compress_preset),
@@ -3992,8 +4045,11 @@ void Runtime::RestoreMetadataFromLog() {
       }
       tags_restored++;
 
-    } else if (entry_type == 1) {
-      // BlobInfo entry
+    } else if (entry_type == 1 || entry_type == 2) {
+      // BlobInfo entry. Type 1 is the pre-#818 layout with no transform_flags_;
+      // type 2 carries it. Both are accepted so an existing metadata log still
+      // restores after an upgrade.
+      const bool has_transform_flags = (entry_type == 2);
       uint32_t key_len;
       ifs.read(reinterpret_cast<char *>(&key_len), sizeof(key_len));
       std::string composite_key(key_len, '\0');
@@ -4006,6 +4062,11 @@ void Runtime::RestoreMetadataFromLog() {
 
       float score;
       ifs.read(reinterpret_cast<char *>(&score), sizeof(score));
+      uint32_t transform_flags = 0;
+      if (has_transform_flags) {
+        ifs.read(reinterpret_cast<char *>(&transform_flags),
+                 sizeof(transform_flags));
+      }
       int32_t compress_lib;
       ifs.read(reinterpret_cast<char *>(&compress_lib), sizeof(compress_lib));
       int32_t compress_preset;
@@ -4024,6 +4085,16 @@ void Runtime::RestoreMetadataFromLog() {
       blob_info.compress_lib_ = compress_lib;
       blob_info.compress_preset_ = compress_preset;
       blob_info.trace_key_ = trace_key;
+      if (has_transform_flags) {
+        blob_info.transform_flags_ = transform_flags;
+      } else if (compress_lib != 0) {
+        // Legacy entry: the authoritative bit did not exist when this log was
+        // written, so compress_lib_ is the only evidence available. Treat it as
+        // "transformed" -- it over-reports (it is also set when compression was
+        // attempted but not applied), and over-reporting only costs the direct-
+        // read fast path, whereas under-reporting hands back codec bytes.
+        blob_info.MarkTransformed(kBlobTransformCompressed);
+      }
 
       // Read per-block data
       for (uint32_t i = 0; i < num_blocks; i++) {
@@ -4159,6 +4230,20 @@ void Runtime::ReplayTransactionLogs() {
         BlobInfo blob_info;
         blob_info.blob_name_ = txn.blob_name_;
         blob_info.score_ = txn.score_;
+        // Carry over any transform mark already restored for this key (issue
+        // #818). The WAL is only truncated once it exceeds a size threshold,
+        // so a kCreateNewBlob record can outlive the metadata flush that
+        // recorded the blob's transform state -- and this insert_or_assign
+        // would otherwise reset that state to "untransformed", i.e. fail open
+        // into direct reads of codec bytes. A later kSetBlobTransform record,
+        // when present, ORs in on top of this.
+        {
+          std::shared_ptr<BlobInfo> existing =
+              tag_blob_name_to_info_.get(composite_key);
+          if (existing) {
+            blob_info.transform_flags_ = existing->transform_flags_;
+          }
+        }
         tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
         MirrorBlobToShm(composite_key, blob_info);
         blobs_replayed++;
@@ -4209,6 +4294,24 @@ void Runtime::ReplayTransactionLogs() {
           blob_info_ptr->total_size_cache_ = 0;  // blocks_ cleared
         }
         blobs_replayed++;
+
+      } else if (type == TxnType::kSetBlobTransform) {
+        // issue #818. Replayed AFTER kCreateNewBlob for the same blob (records
+        // are applied in log order, and the mark is always logged later in the
+        // put than the create), so this reinstates the bit on top of the
+        // default-constructed BlobInfo that kCreateNewBlob inserts.
+        auto txn = TransactionLog::DeserializeSetBlobTransform(payload);
+        TagId tag_id{txn.tag_major_, txn.tag_minor_};
+        std::string composite_key = std::to_string(tag_id.major_) + "." +
+                                    std::to_string(tag_id.minor_) + "." +
+                                    txn.blob_name_;
+        std::shared_ptr<BlobInfo> blob_info_ptr =
+            tag_blob_name_to_info_.get(composite_key);
+        if (blob_info_ptr) {
+          blob_info_ptr->transform_flags_ |= txn.transform_flags_;
+          MirrorBlobToShm(composite_key, *blob_info_ptr);
+          blobs_replayed++;
+        }
 
       } else if (type == TxnType::kDelBlob) {
         auto txn = TransactionLog::DeserializeDelBlob(payload);

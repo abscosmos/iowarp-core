@@ -37,6 +37,7 @@
 #include <clio_ctp/data_structures/ipc/string.h>
 #include <clio_ctp/data_structures/ipc/unordered_map.h>
 
+#include "clio_cte/core/blob_transform.h"
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/types.h"
 
@@ -94,6 +95,10 @@ enum ShmBlobFlags : clio::run::u32 {
    *  a PREFIX of it. Reads bounded by CoveredBytes() are still served; reads
    *  past the prefix must fall back to RPC. */
   kShmBlobTruncated = 1u << 1,
+  /** The stored bytes are transformed (compressed/encrypted/...), so copying
+   *  them out verbatim would hand the caller codec bytes. Mirrors
+   *  BlobInfo::IsTransformed(); see transform_flags_ below. */
+  kShmBlobTransformed = 1u << 2,
 };
 
 /**
@@ -120,7 +125,18 @@ struct ShmBlobRecord {
   float score_;
   clio::run::u32 flags_;
   clio::run::u32 num_blocks_;
-  clio::run::u32 reserved_;
+  /**
+   * Verbatim mirror of BlobInfo::transform_flags_ (issue #818) -- the
+   * authoritative "these are not the caller's bytes" word, carried so a client
+   * can tell WHY the fast path was refused and, later, undo the transform
+   * itself. Occupies the slot formerly named `reserved_`, so the record's size
+   * and layout are unchanged.
+   *
+   * Note total_size_ is the STORED size. For a transformed blob that is the
+   * post-transform byte count, which is not the blob's logical length -- one
+   * more reason a transformed record must never serve a direct read.
+   */
+  clio::run::u32 transform_flags_;
   ShmBlockDesc blocks_[kMaxInlineBlocks];
 
   ShmBlobRecord()
@@ -131,7 +147,12 @@ struct ShmBlobRecord {
         score_(0.0f),
         flags_(0),
         num_blocks_(0),
-        reserved_(0) {}
+        transform_flags_(0) {}
+
+  /** True if this blob's stored bytes have been rewritten by some transform. */
+  bool IsTransformed() const {
+    return transform_flags_ != 0 || (flags_ & kShmBlobTransformed) != 0;
+  }
 
   /**
    * True if the payload may be read directly out of shared memory.
@@ -141,9 +162,18 @@ struct ShmBlobRecord {
    * exactly; refusing the whole blob threw away complete information about the
    * part it did have. Callers must bound the read by CoveredBytes(), not by
    * total_size_ -- that is what keeps a truncated record safe.
+   *
+   * A TRANSFORMED record never qualifies (issue #818): its stored bytes are a
+   * codec's output, so copying them out would succeed and return the wrong
+   * thing. The transform check is deliberately redundant with the runtime
+   * clearing kShmBlobDirectReadable when it builds the record: this is the
+   * "default must be refuse" discipline the cache is built on, so a future
+   * writer that forgets to clear the flag still cannot cause a client to hand
+   * codec bytes back as data.
    */
   bool IsDirectReadable() const {
-    return (flags_ & kShmBlobDirectReadable) != 0 && num_blocks_ > 0;
+    return (flags_ & kShmBlobDirectReadable) != 0 && !IsTransformed() &&
+           num_blocks_ > 0;
   }
 
   /**
