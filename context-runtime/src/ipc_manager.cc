@@ -3854,6 +3854,13 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
       }
       if (worker) {
         worker->AddToRetryQueue(task_ptr);
+      } else {
+        // No worker published yet (pre-SpawnWorkerThreads): nothing can ever
+        // retry this task — make the loss loud instead of a silent hang.
+        HLOG(kFatal,
+             "RouteTask: dropping unroutable task (pool={} method={}) — no "
+             "worker exists to retry it",
+             task_ptr->pool_id_, task_ptr->method_);
       }
     }
     return result;
