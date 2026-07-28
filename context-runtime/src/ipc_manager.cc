@@ -3829,6 +3829,29 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
       HLOG(kError, "RouteTask: RouteLocal returned {} for pool={} method={}, worker={}",
            (int)result, task_ptr->pool_id_, task_ptr->method_,
            worker ? (int)worker->GetId() : -1);
+      if (!worker) {
+        // Non-worker thread (e.g. ServerInit compose on the main thread, issue
+        // #841): there is no current worker to park the task on, and dropping
+        // it wedges any waiter forever. Retry queues are mutex-guarded, so
+        // cross-thread push is safe — park on worker 0 (the scheduler worker),
+        // which stays in its loop and drains its retry queue every <=32
+        // iterations even when the runtime is otherwise idle.
+        auto *orchestrator = CLIO_WORK_ORCHESTRATOR;
+        if (orchestrator) {
+          worker = orchestrator->GetWorker(0);
+        }
+        if (worker) {
+          // This task never went through ProcessNewTask, so RunFuture is
+          // unbound and the caller's Future is dropped when routing returns.
+          // Anchor the FutureShm to the task's RunContext (and break the
+          // ownership cycle with a non-owning task handle) exactly as
+          // RouteManyToOne does, so ProcessRetryQueue can re-route it and the
+          // waiter still gets signalled on completion.
+          task_ptr->RunFuture() = future;
+          task_ptr->RunFuture().GetTaskPtr() =
+              clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
+        }
+      }
       if (worker) {
         worker->AddToRetryQueue(task_ptr);
       }
