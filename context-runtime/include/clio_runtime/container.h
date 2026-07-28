@@ -380,26 +380,6 @@ class Container {
                          clio::run::shared_ptr<Task> task_ptr) = 0;
 
   /**
-   * Fix up POD bytewise-copied tasks (clio::run::priv::string SSO data_
-   * pointers, etc.) before dispatching Run. Called by the GPU2CPU pop
-   * path when the kernel's task was in kDeviceMem and the worker had
-   * to D2H-copy the POD bytes into a host scratch buffer — at that
-   * point any embedded `data_` pointers still reference the original
-   * device buffer offsets and must be re-pointed at the scratch copy.
-   *
-   * Default no-op for chimods whose tasks are already trivially
-   * relocatable (no SSO strings, no SVO vectors). Each chimod that
-   * has SSO/SVO members should override and dispatch per method to
-   * the per-task `FixupAfterCopy()`.
-   */
-  virtual void FixupAfterCopy(u32 method,
-                              clio::run::shared_ptr<Task> &task_ptr) {
-    (void)method;
-    (void)task_ptr;
-  }
-
-
-  /**
    * Get remaining work count for this container - PURE VIRTUAL
    * Must be implemented by all derived container classes
    * @return Number of work units remaining in this container

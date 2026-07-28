@@ -382,11 +382,6 @@ struct RegisterTargetTask : public clio::run::Task {
     Task::SerializeOut(ar);
   }
 
-  /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    target_name_.FixupSsoPointer();
-  }
-
   /**
    * Copy from another RegisterTargetTask
    * Used when creating replicas for remote execution
@@ -1273,11 +1268,6 @@ struct GetOrCreateTagTask : public clio::run::Task {
     ar(tag_id_);
   }
 
-  /** Fix up priv::string SSO pointer after cudaMemcpy for CPU→GPU */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    tag_name_.FixupSsoPointer();
-  }
-
   /**
    * Copy from another GetOrCreateTagTask
    */
@@ -1519,12 +1509,6 @@ struct PutBlobTask : public clio::run::Task {
     // CLIO_FORCE_NET (issue #500).
     ar(blob_name_, context_);
     ar.PopPod();
-  }
-
-  /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blob_name_.FixupSsoPointer();
-    segments_.FixupSvoPtr();
   }
 
   /**
@@ -1780,12 +1764,6 @@ struct GetBlobTask : public clio::run::Task {
     }
   }
 
-  /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blob_name_.FixupSsoPointer();
-    segments_.FixupSvoPtr();
-  }
-
   /**
    * Copy from another GetBlobTask
    */
@@ -1968,8 +1946,8 @@ struct EvictTask : public clio::run::Task {
 // These mirror PutBlob/GetBlob/ReorganizeBlob but carry the blob name in an
 // inline clio::run::priv::fixed_string<32> (no allocator, no SSO) instead of a
 // priv::string. Every field is therefore POD and the whole task is
-// bitwise-relocatable: a cudaMemcpy D<->H of the task is correct with ZERO
-// FixupAfterCopy (none is defined). Blob names are capped at 31 chars + NUL.
+// bitwise-relocatable: a cudaMemcpy D<->H of the task is correct with zero
+// post-copy fixup. Blob names are capped at 31 chars + NUL.
 // They share the runtime handler logic with the non-POD tasks via the
 // Runtime::*Impl<TaskT> member templates (same field names; both name types
 // expose .str()).
@@ -2081,8 +2059,6 @@ struct PodPutBlobTask : public clio::run::Task {
     // blob_data_ must NOT be echoed).
     ar(blob_name_, context_);
   }
-
-  // No FixupAfterCopy — fixed_string is position-independent.
 
   void Copy(const ctp::ipc::FullPtr<PodPutBlobTask> &other) {
     Task::Copy(other.template Cast<Task>());
@@ -2203,8 +2179,6 @@ struct PodGetBlobTask : public clio::run::Task {
       ar.bulk(blob_data_, size_, BULK_XFER);
     }
   }
-
-  // No FixupAfterCopy — fixed_string is position-independent.
 
   void Copy(const ctp::ipc::FullPtr<PodGetBlobTask> &other) {
     Task::Copy(other.template Cast<Task>());

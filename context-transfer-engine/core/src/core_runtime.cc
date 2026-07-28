@@ -294,27 +294,6 @@ clio::run::u64 Runtime::ParseCapacityToBytes(const std::string &capacity_str) {
   return static_cast<clio::run::u64>(value * multiplier);
 }
 
-void Runtime::FixupAfterCopy(clio::run::u32 method,
-                              clio::run::shared_ptr<clio::run::Task> &task_ptr) {
-  switch (method) {
-    case Method::kRegisterTarget:
-      task_ptr.template Cast<RegisterTargetTask>().get()->FixupAfterCopy();
-      break;
-    case Method::kGetOrCreateTag:
-      task_ptr.template Cast<GetOrCreateTagTask<CreateParams>>()
-          .get()->FixupAfterCopy();
-      break;
-    case Method::kPutBlob:
-      task_ptr.template Cast<PutBlobTask>().get()->FixupAfterCopy();
-      break;
-    case Method::kGetBlob:
-      task_ptr.template Cast<GetBlobTask>().get()->FixupAfterCopy();
-      break;
-    default:
-      break;
-  }
-}
-
 namespace {
 
 /**
