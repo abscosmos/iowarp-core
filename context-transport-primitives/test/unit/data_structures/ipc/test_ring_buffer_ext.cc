@@ -236,8 +236,14 @@ TEST_CASE("ext_spsc_queue: concurrent producers with a lagging consumer",
 
   ext_spsc_queue<int, ArenaAllocator<false>> rb(alloc, 16);
 
-  constexpr int kProducers = 4;
-  constexpr int kPerProducer = 10000;
+  // Sized for CI's 2-vCPU Windows runners: the embedded ctp::Mutex is a FAIR
+  // ticket lock, so every acquire under contention is a strict FIFO handoff —
+  // with more threads than cores each handoff can cost a scheduler quantum
+  // (~15ms granularity on Windows). 4 producers x 10k items timed out the icx
+  // jobs at 120s; 2 x 4000 keeps the growth-under-concurrency coverage with
+  // an order of magnitude fewer contended handoffs.
+  constexpr int kProducers = 2;
+  constexpr int kPerProducer = 4000;
 
   // Producers burst-push everything with no space check; the consumer starts
   // late so the queue MUST grow while producers are still pushing.
@@ -253,7 +259,7 @@ TEST_CASE("ext_spsc_queue: concurrent producers with a lagging consumer",
   std::vector<bool> seen(kProducers * kPerProducer, false);
   std::atomic<int> consumed{0};
   std::thread consumer([&rb, &seen, &consumed]() {
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
     int val;
     while (consumed.load() < kProducers * kPerProducer) {
       if (rb.Pop(val)) {

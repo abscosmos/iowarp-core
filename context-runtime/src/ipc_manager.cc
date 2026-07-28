@@ -42,10 +42,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -3831,6 +3833,32 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
            worker ? (int)worker->GetId() : -1);
       if (worker) {
         worker->AddToRetryQueue(task_ptr);
+      } else {
+        // issue #822: no worker context — this is a non-worker thread
+        // (ServerInit's main thread, an embedded client). There is no retry
+        // queue here, so the old code DROPPED the task on Retry/Dne and its
+        // future was never completed: a task.Wait() caller then polls
+        // FUTURE_COMPLETE forever. Concretely: the restart-log replay's
+        // AsyncCompose can route before the just-created admin container's
+        // registration (finished by a worker task) is visible, hit Dne, and
+        // hang ServerInit — a startup-timing window that CI's 2-vCPU runners
+        // open reliably. Retry inline (the window is transient), and if it
+        // never closes, FAIL the future so the waiter unblocks loudly.
+        constexpr int kInlineRetryMs = 5000;
+        for (int i = 0; i < kInlineRetryMs && (result == RouteResult::Retry ||
+                                               result == RouteResult::Dne);
+             ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          result = RouteLocal(future, force_enqueue);
+        }
+        if (result == RouteResult::Retry || result == RouteResult::Dne) {
+          HLOG(kError,
+               "RouteTask: inline retry exhausted ({} ms) on non-worker "
+               "thread; failing task pool={} method={}",
+               kInlineRetryMs, task_ptr->pool_id_, task_ptr->method_);
+          task_ptr->SetReturnCode(static_cast<u32>(-1));
+          task_ptr->SetComplete();
+        }
       }
     }
     return result;
