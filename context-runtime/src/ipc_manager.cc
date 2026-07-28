@@ -3870,46 +3870,22 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
           result = RouteLocal(future, force_enqueue);
         }
         if (result == RouteResult::Retry || result == RouteResult::Dne) {
-          // Inline retry exhausted. Rather than failing the waiter outright,
-          // park the task on a published worker's retry queue (issue #841):
-          // retry queues are mutex-guarded, so a cross-thread push is safe,
-          // and worker 0 (the scheduler worker) drains its retry queue every
-          // loop iteration even when the runtime is otherwise idle — the task
-          // then completes whenever the container finally appears, with no
-          // arbitrary deadline.
-          Worker *fallback = nullptr;
-          auto *orchestrator = CLIO_WORK_ORCHESTRATOR;
-          if (orchestrator) {
-            fallback = orchestrator->GetWorker(0);
-          }
-          if (fallback) {
-            // This task never went through ProcessNewTask, so RunFuture is
-            // unbound and the caller's Future is dropped when routing returns.
-            // Anchor the FutureShm to the task's RunContext (and break the
-            // ownership cycle with a non-owning task handle) exactly as
-            // RouteManyToOne does, so ProcessRetryQueue can re-route it and
-            // the waiter still gets signalled on completion.
-            HLOG(kWarning,
-                 "RouteTask: inline retry exhausted ({} ms) on non-worker "
-                 "thread; parking task pool={} method={} on worker 0's retry "
-                 "queue",
-                 kInlineRetryMs, task_ptr->pool_id_, task_ptr->method_);
-            task_ptr->RunFuture() = future;
-            task_ptr->RunFuture().GetTaskPtr() =
-                clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
-            fallback->AddToRetryQueue(task_ptr);
-          } else {
-            // No worker published at all (pre-SpawnWorkerThreads): nothing can
-            // ever retry this task. FAIL the future so the waiter unblocks
-            // loudly instead of hanging silently.
-            HLOG(kError,
-                 "RouteTask: inline retry exhausted ({} ms) on non-worker "
-                 "thread and no worker exists to park the task; failing "
-                 "pool={} method={}",
-                 kInlineRetryMs, task_ptr->pool_id_, task_ptr->method_);
-            task_ptr->SetReturnCode(static_cast<u32>(-1));
-            task_ptr->SetComplete();
-          }
+          // Inline retry exhausted: this is no longer the ms-scale transient
+          // window but a task that cannot resolve in this phase. FAIL the
+          // future so the waiter unblocks loudly. (An earlier revision parked
+          // the task on worker 0's retry queue here instead, to avoid the
+          // deadline — but a task that is still unroutable after 5 s of
+          // retries just churns the retry queue forever, and re-queuing it
+          // through the RunFuture's non-owning task handle dangled the queue
+          // entry once the popping iteration's owning reference died: the icx
+          // windows-2025 cte_tag_large SEGFAULT. Terminal failure is the
+          // correct end state.)
+          HLOG(kError,
+               "RouteTask: inline retry exhausted ({} ms) on non-worker "
+               "thread; failing task pool={} method={}",
+               kInlineRetryMs, task_ptr->pool_id_, task_ptr->method_);
+          task_ptr->SetReturnCode(static_cast<u32>(-1));
+          task_ptr->SetComplete();
         }
       }
     }
