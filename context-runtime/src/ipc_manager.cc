@@ -3852,7 +3852,7 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
       if (worker) {
         worker->AddToRetryQueue(task_ptr);
       } else {
-        // issue #822: no worker context — this is a non-worker thread
+        // issue #822/#841: no worker context — this is a non-worker thread
         // (ServerInit's main thread, an embedded client). There is no retry
         // queue here, so the old code DROPPED the task on Retry/Dne and its
         // future was never completed: a task.Wait() caller then polls
@@ -3860,16 +3860,38 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
         // AsyncCompose can route before the just-created admin container's
         // registration (finished by a worker task) is visible, hit Dne, and
         // hang ServerInit — a startup-timing window that CI's 2-vCPU runners
-        // open reliably. Retry inline (the window is transient), and if it
-        // never closes, FAIL the future so the waiter unblocks loudly.
+        // open reliably. Retry inline first: the window is transient and
+        // normally closes within a few milliseconds.
+        //
+        // EXCEPT for periodic tasks. The admin container's Create spawns its
+        // periodic service tasks (kSend/kClientSend pumps, kHeartbeatProbe,
+        // kSystemMonitor) on THIS thread, and the container is only
+        // registered after Create returns — so for those, no amount of
+        // waiting here can succeed: the retry blocks the exact thread whose
+        // progress it awaits. Observed as 5 s x N stalls at every runtime
+        // init (unit-amd64 +19 min; the icx windows gate's rotating per-test
+        // timeouts, a retry storm filling the whole 300 s window). Fail them
+        // immediately instead — the same harmless outcome as the historical
+        // silent drop, but loud and with a completed future.
         constexpr int kInlineRetryMs = 5000;
-        for (int i = 0; i < kInlineRetryMs && (result == RouteResult::Retry ||
-                                               result == RouteResult::Dne);
+        for (int i = 0;
+             !task_ptr->IsPeriodic() && i < kInlineRetryMs &&
+             (result == RouteResult::Retry || result == RouteResult::Dne);
              ++i) {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
           result = RouteLocal(future, force_enqueue);
         }
         if (result == RouteResult::Retry || result == RouteResult::Dne) {
+          // Inline retry exhausted: this is no longer the ms-scale transient
+          // window but a task that cannot resolve in this phase. FAIL the
+          // future so the waiter unblocks loudly. (An earlier revision parked
+          // the task on worker 0's retry queue here instead, to avoid the
+          // deadline — but a task that is still unroutable after 5 s of
+          // retries just churns the retry queue forever, and re-queuing it
+          // through the RunFuture's non-owning task handle dangled the queue
+          // entry once the popping iteration's owning reference died: the icx
+          // windows-2025 cte_tag_large SEGFAULT. Terminal failure is the
+          // correct end state.)
           HLOG(kError,
                "RouteTask: inline retry exhausted ({} ms) on non-worker "
                "thread; failing task pool={} method={}",
