@@ -875,12 +875,15 @@ struct BlobInfo {
    * Source of placement generations: a runtime-wide monotonic counter, NOT a
    * per-blob increment.
    *
-   * Per-blob counting is unsafe across a re-create. ReorganizeBlob moves a blob
-   * by DelBlob + PutBlob, and the replacement BlobInfo starts at zero: a blob
-   * of the same size re-extends into the same number of blocks and lands on the
-   * SAME generation value it had before the move. A client that copied from the
+   * Per-blob counting is unsafe across a re-create (a DelBlob followed by a
+   * PutBlob of the same name): the replacement BlobInfo starts at zero, so a
+   * blob of the same size re-extends into the same number of blocks and lands
+   * on the SAME generation value it had before. A client that copied from the
    * old (now freed, possibly reallocated) blocks would then re-read an equal
    * generation and accept the bytes. A global counter cannot collide that way.
+   * (ReorganizeBlob used to be such a re-create; since issue #753 it keeps the
+   * BlobInfo alive and moves the blocks in place, but user-driven del+put
+   * re-creates remain.)
    */
   static std::atomic<clio::run::u64> &PlacementGenCounter() {
     static std::atomic<clio::run::u64> counter{1};
@@ -1066,6 +1069,17 @@ struct BlobInfo {
     ctp::ipc::atomic_ref<clio::run::u64> ref(write_owner_);
     clio::run::u64 expected = tok;
     ref.compare_exchange_strong(expected, 0);
+  }
+
+  /**
+   * True while some task holds the per-blob write lock. Advisory only — the
+   * answer can change the instant after it is read — so it is NOT a substitute
+   * for acquiring the lock. Readers use it to tell a torn mid-mutation layout
+   * (a reorganize has freed the old placement and not yet published the new
+   * one, issue #753) apart from a plain read past EOF.
+   */
+  bool IsWriteLocked() {
+    return ctp::ipc::atomic_ref<clio::run::u64>(write_owner_).load() != 0;
   }
 #endif  // CTP_IS_HOST
 };

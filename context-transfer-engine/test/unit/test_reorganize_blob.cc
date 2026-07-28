@@ -411,6 +411,80 @@ TEST_CASE("ReorganizeBlob - Promote to DRAM", "[reorganize][promote][dram][nolea
 }
 
 /**
+ * Regression (issue #753): a GetBlob issued while the SAME blob is being
+ * reorganized must neither fail (the old DelBlob + re-Put implementation left
+ * a window with no metadata entry at all, so concurrent reads returned "blob
+ * not found") nor observe torn data (an empty or half-written block layout).
+ * Bounce the blob between tiers and overlap every in-flight move with reads.
+ */
+TEST_CASE("ReorganizeBlob - Concurrent GetBlob during move",
+          "[reorganize][concurrent][integrity][noleak]") {
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+
+  auto* cte_client = CLIO_CTE_CLIENT;
+  REQUIRE(cte_client != nullptr);
+
+  std::string tag_name = "reorganize_test_tag";
+  clio::cte::core::Tag tag(tag_name);
+  clio::cte::core::TagId tag_id = tag.GetTagId();
+  std::string blob_name = "test_blob_concurrent";
+
+  // Seed the blob in DRAM with a known pattern.
+  auto put_buffer = CLIO_IPC->AllocateBuffer(kBlobSize);
+  REQUIRE(!put_buffer.IsNull());
+  auto test_data = g_fixture->CreateTestData(kBlobSize, 'C');
+  std::memcpy(put_buffer.ptr_, test_data.data(), kBlobSize);
+  auto put_task = tag.AsyncPutBlob(blob_name,
+                                   put_buffer.shm_.template Cast<void>(),
+                                   kBlobSize, 0, kDramScore);
+  put_task.Wait();
+  REQUIRE(put_task->GetReturnCode() == 0);
+
+  auto read_buffer = CLIO_IPC->AllocateBuffer(kBlobSize);
+  REQUIRE(!read_buffer.IsNull());
+
+  // Bounce between tiers; every round overlaps reads with the in-flight move.
+  for (int round = 0; round < 6; ++round) {
+    const float target_score = (round % 2 == 0) ? kDiskScore : kDramScore;
+    auto reorg_task =
+        cte_client->AsyncReorganizeBlob(tag_id, blob_name, target_score);
+    for (int i = 0; i < 8; ++i) {
+      std::memset(read_buffer.ptr_, 0, kBlobSize);
+      auto get_task = cte_client->AsyncGetBlob(
+          tag_id, blob_name.c_str(), 0, kBlobSize, 0,
+          read_buffer.shm_.template Cast<void>());
+      get_task.Wait();
+      REQUIRE(get_task->GetReturnCode() == 0);
+      std::vector<char> read_data(kBlobSize);
+      std::memcpy(read_data.data(), read_buffer.ptr_, kBlobSize);
+      REQUIRE(g_fixture->VerifyTestData(read_data, 'C'));
+    }
+    reorg_task.Wait();
+    REQUIRE(reorg_task->GetReturnCode() == 0);
+  }
+
+  // The blob must still verify after the final move settles.
+  std::memset(read_buffer.ptr_, 0, kBlobSize);
+  auto final_get = cte_client->AsyncGetBlob(
+      tag_id, blob_name.c_str(), 0, kBlobSize, 0,
+      read_buffer.shm_.template Cast<void>());
+  final_get.Wait();
+  REQUIRE(final_get->GetReturnCode() == 0);
+  std::vector<char> final_data(kBlobSize);
+  std::memcpy(final_data.data(), read_buffer.ptr_, kBlobSize);
+  REQUIRE(g_fixture->VerifyTestData(final_data, 'C'));
+
+  // Cleanup this case's blob (the shared Cleanup case removes the tag).
+  auto del_task = cte_client->AsyncDelBlob(tag_id, blob_name);
+  del_task.Wait();
+
+  CLIO_IPC->FreeBuffer(read_buffer);
+  CLIO_IPC->FreeBuffer(put_buffer);
+  INFO("SUCCESS: concurrent reads during reorganize never failed");
+}
+
+/**
  * Test: Cleanup all blobs and tags
  */
 TEST_CASE("ReorganizeBlob - Cleanup", "[reorganize][cleanup]") {
