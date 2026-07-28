@@ -661,11 +661,25 @@ size_t ConfigManager::CalculateQueueSegmentSize() const {
   // unrecoverable under saturation.
   u32 total_workers = num_threads_ + 1 + GetElasticLaneHeadroom();
 
+  // issue #822: worker lanes are growable (ext_spsc_queue) — queue_depth_ is
+  // only their INITIAL capacity. Budget arena space for growth: doubling from
+  // queue_depth_ up to GROWTH_CAP consumes < 2*GROWTH_CAP entries per ring
+  // total, because the arena is a bump allocator that never reuses the freed
+  // smaller generations. This is an address-space reservation, not RAM — the
+  // memfd segment only faults pages that are actually written — so we can be
+  // generous. A lane that outgrows GROWTH_CAP fails its allocation LOUDLY
+  // (allocator throw) instead of silently wedging, which is the intended
+  // trade: by then ~128Ki tasks are backed up on one worker and the system
+  // is already sick.
+  constexpr size_t GROWTH_CAP = 128 * 1024;  // entries per ring
+  const size_t depth_budget =
+      2 * std::max<size_t>(queue_depth_, GROWTH_CAP);
+
   // Calculate worker task queues size: TaskQueue with total_workers lanes
   size_t worker_queues_size = TaskQueue::CalculateSize(
       total_workers,      // num_lanes
       NUM_PRIORITIES,     // num_priorities
-      queue_depth_);      // depth per queue
+      depth_budget);      // growth budget per queue (initial depth is queue_depth_)
 
   // Calculate network queue size: NetQueue with 1 lane, 4 priorities
   size_t net_queue_size = NetQueue::CalculateSize(
