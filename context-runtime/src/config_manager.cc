@@ -615,23 +615,26 @@ size_t ConfigManager::CalculateMainSegmentSize() const {
     return main_segment_size_;
   }
 
-  // 0 = auto. The main segment holds task data (FutureShm, BuddyAllocator
-  // metadata). Size it from the process's real memory budget — cgroup-aware,
-  // not host RAM (issue #727): a quarter of the budget, capped at the
-  // historical 1 GiB so real nodes see no change, floored at 64 MiB so
-  // task/FutureShm traffic keeps flowing on tiny budgets. When the budget is
-  // unknown, keep the historical flat default.
+  // 0 = auto: the machine's RAM capacity, mirroring the metadata segment. The
+  // main segment holds task data (FutureShm, BuddyAllocator metadata) and is
+  // an address-space RESERVATION, not an allocation — on Linux it is a sparse
+  // memfd that is never pre-faulted, so only pages actually written consume
+  // memory, and growing the segment later would invalidate every client's
+  // mapping. Reserve big up front so task-data capacity scales with the host
+  // instead of hitting the old flat 1 GiB ceiling (issue #727). Safety is
+  // enforced downstream at creation time (ipc_manager.cc): clamped to half
+  // the cgroup-aware process memory budget, and capped at 1 GiB off Linux,
+  // where the segment is a real file (macOS/BSD) or up-front commit charge
+  // (Windows) rather than sparse memory.
   //
-  // Resolved here rather than at the creation site so that every reader of
-  // this value — GetMemorySegmentSize(kMainSegment) included — sees the size
-  // the segment will actually get, never a bare sentinel.
-  const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
-  size_t auto_size = ctp::Unit<size_t>::Gigabytes(1);
-  if (budget > 0) {
-    auto_size = std::min(auto_size,
-                         std::max(ctp::Unit<size_t>::Megabytes(64), budget / 4));
+  // Resolved here rather than at the creation site so that no reader of this
+  // value — GetMemorySegmentSize(kMainSegment) included — ever sees a bare
+  // 0 sentinel.
+  size_t ram = ctp::SystemInfo::GetRamCapacity();
+  if (ram == 0) {
+    return ctp::Unit<size_t>::Gigabytes(1);  // introspection failed; old default
   }
-  return auto_size;
+  return ram;
 }
 
 size_t ConfigManager::CalculateMetadataSegmentSize() const {

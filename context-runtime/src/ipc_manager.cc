@@ -885,17 +885,18 @@ bool IpcManager::ServerInitShm() {
         config->GetSharedMemorySegmentName(kMainSegment);
 
     // Main segment size (issue #727): yaml `runtime: main_segment_size` /
-    // CLIO_MAIN_SEGMENT_SIZE when set, otherwise the budget-aware auto default
-    // CalculateMainSegmentSize() resolves. On Linux the segment is a sparse
-    // memfd, so the exposure is not the reservation but the LIVE SET in
+    // CLIO_MAIN_SEGMENT_SIZE when set, otherwise the auto default
+    // CalculateMainSegmentSize() resolves — the machine's RAM capacity,
+    // mirroring the metadata segment. On Linux the segment is a sparse memfd,
+    // so the exposure is not the reservation but the LIVE SET in
     // memory-limited containers — and on Windows the whole size is commit
-    // charge up front. The old flat 1 GiB default could be several times a
-    // small deployment's entire budget.
+    // charge up front.
     //
-    // Explicit values are respected up to the same half-budget guard the
-    // metadata segment uses — beyond that the live set can only end in
-    // SIGBUS/OOM, so clamp loudly instead of booting a time bomb. The auto
-    // default is already a quarter of the budget, so it never trips this.
+    // Both the auto default and explicit values pass the same half-budget
+    // guard the metadata segment uses — beyond that the live set can only end
+    // in SIGBUS/OOM, so clamp instead of booting a time bomb. The RAM-sized
+    // auto default trips it by design (RAM > budget/2 always), landing the
+    // segment at half the cgroup-aware budget.
     size_t main_segment_size = config->CalculateMainSegmentSize();
     {
       const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
@@ -906,6 +907,23 @@ bool IpcManager::ServerInitShm() {
              main_segment_size, budget, budget / 2);
         main_segment_size = budget / 2;
       }
+
+      // OFF LINUX THE SEGMENT IS NOT SPARSE MEMORY (issues #727/#817):
+      // macOS/BSD back it with a regular file (no memfd) and Windows charges
+      // the whole reservation as commit up front — a RAM-sized request there
+      // is a real cost, exactly what #727 complained about. Keep the
+      // historical 1 GiB cap on those platforms; explicit configuration can
+      // still go smaller.
+#ifndef __linux__
+      constexpr size_t kNonLinuxMainCap = 1024ULL * 1024 * 1024;  // 1 GiB
+      if (main_segment_size > kNonLinuxMainCap) {
+        HLOG(kInfo,
+             "Main segment: not sparse memory on this platform; "
+             "clamping {} bytes to {} bytes",
+             main_segment_size, kNonLinuxMainCap);
+        main_segment_size = kNonLinuxMainCap;
+      }
+#endif
     }
 
     HLOG(kInfo, "Initializing main shared memory segment: {} bytes ({} MB)",

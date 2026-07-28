@@ -275,15 +275,13 @@ TEST_CASE("IpcInternals - main segment size is configurable (issue #727)",
   REQUIRE(config->CalculateMainSegmentSize() ==
           ctp::Unit<size_t>::Megabytes(128));
 
-  // The auto default: a quarter of the process's memory budget, capped at the
-  // historical 1 GiB and floored at 64 MiB (1 GiB flat when the budget is
-  // unknown). Recomputed here rather than hardcoded so the expectation holds
-  // on tiny CI containers as well as real nodes.
-  const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
-  size_t expect_auto = ctp::Unit<size_t>::Gigabytes(1);
-  if (budget > 0) {
-    expect_auto = std::min(
-        expect_auto, std::max(ctp::Unit<size_t>::Megabytes(64), budget / 4));
+  // The auto default: the machine's RAM capacity (flat 1 GiB when
+  // introspection fails), mirroring the metadata segment. The half-budget and
+  // non-Linux clamps apply at segment creation (ServerInitShm), not here.
+  // Recomputed rather than hardcoded so the expectation holds on any host.
+  size_t expect_auto = ctp::SystemInfo::GetRamCapacity();
+  if (expect_auto == 0) {
+    expect_auto = ctp::Unit<size_t>::Gigabytes(1);
   }
 
   SECTION("0 selects the auto default");
