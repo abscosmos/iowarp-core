@@ -703,14 +703,6 @@ class Task {
   void AggregateIn(const ctp::ipc::FullPtr<Task>& member_task) {
     (void)member_task;
   }
-
-  /**
-   * Fix up internal pointers after a cudaMemcpy/memcpy (POD copy path).
-   * Override in tasks that contain priv::vector or other pointer-bearing
-   * fields to re-seat inline (SVO) pointers to the new host address.
-   * Default is a no-op for pure POD tasks.
-   */
-  CTP_CROSS_FUN void FixupAfterCopy() {}
 };
 
 }  // namespace clio::run

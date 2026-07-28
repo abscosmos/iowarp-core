@@ -354,11 +354,6 @@ struct AllocateBlocksTask : public clio::run::Task {
       : clio::run::Task(task_node, pool_id, pool_query, Method::kAllocateBlocks), size_(size), blocks_(CLIO_PRIV_ALLOC) {
   }
 
-  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
-  }
-
   /** Serialize IN and INOUT parameters */
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
@@ -445,11 +440,6 @@ struct FreeBlocksTask : public clio::run::Task {
     // No additional output parameters
   }
 
-  /** Fix up SVO pointer after POD copy (e.g., CPU→GPU memcpy) */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
-  }
-
   /**
    * Copy from another FreeBlocksTask (assumes this task is already constructed)
    * @param other Pointer to the source task to copy from
@@ -522,11 +512,6 @@ struct WriteTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     ar(bytes_written_, io_error_);
-  }
-
-  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
   }
 
   /** AggregateOut */
@@ -607,11 +592,6 @@ struct ReadTask : public clio::run::Task {
     ar(length_, bytes_read_, io_error_);
     // Use BULK_XFER to actually transfer the read data back
     ar.bulk(data_, length_, BULK_XFER);
-  }
-
-  /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
-  CTP_CROSS_FUN void FixupAfterCopy() {
-    blocks_.FixupSvoPtr();
   }
 
   /** AggregateOut */
