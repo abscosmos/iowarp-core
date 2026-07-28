@@ -770,6 +770,13 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       std::memcpy(compressed_shm.ptr_ + header_size, compressed_buffer.data(),
                   compressed_size);
 
+      // Tell the runtime these bytes are no longer the caller's bytes, so it
+      // can mark the blob authoritatively (issue #818). This is the ONLY place
+      // that knows it for certain -- compress_lib_ is set on the not-beneficial
+      // path below too, where the stored bytes are raw.
+      context.transform_flags_ |= clio::cte::core::kBlobTransformed |
+                                  clio::cte::core::kBlobTransformCompressed;
+
       // Call PutBlob with header + compressed data
       ctp::ipc::ShmPtr<> compressed_shm_ptr =
           compressed_shm.shm_.template Cast<void>();
@@ -802,13 +809,20 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       // Compression failed or didn't reduce size - store original data
       HLOG(kDebug, "Compression not beneficial, storing original data");
 
+      // Mark uncompressed BEFORE the put, not after. The bytes below are the
+      // caller's original bytes, so the blob must not be recorded as carrying
+      // the codec we merely attempted -- this used to be zeroed only after
+      // PutBlob had already copied compress_lib_ onto the BlobInfo, which is
+      // half of why compress_lib_ cannot be trusted as a transform signal
+      // (issue #818). transform_flags_ is deliberately left unset here.
+      context.compress_lib_ = 0;
+
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
           clio::run::PoolQuery::Local());
       put_task.Wait();
 
-      context.compress_lib_ = 0;  // Mark as uncompressed
       task->context_ = put_task->context_;
       task->return_code_ = put_task->return_code_;
     }

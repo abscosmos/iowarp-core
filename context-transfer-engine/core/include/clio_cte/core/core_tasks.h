@@ -42,6 +42,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/autogen/core_methods.h>
 #include <clio_cte/core/core_config.h>
+#include <clio_cte/core/blob_transform.h>
 // Include admin tasks for GetOrCreatePoolTask
 #include <clio_runtime/admin/admin_tasks.h>
 // Include bdev tasks for BdevType enum
@@ -822,8 +823,19 @@ struct BlobInfo {
   // the WAL/metadata log, so it resets on restart (organizers must treat a
   // zero count as "cold or freshly restored", which decays gracefully).
   clio::run::u64 access_count_;
-  int compress_lib_;     // Compression library ID used for this blob (0 = no
-                         // compression)
+  // Authoritative record of whether the stored bytes have been rewritten by
+  // some transform (compression, encryption, ...). See BlobTransformFlags.
+  // STICKY: once set it is never cleared by a later put. A partial overwrite of
+  // a compressed blob with raw bytes leaves a blob that is neither wholly raw
+  // nor wholly transformed, and the only safe reading of that is "transformed"
+  // -- over-refusing the direct-read fast path costs a round-trip, whereas
+  // under-refusing hands back codec bytes as if they were data. Cleared only
+  // when the blob itself is destroyed.
+  clio::run::u32 transform_flags_;
+  int compress_lib_;     // Compression library ID *requested* for this blob
+                         // (0 = none). Provenance/telemetry only -- NOT a
+                         // reliable answer to "is this blob compressed?";
+                         // ask IsTransformed(). See BlobTransformFlags.
   int compress_preset_;  // Compression preset used (1=FAST, 2=BALANCED, 3=BEST)
   clio::run::u64
       trace_key_;  // Unique trace ID for linking to trace logs (0 = not traced)
@@ -889,6 +901,7 @@ struct BlobInfo {
         last_modified_(0),
         last_read_(0),
         access_count_(0),
+        transform_flags_(kBlobTransformNone),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -906,6 +919,7 @@ struct BlobInfo {
         last_modified_(0),
         last_read_(0),
         access_count_(0),
+        transform_flags_(kBlobTransformNone),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -924,6 +938,7 @@ struct BlobInfo {
         last_modified_(GetCurrentTimeNs()),
         last_read_(GetCurrentTimeNs()),
         access_count_(0),
+        transform_flags_(kBlobTransformNone),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -942,6 +957,7 @@ struct BlobInfo {
         last_modified_(other.last_modified_),
         last_read_(other.last_read_),
         access_count_(other.access_count_),
+        transform_flags_(other.transform_flags_),
         compress_lib_(other.compress_lib_),
         compress_preset_(other.compress_preset_),
         trace_key_(other.trace_key_),
@@ -960,6 +976,7 @@ struct BlobInfo {
       last_modified_ = other.last_modified_;
       last_read_ = other.last_read_;
       access_count_ = other.access_count_;
+      transform_flags_ = other.transform_flags_;
       compress_lib_ = other.compress_lib_;
       compress_preset_ = other.compress_preset_;
       trace_key_ = other.trace_key_;
@@ -968,6 +985,30 @@ struct BlobInfo {
       placement_gen_ = other.placement_gen_;
     }
     return *this;
+  }
+
+  /**
+   * THE question to ask before handing a blob's stored bytes to a caller as if
+   * they were data: true means they must be run back through the inverse
+   * transform first (or the request refused).
+   *
+   * Tests the whole word, not one bit, so a transform introduced by a newer
+   * writer than this reader still answers "yes".
+   */
+  CTP_CROSS_FUN bool IsTransformed() const {
+    return transform_flags_ != kBlobTransformNone;
+  }
+
+  /**
+   * Record that the bytes being stored are transformed. Called by whoever
+   * actually rewrote them (e.g. the compressor chimod), never inferred.
+   *
+   * `kind` is the descriptive bit(s); kBlobTransformed is added automatically
+   * so a caller cannot set a kind without also setting the authoritative bit.
+   * Accumulates -- see the stickiness note on transform_flags_.
+   */
+  CTP_CROSS_FUN void MarkTransformed(clio::run::u32 kind) {
+    transform_flags_ |= kBlobTransformed | kind;
   }
 
   // Authoritative O(blocks) sum; the source of truth for total_size_cache_.
@@ -1076,6 +1117,22 @@ struct Context {
   bool emulate_;                    // IN: skip real I/O, model the time
   clio::run::u64 emulated_time_ns_;  // OUT: modeled duration of the skipped I/O
 
+  // IN (PutBlob): set by a caller that has ALREADY rewritten the bytes it is
+  // handing over (compressor chimod today, encryption later), so the runtime
+  // can mark the blob authoritatively. See BlobTransformFlags.
+  // OUT (GetBlob): the blob's recorded transform state, so a Get caller --
+  // scalar, POD, or vectored -- can detect that the returned bytes are stored
+  // form, not the producer's original bytes (GetBlob does not undo
+  // transforms).
+  //
+  // Deliberately OUTSIDE the #if below: a field whose presence depends on a
+  // compile flag changes Context's (and therefore PutBlobTask's) layout between
+  // translation units built with different flags, which is a live ABI-skew
+  // hazard in this tree -- some targets hardcode CTP_ENABLE_COMPRESS=1 while
+  // the option itself defaults OFF. The safety bit must never be the thing that
+  // goes missing.
+  clio::run::u32 transform_flags_;
+
 #if CTP_ENABLE_COMPRESS
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
   int compress_lib_;      // The compression library to apply (0-10)
@@ -1107,7 +1164,8 @@ struct Context {
         min_persistence_level_(0),
         preallocate_(0),
         emulate_(false),
-        emulated_time_ns_(0)
+        emulated_time_ns_(0),
+        transform_flags_(kBlobTransformNone)
 #if CTP_ENABLE_COMPRESS
         ,
         dynamic_compress_(0),
@@ -1133,7 +1191,7 @@ struct Context {
   template <class Archive>
   CTP_CROSS_FUN void serialize(Archive &ar) {
     ar.range(persistence_target_, min_persistence_level_, preallocate_,
-             emulate_, emulated_time_ns_);
+             emulate_, emulated_time_ns_, transform_flags_);
 #if CTP_ENABLE_COMPRESS
     ar.range(dynamic_compress_, compress_lib_, compress_preset_, target_psnr_,
              psnr_chance_, max_performance_, consumer_node_, data_type_,
