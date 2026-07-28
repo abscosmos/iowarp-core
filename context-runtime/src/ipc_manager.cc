@@ -3873,11 +3873,18 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
         // timeouts, a retry storm filling the whole 300 s window). Fail them
         // immediately instead — the same harmless outcome as the historical
         // silent drop, but loud and with a completed future.
-        constexpr int kInlineRetryMs = 5000;
-        for (int i = 0;
-             !task_ptr->IsPeriodic() && i < kInlineRetryMs &&
-             (result == RouteResult::Retry || result == RouteResult::Dne);
-             ++i) {
+        //
+        // The budget is a wall-clock DEADLINE, not an iteration count (issue
+        // #849): sleep_for(1ms) rounds up to the platform timer granularity —
+        // ~15.6ms on Windows — so a 5000-iteration loop actually burned ~75s
+        // per unroutable task there, and ServerInit's handful of exhausted
+        // retries alone exceeded a 300s ctest window.
+        constexpr auto kInlineRetryBudget = std::chrono::seconds(5);
+        const auto deadline =
+            std::chrono::steady_clock::now() + kInlineRetryBudget;
+        while (!task_ptr->IsPeriodic() &&
+               (result == RouteResult::Retry || result == RouteResult::Dne) &&
+               std::chrono::steady_clock::now() < deadline) {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
           result = RouteLocal(future, force_enqueue);
         }
@@ -3895,7 +3902,9 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
           HLOG(kError,
                "RouteTask: inline retry exhausted ({} ms) on non-worker "
                "thread; failing task pool={} method={}",
-               kInlineRetryMs, task_ptr->pool_id_, task_ptr->method_);
+               std::chrono::duration_cast<std::chrono::milliseconds>(
+                   kInlineRetryBudget).count(),
+               task_ptr->pool_id_, task_ptr->method_);
           task_ptr->SetReturnCode(static_cast<u32>(-1));
           task_ptr->SetComplete();
         }
@@ -4034,7 +4043,13 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
   ContainerHold exec_container = exec_dc.get();
 
   if (!exec_container) {
-    HLOG(kError, "RouteLocal: Container not found for pool={} container_id={} method={}",
+    // kDebug, not kError: this is the routine transient-miss result that the
+    // retry paths (worker retry queue, the non-worker inline retry loop) poll
+    // against — at kError a single exhausted 5s inline retry emits ~5000
+    // lines, and a green coverage run logs ~19k of these (issue #849). The
+    // callers in RouteTask log the kError summary on first failure and on
+    // retry exhaustion.
+    HLOG(kDebug, "RouteLocal: Container not found for pool={} container_id={} method={}",
          task_ptr->pool_id_, container_id, task_ptr->method_);
     return RouteResult::Dne;
   }
