@@ -3862,9 +3862,21 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
         // hang ServerInit — a startup-timing window that CI's 2-vCPU runners
         // open reliably. Retry inline first: the window is transient and
         // normally closes within a few milliseconds.
+        //
+        // EXCEPT for periodic tasks. The admin container's Create spawns its
+        // periodic service tasks (kSend/kClientSend pumps, kHeartbeatProbe,
+        // kSystemMonitor) on THIS thread, and the container is only
+        // registered after Create returns — so for those, no amount of
+        // waiting here can succeed: the retry blocks the exact thread whose
+        // progress it awaits. Observed as 5 s x N stalls at every runtime
+        // init (unit-amd64 +19 min; the icx windows gate's rotating per-test
+        // timeouts, a retry storm filling the whole 300 s window). Fail them
+        // immediately instead — the same harmless outcome as the historical
+        // silent drop, but loud and with a completed future.
         constexpr int kInlineRetryMs = 5000;
-        for (int i = 0; i < kInlineRetryMs && (result == RouteResult::Retry ||
-                                               result == RouteResult::Dne);
+        for (int i = 0;
+             !task_ptr->IsPeriodic() && i < kInlineRetryMs &&
+             (result == RouteResult::Retry || result == RouteResult::Dne);
              ++i) {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
           result = RouteLocal(future, force_enqueue);
