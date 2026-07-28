@@ -204,8 +204,9 @@ class ConfigManager : public ctp::BaseConfig {
    * Size of the main task-data segment (issue #727).
    * @return The explicit size when main_segment_size_ > 0 (yaml
    *         `runtime: main_segment_size` or CLIO_MAIN_SEGMENT_SIZE), else the
-   *         auto default: a quarter of the process's cgroup-aware memory
-   *         budget, capped at 1 GiB and floored at 64 MiB. Never 0.
+   *         auto default: the machine's RAM capacity (1 GiB if introspection
+   *         fails). The reservation is sparse; creation-time clamps in
+   *         ipc_manager.cc bound what the segment actually gets. Never 0.
    */
   size_t CalculateMainSegmentSize() const;
 
@@ -430,9 +431,11 @@ class ConfigManager : public ctp::BaseConfig {
   u32 shm_client_spin_us_ = 50;  // issue #807/#784: waiter spin before park
   u32 queue_depth_ = 1024;
 
-  // issue #727: 0 = auto (sized from the memory budget at segment creation).
-  // Settable via yaml `runtime: main_segment_size` or CLIO_MAIN_SEGMENT_SIZE;
-  // LoadDefault() also installs 0, this initializer just matches it.
+  // issue #727: 0 = auto (the machine's RAM capacity — a sparse reservation;
+  // see CalculateMainSegmentSize() and the creation-time clamps in
+  // ipc_manager.cc). Settable via yaml `runtime: main_segment_size` or
+  // CLIO_MAIN_SEGMENT_SIZE; LoadDefault() also installs 0, this initializer
+  // just matches it.
   size_t main_segment_size_ = 0;
   size_t client_data_segment_size_ = ctp::Unit<size_t>::Megabytes(256);
   // issue #783: metadata segment. Deliberately huge and never pre-faulted --
