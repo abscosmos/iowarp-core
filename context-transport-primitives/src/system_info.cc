@@ -708,6 +708,22 @@ void *SystemInfo::MapSharedMemory(const File &fd, size_t size, i64 off) {
     perror("mmap");
     return nullptr;
   }
+#if defined(__linux__) && defined(MADV_DONTDUMP)
+  // Exclude giant shared reservations from core dumps. The runtime's main and
+  // metadata segments default to the machine's RAM capacity (issues #727 and
+  // #783) and stay almost entirely sparse — but a core dump MATERIALIZES the
+  // whole range as zeros, and a piped core_pattern (systemd-coredump, apport,
+  // WSL) bypasses RLIMIT_CORE=0. The runtime's abort()-based shutdown then
+  // spends minutes streaming zeros through the pipe: the daemon outlived the
+  // 60 s shutdown wait of cr_cli_runtime_command_tests / cr_cli_cte_wal_restart
+  // / cr_cli_compose_restart in CI (verified: abort-to-death 65 s → 2 s with
+  // these pages excluded). Small segments stay dumpable; nothing of value is
+  // lost from a reservation that is overwhelmingly unfaulted.
+  constexpr size_t kDontDumpMin = 1ULL << 30;  // 1 GiB
+  if (size >= kDontDumpMin) {
+    (void)madvise(ptr, size, MADV_DONTDUMP);
+  }
+#endif
   CTP_MSAN_UNPOISON(ptr, size);
   return ptr;
 #elif CTP_ENABLE_WINDOWS_SYSINFO

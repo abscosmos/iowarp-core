@@ -42,10 +42,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #ifdef __linux__
 #include <sys/mman.h>
 #endif
@@ -885,17 +887,18 @@ bool IpcManager::ServerInitShm() {
         config->GetSharedMemorySegmentName(kMainSegment);
 
     // Main segment size (issue #727): yaml `runtime: main_segment_size` /
-    // CLIO_MAIN_SEGMENT_SIZE when set, otherwise the budget-aware auto default
-    // CalculateMainSegmentSize() resolves. On Linux the segment is a sparse
-    // memfd, so the exposure is not the reservation but the LIVE SET in
+    // CLIO_MAIN_SEGMENT_SIZE when set, otherwise the auto default
+    // CalculateMainSegmentSize() resolves — the machine's RAM capacity,
+    // mirroring the metadata segment. On Linux the segment is a sparse memfd,
+    // so the exposure is not the reservation but the LIVE SET in
     // memory-limited containers — and on Windows the whole size is commit
-    // charge up front. The old flat 1 GiB default could be several times a
-    // small deployment's entire budget.
+    // charge up front.
     //
-    // Explicit values are respected up to the same half-budget guard the
-    // metadata segment uses — beyond that the live set can only end in
-    // SIGBUS/OOM, so clamp loudly instead of booting a time bomb. The auto
-    // default is already a quarter of the budget, so it never trips this.
+    // Both the auto default and explicit values pass the same half-budget
+    // guard the metadata segment uses — beyond that the live set can only end
+    // in SIGBUS/OOM, so clamp instead of booting a time bomb. The RAM-sized
+    // auto default trips it by design (RAM > budget/2 always), landing the
+    // segment at half the cgroup-aware budget.
     size_t main_segment_size = config->CalculateMainSegmentSize();
     {
       const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
@@ -906,6 +909,23 @@ bool IpcManager::ServerInitShm() {
              main_segment_size, budget, budget / 2);
         main_segment_size = budget / 2;
       }
+
+      // OFF LINUX THE SEGMENT IS NOT SPARSE MEMORY (issues #727/#817):
+      // macOS/BSD back it with a regular file (no memfd) and Windows charges
+      // the whole reservation as commit up front — a RAM-sized request there
+      // is a real cost, exactly what #727 complained about. Keep the
+      // historical 1 GiB cap on those platforms; explicit configuration can
+      // still go smaller.
+#ifndef __linux__
+      constexpr size_t kNonLinuxMainCap = 1024ULL * 1024 * 1024;  // 1 GiB
+      if (main_segment_size > kNonLinuxMainCap) {
+        HLOG(kInfo,
+             "Main segment: not sparse memory on this platform; "
+             "clamping {} bytes to {} bytes",
+             main_segment_size, kNonLinuxMainCap);
+        main_segment_size = kNonLinuxMainCap;
+      }
+#endif
     }
 
     HLOG(kInfo, "Initializing main shared memory segment: {} bytes ({} MB)",
@@ -3829,38 +3849,68 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
       HLOG(kError, "RouteTask: RouteLocal returned {} for pool={} method={}, worker={}",
            (int)result, task_ptr->pool_id_, task_ptr->method_,
            worker ? (int)worker->GetId() : -1);
-      if (!worker) {
-        // Non-worker thread (e.g. ServerInit compose on the main thread, issue
-        // #841): there is no current worker to park the task on, and dropping
-        // it wedges any waiter forever. Retry queues are mutex-guarded, so
-        // cross-thread push is safe — park on worker 0 (the scheduler worker),
-        // which stays in its loop and drains its retry queue every <=32
-        // iterations even when the runtime is otherwise idle.
-        auto *orchestrator = CLIO_WORK_ORCHESTRATOR;
-        if (orchestrator) {
-          worker = orchestrator->GetWorker(0);
-        }
-        if (worker) {
-          // This task never went through ProcessNewTask, so RunFuture is
-          // unbound and the caller's Future is dropped when routing returns.
-          // Anchor the FutureShm to the task's RunContext (and break the
-          // ownership cycle with a non-owning task handle) exactly as
-          // RouteManyToOne does, so ProcessRetryQueue can re-route it and the
-          // waiter still gets signalled on completion.
-          task_ptr->RunFuture() = future;
-          task_ptr->RunFuture().GetTaskPtr() =
-              clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
-        }
-      }
       if (worker) {
         worker->AddToRetryQueue(task_ptr);
       } else {
-        // No worker published yet (pre-SpawnWorkerThreads): nothing can ever
-        // retry this task — make the loss loud instead of a silent hang.
-        HLOG(kFatal,
-             "RouteTask: dropping unroutable task (pool={} method={}) — no "
-             "worker exists to retry it",
-             task_ptr->pool_id_, task_ptr->method_);
+        // issue #822/#841: no worker context — this is a non-worker thread
+        // (ServerInit's main thread, an embedded client). There is no retry
+        // queue here, so the old code DROPPED the task on Retry/Dne and its
+        // future was never completed: a task.Wait() caller then polls
+        // FUTURE_COMPLETE forever. Concretely: the restart-log replay's
+        // AsyncCompose can route before the just-created admin container's
+        // registration (finished by a worker task) is visible, hit Dne, and
+        // hang ServerInit — a startup-timing window that CI's 2-vCPU runners
+        // open reliably. Retry inline first: the window is transient and
+        // normally closes within a few milliseconds.
+        constexpr int kInlineRetryMs = 5000;
+        for (int i = 0; i < kInlineRetryMs && (result == RouteResult::Retry ||
+                                               result == RouteResult::Dne);
+             ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          result = RouteLocal(future, force_enqueue);
+        }
+        if (result == RouteResult::Retry || result == RouteResult::Dne) {
+          // Inline retry exhausted. Rather than failing the waiter outright,
+          // park the task on a published worker's retry queue (issue #841):
+          // retry queues are mutex-guarded, so a cross-thread push is safe,
+          // and worker 0 (the scheduler worker) drains its retry queue every
+          // loop iteration even when the runtime is otherwise idle — the task
+          // then completes whenever the container finally appears, with no
+          // arbitrary deadline.
+          Worker *fallback = nullptr;
+          auto *orchestrator = CLIO_WORK_ORCHESTRATOR;
+          if (orchestrator) {
+            fallback = orchestrator->GetWorker(0);
+          }
+          if (fallback) {
+            // This task never went through ProcessNewTask, so RunFuture is
+            // unbound and the caller's Future is dropped when routing returns.
+            // Anchor the FutureShm to the task's RunContext (and break the
+            // ownership cycle with a non-owning task handle) exactly as
+            // RouteManyToOne does, so ProcessRetryQueue can re-route it and
+            // the waiter still gets signalled on completion.
+            HLOG(kWarning,
+                 "RouteTask: inline retry exhausted ({} ms) on non-worker "
+                 "thread; parking task pool={} method={} on worker 0's retry "
+                 "queue",
+                 kInlineRetryMs, task_ptr->pool_id_, task_ptr->method_);
+            task_ptr->RunFuture() = future;
+            task_ptr->RunFuture().GetTaskPtr() =
+                clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
+            fallback->AddToRetryQueue(task_ptr);
+          } else {
+            // No worker published at all (pre-SpawnWorkerThreads): nothing can
+            // ever retry this task. FAIL the future so the waiter unblocks
+            // loudly instead of hanging silently.
+            HLOG(kError,
+                 "RouteTask: inline retry exhausted ({} ms) on non-worker "
+                 "thread and no worker exists to park the task; failing "
+                 "pool={} method={}",
+                 kInlineRetryMs, task_ptr->pool_id_, task_ptr->method_);
+            task_ptr->SetReturnCode(static_cast<u32>(-1));
+            task_ptr->SetComplete();
+          }
+        }
       }
     }
     return result;

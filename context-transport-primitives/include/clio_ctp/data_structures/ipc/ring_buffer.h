@@ -72,7 +72,9 @@ enum RingQueueFlag : uint32_t {
   /** Fixed-size buffer (no dynamic resizing) */
   RING_BUFFER_FIXED_SIZE = 0x20,
   /** Serialize Pop() with a ctp::Mutex (enables multi-consumer / MPMC) */
-  RING_BUFFER_LOCK_POP = 0x40
+  RING_BUFFER_LOCK_POP = 0x40,
+  /** Serialize Push()/Emplace() with the same ctp::Mutex as LOCK_POP */
+  RING_BUFFER_LOCK_PUSH = 0x80
 };
 
 /**
@@ -212,7 +214,21 @@ class ring_buffer : public ShmContainer<AllocT> {
       (FLAGS & RING_BUFFER_ERROR_ON_NO_SPACE) != 0;
   static constexpr bool DynamicSize = (FLAGS & RING_BUFFER_DYNAMIC_SIZE) != 0;
   static constexpr bool LockPop = (FLAGS & RING_BUFFER_LOCK_POP) != 0;
+  static constexpr bool LockPush = (FLAGS & RING_BUFFER_LOCK_PUSH) != 0;
   static constexpr bool IsAtomic = IsMPSC;
+
+  // A growable ring relocates its entry vector, so every mutation needs
+  // exclusive access: either the ring is genuinely single-threaded (bare
+  // SPSC ext_ring_buffer) or push AND pop are serialized by the embedded
+  // mutex (ext_spsc_queue). A grow racing a lock-free Pop/Emplace would be
+  // a use-after-free on the old vector.
+  static_assert(!DynamicSize || !WaitForSpace,
+                "DYNAMIC_SIZE and WAIT_FOR_SPACE are mutually exclusive");
+  static_assert(!DynamicSize || !ErrorOnNoSpace,
+                "DYNAMIC_SIZE and ERROR_ON_NO_SPACE are mutually exclusive");
+  static_assert(!DynamicSize || IsSPSC || (LockPush && LockPop),
+                "DYNAMIC_SIZE requires single-threaded SPSC use or "
+                "LOCK_PUSH|LOCK_POP serialization");
 
   using entry_vector = vector<entry_type, AllocT>;
   using head_type = ctp::ipc::opt_atomic<u64, IsAtomic>;
@@ -229,8 +245,11 @@ class ring_buffer : public ShmContainer<AllocT> {
   ctp::ipc::opt_atomic<bool, IsAtomic>
       active_; /**< Whether worker is accepting tasks (true) or blocked in
                   epoll_wait (false) */
-  ctp::ipc::Mutex pop_lock_; /**< Used by Pop() when RING_BUFFER_LOCK_POP is
-                                  set; otherwise unused. */
+  ctp::ipc::Mutex lock_; /**< Serializes Pop() under RING_BUFFER_LOCK_POP and
+                              Push()/Emplace() under RING_BUFFER_LOCK_PUSH.
+                              One shared mutex: with both flags set the ring
+                              is fully serialized (required for DYNAMIC_SIZE
+                              growth with concurrent producers/consumers). */
 
  public:
   /**
@@ -454,6 +473,9 @@ class ring_buffer : public ShmContainer<AllocT> {
    */
   CTP_CROSS_FUN
   bool PushSystem(const T& val) {
+    // No growable variant: the slot-reservation flow below assumes a fixed
+    // modulus, and GPU producers cannot take the growth lock.
+    static_assert(!DynamicSize, "PushSystem does not support DYNAMIC_SIZE");
     // System-scope fetch_add: CPU sees the tail increment immediately
     u64 head = head_.load_system();
     u64 tail = tail_.fetch_add_system(1);
@@ -502,6 +524,68 @@ class ring_buffer : public ShmContainer<AllocT> {
    */
   template <typename... Args>
   CTP_CROSS_FUN bool Emplace(Args&&... args) {
+    // When RING_BUFFER_LOCK_PUSH is set, serialize the whole push with the
+    // shared ring mutex (the same one LOCK_POP uses), so producers are safe
+    // against each other, against the consumer, and against DYNAMIC_SIZE
+    // growth relocating the entry vector.
+    if constexpr (LockPush) {
+      ctp::ipc::ScopedMutex guard(lock_, 0);
+      return EmplaceImpl(std::forward<Args>(args)...);
+    } else {
+      return EmplaceImpl(std::forward<Args>(args)...);
+    }
+  }
+
+ private:
+  /** Body of Emplace(); callers hold lock_ when LOCK_PUSH is set. */
+  template <typename... Args>
+  CTP_CROSS_FUN bool EmplaceImpl(Args&&... args) {
+    if constexpr (DynamicSize) {
+      // Exclusive-access path (bare SPSC or LOCK_PUSH|LOCK_POP): a full ring
+      // GROWS instead of spinning (WAIT_FOR_SPACE) or failing
+      // (ERROR_ON_NO_SPACE). This is what breaks the producer==consumer
+      // deadlock class of issue #822: a worker pushing onto the lane it
+      // drains can always complete the push. Publish order matters for
+      // lock-free observers (Empty()/Size() in the worker park path): write
+      // the entry, mark it ready, THEN advance tail.
+      u64 head = head_.load();
+      u64 tail = tail_.load();
+      if (tail - head + 1 >= queue_.size()) {
+        Grow();
+      }
+      size_t idx = tail % queue_.size();
+      auto& entry = queue_[idx];
+      entry.data_ = T(std::forward<Args>(args)...);
+      ctp::ipc::threadfence();
+      entry.SetReady();
+      tail_.store_system(tail + 1);
+      return true;
+    } else {
+      return EmplaceFixed(std::forward<Args>(args)...);
+    }
+  }
+
+  /**
+   * Double the ring's capacity, remapping live entries [head, tail) to their
+   * slots under the new modulus. Requires exclusive access (see the
+   * DYNAMIC_SIZE static_assert). Consumed slots are NOT copied, so stale
+   * element copies (and any resources they pin) are dropped on every grow.
+   */
+  CTP_CROSS_FUN void Grow() {
+    size_t old_size = queue_.size();
+    size_t new_size = (old_size > 1) ? ((old_size - 1) * 2 + 1) : 2;
+    entry_vector new_queue(this->GetAllocator(), new_size);
+    u64 head = head_.load();
+    u64 tail = tail_.load();
+    for (u64 pos = head; pos < tail; ++pos) {
+      new_queue[pos % new_size] = queue_[pos % old_size];
+    }
+    queue_ = std::move(new_queue);
+  }
+
+  /** Fixed-capacity body of Emplace() (all non-DYNAMIC_SIZE flag modes). */
+  template <typename... Args>
+  CTP_CROSS_FUN bool EmplaceFixed(Args&&... args) {
     // Load head and allocate a slot atomically.
     // fetch_add_system ensures the tail increment is immediately visible to
     // CPU threads polling the ring buffer without cudaDeviceSynchronize.
@@ -543,12 +627,6 @@ class ring_buffer : public ShmContainer<AllocT> {
         tail_.fetch_sub(1);
         return false;
       }
-    } else if constexpr (DynamicSize) {
-      size_t size = tail - head + 1;
-      if (size >= queue.size()) {
-        // Would need to resize vector - not implemented for now
-        return false;
-      }
     }
 
     // Emplace into queue at our slot
@@ -565,6 +643,7 @@ class ring_buffer : public ShmContainer<AllocT> {
     return true;
   }
 
+ public:
   /**
    * Pop an element from the buffer
    *
@@ -580,7 +659,7 @@ class ring_buffer : public ShmContainer<AllocT> {
     // and produce unfair scheduling. The lock removes that contention and
     // gives callers a single, simple Pop() entry point.
     if constexpr (LockPop) {
-      ctp::ipc::ScopedMutex guard(pop_lock_, 0);
+      ctp::ipc::ScopedMutex guard(lock_, 0);
       return PopUnlocked(val);
     } else {
       return PopUnlocked(val);
@@ -731,33 +810,37 @@ class ring_buffer : public ShmContainer<AllocT> {
   CTP_INLINE_CROSS_FUN
   void Reset() { Clear(); }
 
-  /**
-   * Resize the buffer to a new depth
-   *
-   * @param new_depth The new capacity
-   */
-  CTP_CROSS_FUN
-  void Resize(size_t new_depth) {
-    ring_buffer new_queue(this->GetAllocator(), new_depth);
-    T val;
-    while (Pop(val)) {
-      new_queue.Push(val);
-    }
-    // Move new_queue data into this
-    queue_ = std::move(new_queue.queue_);
-  }
 };
 
 /**
  * Typedef for extensible ring buffer (single-thread only).
  *
- * This ring buffer will dynamically resize when capacity is reached,
- * making it suitable for scenarios where size cannot be predicted upfront.
- * NOT thread-safe for multiple producers.
+ * This ring buffer doubles its capacity when full (Push never fails or
+ * blocks), making it suitable for scenarios where size cannot be predicted
+ * upfront. NOT thread-safe: single producer AND single consumer on the same
+ * thread of execution (growth relocates the entry vector).
  */
 template <typename T, typename AllocT = ctp::ipc::Allocator>
 using ext_ring_buffer =
     ring_buffer<T, AllocT, (RING_BUFFER_SPSC_FLAGS | RING_BUFFER_DYNAMIC_SIZE)>;
+
+/**
+ * Typedef for the extensible mutex-guarded queue (issue #822).
+ *
+ * SPSC-style ring semantics serialized by the embedded ctp::Mutex on BOTH
+ * push and pop, so any producer/consumer topology (threads or processes) is
+ * safe. A full queue GROWS (doubles) instead of busy-spinning
+ * (WAIT_FOR_SPACE) or failing (ERROR_ON_NO_SPACE) — a producer that is also
+ * the consumer of the same ring can therefore never deadlock on a full ring
+ * (the issue #822 producer==consumer WAIT_FOR_SPACE hang). head_/tail_ keep
+ * the MPSC atomic types so lock-free observers (Empty()/Size() in the worker
+ * park/wake path) stay well-defined; all mutation happens under the lock.
+ */
+template <typename T, typename AllocT = ctp::ipc::Allocator>
+using ext_spsc_queue =
+    ring_buffer<T, AllocT,
+                (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_DYNAMIC_SIZE |
+                 RING_BUFFER_LOCK_PUSH | RING_BUFFER_LOCK_POP)>;
 
 /**
  * Typedef for fixed-size SPSC (Single Producer Single Consumer) ring buffer.

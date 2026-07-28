@@ -754,19 +754,22 @@ struct TaskQueueHeader {
 };
 
 // Type alias for individual lanes with per-lane headers (moved outside
-// TaskQueue class) Worker queues store Future<Task> objects directly
+// TaskQueue class) Worker queues store Future<Task> objects directly.
+// issue #822: lanes are ext_spsc_queue (mutex-serialized, growable) instead
+// of WAIT_FOR_SPACE MPSC rings — a push onto a full lane grows the lane
+// rather than busy-spinning, so a worker enqueuing onto the lane it drains
+// (producer==consumer) can no longer deadlock when queue_depth is small.
 using TaskLane =
-    ctp::ipc::multi_mpsc_ring_buffer<Future<Task>,
-                                 CLIO_QUEUE_ALLOC_T>::ring_buffer_type;
+    ctp::ipc::multi_ext_spsc_queue<Future<Task>,
+                                   CLIO_QUEUE_ALLOC_T>::ring_buffer_type;
 
 /**
- * Simple wrapper around ctp::ipc::multi_mpsc_ring_buffer
- *
- * This wrapper adds custom enqueue and dequeue functions while maintaining
- * compatibility with existing code that expects the multi_mpsc_ring_buffer
- * interface.
+ * Multi-lane worker task queue (one growable mutex-guarded ring per
+ * lane/priority); see the TaskLane comment above for the issue #822
+ * rationale.
  */
-typedef ctp::ipc::multi_mpsc_ring_buffer<Future<Task>, CLIO_QUEUE_ALLOC_T> TaskQueue;
+typedef ctp::ipc::multi_ext_spsc_queue<Future<Task>, CLIO_QUEUE_ALLOC_T>
+    TaskQueue;
 
 }  // namespace clio::run
 
