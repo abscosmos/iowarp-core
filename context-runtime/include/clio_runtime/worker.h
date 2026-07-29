@@ -185,10 +185,16 @@ class Worker {
     return event_queue_.load(std::memory_order_acquire);
   }
 
-  /** Event-queue element type (completion futures for parked parents). */
+  /** Event-queue element type (completion futures for parked parents).
+   * issue #822: ext_spsc_queue (mutex-serialized, growable) instead of a
+   * WAIT_FOR_SPACE MPSC ring. The old ring relied on a sizing invariant —
+   * "a parent fills at most ~queue_depth subtask slots in its lane, so 2x
+   * that is enough completion headroom" (#620) — that no longer holds now
+   * that task lanes GROW past queue_depth; overflowing it would busy-spin
+   * the pushing worker forever. A growable queue removes the invariant. */
   using EventQueue =
-      ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>,
-                                 ctp::ipc::MallocAllocator>;
+      ctp::ipc::ext_spsc_queue<Future<Task, CLIO_QUEUE_ALLOC_T>,
+                               ctp::ipc::MallocAllocator>;
 
   /**
    * issue #785: take ownership of a stalled worker's event queue.
@@ -716,10 +722,10 @@ class Worker {
   // Stores Future<Task> objects to set FUTURE_COMPLETE, avoiding stale
   // RunContext* pointers. Allocated from malloc allocator (temporary runtime
   // data, not IPC), sized in Init() to EVENT_QUEUE_DEPTH_MULTIPLIER x the
-  // configured per-worker task-queue depth (GetQueueDepth()): a parent fills at
-  // most ~queue_depth subtask slots in its lane, so giving the completion ring
-  // 2x that headroom keeps the WAIT_FOR_SPACE Emplace from ever blocking on a
-  // single parent's fan-out (which otherwise self-deadlocks the worker, #620).
+  // configured per-worker task-queue depth (GetQueueDepth()). issue #822:
+  // this is now only the INITIAL capacity — the queue grows when full
+  // (ext_spsc_queue), so the old #620 requirement that the multiplier
+  // out-size any single parent's fan-out no longer gates correctness.
   static constexpr u32 EVENT_QUEUE_DEPTH_MULTIPLIER = 2;
   // issue #785: atomic because the monitor thread reassigns it during a stall
   // rescue. ProcessEventQueue re-reads it each drain.
@@ -753,13 +759,14 @@ class Worker {
   // A plain vector, not a queue: this is produced and consumed by THIS worker
   // thread within one phase, so there is no handoff to synchronize.
   std::vector<clio::run::shared_ptr<Task>> batch_passthrough_;
-  // merged task uid -> the parent tasks it completes. Only touched by this
-  // worker (the merged task is submitted Local and runs here), but EndTask can
-  // be reached from the monitor's rescue path, so it is mutex-guarded like
-  // BatchManager::pending_.
-  std::mutex batch_pending_mu_;
-  std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>>
-      batch_pending_;
+  // issue #820/#822: the "merged uid -> parent tasks" registry is PROCESS-GLOBAL
+  // (see worker.cc BatchPendingRegistry), NOT a per-worker member. A merged task
+  // is an I/O task: it suspends on the bdev put/get and its continuation resumes
+  // on WHATEVER worker the scheduler picks, which is frequently not the worker
+  // that emitted it. A per-worker map made the completing worker miss the entry
+  // and orphan the parents (client Wait() hangs forever). The global registry
+  // also uses a global-unique key because CreateTaskId().unique_ is only unique
+  // within one worker thread (thread-local counter), so two workers collide.
 
   // Worker spawn time
   ctp::Timepoint spawn_time_;  // Time when worker was spawned

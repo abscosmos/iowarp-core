@@ -210,6 +210,74 @@ TEST_CASE("ShmCache: truncated blob is readable only over its prefix",
   REQUIRE_FALSE(empty.IsDirectReadable());
 }
 
+TEST_CASE("ShmCache: transformed blob is not direct-readable", "[shm_cache]") {
+  // issue #818. A compressed/encrypted blob stores codec output, so copying
+  // its bytes out of shared memory would SUCCEED and return the wrong thing.
+  // Placement alone (node-local + kRam) must not be enough to qualify.
+  SECTION("descriptive transform bits refuse") {
+    ShmBlobRecord rec;
+    rec.num_blocks_ = 1;
+    rec.flags_ = kShmBlobDirectReadable;
+    rec.transform_flags_ = kBlobTransformed | kBlobTransformCompressed;
+    REQUIRE(rec.IsTransformed());
+    REQUIRE_FALSE(rec.IsDirectReadable());
+  }
+
+  SECTION("an unknown future transform still refuses") {
+    // The guard tests the whole word, not one known bit, so a transform
+    // introduced by a writer newer than this reader fails safe.
+    ShmBlobRecord rec;
+    rec.num_blocks_ = 1;
+    rec.flags_ = kShmBlobDirectReadable;
+    rec.transform_flags_ = 1u << 20;
+    REQUIRE(rec.IsTransformed());
+    REQUIRE_FALSE(rec.IsDirectReadable());
+  }
+
+  SECTION("the record flag alone refuses even if the word is empty") {
+    // Defence in depth: the runtime clears kShmBlobDirectReadable when it
+    // builds a transformed record, but the client must not depend on that.
+    ShmBlobRecord rec;
+    rec.num_blocks_ = 1;
+    rec.flags_ = kShmBlobDirectReadable | kShmBlobTransformed;
+    REQUIRE(rec.IsTransformed());
+    REQUIRE_FALSE(rec.IsDirectReadable());
+  }
+
+  SECTION("an untransformed blob is unaffected") {
+    ShmBlobRecord rec;
+    rec.num_blocks_ = 1;
+    rec.flags_ = kShmBlobDirectReadable;
+    REQUIRE_FALSE(rec.IsTransformed());
+    REQUIRE(rec.IsDirectReadable());
+  }
+}
+
+TEST_CASE("ShmCache: transform state survives the map round-trip",
+          "[shm_cache]") {
+  // The record is copied through the seqlock as raw bytes; prove the transform
+  // word rides along rather than being dropped like the old reserved_ slot.
+  Fixture f;
+  REQUIRE(f.Create());
+
+  ShmBlobRecord rec;
+  rec.total_size_ = 1024;
+  rec.num_blocks_ = 1;
+  rec.flags_ = kShmBlobTransformed;  // direct-readable deliberately NOT set
+  rec.transform_flags_ = kBlobTransformed | kBlobTransformCompressed;
+  rec.blocks_[0].size_ = 1024;
+  REQUIRE(PutBlob(f, "1.0.zblob", rec));
+
+  ShmBlobRecord out;
+  REQUIRE(f.root->blob_key_to_info_.TryGetBytes("1.0.zblob", 9, &out));
+  REQUIRE(out.transform_flags_ ==
+          (kBlobTransformed | kBlobTransformCompressed));
+  REQUIRE(out.IsTransformed());
+  REQUIRE_FALSE(out.IsDirectReadable());
+
+  f.Destroy();
+}
+
 TEST_CASE("ShmCache: tag maps round-trip", "[shm_cache]") {
   Fixture f;
   REQUIRE(f.Create());

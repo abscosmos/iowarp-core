@@ -615,23 +615,26 @@ size_t ConfigManager::CalculateMainSegmentSize() const {
     return main_segment_size_;
   }
 
-  // 0 = auto. The main segment holds task data (FutureShm, BuddyAllocator
-  // metadata). Size it from the process's real memory budget — cgroup-aware,
-  // not host RAM (issue #727): a quarter of the budget, capped at the
-  // historical 1 GiB so real nodes see no change, floored at 64 MiB so
-  // task/FutureShm traffic keeps flowing on tiny budgets. When the budget is
-  // unknown, keep the historical flat default.
+  // 0 = auto: the machine's RAM capacity, mirroring the metadata segment. The
+  // main segment holds task data (FutureShm, BuddyAllocator metadata) and is
+  // an address-space RESERVATION, not an allocation — on Linux it is a sparse
+  // memfd that is never pre-faulted, so only pages actually written consume
+  // memory, and growing the segment later would invalidate every client's
+  // mapping. Reserve big up front so task-data capacity scales with the host
+  // instead of hitting the old flat 1 GiB ceiling (issue #727). Safety is
+  // enforced downstream at creation time (ipc_manager.cc): clamped to half
+  // the cgroup-aware process memory budget, and capped at 1 GiB off Linux,
+  // where the segment is a real file (macOS/BSD) or up-front commit charge
+  // (Windows) rather than sparse memory.
   //
-  // Resolved here rather than at the creation site so that every reader of
-  // this value — GetMemorySegmentSize(kMainSegment) included — sees the size
-  // the segment will actually get, never a bare sentinel.
-  const size_t budget = ctp::SystemInfo::GetProcessMemoryBudget();
-  size_t auto_size = ctp::Unit<size_t>::Gigabytes(1);
-  if (budget > 0) {
-    auto_size = std::min(auto_size,
-                         std::max(ctp::Unit<size_t>::Megabytes(64), budget / 4));
+  // Resolved here rather than at the creation site so that no reader of this
+  // value — GetMemorySegmentSize(kMainSegment) included — ever sees a bare
+  // 0 sentinel.
+  size_t ram = ctp::SystemInfo::GetRamCapacity();
+  if (ram == 0) {
+    return ctp::Unit<size_t>::Gigabytes(1);  // introspection failed; old default
   }
-  return auto_size;
+  return ram;
 }
 
 size_t ConfigManager::CalculateMetadataSegmentSize() const {
@@ -640,12 +643,21 @@ size_t ConfigManager::CalculateMetadataSegmentSize() const {
     return metadata_segment_size_;
   }
 
-  // Default 8 GB. This is an address-space reservation, not an allocation: the
-  // segment is never pre-faulted, so only pages the runtime actually writes
-  // consume RAM. Sized generously because the CTE metadata cache (issue #783)
-  // holds one entry per live tag and blob, and growing the segment later would
-  // invalidate every client's mapping.
-  return ctp::Unit<size_t>::Gigabytes(8);
+  // Default: the machine's RAM capacity. This is an address-space RESERVATION,
+  // not an allocation: the segment is sparse and never pre-faulted, so only
+  // pages the runtime actually writes consume memory. Sizing the reservation
+  // like RAM means metadata capacity scales with the machine instead of hitting
+  // an arbitrary fixed ceiling (the old 8 GB default), and growing the segment
+  // later is impossible without invalidating every client's mapping — so
+  // reserve big up front. Safety is enforced downstream at creation time
+  // (ipc_manager.cc): on Linux the request is clamped to half the
+  // cgroup-aware process memory budget (containers!), and on non-Linux — where
+  // the segment is a real file, not memfd — it is capped at 1 GB.
+  size_t ram = ctp::SystemInfo::GetRamCapacity();
+  if (ram == 0) {
+    return ctp::Unit<size_t>::Gigabytes(8);  // introspection failed; old default
+  }
+  return ram;
 }
 
 size_t ConfigManager::CalculateQueueSegmentSize() const {
@@ -661,11 +673,25 @@ size_t ConfigManager::CalculateQueueSegmentSize() const {
   // unrecoverable under saturation.
   u32 total_workers = num_threads_ + 1 + GetElasticLaneHeadroom();
 
+  // issue #822: worker lanes are growable (ext_spsc_queue) — queue_depth_ is
+  // only their INITIAL capacity. Budget arena space for growth: doubling from
+  // queue_depth_ up to GROWTH_CAP consumes < 2*GROWTH_CAP entries per ring
+  // total, because the arena is a bump allocator that never reuses the freed
+  // smaller generations. This is an address-space reservation, not RAM — the
+  // memfd segment only faults pages that are actually written — so we can be
+  // generous. A lane that outgrows GROWTH_CAP fails its allocation LOUDLY
+  // (allocator throw) instead of silently wedging, which is the intended
+  // trade: by then ~128Ki tasks are backed up on one worker and the system
+  // is already sick.
+  constexpr size_t GROWTH_CAP = 128 * 1024;  // entries per ring
+  const size_t depth_budget =
+      2 * std::max<size_t>(queue_depth_, GROWTH_CAP);
+
   // Calculate worker task queues size: TaskQueue with total_workers lanes
   size_t worker_queues_size = TaskQueue::CalculateSize(
       total_workers,      // num_lanes
       NUM_PRIORITIES,     // num_priorities
-      queue_depth_);      // depth per queue
+      depth_budget);      // growth budget per queue (initial depth is queue_depth_)
 
   // Calculate network queue size: NetQueue with 1 lane, 4 priorities
   size_t net_queue_size = NetQueue::CalculateSize(

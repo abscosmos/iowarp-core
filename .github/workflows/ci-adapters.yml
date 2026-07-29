@@ -89,7 +89,7 @@ jobs:
                 -DCLIO_CTE_ENABLE_COMPRESS=OFF \
                 -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
                 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-                -DCLIO_CTP_LOG_LEVEL=0
+                -DCLIO_CTP_LOG_LEVEL=1
               cmake --build build-adapters -j"$(nproc)"
               # Adapter unit/smoke tests. Exclude the docker-in-docker FUSE
               # integration test (LABELS include "docker").

@@ -87,14 +87,6 @@ public:
   ~Runtime() override;
 
   /**
-   * Fix up POD task members (clio::run::priv::string SSO data_ pointers,
-   * etc.) after a GPU2CPU D2H POD memcpy. Dispatched by the GPU pop
-   * path on the worker before Run.
-   */
-  void FixupAfterCopy(clio::run::u32 method,
-                      clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
-
-  /**
    * Create the container (Method::kCreate)
    * This method both creates and initializes the container
    * Returns TaskResume for coroutine-based async operations
@@ -164,6 +156,9 @@ public:
   clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
   /** Reorganize single blob (Method::kReorganizeBlob) - update score. */
   clio::run::TaskResume ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task);
+  /** Evict lowest-score blobs off a tier until a byte budget is reclaimed
+   *  (Method::kEvict). Broadcast; each shard reports its share. */
+  clio::run::TaskResume Evict(clio::run::shared_ptr<EvictTask> &task);
 
   /**
    * Rescore-and-move one blob without spawning a ReorganizeBlobTask (issue
@@ -639,7 +634,8 @@ private:
    */
   clio::run::TaskResume ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset, clio::run::u64 size,
                              float blob_score, clio::run::u32 &error_code,
-                             int min_persistence_level = 0);
+                             int min_persistence_level = 0,
+                             clio::run::u64 preallocate = 0);
 
   /**
    * Resize a blob to exactly new_size: grow (allocate appended blocks via

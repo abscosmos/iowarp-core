@@ -53,6 +53,21 @@ enum class TxnType : uint8_t {
   kDelBlob = 3,
   kCreateTag = 4,
   kDelTag = 5,
+  /**
+   * Blob's stored bytes were transformed (issue #818).
+   *
+   * A separate record rather than a field on kCreateNewBlob for two reasons.
+   * The transform is only known at the END of a put, after the bytes have been
+   * written, whereas kCreateNewBlob is logged when the blob is first created.
+   * And replay must be able to re-apply the mark on top of a blob that
+   * kCreateNewBlob has just reinserted with default (untransformed) state --
+   * see ReplayTransactionLogs.
+   *
+   * Appending a type is safe for an older runtime: its replay chain ignores
+   * types it does not recognise, which leaves it exactly where it was before
+   * this record existed.
+   */
+  kSetBlobTransform = 6,
 };
 
 /** A single block entry within TxnExtendBlob */
@@ -85,6 +100,14 @@ struct TxnClearBlob {
   clio::run::u32 tag_major_;
   clio::run::u32 tag_minor_;
   std::string blob_name_;
+};
+
+/** Payload: mark a blob's stored bytes as transformed (issue #818) */
+struct TxnSetBlobTransform {
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
+  std::string blob_name_;
+  clio::run::u32 transform_flags_;
 };
 
 /** Payload: delete a blob */
@@ -171,6 +194,15 @@ class TransactionLog {
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
     WriteString(buffer_, txn.blob_name_);
+    WriteRecord(type, buffer_);
+  }
+
+  void Log(TxnType type, const TxnSetBlobTransform &txn) {
+    buffer_.clear();
+    WriteU32(buffer_, txn.tag_major_);
+    WriteU32(buffer_, txn.tag_minor_);
+    WriteString(buffer_, txn.blob_name_);
+    WriteU32(buffer_, txn.transform_flags_);
     WriteRecord(type, buffer_);
   }
 
@@ -284,6 +316,17 @@ class TransactionLog {
       txn.new_blocks_[i].target_offset_ = ReadU64(data, off);
       txn.new_blocks_[i].size_ = ReadU64(data, off);
     }
+    return txn;
+  }
+
+  static TxnSetBlobTransform DeserializeSetBlobTransform(
+      const std::vector<char> &data) {
+    TxnSetBlobTransform txn;
+    size_t off = 0;
+    txn.tag_major_ = ReadU32(data, off);
+    txn.tag_minor_ = ReadU32(data, off);
+    txn.blob_name_ = ReadString(data, off);
+    txn.transform_flags_ = ReadU32(data, off);
     return txn;
   }
 

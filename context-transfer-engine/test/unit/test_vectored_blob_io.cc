@@ -251,6 +251,55 @@ TEST_CASE("Vectored PutBlob == N single puts, and segments apply in list order",
 // task with a zero-size or null-buffer segment must be REFUSED, not silently
 // half-applied. These are cheap, deterministic, and were the runtime's untested
 // error paths.
+TEST_CASE("Vectored PRIVATE-memory put/get roundtrip (strided)",
+          "[cte][vectored][private]") {
+  // The PrivBlobSegment overloads: put N strided regions from caller-owned
+  // char* buffers, read them back into different char* buffers, byte-compare.
+  // Under the embedded runtime this exercises the FromRaw direct paths and,
+  // on the second read, the all-or-nothing SHM fast path (RAM target).
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+  auto *cte = CLIO_CTE_CLIENT;
+
+  clio::cte::core::Tag tag("vectored_priv_tag");
+  clio::cte::core::TagId tag_id = tag.GetTagId();
+  const std::string blob = "priv_strided";
+
+  const size_t kSeg = 4096;
+  const int kN = 16;
+  const clio::run::u64 kStride = 2 * kSeg;  // strided: gap between regions
+
+  std::vector<std::vector<char>> src(kN), dst(kN);
+  std::vector<clio::cte::core::Client::PrivBlobSegment> put_segs,
+      get_segs;
+  for (int i = 0; i < kN; ++i) {
+    src[i].assign(kSeg, static_cast<char>((i % 250) + 1));
+    dst[i].assign(kSeg, 0);
+    put_segs.push_back(clio::cte::core::Client::PrivBlobSegment(
+        static_cast<clio::run::u64>(i) * kStride, kSeg, src[i].data()));
+    get_segs.push_back(clio::cte::core::Client::PrivBlobSegment(
+        static_cast<clio::run::u64>(i) * kStride, kSeg, dst[i].data()));
+  }
+
+  auto pv = cte->AsyncPutBlobVectored(tag_id, blob, put_segs);
+  REQUIRE(pv.get() != nullptr);
+  pv.Wait();
+  REQUIRE(pv->GetReturnCode() == 0);
+
+  for (int pass = 0; pass < 2; ++pass) {  // pass 2 favors the SHM fast path
+    for (auto &d : dst) std::fill(d.begin(), d.end(), 0);
+    auto gv = cte->AsyncGetBlobVectored(tag_id, blob, get_segs);
+    REQUIRE(gv.get() != nullptr);
+    gv.Wait();
+    REQUIRE(gv->GetReturnCode() == 0);
+    for (int i = 0; i < kN; ++i) {
+      REQUIRE(std::memcmp(dst[i].data(), src[i].data(), kSeg) == 0);
+    }
+  }
+  std::printf("[#820] private vectored roundtrip: %d strided x %zu B OK\n",
+              kN, kSeg);
+}
+
 TEST_CASE("Vectored I/O rejects malformed segments", "[cte][vectored][820]") {
   REQUIRE(g_fixture != nullptr);
   REQUIRE(g_fixture->initialized_);
@@ -310,6 +359,92 @@ TEST_CASE("Vectored I/O rejects malformed segments", "[cte][vectored][820]") {
   }
   ipc->FreeBuffer(good);
   std::printf("[#820] vectored I/O rejects zero-size and null segments\n");
+}
+
+TEST_CASE("Vectored put/get honor the blob-transform bit",
+          "[cte][vectored][818]") {
+  // issue #818. The vectored APIs share PutBlobTask/GetBlobTask with the
+  // scalar path, so the transform declaration must flow through them
+  // identically: a vectored put that declares Context::transform_flags_ marks
+  // the blob, the SHM cache record refuses direct reads, and a vectored get
+  // still returns the stored bytes through the RPC fallback.
+  REQUIRE(g_fixture != nullptr);
+  REQUIRE(g_fixture->initialized_);
+  auto *ipc = CLIO_IPC;
+  auto *cte = CLIO_CTE_CLIENT;
+
+  clio::cte::core::Tag tag("vectored_transform_tag");
+  clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  const size_t kSeg = 4096;
+  const int kN = 4;
+
+  auto put_vectored = [&](const std::string &blob, clio::run::u32 transform) {
+    std::vector<ctp::ipc::FullPtr<char>> bufs;
+    std::vector<clio::cte::core::BlobSegment> segs;
+    for (int i = 0; i < kN; ++i) {
+      auto b = FillBuf(kSeg, static_cast<char>('a' + i));
+      bufs.push_back(b);
+      segs.push_back(clio::cte::core::BlobSegment(
+          static_cast<clio::run::u64>(i) * kSeg, kSeg,
+          ctp::ipc::ShmPtr<>(b.shm_)));
+    }
+    clio::cte::core::Context ctx;
+    ctx.transform_flags_ = transform;
+    auto pv = cte->AsyncPutBlobVectored(tag_id, blob, segs, /*score=*/-1.0f,
+                                        ctx);
+    pv.Wait();
+    REQUIRE(pv->GetReturnCode() == 0);
+    for (auto &b : bufs) ipc->FreeBuffer(b);
+  };
+
+  put_vectored("vt_raw", clio::cte::core::kBlobTransformNone);
+  put_vectored("vt_transformed", clio::cte::core::kBlobTransformed |
+                                     clio::cte::core::kBlobTransformCompressed);
+
+  // The mark reaches the cache record, and only for the declared blob.
+  if (cte->HasShmCache()) {
+    clio::cte::core::ShmBlobRecord raw_rec, xf_rec;
+    REQUIRE(cte->TryGetBlobRecordShm(tag_id, "vt_raw", &raw_rec));
+    REQUIRE(cte->TryGetBlobRecordShm(tag_id, "vt_transformed", &xf_rec));
+    REQUIRE_FALSE(raw_rec.IsTransformed());
+    REQUIRE(xf_rec.IsTransformed());
+    REQUIRE_FALSE(xf_rec.IsDirectReadable());
+    REQUIRE((xf_rec.flags_ & clio::cte::core::kShmBlobDirectReadable) == 0);
+    // CONTROL: the raw blob on the same tier IS direct-readable, so the
+    // refusal above is attributable to the bit and not to placement.
+    REQUIRE(raw_rec.IsDirectReadable());
+  } else {
+    std::printf("[#818] SHM cache unavailable; record assertions skipped\n");
+  }
+
+  // A vectored get of the transformed blob must still return the stored
+  // bytes -- the guard degrades to the RPC path, never to an error.
+  {
+    std::vector<ctp::ipc::FullPtr<char>> bufs;
+    std::vector<clio::cte::core::BlobSegment> segs;
+    for (int i = 0; i < kN; ++i) {
+      auto b = FillBuf(kSeg, 0);
+      bufs.push_back(b);
+      segs.push_back(clio::cte::core::BlobSegment(
+          static_cast<clio::run::u64>(i) * kSeg, kSeg,
+          ctp::ipc::ShmPtr<>(b.shm_)));
+    }
+    auto gv = cte->AsyncGetBlobVectored(tag_id, "vt_transformed", segs);
+    gv.Wait();
+    REQUIRE(gv->GetReturnCode() == 0);
+    // ...and the get REPORTS the transform state back through its context, so
+    // the caller can detect the bytes are stored form, not the original.
+    REQUIRE((gv->context_.transform_flags_ &
+             clio::cte::core::kBlobTransformed) != 0);
+    for (int i = 0; i < kN; ++i) {
+      std::vector<char> want(kSeg, static_cast<char>('a' + i));
+      REQUIRE(std::memcmp(bufs[static_cast<size_t>(i)].ptr_, want.data(),
+                          kSeg) == 0);
+      ipc->FreeBuffer(bufs[static_cast<size_t>(i)]);
+    }
+  }
+  std::printf("[#818] vectored put/get honor the transform bit\n");
 }
 
 int main(int argc, char **argv) {

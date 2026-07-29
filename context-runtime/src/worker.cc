@@ -485,7 +485,18 @@ u32 Worker::ProcessNewTasks(TaskLane *lane) {
     return e != nullptr && !(std::string(e) == "0" || std::string(e) == "false");
   }();
   if (lane_batch && BatchingEnabled()) {
-    return BatchLane(lane, MAX_TASKS_PER_ITERATION * 4);
+    // issue #820: size the batch to the CURRENT lane depth so a deep backlog
+    // (e.g. a burst of same-blob writes that RouteTask funneled onto this one
+    // lane) collapses in a SINGLE merged task instead of being chopped at a
+    // fixed budget. Size() is a single-consumer snapshot -- this worker is the
+    // only consumer of its lane (mpsc), so it can only UNDER-read when a
+    // producer enqueues concurrently, and those late arrivals simply batch on
+    // the next iteration; it never over-reads. Floor at the previous fixed
+    // budget so a shallow lane never batches LESS than before, and the natural
+    // ceiling is the ring's capacity (Size() cannot exceed it).
+    const u32 depth = static_cast<u32>(lane->Size());
+    const u32 batch_budget = std::max(depth, MAX_TASKS_PER_ITERATION * 4);
+    return BatchLane(lane, batch_budget);
   }
 
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
@@ -588,18 +599,34 @@ clio::run::shared_ptr<Task> Worker::RouteOnly(Future<Task> &future,
 
 
 namespace {
+// issue #820/#822: process-global registry of "merged-task key -> parent tasks
+// it must complete". Global (not per-worker) because a merged task is an I/O
+// task whose continuation resumes on an arbitrary worker after the bdev put/get
+// suspends, so the worker that COMPLETES it is often not the one that EMITTED
+// it. g_batch_key_seq mints a process-unique key per merged task: it cannot use
+// CreateTaskId().unique_ because that counter is thread-local, so two workers
+// mint identical unique_ values and would clobber each other's parents in a
+// shared map. Keys start at a high base so they never alias a normal
+// per-thread task unique_ (defense in depth; the map is only keyed by these).
+struct BatchPendingRegistry {
+  std::mutex mu;
+  std::unordered_map<clio::run::u64,
+                     std::vector<clio::run::shared_ptr<Task>>> pending;
+};
+BatchPendingRegistry &GlobalBatchPending() {
+  static BatchPendingRegistry reg;
+  return reg;
+}
+std::atomic<clio::run::u64> g_batch_key_seq{clio::run::u64{1} << 48};
+
 /** issue #820: hands a container's merged tasks back to the worker. */
 class WorkerBatchSink : public BatchSink {
  public:
   using RunAsIs = std::function<void(const clio::run::shared_ptr<Task> &)>;
 
-  WorkerBatchSink(
-      RunAsIs run_as_is, RunAsIs run_merged, std::mutex &mu,
-      std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>> &pending)
+  WorkerBatchSink(RunAsIs run_as_is, RunAsIs run_merged)
       : run_as_is_(std::move(run_as_is)),
-        run_merged_(std::move(run_merged)),
-        mu_(mu),
-        pending_(pending) {}
+        run_merged_(std::move(run_merged)) {}
 
   void Passthrough(const clio::run::shared_ptr<Task> &task) override {
     if (task.IsNull()) {
@@ -617,11 +644,17 @@ class WorkerBatchSink : public BatchSink {
     // A fresh id and a Local query, so this task gets its OWN RunContext and
     // future rather than inheriting a member's.
     merged->task_id_ = CreateTaskId();
+    // Stamp a PROCESS-GLOBAL key into unique_ so the (arbitrary) worker that
+    // later completes this task finds its parents in the global registry.
+    // CreateTaskId().unique_ is thread-local and collides across workers.
+    merged->task_id_.unique_ =
+        g_batch_key_seq.fetch_add(1, std::memory_order_relaxed);
     merged->pool_query_ = PoolQuery::Local();
     merged->SetFlags(TASK_BATCH_MERGED);
     if (!parents.empty()) {
-      std::lock_guard<std::mutex> lk(mu_);
-      pending_[merged->task_id_.unique_] = std::move(parents);
+      auto &reg = GlobalBatchPending();
+      std::lock_guard<std::mutex> lk(reg.mu);
+      reg.pending[merged->task_id_.unique_] = std::move(parents);
     }
     // Run it HERE rather than CLIO_IPC->Send().
     //
@@ -641,8 +674,6 @@ class WorkerBatchSink : public BatchSink {
  private:
   RunAsIs run_as_is_;
   RunAsIs run_merged_;
-  std::mutex &mu_;
-  std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>> &pending_;
 };
 }  // namespace
 
@@ -761,8 +792,7 @@ u32 Worker::BatchCollect(TaskLane *lane, u32 budget, bool from_lane) {
           t->SetEventQueue(event_queue_.load(std::memory_order_acquire));
           t->RunFuture() = f;
           ExecTask(t, /*is_started=*/false);
-        },
-        batch_pending_mu_, batch_pending_);
+        });
     // Distinct pools present in the groups; each container picks out its own
     // keys and must leave the map empty.
     std::vector<PoolId> pools;
@@ -800,13 +830,17 @@ u32 Worker::BatchCollect(TaskLane *lane, u32 budget, bool from_lane) {
 void Worker::CompleteBatchParents(clio::run::shared_ptr<Task> &merged) {
   std::vector<clio::run::shared_ptr<Task>> parents;
   {
-    std::lock_guard<std::mutex> lk(batch_pending_mu_);
-    auto it = batch_pending_.find(merged->task_id_.unique_);
-    if (it == batch_pending_.end()) {
+    auto &reg = GlobalBatchPending();
+    std::lock_guard<std::mutex> lk(reg.mu);
+    auto it = reg.pending.find(merged->task_id_.unique_);
+    if (it == reg.pending.end()) {
+      // A merged task with no registered parents (parents.empty() at Emit) is a
+      // legitimate no-op; a genuine miss cannot happen now that the registry is
+      // global and the key is process-unique.
       return;
     }
     parents = std::move(it->second);
-    batch_pending_.erase(it);
+    reg.pending.erase(it);
   }
   u32 rc = merged->GetReturnCode();
   ContainerId completer = merged->GetCompleter();
@@ -1044,13 +1078,41 @@ void Worker::SuspendMe() {
     // 50ms max_sleep re-poll, which under the ARM weak-memory model fires
     // constantly and crawled cr_cli_cfs_parallel_stress into its timeout (x86
     // TSO mostly hid it).
+    // Unified park handshake — this is what lets producers STOP signalling a
+    // running worker (see IpcManager::AwakenWorker). Publish "parked" on BOTH
+    // wakeup surfaces before the final re-check: the inbound SHM shard
+    // (SetShardParked -> consumer_parked_, for client submits) AND this worker's
+    // lane (SetActive(false), for intra-runtime lane pushes + completion
+    // event-queue emplaces). The seq_cst fence between the publish and the
+    // re-check makes it a Dekker StoreLoad: a producer that pushes THEN loads
+    // the flag either sees us parked (and signals) or we see its task here (and
+    // skip the park). A residual miss self-heals within max_sleep (<=50ms) — the
+    // worker re-polls unconditionally — so gating can cost bounded latency but
+    // never a lost-wakeup hang (which is why the earlier gated attempt, made
+    // before the max_sleep cap existed, could hang and this one cannot).
+    TaskLane *park_lane = assigned_lane_.load(std::memory_order_acquire);
+    EventQueue *park_eq = event_queue_.load(std::memory_order_acquire);
+    if (park_lane) park_lane->SetActive(false);
     CLIO_IPC->SetShardParked(worker_id_, true);
-    if (!CLIO_IPC->ShardEmpty(worker_id_)) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    bool late_work = false;
+    if (park_lane && !park_lane->Empty()) late_work = true;
+    if (!late_work && park_eq && !park_eq->Empty()) late_work = true;
+    if (!late_work) {
+      std::lock_guard<std::mutex> lk(park_mtx_);
+      for (EventQueue *aq : adopted_event_queues_) {
+        if (aq && !aq->Empty()) { late_work = true; break; }
+      }
+    }
+    if (!late_work && !CLIO_IPC->ShardEmpty(worker_id_)) late_work = true;
+    if (late_work) {
+      if (park_lane) park_lane->SetActive(true);
       CLIO_IPC->SetShardParked(worker_id_, false);
-      return;  // a request arrived during/before the park setup — go drain it
+      return;  // a task landed during park setup — go drain it
     }
     // Wait for signal using EventManager
     int nfds = event_manager_.Wait(timeout_us);
+    if (park_lane) park_lane->SetActive(true);
     CLIO_IPC->SetShardParked(worker_id_, false);
 
     if (nfds == 0) {

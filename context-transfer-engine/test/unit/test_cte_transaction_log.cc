@@ -177,6 +177,38 @@ TEST_CASE("TransactionLog - ClearBlob DelBlob roundtrip", "[cte][txnlog]") {
   TxnRemove(path);
 }
 
+TEST_CASE("TransactionLog - SetBlobTransform roundtrip", "[cte][txnlog]") {
+  // issue #818: the record that persists a blob's transform mark between the
+  // put that set it and the next metadata flush.
+  std::string path = TxnTempFile("txn_set_transform");
+  TxnRemove(path);
+
+  TransactionLog log;
+  log.Open(path, 4096);
+
+  TxnSetBlobTransform txn;
+  txn.tag_major_ = 21;
+  txn.tag_minor_ = 22;
+  txn.blob_name_ = "compressed_blob";
+  txn.transform_flags_ = 0x3;  // kBlobTransformed | kBlobTransformCompressed
+  log.Log(TxnType::kSetBlobTransform, txn);
+  log.Sync();
+
+  auto entries = log.Load();
+  REQUIRE(entries.size() == 1);
+  REQUIRE(entries[0].first == TxnType::kSetBlobTransform);
+
+  TxnSetBlobTransform out =
+      TransactionLog::DeserializeSetBlobTransform(entries[0].second);
+  REQUIRE(out.tag_major_ == 21);
+  REQUIRE(out.tag_minor_ == 22);
+  REQUIRE(out.blob_name_ == "compressed_blob");
+  REQUIRE(out.transform_flags_ == 0x3);
+
+  log.Close();
+  TxnRemove(path);
+}
+
 TEST_CASE("TransactionLog - CreateTag DelTag roundtrip", "[cte][txnlog]") {
   std::string path = TxnTempFile("txn_tags");
   TxnRemove(path);

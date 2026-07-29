@@ -25,6 +25,7 @@
 #include "../runtime_server.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -61,7 +62,18 @@ TEST_CASE("DaemonDetachedSpawn - transport initializes without a console (#721)"
   // Spawn the daemon with NO controlling console (the #721 failure mode).
   test::RuntimeServer server;
   REQUIRE(server.Start(kPort, "127.0.0.1", /*ephemeral=*/true, /*detached=*/true));
-  REQUIRE(server.WaitForReady());
+  const bool ready = server.WaitForReady();
+  if (!ready) {
+    // Intermittent windows-only failure mode (issue #848): the daemon dies
+    // during startup and WaitForReady returns fast via its IsRunning check.
+    // A bare REQUIRE leaves nothing to diagnose in CI, so dump the daemon's
+    // captured output and liveness before failing.
+    std::printf(
+        "[detached-spawn] daemon not ready (IsRunning=%d); daemon log "
+        "follows:\n----\n%s\n----\n",
+        static_cast<int>(server.IsRunning()), ReadWholeFile(log_path).c_str());
+  }
+  REQUIRE(ready);
 
   // Connect a TCP client: its DEALER must reach the daemon's ROUTER (the socket
   // that WSAStartup failure left dead). Bound the wait so a dead transport fails

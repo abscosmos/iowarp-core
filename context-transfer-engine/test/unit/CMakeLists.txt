@@ -74,6 +74,11 @@ add_executable(test_reorganize_blob
     test_reorganize_blob.cc
 )
 
+# Score-driven capacity eviction (Method::kEvict) API tests
+add_executable(test_evict
+    test_evict.cc
+)
+
 # Internal data organizer (issue #738): factory/frecency-score/config units
 # plus the end-to-end periodic DynamicReorganize promote/demote flow.
 add_executable(test_data_organizer
@@ -99,6 +104,10 @@ add_executable(test_concurrent_io_stress
 # Same-blob write-race regression (#680 / xfstests generic/074). Many threads
 # write disjoint regions of ONE shared blob; the per-blob write token must keep
 # each region intact.
+add_executable(test_wakeup_never_miss
+    test_wakeup_never_miss.cc
+)
+
 add_executable(test_concurrent_same_blob
     test_concurrent_same_blob.cc
 )
@@ -331,6 +340,18 @@ target_link_libraries(test_reorganize_blob
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
 
+# Link test_evict - using simple_test.h framework (NOT Catch2)
+target_link_libraries(test_evict
+    clio_cte_core_runtime         # CTE core runtime library
+    clio_cte_core_client          # CTE core client library
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
+    ctp::cxx                    # ClioCtp library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
 # Link test_data_organizer - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_data_organizer
     clio_cte_core_runtime         # CTE core runtime library
@@ -380,6 +401,21 @@ target_link_libraries(test_concurrent_io_stress
     ${CMAKE_THREAD_LIBS_INIT}
 )
 target_include_directories(test_concurrent_io_stress PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+# Link test_wakeup_never_miss (gated signalling park/wake race) - same deps.
+target_link_libraries(test_wakeup_never_miss
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+target_include_directories(test_wakeup_never_miss PRIVATE
     ${CMAKE_SOURCE_DIR}/context-runtime/test
 )
 
@@ -752,6 +788,21 @@ set_tests_properties(
 # the environment. 8 threads x 100 iters still races ~800 concurrent same-blob
 # extends, which is what detects the corruption; the 1500-iter soak is a local
 # knob (override SAME_BLOB_ITERS/SAME_BLOB_THREADS for a heavier run).
+# Targeted never-miss-wakeup regression (gated producer->worker signalling).
+# Cold-submits after every worker parks; a missed wake shows as the ~50ms
+# max_sleep self-heal latency signature on nearly every op (budgeted assert),
+# and a lost-wake hang trips the timeout. CI pins a lighter iteration count;
+# the 800-iter soak is the local default.
+add_test(NAME cr_wakeup_never_miss
+    COMMAND test_wakeup_never_miss)
+set_tests_properties(
+    cr_wakeup_never_miss
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "regression;wakeup;runtime"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;WAKEUP_ITERS=400"
+)
+
 add_test(NAME cte_concurrent_same_blob_all
     COMMAND test_concurrent_same_blob)
 
@@ -812,6 +863,18 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout
         LABELS "unit;reorganize;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
+# Add score-driven eviction tests (Method::kEvict)
+add_test(NAME cte_evict
+    COMMAND test_evict)
+
+set_tests_properties(
+    cte_evict
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;evict;cte"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
@@ -1058,7 +1121,7 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # Install Targets
 # ------------------------------------------------------------------------------
-set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob test_data_organizer test_io_emulation)
+set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob test_evict test_data_organizer test_io_emulation)
 # (The legacy test_cte_gpu_coroutine / test_gpu_core / test_gpu_create targets
 # and their ctest registrations were removed along with the GPU runtime. CTE
 # GPU coverage now lives in test_cte_devmem_putget (cte_devmem_putget_cuda).)
@@ -1283,6 +1346,117 @@ set_tests_properties(cfs_shm_read PROPERTIES
     RESOURCE_LOCK "clio_runtime_port"
     TIMEOUT 180
     LABELS "unit;cte;cfs;msan_skip")
+endif()  # UNIX
+
+# Private-memory AsyncGetBlob (issue #823). UNIX-only because the "separate"
+# configuration forks a real clio_run daemon (RuntimeServer / unistd.h), the
+# same shape the cfs_shm_read test uses. The two ctest entries below run the
+# SAME binary in the two runtime configurations the issue calls for: inline
+# (co-located runtime -> direct write into private memory) and separate (pure
+# client -> SHM staging + PostWait copy).
+if(UNIX)
+add_executable(test_getblob_priv
+    test_getblob_priv.cc
+)
+
+target_include_directories(test_getblob_priv PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_compile_definitions(test_getblob_priv PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
+target_link_libraries(test_getblob_priv
+    clio_cte_core_client
+    # Config helpers used by the client live in the runtime library; keep it
+    # after the client on the link line (see the cfs_shm_read note above).
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# The co-located (inline) runtime dlopens the chimods from CLIO_REPO_PATH; the
+# separate configuration forks clio_run. Both need the runtime modules built.
+add_dependencies(test_getblob_priv
+    clio_run
+    clio_cte_core_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+
+set(_getblob_priv_env
+    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
+if(APPLE)
+  string(APPEND _getblob_priv_env ";CLIO_IPC_MODE=ipc")
+endif()
+
+# Inline: this process starts the runtime co-located (direct-write path).
+add_test(NAME cte_getblob_priv_inline
+    COMMAND test_getblob_priv
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cte_getblob_priv_inline PROPERTIES
+    ENVIRONMENT "${_getblob_priv_env}"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 120
+    LABELS "unit;core;cte;msan_skip")
+
+# Separate: forks a real daemon and attaches as a pure client (staging path).
+add_test(NAME cte_getblob_priv_separate
+    COMMAND test_getblob_priv
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cte_getblob_priv_separate PROPERTIES
+    ENVIRONMENT "${_getblob_priv_env};CLIO_GETBLOB_PRIV_MODE=separate"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 180
+    LABELS "unit;core;cte;msan_skip")
+
+# Write-side mirror (issue #830): private-memory AsyncPutBlob. Same two
+# configurations as the getblob_priv pair above — inline (co-located runtime,
+# zero-copy FromRaw write) and separate (pure client, TASK_DATA_OWNER staging).
+add_executable(test_putblob_priv
+    test_putblob_priv.cc
+)
+
+target_include_directories(test_putblob_priv PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_compile_definitions(test_putblob_priv PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
+target_link_libraries(test_putblob_priv
+    clio_cte_core_client
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_dependencies(test_putblob_priv
+    clio_run
+    clio_cte_core_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+
+add_test(NAME cte_putblob_priv_inline
+    COMMAND test_putblob_priv
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cte_putblob_priv_inline PROPERTIES
+    ENVIRONMENT "${_getblob_priv_env}"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 120
+    LABELS "unit;core;cte;msan_skip")
+
+add_test(NAME cte_putblob_priv_separate
+    COMMAND test_putblob_priv
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cte_putblob_priv_separate PROPERTIES
+    ENVIRONMENT "${_getblob_priv_env};CLIO_PUTBLOB_PRIV_MODE=separate"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 180
+    LABELS "unit;core;cte;msan_skip")
 endif()  # UNIX
 
 add_executable(test_cte_gpu_metadata_cache

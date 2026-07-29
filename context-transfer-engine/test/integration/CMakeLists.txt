@@ -4,6 +4,10 @@ cmake_minimum_required(VERSION 3.10)
 # Restart integration test (no Docker required)
 add_subdirectory(restart)
 
+# Multi-node GPU blob exchange (no Docker: driven by a batch script on a real
+# multi-node GPU allocation). Self-gates on CLIO_CORE_ENABLE_MPI + _CUDA.
+add_subdirectory(xnode_gpu)
+
 # Distributed integration tests require Docker
 if(CLIO_CORE_ENABLE_DOCKER_CI)
     message(STATUS "CTE integration tests enabled (Docker CI)")

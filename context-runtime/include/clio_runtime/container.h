@@ -239,6 +239,33 @@ class Container {
   }
 
   /**
+   * OPT-IN inline (same-thread) execution for pure in-memory methods.
+   *
+   * A caller that is ALREADY on a worker thread and holds an in-process
+   * container may invoke this instead of submitting a task, skipping the
+   * whole enqueue -> other worker -> event-queue-completion round trip
+   * (~20us). Only a method that is synchronous (no I/O, no co_await, no
+   * suspension) and safe to run on ANY worker thread may be wired up here;
+   * everything else must keep returning false so the caller falls back to
+   * the normal task path. First user: bdev kAllocateBlocks, a pure block-
+   * allocator call that was costing a full task round trip per fresh-blob
+   * PutBlob (the dominant small-write cost: 4 KiB Put d64 39k -> 91k IOPS
+   * when allocation is skipped entirely).
+   *
+   * @param method  The module's method id being requested inline.
+   * @param in      Method-specific input (documented at the override).
+   * @param out     Method-specific output (documented at the override).
+   * @return true if the method was executed inline (out is valid);
+   *         false if unsupported here — caller must submit the task instead.
+   */
+  virtual bool InlineOp(u32 method, void *in, void *out) {
+    (void)method;
+    (void)in;
+    (void)out;
+    return false;
+  }
+
+  /**
    * Predict CPU time: a * (compute + 1).
    * @param method_id Method being executed
    * @param stat Task statistics from GetTaskStats()
@@ -351,26 +378,6 @@ class Container {
    */
   virtual TaskResume Run(u32 method,
                          clio::run::shared_ptr<Task> task_ptr) = 0;
-
-  /**
-   * Fix up POD bytewise-copied tasks (clio::run::priv::string SSO data_
-   * pointers, etc.) before dispatching Run. Called by the GPU2CPU pop
-   * path when the kernel's task was in kDeviceMem and the worker had
-   * to D2H-copy the POD bytes into a host scratch buffer — at that
-   * point any embedded `data_` pointers still reference the original
-   * device buffer offsets and must be re-pointed at the scratch copy.
-   *
-   * Default no-op for chimods whose tasks are already trivially
-   * relocatable (no SSO strings, no SVO vectors). Each chimod that
-   * has SSO/SVO members should override and dispatch per method to
-   * the per-task `FixupAfterCopy()`.
-   */
-  virtual void FixupAfterCopy(u32 method,
-                              clio::run::shared_ptr<Task> &task_ptr) {
-    (void)method;
-    (void)task_ptr;
-  }
-
 
   /**
    * Get remaining work count for this container - PURE VIRTUAL
