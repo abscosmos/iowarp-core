@@ -2005,6 +2005,22 @@ clio::run::TaskResume Runtime::RecoverContainers(
     // Only dest node creates the container
     if (static_cast<clio::run::u64>(ra.dest_node_id_) != self_node_id) continue;
 
+    // Idempotence guard (issue #856): a Broadcast task executes once per
+    // LOCAL container of the pool, and after a prior recovery a survivor
+    // hosts more than one admin container — so this handler runs multiple
+    // times with the same assignment list. Re-creating and re-registering an
+    // already-recovered container constructs a second module instance and
+    // drops the first mid-use (the free(): invalid pointer aborts that kill
+    // the new leader during leader-election). Skip assignments that are
+    // already satisfied locally.
+    if (pool_manager->GetContainer(ra.pool_id_, ra.container_id_)) {
+      HLOG(kInfo,
+           "Recovery: container {} for pool {} already present locally; "
+           "skipping duplicate recovery",
+           ra.container_id_, ra.pool_name_);
+      continue;
+    }
+
     HLOG(kInfo, "Recovery: Creating container {} for pool {} ({})",
          ra.container_id_, ra.pool_name_, ra.chimod_name_);
     clio::run::DynamicContainer container(ra.chimod_name_, ra.pool_id_,
