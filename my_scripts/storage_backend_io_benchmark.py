@@ -35,13 +35,21 @@ from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.memory_management import (
-    AdHocMemoryAllocator,
     MemoryAllocatorInterface,
     MemoryFormat,
     MemoryObj,
     MemoryObjMetadata,
     TensorMemoryObj,
 )
+
+# AdHocMemoryAllocator moved to its own module on current LMCache main;
+# accept both locations so the benchmark runs against either.
+try:
+    from lmcache.v1.memory_management import AdHocMemoryAllocator
+except ImportError:
+    from lmcache.v1.memory_allocators.ad_hoc_memory_allocator import (
+        AdHocMemoryAllocator,
+    )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
