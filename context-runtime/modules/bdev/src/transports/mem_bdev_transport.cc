@@ -8,7 +8,9 @@
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <clio_runtime/bdev/bdev_runtime.h>
+#include <clio_ctp/util/config_parse.h>
 #include <clio_ctp/util/gpu_api.h>
+#include <chrono>
 #include <cstdlib>
 
 namespace clio::run::bdev {
@@ -34,6 +36,43 @@ bool MemBdevTransport::Init(const CreateParams& params,
   // exactly as before on the private heap; only the client fast path is lost.
   if (bdev_type_ == BdevType::kRam && runtime != nullptr) {
     InitShmBacking(runtime->pool_id_);
+  }
+
+  // CLIO_PREFAULT: pre-fault the RAM segment at init instead of (or ahead of)
+  // the incremental allocation-time population. "0" means the WHOLE mapping;
+  // any other value is a size string (ConfigParse::ParseSize, e.g. "512MB",
+  // "4GB") pre-faulting that prefix, clamped to the mapping. Unset keeps the
+  // default: pages are populated one populate_unit at a time as allocations
+  // cross the watermark.
+  //
+  // This trades memory for cold-write latency EXPLICITLY: whatever is
+  // pre-faulted is committed RAM immediately, so "0" on a 16GB tier commits
+  // 16GB at compose. The populated watermark starts past the pre-faulted
+  // prefix, so incremental population resumes seamlessly beyond it.
+  if (shm_backed_ && shm_base_ != nullptr) {
+    const char *prefault = std::getenv("CLIO_PREFAULT");
+    if (prefault != nullptr && *prefault != '\0') {
+      clio::run::u64 want;
+      if (std::string(prefault) == "0") {
+        want = shm_usable_;
+      } else {
+        want = std::min<clio::run::u64>(
+            ctp::ConfigParse::ParseSize(prefault), shm_usable_);
+      }
+      if (want > 0) {
+        auto begin = std::chrono::steady_clock::now();
+        ctp::SystemInfo::BulkFault(shm_base_, static_cast<size_t>(want));
+        populated_bytes_.store(want, std::memory_order_release);
+        auto ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - begin)
+                      .count();
+        HLOG(kInfo,
+             "RAM bdev '{}': CLIO_PREFAULT={} pre-faulted {} of {} bytes in "
+             "{} ms",
+             shm_name_, prefault, want, shm_usable_,
+             static_cast<clio::run::u64>(ms));
+      }
+    }
   }
 
   return true;
