@@ -81,3 +81,29 @@ endif()
 
 # NOTE: Compression benchmark (clio_cte_compress_bench) has been moved to
 # context-transfer-engine/compressor/test/
+
+# YCSB JNI binding (issue #862): thin shim behind site.ycsb.db.ClioClient.
+# Built only when JNI headers are present so plain builds don't grow a Java
+# dependency; the Java half lives in benchmark/ycsb/ClioClient.java and is
+# compiled with javac against the YCSB core jar at benchmark time.
+# find_path instead of find_package(JNI): FindJNI refuses headless JDKs
+# (no AWT), and a loadable JNI library needs only jni.h — the JVM resolves
+# its own symbols at System.loadLibrary time.
+find_path(CLIO_JNI_INCLUDE_DIR jni.h
+  HINTS $ENV{JAVA_HOME}/include /usr/lib/jvm/default-java/include)
+if(CLIO_JNI_INCLUDE_DIR)
+  message(STATUS "YCSB JNI binding enabled (jni.h at ${CLIO_JNI_INCLUDE_DIR})")
+  add_library(clio_ycsb_jni SHARED
+    ycsb/clio_ycsb_jni.cc
+  )
+  target_include_directories(clio_ycsb_jni PRIVATE
+    ${CLIO_JNI_INCLUDE_DIR} ${CLIO_JNI_INCLUDE_DIR}/linux)
+  target_link_libraries(clio_ycsb_jni
+    clio::cte::core_client
+    clio::run::cxx
+  )
+  target_compile_features(clio_ycsb_jni PRIVATE cxx_std_17)
+  install(TARGETS clio_ycsb_jni
+    LIBRARY DESTINATION bin
+  )
+endif()
