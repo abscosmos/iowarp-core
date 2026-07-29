@@ -196,9 +196,11 @@ class LMCacheStore {
   /**
    * Fetch byte ranges from multiple blobs into caller-owned byte buffers.
    *
-   * When CLIO_LMCACHE_DIRECT_READ is enabled during Init, a single-host
-   * in-process local runtime writes directly to destination buffers. The
-   * default and all other runtime/routing modes use shared-memory staging.
+   * Uses the CTE private-memory get (issue #823) on every path: a co-located
+   * runtime reads directly into the destination buffers (and shared-cache
+   * hits are served with zero IPC); a separate-process client is staged
+   * internally by the CTE. CLIO_LMCACHE_DIRECT_READ is no longer consulted —
+   * the direct behavior is always on where it is safe.
    *
    * @param blob_names CTE blob names.
    * @param offsets Per-blob byte offsets.
