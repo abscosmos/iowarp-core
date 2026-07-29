@@ -518,7 +518,16 @@ TEST_CASE("ReorganizeBlob - Pipelined reads survive extent reuse (#753)",
   // frees. Both are load-bearing: with a small victim or an empty tier the
   // pre-fix race window is missed and freed extents keep stale-but-correct
   // bytes, hiding the bug.
-  constexpr clio::run::u64 kVictimSize = 8 * 1024 * 1024;
+  // Under CLIO_FORCE_NET every put/get is a ZMQ loopback round trip (~ms on
+  // Windows CI), so the full 8MB/128-chunk geometry blows the 300s+ ctest
+  // budget on the slowest runners. The reader-pin logic under test is
+  // transport-independent — shrink the geometry, keep the shape.
+  const bool kForceNet = []() {
+    const char *e = std::getenv("CLIO_FORCE_NET");
+    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+  }();
+  const clio::run::u64 kVictimSize =
+      kForceNet ? 2 * 1024 * 1024 : 8 * 1024 * 1024;
   // ONE fully-armed round. Repeating the near-full churn cycle accumulates
   // tier capacity-accounting drift until ReorganizeBlob's re-place fails at
   // every score and takes its triple-failure exit — which LOSES the blob
@@ -526,7 +535,7 @@ TEST_CASE("ReorganizeBlob - Pipelined reads survive extent reuse (#753)",
   // tracked separately; this test's job is the reader-vs-reclaim race, and
   // round 0 arms it fully (fresh tiers, zero slack, mid-read clear).
   constexpr int kRounds = 1;
-  constexpr int kDepth = 4;   // pipelined 8MB reads kept in flight
+  const int kDepth = kForceNet ? 2 : 4;  // pipelined victim-size reads in flight
   // Upper bound on fill blobs; the loop below stops at the tier's ACTUAL
   // remaining capacity instead of assuming it (earlier cases in this binary —
   // and their force_net variants — leave tier residue that shifts the number).
@@ -884,8 +893,14 @@ TEST_CASE("ReorganizeBlob - DelBlob under pipelined reads never yields garbage (
   const std::string blob_name = "race_753_del_blob";
 
   // One round, for the same capacity-drift reason as the sibling test above.
+  // Depth shrinks under CLIO_FORCE_NET for the same loopback-latency reason
+  // as the sibling test.
+  const bool kForceNet = []() {
+    const char *e = std::getenv("CLIO_FORCE_NET");
+    return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+  }();
   constexpr int kRounds = 1;
-  constexpr int kDepth = 6;
+  const int kDepth = kForceNet ? 3 : 6;
   constexpr int kChurn = 4;
 
   auto put_buffer = CLIO_IPC->AllocateBuffer(kBlobSize);

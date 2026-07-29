@@ -926,7 +926,11 @@ clio_add_force_net_test(NAME cte_tag_force_net
     COMMAND test_tag_operations ENVIRONMENT "${_cte_fn_env_data}")
 clio_add_force_net_test(NAME cte_query_force_net
     COMMAND test_query ENVIRONMENT "${_cte_fn_env_data}")
-clio_add_force_net_test(NAME cte_reorganize_force_net
+# 600s: the #753 race tests seed a multi-chunk victim + fill the disk tier,
+# and every one of those ops is a loopback net round trip in this variant —
+# the geometry already shrinks under CLIO_FORCE_NET (see the test), but the
+# slowest Windows runners still need headroom over the 300s default.
+clio_add_force_net_test(NAME cte_reorganize_force_net TIMEOUT 600
     COMMAND test_reorganize_blob ENVIRONMENT "${_cte_fn_env_data}")
 # Put(1MB)+DelBlob exercises the 1 MiB-bulk + free-to-partition net round-trip.
 # The full 1024-cycle regression is ~300 ms/cycle over the loopback net path
