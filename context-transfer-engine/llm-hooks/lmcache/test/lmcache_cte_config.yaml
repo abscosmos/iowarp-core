@@ -1,5 +1,6 @@
 # Content Transfer Engine (CTE) Configuration File
 runtime:
+    num_threads: 6
     queue_depth: 65536
 # RAM-only storage configuration for benchmark testing
 compose:
