@@ -65,7 +65,8 @@ class Client : public clio::run::ContainerClient {
       BdevType bdev_type, clio::run::u64 total_size = 0,
       clio::run::u32 io_depth = 32, clio::run::u32 alignment = 4096,
       const PerfMetrics* perf_metrics = nullptr,
-      const std::string& alloc_log_path = "") {
+      const std::string& alloc_log_path = "",
+      clio::run::u64 growth_unit = clio::run::u64(1) << 30) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     // CreateTask should always use admin pool, never the client's pool_id_
@@ -86,7 +87,7 @@ class Client : public clio::run::ContainerClient {
         this,             // Client pointer for PostWait
         // CreateParams arguments (perf_metrics is optional, defaults used if nullptr):
         bdev_type, total_size, io_depth, safe_alignment, perf_metrics,
-        alloc_log_path);
+        alloc_log_path, growth_unit);
 
     // Submit to runtime
     return ipc_manager->Send(task);

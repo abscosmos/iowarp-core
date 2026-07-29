@@ -432,6 +432,78 @@ TEST_CASE("bdev_block_allocation_4kb", "[bdev][allocate][4kb]") {
 }
 
 /**
+ * Regression for #858: the backing file of a file bdev must be allocated
+ * LAZILY, in growth-unit steps, instead of being truncated to the full
+ * capacity at create. (On NTFS a plain SetEndOfFile claims the clusters
+ * eagerly, so the old full-capacity truncate physically reserved the whole
+ * tier at compose time.)
+ */
+TEST_CASE("bdev_lazy_file_growth", "[bdev][file][growth]") {
+  BdevChimodFixture fixture;
+
+  if (fixture.getNumContainers() != 1) {
+    HLOG(kInfo, "bdev_lazy_file_growth: skipping (needs a local stat of the "
+                "backing file; num_containers != 1)");
+    return;
+  }
+
+  constexpr clio::run::u64 kCapacity = 64 * 1024 * 1024;   // 64MB device
+  constexpr clio::run::u64 kGrowthUnit = 8 * 1024 * 1024;  // 8MB steps
+
+  auto file_size_of = [](const std::string& path) -> clio::run::i64 {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return -1;
+    return static_cast<clio::run::i64>(st.st_size);
+  };
+
+  SECTION("Fresh file is backed one growth unit at a time") {
+    REQUIRE(g_initialized);
+    // Deliberately NO createTestFile: the lazy path is the fresh-file path.
+    clio::run::PoolId custom_pool_id(141, 0);
+    clio::run::bdev::Client client(custom_pool_id);
+    auto create_task = client.AsyncCreate(
+        clio::run::PoolQuery::Dynamic(), fixture.getTestFile(), custom_pool_id,
+        clio::run::bdev::BdevType::kFile, kCapacity, 32, 4096,
+        /*perf_metrics=*/nullptr, /*alloc_log_path=*/"", kGrowthUnit);
+    create_task.Wait();
+    REQUIRE(create_task->GetReturnCode() == 0);
+    client.pool_id_ = create_task->new_pool_id_;
+
+    // After create: exactly ONE growth unit on disk, not the full capacity.
+    REQUIRE(file_size_of(fixture.getTestFile()) ==
+            static_cast<clio::run::i64>(kGrowthUnit));
+
+    auto pool_query = clio::run::PoolQuery::DirectHash(0);
+
+    // An allocation inside the backed prefix must not grow the file.
+    auto alloc1 = client.AsyncAllocateBlocks(pool_query, 4 * 1024 * 1024);
+    alloc1.Wait();
+    REQUIRE(alloc1->return_code_ == 0);
+    REQUIRE(fixture.validateBlockAllocation(
+        std::vector<clio::run::bdev::Block>(alloc1->blocks_.begin(),
+                                            alloc1->blocks_.end()),
+        4 * 1024 * 1024));
+    REQUIRE(file_size_of(fixture.getTestFile()) ==
+            static_cast<clio::run::i64>(kGrowthUnit));
+
+    // Crossing the frontier grows the file by whole growth units.
+    auto alloc2 = client.AsyncAllocateBlocks(pool_query, 8 * 1024 * 1024);
+    alloc2.Wait();
+    REQUIRE(alloc2->return_code_ == 0);
+    REQUIRE(file_size_of(fixture.getTestFile()) ==
+            static_cast<clio::run::i64>(2 * kGrowthUnit));
+
+    // Growth is capped at the device capacity, never past it.
+    auto alloc3 = client.AsyncAllocateBlocks(pool_query, 46 * 1024 * 1024);
+    alloc3.Wait();
+    REQUIRE(alloc3->return_code_ == 0);
+    clio::run::i64 final_size = file_size_of(fixture.getTestFile());
+    REQUIRE(final_size > static_cast<clio::run::i64>(2 * kGrowthUnit));
+    REQUIRE(final_size <= static_cast<clio::run::i64>(kCapacity));
+  }
+}
+
+/**
  * Regression for #798: alloc/free accounting must be alignment-symmetric.
  *
  * StandardBlockAllocator charged the caller's raw request on allocate but

@@ -164,6 +164,13 @@ struct CreateParams {
   // disabled (no file created), preserving pre-WAL behavior.
   std::string alloc_log_path_;
 
+  // #858: file-backed devices grow the backing file lazily in units of this
+  // many bytes instead of truncating the full capacity at compose (on NTFS a
+  // plain SetEndOfFile claims the clusters eagerly, so the old full-capacity
+  // truncate reserved the whole tier up front). Ignored by RAM/GPU
+  // transports. YAML key: growth_unit (size string, e.g. "1GB").
+  clio::run::u64 growth_unit_ = clio::run::u64(1) << 30;  // 1 GiB default
+
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_bdev";
 
@@ -206,12 +213,14 @@ struct CreateParams {
   // Constructor with optional performance metrics (as last parameter)
   CreateParams(BdevType bdev_type, clio::run::u64 total_size, clio::run::u32 io_depth,
                clio::run::u32 alignment, const PerfMetrics *perf_metrics = nullptr,
-               const std::string &alloc_log_path = "")
+               const std::string &alloc_log_path = "",
+               clio::run::u64 growth_unit = clio::run::u64(1) << 30)
       : bdev_type_(bdev_type),
         total_size_(total_size),
         io_depth_(io_depth),
         alignment_(alignment),
-        alloc_log_path_(alloc_log_path) {
+        alloc_log_path_(alloc_log_path),
+        growth_unit_(growth_unit) {
     // Set performance metrics (use provided metrics or defaults)
     if (perf_metrics != nullptr) {
       perf_metrics_ = *perf_metrics;
@@ -241,7 +250,7 @@ struct CreateParams {
   template <class Archive>
   void serialize(Archive &ar) {
     ar(bdev_type_, total_size_, io_depth_, alignment_, perf_metrics_,
-       persistence_level_, alloc_log_path_);
+       persistence_level_, alloc_log_path_, growth_unit_);
   }
 
   /**
@@ -286,6 +295,12 @@ struct CreateParams {
     // Load alignment (optional)
     if (config["alignment"]) {
       alignment_ = config["alignment"].as<clio::run::u32>();
+    }
+
+    // Load lazy-growth unit for file-backed devices (optional, default 1GB)
+    if (config["growth_unit"]) {
+      std::string growth_str = config["growth_unit"].as<std::string>();
+      growth_unit_ = ctp::ConfigParse::ParseSize(growth_str);
     }
 
     // Load performance metrics (optional)
