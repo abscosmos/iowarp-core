@@ -55,7 +55,12 @@ struct LMCacheStoreTestAccess;
  */
 class LMCacheStore {
  public:
-  static constexpr std::size_t kDefaultMaxInflight = 16;
+  // Async operations submitted before the window is drained. The private
+  // put/get APIs (#823/#830) keep no per-op staging in the co-located runtime
+  // path, so a deep window costs only task slots there; it also gives the
+  // runtime's task batching (CLIO_BATCH_LANE/CLIO_CTE_BATCHING) a burst deep
+  // enough to actually merge.
+  static constexpr std::size_t kDefaultMaxInflight = 256;
 
   /**
    * Parsed metadata for a CLIOKV1 LMCache record.

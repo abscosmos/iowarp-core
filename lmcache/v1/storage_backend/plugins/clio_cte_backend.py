@@ -69,7 +69,10 @@ class ClioCTEBackend(StoragePluginInterface):
         tag_name = extra_config.get("clio_cte.tag_name", "lmcache_kv")
         config_path = extra_config.get("clio_cte.config_path", "")
         pool_query_mode = extra_config.get("clio_cte.pool_query_mode", "local")
-        self.max_inflight = int(extra_config.get("clio_cte.max_inflight", 16))
+        # Up to 256 async CTE ops in flight before the window drains — matches
+        # LMCacheStore::kDefaultMaxInflight and gives the runtime's task
+        # batching a burst deep enough to merge.
+        self.max_inflight = int(extra_config.get("clio_cte.max_inflight", 256))
 
         self.store = clio_cte_lmcache_ext.LMCacheStore()
         if not self.store.Init(config_path, tag_name, pool_query_mode):

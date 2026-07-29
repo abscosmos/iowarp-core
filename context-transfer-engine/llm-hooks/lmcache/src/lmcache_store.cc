@@ -46,6 +46,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "clio_ctp/data_structures/ipc/ring_buffer.h"
+#include "clio_ctp/memory/allocator/malloc_allocator.h"
 #include "clio_ctp/util/logging.h"
 #include "clio_runtime/manager.h"
 
@@ -299,27 +301,92 @@ std::optional<LMCacheStore::RecordInfo> ParseRecordHeader(
 }
 
 struct PutInFlight {
-  std::size_t index;
+  std::size_t index = 0;
   clio::run::Future<clio::cte::core::PutBlobTask> future;
 };
 
 struct SizeInFlight {
-  std::size_t index;
+  std::size_t index = 0;
   clio::run::Future<clio::cte::core::GetBlobSizeTask> future;
 };
 
 struct GetInFlight {
-  std::size_t index;
+  std::size_t index = 0;
   clio::run::Future<clio::cte::core::GetBlobTask> future;
 };
 
 struct RecordPutInFlight {
-  std::size_t index;
+  std::size_t index = 0;
   // Stable header storage: with the co-located runtime the private-memory put
   // reads straight from these bytes, so they must outlive the Wait().
-  std::unique_ptr<std::array<char, kRecordHeaderSize>> header;
+  // shared_ptr (not unique_ptr) because the flight queue's Peek copies.
+  std::shared_ptr<std::array<char, kRecordHeaderSize>> header;
   clio::run::Future<clio::cte::core::PutBlobTask> future;
 };
+
+/**
+ * Unbounded in-flight window: a growable single-thread SPSC ring
+ * (ctp::ipc::ext_ring_buffer — Push doubles the ring instead of failing or
+ * blocking). The submitting thread is both producer and consumer, so no
+ * locking is involved. Submission NEVER stalls on a window boundary; instead
+ * completed futures are harvested opportunistically from the front after each
+ * submit (ReapInFlight) and the remainder is waited at the end of the batch
+ * (DrainInFlight).
+ */
+template <typename FlightT>
+using FlightQueue =
+    ctp::ipc::ext_ring_buffer<FlightT, ctp::ipc::MallocAllocator>;
+
+/**
+ * Pop every already-complete future from the FRONT of the window, stopping at
+ * the first incomplete one. Wait() is still invoked on each completed future
+ * before it is handed to `done` — on an already-complete future it returns
+ * immediately, but it is what runs the task's PostWait (the client-mode
+ * private get copies its staged bytes into the caller buffer there).
+ *
+ * @param window In-flight queue (oldest submission at the front).
+ * @param operation Operation name for Wait diagnostics.
+ * @param done Callback receiving each completed flight entry.
+ */
+template <typename FlightT, typename DoneFn>
+void ReapInFlight(FlightQueue<FlightT> *window, const char *operation,
+                  DoneFn &&done) {
+  FlightT probe;
+  while (window->Peek(window->GetHead(), probe)) {
+    if (!probe.future.IsComplete()) {
+      return;  // head still running: everything behind it stays queued
+    }
+    FlightT item;
+    if (!window->Pop(item)) {
+      return;
+    }
+    WaitForFuture(&item.future, operation);
+    done(item);
+  }
+}
+
+/**
+ * Blocking end-of-batch drain: wait every remaining in-flight future in
+ * submission order and hand each to `done`.
+ *
+ * @param window In-flight queue.
+ * @param operation Operation name for Wait diagnostics.
+ * @param done Callback receiving each completed flight entry.
+ * @param profile Optional profile accumulator (wait time).
+ */
+template <typename FlightT, typename DoneFn>
+void DrainInFlight(FlightQueue<FlightT> *window, const char *operation,
+                   DoneFn &&done, BatchProfile *profile) {
+  FlightT item;
+  while (window->Pop(item)) {
+    const auto begin = Clock::now();
+    WaitForFuture(&item.future, operation);
+    if (profile != nullptr) {
+      profile->wait += Clock::now() - begin;
+    }
+    done(item);
+  }
+}
 
 /**
  * Build private-memory segments for one CLIOKV1 record (issue #830).
@@ -346,130 +413,6 @@ MakeRecordSegments(std::array<char, kRecordHeaderSize> *header,
   segments.emplace_back(kRecordHeaderSize + metadata.size(), payload_size,
                         const_cast<char *>(static_cast<const char *>(payload)));
   return segments;
-}
-
-/**
- * Wait for pending private-memory put operations.
- *
- * @param window Pending put futures.
- * @param results Per-item status output.
- */
-void DrainPutWindow(std::vector<PutInFlight> *window,
-                    std::vector<bool> *results, BatchProfile *profile) {
-  for (auto &item : *window) {
-    auto begin = Clock::now();
-    WaitForFuture(&item.future, "PutBlob");
-    if (profile != nullptr) {
-      profile->wait += Clock::now() - begin;
-    }
-    (*results)[item.index] = item.future->GetReturnCode() == 0;
-    if (profile != nullptr && (*results)[item.index]) {
-      ++profile->succeeded;
-    }
-  }
-  window->clear();
-}
-
-/**
- * Wait for pending size operations.
- *
- * @param window Pending size futures.
- * @param results Per-item size output.
- */
-void DrainSizeWindow(std::vector<SizeInFlight> *window,
-                     std::vector<std::optional<std::uint64_t>> *results,
-                     BatchProfile *profile) {
-  for (auto &item : *window) {
-    auto begin = Clock::now();
-    WaitForFuture(&item.future, "GetBlobSize");
-    if (profile != nullptr) {
-      profile->wait += Clock::now() - begin;
-    }
-    if (item.future->GetReturnCode() == 0) {
-      (*results)[item.index] = static_cast<std::uint64_t>(item.future->size_);
-      if (profile != nullptr) {
-        ++profile->succeeded;
-      }
-    }
-  }
-  window->clear();
-}
-
-/**
- * Wait for pending private-memory gets. The bytes land in the caller-owned
- * destination inside Wait() (issue #823: directly with a co-located runtime,
- * via the task's PostWait staging copy in client mode) — nothing to copy or
- * free here.
- *
- * @param window Pending get futures.
- * @param results Per-item status output.
- */
-void DrainGetWindow(std::vector<GetInFlight> *window,
-                    std::vector<bool> *results, BatchProfile *profile) {
-  for (auto &item : *window) {
-    auto begin = Clock::now();
-    WaitForFuture(&item.future, "GetBlob");
-    if (profile != nullptr) {
-      profile->wait += Clock::now() - begin;
-    }
-    (*results)[item.index] = item.future->GetReturnCode() == 0;
-    if (profile != nullptr && (*results)[item.index]) {
-      ++profile->succeeded;
-    }
-  }
-  window->clear();
-}
-
-/**
- * DrainGetWindow variant for GetMany: failed reads drop their pre-materialized
- * result vector.
- *
- * @param window Pending get futures.
- * @param results Per-item byte-vector output (pre-filled at submit time; the
- *        private get read directly into the vector's storage).
- */
-void DrainGetManyWindow(
-    std::vector<GetInFlight> *window,
-    std::vector<std::optional<std::vector<std::uint8_t>>> *results,
-    BatchProfile *profile) {
-  for (auto &item : *window) {
-    auto begin = Clock::now();
-    WaitForFuture(&item.future, "GetBlob");
-    if (profile != nullptr) {
-      profile->wait += Clock::now() - begin;
-    }
-    if (item.future->GetReturnCode() == 0) {
-      if (profile != nullptr) {
-        ++profile->succeeded;
-      }
-    } else {
-      (*results)[item.index].reset();
-    }
-  }
-  window->clear();
-}
-
-/**
- * Wait for pending record puts before releasing their stable header storage.
- *
- * @param window Pending record-put futures and header storage.
- * @param results Per-item status output.
- * @param profile Optional batch profile accumulator.
- */
-void DrainRecordPutWindow(std::vector<RecordPutInFlight> *window,
-                          std::vector<bool> *results, BatchProfile *profile) {
-  for (auto &item : *window) {
-    const auto begin = Clock::now();
-    WaitForFuture(&item.future, "PutBlobVectored");
-    if (profile != nullptr) {
-      profile->wait += Clock::now() - begin;
-    }
-    (*results)[item.index] = item.future->GetReturnCode() == 0;
-    if (profile != nullptr && (*results)[item.index]) {
-      ++profile->succeeded;
-    }
-  }
-  window->clear();
 }
 
 }  // namespace
@@ -568,13 +511,22 @@ std::vector<bool> LMCacheStore::PutMany(
     return results;
   }
 
-  max_inflight = NormalizeMaxInflight(max_inflight);
   const bool profile_enabled = ProfileEnabled();
   BatchProfile profile;
   profile.requested = blob_names.size();
-  std::vector<PutInFlight> window;
-  window.reserve(max_inflight);
+  // Unbounded window: submission never stalls; completed futures are reaped
+  // from the front after each submit. max_inflight is retained for API
+  // compatibility only (it seeds the ring's initial capacity).
+  FlightQueue<PutInFlight> window(CTP_MALLOC,
+                                  NormalizeMaxInflight(max_inflight));
   auto *cte_client = CLIO_CTE_CLIENT;
+  auto on_done = [&](const PutInFlight &item) {
+    const bool ok = item.future->GetReturnCode() == 0;
+    results[item.index] = ok;
+    if (profile_enabled && ok) {
+      ++profile.succeeded;
+    }
+  };
 
   for (std::size_t i = 0; i < blob_names.size(); ++i) {
     if (blob_names[i].empty() || payloads[i].empty()) {
@@ -594,20 +546,19 @@ std::vector<bool> LMCacheStore::PutMany(
       ++profile.submitted;
     }
     if (future.IsNull()) {
-      DrainPutWindow(&window, &results, profile_enabled ? &profile : nullptr);
+      DrainInFlight(&window, "PutBlob", on_done,
+                    profile_enabled ? &profile : nullptr);
       HLOG(kError,
            "LMCacheStore::PutMany failed to stage {} bytes for item {}",
            payloads[i].size(), i);
       throw std::bad_alloc();
     }
-    window.push_back({i, std::move(future)});
-
-    if (window.size() >= max_inflight) {
-      DrainPutWindow(&window, &results, profile_enabled ? &profile : nullptr);
-    }
+    window.Emplace(PutInFlight{i, std::move(future)});
+    ReapInFlight(&window, "PutBlob", on_done);
   }
 
-  DrainPutWindow(&window, &results, profile_enabled ? &profile : nullptr);
+  DrainInFlight(&window, "PutBlob", on_done,
+                profile_enabled ? &profile : nullptr);
   if (profile_enabled) {
     LogBatchProfile("PutMany", profile, max_inflight);
   }
@@ -633,13 +584,19 @@ std::vector<bool> LMCacheStore::PutManyRecords(
   // through one internal buffer in client mode. This replaces both the old
   // hand-rolled direct-pointer path (which was safe only for a co-located
   // single-host runtime) and the assemble-into-SHM fallback.
-  max_inflight = NormalizeMaxInflight(max_inflight);
   const bool profile_enabled = ProfileEnabled();
   BatchProfile profile;
   profile.requested = blob_names.size();
-  std::vector<RecordPutInFlight> window;
-  window.reserve(max_inflight);
+  FlightQueue<RecordPutInFlight> window(CTP_MALLOC,
+                                        NormalizeMaxInflight(max_inflight));
   auto *cte_client = CLIO_CTE_CLIENT;
+  auto on_done = [&](const RecordPutInFlight &item) {
+    const bool ok = item.future->GetReturnCode() == 0;
+    results[item.index] = ok;
+    if (profile_enabled && ok) {
+      ++profile.succeeded;
+    }
+  };
 
   try {
     for (std::size_t i = 0; i < blob_names.size(); ++i) {
@@ -652,7 +609,7 @@ std::vector<bool> LMCacheStore::PutManyRecords(
       if (!record_size.has_value()) {
         continue;
       }
-      auto header = std::make_unique<std::array<char, kRecordHeaderSize>>();
+      auto header = std::make_shared<std::array<char, kRecordHeaderSize>>();
       WriteRecordHeader(metadata_jsons[i].size(), payload_sizes[i],
                         header->data());
       auto segments = MakeRecordSegments(header.get(), metadata_jsons[i],
@@ -669,16 +626,14 @@ std::vector<bool> LMCacheStore::PutManyRecords(
       if (future.IsNull()) {
         continue;  // degenerate request or staging-allocation failure
       }
-      window.push_back({i, std::move(header), std::move(future)});
-      if (window.size() >= max_inflight) {
-        DrainRecordPutWindow(&window, &results,
-                             profile_enabled ? &profile : nullptr);
-      }
+      window.Emplace(
+          RecordPutInFlight{i, std::move(header), std::move(future)});
+      ReapInFlight(&window, "PutBlobVectored", on_done);
     }
-    DrainRecordPutWindow(&window, &results,
-                         profile_enabled ? &profile : nullptr);
+    DrainInFlight(&window, "PutBlobVectored", on_done,
+                  profile_enabled ? &profile : nullptr);
   } catch (...) {
-    DrainRecordPutWindow(&window, &results, nullptr);
+    DrainInFlight(&window, "PutBlobVectored", on_done, nullptr);
     throw;
   }
   if (profile_enabled) {
@@ -721,14 +676,22 @@ std::vector<std::optional<std::vector<std::uint8_t>>> LMCacheStore::GetMany(
     return results;
   }
 
-  max_inflight = NormalizeMaxInflight(max_inflight);
   const bool profile_enabled = ProfileEnabled();
   BatchProfile profile;
   profile.requested = blob_names.size();
   const auto sizes = SizeMany(blob_names, max_inflight);
-  std::vector<GetInFlight> window;
-  window.reserve(max_inflight);
+  FlightQueue<GetInFlight> window(CTP_MALLOC,
+                                  NormalizeMaxInflight(max_inflight));
   auto *cte_client = CLIO_CTE_CLIENT;
+  auto on_done = [&](const GetInFlight &item) {
+    if (item.future->GetReturnCode() == 0) {
+      if (profile_enabled) {
+        ++profile.succeeded;
+      }
+    } else {
+      results[item.index].reset();
+    }
+  };
 
   for (std::size_t i = 0; i < blob_names.size(); ++i) {
     if (blob_names[i].empty() || !sizes[i].has_value() || *sizes[i] == 0) {
@@ -738,7 +701,7 @@ std::vector<std::optional<std::vector<std::uint8_t>>> LMCacheStore::GetMany(
     // Materialize the result vector up front and read straight into it
     // (issue #823) — no SHM bounce buffer, no copy-out. The outer results
     // vector is pre-sized, so the element's storage is stable across the
-    // windowed waits below; failed reads drop it in DrainGetManyWindow.
+    // in-flight waits; failed reads drop it in on_done.
     auto begin = Clock::now();
     results[i].emplace(*sizes[i]);
     if (profile_enabled) {
@@ -757,15 +720,12 @@ std::vector<std::optional<std::vector<std::uint8_t>>> LMCacheStore::GetMany(
       results[i].reset();
       continue;
     }
-    window.push_back({i, std::move(future)});
-
-    if (window.size() >= max_inflight) {
-      DrainGetManyWindow(&window, &results,
-                         profile_enabled ? &profile : nullptr);
-    }
+    window.Emplace(GetInFlight{i, std::move(future)});
+    ReapInFlight(&window, "GetBlob", on_done);
   }
 
-  DrainGetManyWindow(&window, &results, profile_enabled ? &profile : nullptr);
+  DrainInFlight(&window, "GetBlob", on_done,
+                profile_enabled ? &profile : nullptr);
   if (profile_enabled) {
     LogBatchProfile("GetMany", profile, max_inflight);
   }
@@ -821,9 +781,16 @@ std::vector<bool> LMCacheStore::GetManyInto(
   const std::vector<std::optional<std::uint64_t>> sizes =
       known_blob_sizes.empty() ? SizeMany(blob_names, max_inflight)
                                : known_blob_sizes;
-  std::vector<GetInFlight> window;
-  window.reserve(max_inflight);
+  FlightQueue<GetInFlight> window(CTP_MALLOC,
+                                  NormalizeMaxInflight(max_inflight));
   auto *cte_client = CLIO_CTE_CLIENT;
+  auto on_done = [&](const GetInFlight &item) {
+    const bool ok = item.future->GetReturnCode() == 0;
+    results[item.index] = ok;
+    if (profile_enabled && ok) {
+      ++profile.succeeded;
+    }
+  };
 
   for (std::size_t i = 0; i < blob_names.size(); ++i) {
     if (blob_names[i].empty() || destinations[i] == nullptr ||
@@ -845,14 +812,12 @@ std::vector<bool> LMCacheStore::GetManyInto(
     if (future.IsNull()) {
       continue;
     }
-    window.push_back({i, std::move(future)});
-
-    if (window.size() >= max_inflight) {
-      DrainGetWindow(&window, &results, profile_enabled ? &profile : nullptr);
-    }
+    window.Emplace(GetInFlight{i, std::move(future)});
+    ReapInFlight(&window, "GetBlob", on_done);
   }
 
-  DrainGetWindow(&window, &results, profile_enabled ? &profile : nullptr);
+  DrainInFlight(&window, "GetBlob", on_done,
+                profile_enabled ? &profile : nullptr);
   if (profile_enabled) {
     LogBatchProfile("GetManyInto", profile, max_inflight);
   }
@@ -877,13 +842,19 @@ std::vector<bool> LMCacheStore::GetManyRangesInto(
   // buffers on every path. This replaces both the old CLIO_LMCACHE_DIRECT_READ
   // hand-rolled pointer path (safe only for a co-located single-host runtime)
   // and the SHM bounce-buffer fallback.
-  max_inflight = NormalizeMaxInflight(max_inflight);
   const bool profile_enabled = ProfileEnabled();
   BatchProfile profile;
   profile.requested = blob_names.size();
-  std::vector<GetInFlight> window;
-  window.reserve(max_inflight);
+  FlightQueue<GetInFlight> window(CTP_MALLOC,
+                                  NormalizeMaxInflight(max_inflight));
   auto *cte_client = CLIO_CTE_CLIENT;
+  auto on_done = [&](const GetInFlight &item) {
+    const bool ok = item.future->GetReturnCode() == 0;
+    results[item.index] = ok;
+    if (profile_enabled && ok) {
+      ++profile.succeeded;
+    }
+  };
 
   for (std::size_t i = 0; i < blob_names.size(); ++i) {
     if (blob_names[i].empty() || destinations[i] == nullptr || sizes[i] == 0 ||
@@ -903,14 +874,12 @@ std::vector<bool> LMCacheStore::GetManyRangesInto(
     if (future.IsNull()) {
       continue;
     }
-    window.push_back({i, std::move(future)});
-
-    if (window.size() >= max_inflight) {
-      DrainGetWindow(&window, &results, profile_enabled ? &profile : nullptr);
-    }
+    window.Emplace(GetInFlight{i, std::move(future)});
+    ReapInFlight(&window, "GetBlob", on_done);
   }
 
-  DrainGetWindow(&window, &results, profile_enabled ? &profile : nullptr);
+  DrainInFlight(&window, "GetBlob", on_done,
+                profile_enabled ? &profile : nullptr);
   if (profile_enabled) {
     LogBatchProfile("GetManyRangesInto", profile, max_inflight);
   }
@@ -1052,13 +1021,20 @@ std::vector<std::optional<std::uint64_t>> LMCacheStore::SizeMany(
     return results;
   }
 
-  max_inflight = NormalizeMaxInflight(max_inflight);
   const bool profile_enabled = ProfileEnabled();
   BatchProfile profile;
   profile.requested = blob_names.size();
-  std::vector<SizeInFlight> window;
-  window.reserve(max_inflight);
+  FlightQueue<SizeInFlight> window(CTP_MALLOC,
+                                   NormalizeMaxInflight(max_inflight));
   auto *cte_client = CLIO_CTE_CLIENT;
+  auto on_done = [&](const SizeInFlight &item) {
+    if (item.future->GetReturnCode() == 0) {
+      results[item.index] = static_cast<std::uint64_t>(item.future->size_);
+      if (profile_enabled) {
+        ++profile.succeeded;
+      }
+    }
+  };
 
   for (std::size_t i = 0; i < blob_names.size(); ++i) {
     if (blob_names[i].empty()) {
@@ -1072,14 +1048,12 @@ std::vector<std::optional<std::uint64_t>> LMCacheStore::SizeMany(
       profile.submit += Clock::now() - begin;
       ++profile.submitted;
     }
-    window.push_back({i, future});
-
-    if (window.size() >= max_inflight) {
-      DrainSizeWindow(&window, &results, profile_enabled ? &profile : nullptr);
-    }
+    window.Emplace(SizeInFlight{i, std::move(future)});
+    ReapInFlight(&window, "GetBlobSize", on_done);
   }
 
-  DrainSizeWindow(&window, &results, profile_enabled ? &profile : nullptr);
+  DrainInFlight(&window, "GetBlobSize", on_done,
+                profile_enabled ? &profile : nullptr);
   if (profile_enabled) {
     LogBatchProfile("SizeMany", profile, max_inflight);
   }
