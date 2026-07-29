@@ -97,7 +97,12 @@ if(CLIO_JNI_INCLUDE_DIR)
     ycsb/clio_ycsb_jni.cc
   )
   target_include_directories(clio_ycsb_jni PRIVATE
-    ${CLIO_JNI_INCLUDE_DIR} ${CLIO_JNI_INCLUDE_DIR}/linux)
+    ${CLIO_JNI_INCLUDE_DIR}
+    # jni.h includes the per-platform jni_md.h from a subdirectory; listing
+    # all three is harmless (nonexistent include dirs are ignored).
+    ${CLIO_JNI_INCLUDE_DIR}/linux
+    ${CLIO_JNI_INCLUDE_DIR}/darwin
+    ${CLIO_JNI_INCLUDE_DIR}/win32)
   target_link_libraries(clio_ycsb_jni
     clio::cte::core_client
     clio::run::cxx
