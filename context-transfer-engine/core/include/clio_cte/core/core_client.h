@@ -876,6 +876,52 @@ class Client : public clio::run::ContainerClient {
       fut = AsyncPutBlob(tag_id, blob_name, offset, size, priv_data, score,
                          context, flags, pool_query);
     }
+    DeferRegister(std::move(fut), tag_id, blob_name, size);
+    return 0;
+  }
+
+  /**
+   * Deferred PRIVATE-MEMORY VECTORED put: the vectored analog of
+   * AsyncPutBlobDefer, sharing the same registry, staging-exhaustion backoff,
+   * and buffer-lifetime contract (client mode stages every segment during this
+   * call; runtime mode reads the segment buffers until the put is awaited).
+   *
+   * @return 0 submitted; -1 degenerate request (no segments / zero total /
+   *         null segment source); -2 shared memory exhausted with nothing
+   *         left to await.
+   */
+  int AsyncPutBlobVectoredDefer(
+      const TagId &tag_id, const std::string &blob_name,
+      const std::vector<PrivBlobSegment> &segments, float score = -1.0f,
+      const Context &context = Context(), clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    clio::run::u64 total = 0;
+    for (const auto &seg : segments) {
+      if (seg.data_ == nullptr) {
+        return -1;
+      }
+      total += seg.size_;
+    }
+    if (total == 0) {
+      return -1;
+    }
+    auto fut = AsyncPutBlobVectored(tag_id, blob_name, segments, score, context,
+                                    flags, pool_query);
+    while (fut.IsNull()) {
+      if (!DeferAwaitOldest()) {
+        return -2;
+      }
+      fut = AsyncPutBlobVectored(tag_id, blob_name, segments, score, context,
+                                 flags, pool_query);
+    }
+    DeferRegister(std::move(fut), tag_id, blob_name, total);
+    return 0;
+  }
+
+  /** Register a submitted put's future in the defer registry. */
+  static void DeferRegister(clio::run::Future<PutBlobTask> fut,
+                            const TagId &tag_id, const std::string &blob_name,
+                            clio::run::u64 size) {
     DeferRegistry &reg = DeferRegistry::Get();
     std::string key = DeferKey(tag_id, blob_name);
     std::lock_guard<std::mutex> lk(reg.mtx_);
@@ -883,7 +929,6 @@ class Client : public clio::run::ContainerClient {
     reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
     reg.inflight_bytes_ += size;
     reg.per_key_[std::move(key)]++;
-    return 0;
   }
 
   /** Await every deferred put targeting (tag_id, blob_name). FIFO order, so

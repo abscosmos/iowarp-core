@@ -42,7 +42,6 @@
 #include <exception>
 #include <limits>
 #include <memory>
-#include <new>
 #include <stdexcept>
 #include <utility>
 
@@ -300,11 +299,6 @@ std::optional<LMCacheStore::RecordInfo> ParseRecordHeader(
   return info;
 }
 
-struct PutInFlight {
-  std::size_t index = 0;
-  clio::run::Future<clio::cte::core::PutBlobTask> future;
-};
-
 struct SizeInFlight {
   std::size_t index = 0;
   clio::run::Future<clio::cte::core::GetBlobSizeTask> future;
@@ -315,14 +309,59 @@ struct GetInFlight {
   clio::run::Future<clio::cte::core::GetBlobTask> future;
 };
 
-struct RecordPutInFlight {
-  std::size_t index = 0;
-  // Stable header storage: with the co-located runtime the private-memory put
-  // reads straight from these bytes, so they must outlive the Wait().
-  // shared_ptr (not unique_ptr) because the flight queue's Peek copies.
-  std::shared_ptr<std::array<char, kRecordHeaderSize>> header;
-  clio::run::Future<clio::cte::core::PutBlobTask> future;
-};
+/**
+ * End-of-batch barrier for deferred puts (issue #862).
+ *
+ * With a co-located runtime the deferred private-memory puts read the caller's
+ * buffers zero-copy until they complete, and every buffer a put batch hands to
+ * the CTE (payload strings, record headers, metadata) lives only for the
+ * duration of the store call — so this batch's puts must land before the call
+ * returns. Awaiting per key (rather than draining the whole process-wide
+ * registry to zero) waits on exactly this batch even while other threads keep
+ * submitting. In client mode the CTE stages every payload at submit time, so
+ * the puts stay deferred past the call and the registry's own
+ * staging-exhaustion backoff is the only flow control needed.
+ *
+ * @param tag_id Tag the batch wrote to.
+ * @param blob_names Batch blob names.
+ * @param accepted Per-blob submit status; only accepted puts are awaited.
+ * @param profile Optional profile accumulator (wait time).
+ */
+void AwaitBatchPuts(const clio::cte::core::TagId &tag_id,
+                    const std::vector<std::string> &blob_names,
+                    const std::vector<bool> &accepted, BatchProfile *profile) {
+  if (!CLIO_RUNTIME_MANAGER->IsRuntime()) {
+    return;
+  }
+  const auto begin = Clock::now();
+  for (std::size_t i = 0; i < blob_names.size(); ++i) {
+    if (accepted[i]) {
+      clio::cte::core::Client::AwaitPendingPuts(tag_id, blob_names[i]);
+    }
+  }
+  if (profile != nullptr) {
+    profile->wait += Clock::now() - begin;
+  }
+}
+
+/**
+ * Log deferred-put completion failures observed since `errors_before`.
+ *
+ * Deferred puts report completion failures through the CTE client's sticky
+ * error counter, not per operation; a failed put simply never publishes its
+ * blob, so later lookups miss and LMCache recomputes.
+ *
+ * @param operation Operation name.
+ * @param errors_before DeferErrorCount() snapshot from before the batch.
+ */
+void WarnDeferErrors(const char *operation, std::uint64_t errors_before) {
+  const std::uint64_t delta =
+      clio::cte::core::Client::DeferErrorCount() - errors_before;
+  if (delta != 0) {
+    HLOG(kWarning, "LMCacheStore::{}: {} deferred puts failed on completion",
+         operation, delta);
+  }
+}
 
 /**
  * Unbounded in-flight window: a growable single-thread SPSC ring
@@ -489,18 +528,23 @@ bool LMCacheStore::PutBytes(const std::string &blob_name,
     return false;
   }
 
-  // Private-memory put (issue #830): the CTE reads straight from `data` when
-  // co-located with the runtime and stages internally otherwise — no manual
-  // AllocateBuffer/memcpy/FreeBuffer round-trip.
+  // Deferred private-memory put (issue #862): the CTE client's registry owns
+  // the future and awaits its own oldest deferred puts when client-mode SHM
+  // staging runs out — the store keeps no window and no buffers.
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto task = cte_client->AsyncPutBlob(
+  const std::uint64_t errors_before =
+      clio::cte::core::Client::DeferErrorCount();
+  const int rc = cte_client->AsyncPutBlobDefer(
       tag_id_, blob_name, 0, data.size(), data.data(), 1.0f,
       clio::cte::core::Context(), 0, pool_query_);
-  if (task.IsNull()) {
-    return false;  // degenerate request or staging-allocation failure
+  if (rc != 0) {
+    return false;
   }
-  WaitForFuture(&task, "PutBlob");
-  return task->GetReturnCode() == 0;
+  // Single-blob put: await it so the return value is a real commit status
+  // (which also satisfies the runtime-mode contract that `data` outlive the
+  // zero-copy write).
+  clio::cte::core::Client::AwaitPendingPuts(tag_id_, blob_name);
+  return clio::cte::core::Client::DeferErrorCount() == errors_before;
 }
 
 std::vector<bool> LMCacheStore::PutMany(
@@ -514,30 +558,22 @@ std::vector<bool> LMCacheStore::PutMany(
   const bool profile_enabled = ProfileEnabled();
   BatchProfile profile;
   profile.requested = blob_names.size();
-  // Unbounded window: submission never stalls; completed futures are reaped
-  // from the front after each submit. max_inflight is retained for API
-  // compatibility only (it seeds the ring's initial capacity).
-  FlightQueue<PutInFlight> window(CTP_MALLOC,
-                                  NormalizeMaxInflight(max_inflight));
+  // Deferred private-memory puts (issue #862): every put is submitted through
+  // the CTE client's defer registry, which owns the futures and self-throttles
+  // on real SHM capacity (client-mode staging exhaustion awaits the oldest
+  // deferred put and retries instead of failing the batch). The store keeps no
+  // put window; a result of true means the put was ACCEPTED — completion
+  // failures surface through DeferErrorCount and a missing blob.
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto on_done = [&](const PutInFlight &item) {
-    const bool ok = item.future->GetReturnCode() == 0;
-    results[item.index] = ok;
-    if (profile_enabled && ok) {
-      ++profile.succeeded;
-    }
-  };
-
+  const std::uint64_t errors_before =
+      clio::cte::core::Client::DeferErrorCount();
   for (std::size_t i = 0; i < blob_names.size(); ++i) {
     if (blob_names[i].empty() || payloads[i].empty()) {
       continue;
     }
 
-    // Private-memory put (issue #830): reads straight from the caller's
-    // payload string. `payloads` outlives every Wait() in this call, which is
-    // the buffer-lifetime contract of the co-located zero-copy path.
-    auto begin = Clock::now();
-    auto future = cte_client->AsyncPutBlob(
+    const auto begin = Clock::now();
+    const int rc = cte_client->AsyncPutBlobDefer(
         tag_id_, blob_names[i], 0, payloads[i].size(), payloads[i].data(),
         1.0f, clio::cte::core::Context(), 0, pool_query_);
     if (profile_enabled) {
@@ -545,20 +581,15 @@ std::vector<bool> LMCacheStore::PutMany(
       profile.bytes += payloads[i].size();
       ++profile.submitted;
     }
-    if (future.IsNull()) {
-      DrainInFlight(&window, "PutBlob", on_done,
-                    profile_enabled ? &profile : nullptr);
-      HLOG(kError,
-           "LMCacheStore::PutMany failed to stage {} bytes for item {}",
-           payloads[i].size(), i);
-      throw std::bad_alloc();
+    results[i] = rc == 0;
+    if (profile_enabled && rc == 0) {
+      ++profile.succeeded;
     }
-    window.Emplace(PutInFlight{i, std::move(future)});
-    ReapInFlight(&window, "PutBlob", on_done);
   }
 
-  DrainInFlight(&window, "PutBlob", on_done,
-                profile_enabled ? &profile : nullptr);
+  AwaitBatchPuts(tag_id_, blob_names, results,
+                 profile_enabled ? &profile : nullptr);
+  WarnDeferErrors("PutMany", errors_before);
   if (profile_enabled) {
     LogBatchProfile("PutMany", profile, max_inflight);
   }
@@ -577,65 +608,51 @@ std::vector<bool> LMCacheStore::PutManyRecords(
     return results;
   }
 
-  // One private-memory vectored put per record (issues #823/#830): the
-  // header/metadata/payload segments reference caller memory directly, so
-  // there is no record-assembly staging buffer on ANY path — the CTE reads
-  // the segments zero-copy when co-located with the runtime and stages them
-  // through one internal buffer in client mode. This replaces both the old
-  // hand-rolled direct-pointer path (which was safe only for a co-located
-  // single-host runtime) and the assemble-into-SHM fallback.
+  // One DEFERRED private-memory vectored put per record (issues #830/#862):
+  // the header/metadata/payload segments reference caller memory directly —
+  // zero-copy with a co-located runtime, staged through one internal buffer in
+  // client mode — and the CTE client's defer registry owns the futures. The
+  // headers vector below is the only store-side storage: pre-sized so the
+  // segment pointers stay stable, alive until AwaitBatchPuts lands the batch.
   const bool profile_enabled = ProfileEnabled();
   BatchProfile profile;
   profile.requested = blob_names.size();
-  FlightQueue<RecordPutInFlight> window(CTP_MALLOC,
-                                        NormalizeMaxInflight(max_inflight));
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto on_done = [&](const RecordPutInFlight &item) {
-    const bool ok = item.future->GetReturnCode() == 0;
-    results[item.index] = ok;
-    if (profile_enabled && ok) {
+  const std::uint64_t errors_before =
+      clio::cte::core::Client::DeferErrorCount();
+  std::vector<std::array<char, kRecordHeaderSize>> headers(blob_names.size());
+  for (std::size_t i = 0; i < blob_names.size(); ++i) {
+    if (blob_names[i].empty() || metadata_jsons[i].empty() ||
+        payloads[i] == nullptr || payload_sizes[i] == 0) {
+      continue;
+    }
+    const auto record_size =
+        ComputeRecordSize(metadata_jsons[i].size(), payload_sizes[i]);
+    if (!record_size.has_value()) {
+      continue;
+    }
+    WriteRecordHeader(metadata_jsons[i].size(), payload_sizes[i],
+                      headers[i].data());
+    auto segments = MakeRecordSegments(&headers[i], metadata_jsons[i],
+                                       payloads[i], payload_sizes[i]);
+    const auto begin = Clock::now();
+    const int rc = cte_client->AsyncPutBlobVectoredDefer(
+        tag_id_, blob_names[i], segments, 1.0f, clio::cte::core::Context(), 0,
+        pool_query_);
+    if (profile_enabled) {
+      profile.submit += Clock::now() - begin;
+      profile.bytes += *record_size;
+      ++profile.submitted;
+    }
+    results[i] = rc == 0;
+    if (profile_enabled && rc == 0) {
       ++profile.succeeded;
     }
-  };
-
-  try {
-    for (std::size_t i = 0; i < blob_names.size(); ++i) {
-      if (blob_names[i].empty() || metadata_jsons[i].empty() ||
-          payloads[i] == nullptr || payload_sizes[i] == 0) {
-        continue;
-      }
-      const auto record_size =
-          ComputeRecordSize(metadata_jsons[i].size(), payload_sizes[i]);
-      if (!record_size.has_value()) {
-        continue;
-      }
-      auto header = std::make_shared<std::array<char, kRecordHeaderSize>>();
-      WriteRecordHeader(metadata_jsons[i].size(), payload_sizes[i],
-                        header->data());
-      auto segments = MakeRecordSegments(header.get(), metadata_jsons[i],
-                                         payloads[i], payload_sizes[i]);
-      const auto begin = Clock::now();
-      auto future = cte_client->AsyncPutBlobVectored(
-          tag_id_, blob_names[i], segments, 1.0f, clio::cte::core::Context(),
-          0, pool_query_);
-      if (profile_enabled) {
-        profile.submit += Clock::now() - begin;
-        profile.bytes += *record_size;
-        ++profile.submitted;
-      }
-      if (future.IsNull()) {
-        continue;  // degenerate request or staging-allocation failure
-      }
-      window.Emplace(
-          RecordPutInFlight{i, std::move(header), std::move(future)});
-      ReapInFlight(&window, "PutBlobVectored", on_done);
-    }
-    DrainInFlight(&window, "PutBlobVectored", on_done,
-                  profile_enabled ? &profile : nullptr);
-  } catch (...) {
-    DrainInFlight(&window, "PutBlobVectored", on_done, nullptr);
-    throw;
   }
+
+  AwaitBatchPuts(tag_id_, blob_names, results,
+                 profile_enabled ? &profile : nullptr);
+  WarnDeferErrors("PutManyRecords", errors_before);
   if (profile_enabled) {
     LogBatchProfile("PutManyRecords", profile, max_inflight);
   }
@@ -649,14 +666,14 @@ std::optional<std::vector<std::uint8_t>> LMCacheStore::GetBytes(
     return std::nullopt;
   }
 
-  // Private-memory get (issue #823): the bytes land straight in the result
-  // vector — zero-IPC on a shared-cache hit, direct bdev read with a
-  // co-located runtime, staged internally in client mode.
+  // Deferred private-memory get (issues #823/#862): read-after-write safe —
+  // any deferred put still in flight for this blob is awaited first — with
+  // the bytes landing straight in the result vector.
   std::vector<std::uint8_t> result(*blob_size);
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto task = cte_client->AsyncGetBlob(
-      tag_id_, blob_name, 0, *blob_size, 0,
-      reinterpret_cast<char *>(result.data()), pool_query_);
+  auto task = cte_client->AsyncGetBlobDefer(
+      tag_id_, blob_name, 0, *blob_size,
+      reinterpret_cast<char *>(result.data()), 0, pool_query_);
   if (task.IsNull()) {
     return std::nullopt;  // staging-allocation failure in client mode
   }
@@ -708,9 +725,9 @@ std::vector<std::optional<std::vector<std::uint8_t>>> LMCacheStore::GetMany(
       profile.alloc += Clock::now() - begin;
     }
     begin = Clock::now();
-    auto future = cte_client->AsyncGetBlob(
-        tag_id_, blob_names[i], 0, *sizes[i], 0,
-        reinterpret_cast<char *>(results[i]->data()), pool_query_);
+    auto future = cte_client->AsyncGetBlobDefer(
+        tag_id_, blob_names[i], 0, *sizes[i],
+        reinterpret_cast<char *>(results[i]->data()), 0, pool_query_);
     if (profile_enabled) {
       profile.submit += Clock::now() - begin;
       profile.bytes += *sizes[i];
@@ -746,11 +763,12 @@ bool LMCacheStore::GetBytesInto(const std::string &blob_name, void *destination,
     return false;
   }
 
-  // Private-memory get (issue #823): read straight into the caller's buffer.
+  // Deferred private-memory get (issues #823/#862): read straight into the
+  // caller's buffer, after any deferred put for this blob has landed.
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto task = cte_client->AsyncGetBlob(tag_id_, blob_name, 0, *blob_size, 0,
-                                       static_cast<char *>(destination),
-                                       pool_query_);
+  auto task = cte_client->AsyncGetBlobDefer(tag_id_, blob_name, 0, *blob_size,
+                                            static_cast<char *>(destination),
+                                            0, pool_query_);
   if (task.IsNull()) {
     return false;  // staging-allocation failure in client mode
   }
@@ -799,11 +817,12 @@ std::vector<bool> LMCacheStore::GetManyInto(
       continue;
     }
 
-    // Private-memory get (issue #823): read straight into the caller buffer.
+    // Deferred private-memory get (issues #823/#862): read straight into the
+    // caller buffer.
     auto begin = Clock::now();
-    auto future = cte_client->AsyncGetBlob(
-        tag_id_, blob_names[i], 0, *sizes[i], 0,
-        static_cast<char *>(destinations[i]), pool_query_);
+    auto future = cte_client->AsyncGetBlobDefer(
+        tag_id_, blob_names[i], 0, *sizes[i],
+        static_cast<char *>(destinations[i]), 0, pool_query_);
     if (profile_enabled) {
       profile.submit += Clock::now() - begin;
       profile.bytes += *sizes[i];
@@ -863,9 +882,9 @@ std::vector<bool> LMCacheStore::GetManyRangesInto(
     }
 
     auto begin = Clock::now();
-    auto future = cte_client->AsyncGetBlob(
-        tag_id_, blob_names[i], offsets[i], sizes[i], 0,
-        static_cast<char *>(destinations[i]), pool_query_);
+    auto future = cte_client->AsyncGetBlobDefer(
+        tag_id_, blob_names[i], offsets[i], sizes[i],
+        static_cast<char *>(destinations[i]), 0, pool_query_);
     if (profile_enabled) {
       profile.submit += Clock::now() - begin;
       profile.bytes += sizes[i];
@@ -1005,6 +1024,9 @@ std::optional<std::uint64_t> LMCacheStore::Size(const std::string &blob_name) {
     return std::nullopt;
   }
 
+  // A still-deferred put has published no metadata yet; land it first
+  // (issue #862 — free when nothing is pending: one relaxed load).
+  clio::cte::core::Client::AwaitPendingPuts(tag_id_, blob_name);
   auto *cte_client = CLIO_CTE_CLIENT;
   auto task = cte_client->AsyncGetBlobSize(tag_id_, blob_name, pool_query_);
   WaitForFuture(&task, "GetBlobSize");
@@ -1041,6 +1063,9 @@ std::vector<std::optional<std::uint64_t>> LMCacheStore::SizeMany(
       continue;
     }
 
+    // Deferred puts publish metadata only on completion; land this key's
+    // puts before asking for its size (issue #862).
+    clio::cte::core::Client::AwaitPendingPuts(tag_id_, blob_names[i]);
     auto begin = Clock::now();
     auto future =
         cte_client->AsyncGetBlobSize(tag_id_, blob_names[i], pool_query_);
@@ -1065,6 +1090,8 @@ bool LMCacheStore::Delete(const std::string &blob_name) {
     return false;
   }
 
+  // Keep put→delete ordering for a key whose put is still deferred.
+  clio::cte::core::Client::AwaitPendingPuts(tag_id_, blob_name);
   auto *cte_client = CLIO_CTE_CLIENT;
   auto task = cte_client->AsyncDelBlob(tag_id_, blob_name, pool_query_);
   WaitForFuture(&task, "DeleteBlob");
@@ -1072,6 +1099,10 @@ bool LMCacheStore::Delete(const std::string &blob_name) {
 }
 
 void LMCacheStore::Close() {
+  if (ready_) {
+    // Land any client-mode deferred puts before the client goes away.
+    clio::cte::core::Client::AwaitPutsUntilSpace(0);
+  }
   ready_ = false;
   direct_read_enabled_ = false;
   tag_id_ = clio::cte::core::TagId();
