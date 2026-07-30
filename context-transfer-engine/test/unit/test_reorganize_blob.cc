@@ -868,9 +868,22 @@ TEST_CASE("ReorganizeBlob - Reader pin/drain protocol invariants (#753)",
     while (blob.HasReadPins()) {
       std::this_thread::yield();
     }
-    // Quiescent: no pin may appear while the drain bit is held.
+    // Quiescent: no reader may ACQUIRE a pin while the drain bit is held.
+    // Note HasReadPins() may FLICKER nonzero here by design: TryPinRead's
+    // optimistic fetch_add briefly raises the count before backing off when
+    // it loses the race with the drain bit, and the runtime's drainers
+    // simply re-poll (windows-2022 caught exactly that transient). The real
+    // invariant is that no acquisition SUCCEEDS — i.e. pins_taken must not
+    // advance while the bit is held.
+    const clio::run::u64 taken_at_drain = pins_taken.load();
     for (int spin = 0; spin < 50; ++spin) {
-      if (blob.HasReadPins()) ++quiescence_violations;
+      std::this_thread::yield();
+    }
+    if (pins_taken.load() != taken_at_drain) ++quiescence_violations;
+    // A flicker must also DRAIN: re-poll to stable zero before re-admitting,
+    // exactly as the runtime's extent-freeing mutators do.
+    while (blob.HasReadPins()) {
+      std::this_thread::yield();
     }
     blob.EndDrainReaders();
     // Give readers a bounded window to make progress before the next drain.
