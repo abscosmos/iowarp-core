@@ -68,7 +68,7 @@ echo ""
 # Python >= 3.14 interpreter (execute_download_actions IndexError, same bug as
 # the PYVER note above), and "Miniconda3-latest" now ships a 3.14 base — so
 # fresh installs must pin, and a detected system conda must be checked.
-MINICONDA_RELEASE="py312_24.11.1-0"
+MINICONDA_RELEASE="py312_26.5.3-2"
 
 # Function to install Miniconda
 install_miniconda() {
