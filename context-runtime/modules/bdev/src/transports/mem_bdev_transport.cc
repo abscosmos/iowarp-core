@@ -8,7 +8,9 @@
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <clio_runtime/bdev/bdev_runtime.h>
+#include <clio_ctp/util/config_parse.h>
 #include <clio_ctp/util/gpu_api.h>
+#include <chrono>
 #include <cstdlib>
 
 namespace clio::run::bdev {
@@ -17,6 +19,7 @@ bool MemBdevTransport::Init(const CreateParams& params,
                             const std::string& /*pool_name*/, Runtime* runtime) {
   ram_capacity_ = (params.total_size_ == 0) ? DefaultRamCapacityBytes() : params.total_size_;
   bdev_type_ = params.bdev_type_;
+  populate_unit_ = params.populate_unit_;
   force_sync_gpu_ = (std::getenv("CLIO_BDEV_FORCE_SYNC") != nullptr);
 
   clio::run::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
@@ -33,6 +36,43 @@ bool MemBdevTransport::Init(const CreateParams& params,
   // exactly as before on the private heap; only the client fast path is lost.
   if (bdev_type_ == BdevType::kRam && runtime != nullptr) {
     InitShmBacking(runtime->pool_id_);
+  }
+
+  // CLIO_PREFAULT: pre-fault the RAM segment at init instead of (or ahead of)
+  // the incremental allocation-time population. "0" means the WHOLE mapping;
+  // any other value is a size string (ConfigParse::ParseSize, e.g. "512MB",
+  // "4GB") pre-faulting that prefix, clamped to the mapping. Unset keeps the
+  // default: pages are populated one populate_unit at a time as allocations
+  // cross the watermark.
+  //
+  // This trades memory for cold-write latency EXPLICITLY: whatever is
+  // pre-faulted is committed RAM immediately, so "0" on a 16GB tier commits
+  // 16GB at compose. The populated watermark starts past the pre-faulted
+  // prefix, so incremental population resumes seamlessly beyond it.
+  if (shm_backed_ && shm_base_ != nullptr) {
+    const char *prefault = std::getenv("CLIO_PREFAULT");
+    if (prefault != nullptr && *prefault != '\0') {
+      clio::run::u64 want;
+      if (std::string(prefault) == "0") {
+        want = shm_usable_;
+      } else {
+        want = std::min<clio::run::u64>(
+            ctp::ConfigParse::ParseSize(prefault), shm_usable_);
+      }
+      if (want > 0) {
+        auto begin = std::chrono::steady_clock::now();
+        ctp::SystemInfo::BulkFault(shm_base_, static_cast<size_t>(want));
+        populated_bytes_.store(want, std::memory_order_release);
+        auto ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - begin)
+                      .count();
+        HLOG(kInfo,
+             "RAM bdev '{}': CLIO_PREFAULT={} pre-faulted {} of {} bytes in "
+             "{} ms",
+             shm_name_, prefault, want, shm_usable_,
+             static_cast<clio::run::u64>(ms));
+      }
+    }
   }
 
   return true;
@@ -145,7 +185,48 @@ void MemBdevTransport::FreeRamPage(RamPage &page) {
 }
 
 bool MemBdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) {
-  return allocator_.AllocateBlocks(size, worker_id, blocks);
+  if (!allocator_.AllocateBlocks(size, worker_id, blocks)) {
+    return false;
+  }
+  // Bulk-fault any not-yet-populated pages these blocks cover, so the
+  // upcoming data memcpy does not take one demand fault per 4KB. Recycled and
+  // below-watermark blocks skip this with a single atomic load.
+  clio::run::u64 end = 0;
+  for (const Block &b : blocks) {
+    clio::run::u64 e = b.offset_ + b.size_;
+    if (e > end) end = e;
+  }
+  EnsurePopulated(end);
+  return true;
+}
+
+void MemBdevTransport::EnsurePopulated(clio::run::u64 end) {
+  if (!shm_backed_ || shm_base_ == nullptr || populate_unit_ == 0) {
+    return;
+  }
+  clio::run::u64 cur = populated_bytes_.load(std::memory_order_acquire);
+  while (end > cur) {
+    clio::run::u64 target =
+        ((end + populate_unit_ - 1) / populate_unit_) * populate_unit_;
+    if (target > shm_usable_) {
+      target = shm_usable_;
+    }
+    if (target <= cur) {
+      return;  // range already covered (or mapping exhausted)
+    }
+    // Claim [cur, target) by CAS, then populate it. Claiming FIRST is what
+    // makes this lock-free-safe: population is advisory, so a thread that
+    // sees the advanced watermark before our BulkFault completes simply
+    // demand-faults those pages as it always did. Losers re-read `cur` and
+    // either find their range covered or claim the next disjoint span, so
+    // concurrent claims never overlap and never double-populate.
+    if (populated_bytes_.compare_exchange_weak(cur, target,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
+      ctp::SystemInfo::BulkFault(shm_base_ + cur, target - cur);
+      return;
+    }
+  }
 }
 
 void MemBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks) {
