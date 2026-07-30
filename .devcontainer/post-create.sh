@@ -30,13 +30,6 @@ if [ -f /tmp/host-claude.json ] && [ -s /tmp/host-claude.json ]; then
     sudo chown "${DEVUSER}:${DEVUSER}" "${HOME_DIR}/.claude.json"
 fi
 
-# Copy host Codex config into container
-if [ -d /tmp/host-codex ] && [ "$(ls -A /tmp/host-codex)" ]; then
-    sudo cp -r /tmp/host-codex "${HOME_DIR}/.codex"
-    sudo chown -R "${DEVUSER}:${DEVUSER}" "${HOME_DIR}/.codex"
-fi
-
-
 # Fix docker socket permissions (dynamic GID match)
 "$(dirname "$0")/post-start.sh"
 
@@ -45,3 +38,10 @@ sudo service ssh start
 
 # Activate Python virtual environment
 echo "Python venv available at ${HOME_DIR}/venv (auto-activated in new shells)"
+
+# Provision YCSB + comparison stores into external/ (issue #862).
+# Best-effort: benchmark tooling must not block container creation.
+if [ -x /workspace/docker/provision-ycsb.sh ]; then
+    /workspace/docker/provision-ycsb.sh /workspace || \
+        echo "WARN: YCSB provisioning incomplete (re-run docker/provision-ycsb.sh)"
+fi
