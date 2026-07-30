@@ -31,7 +31,12 @@ jobs:
       - name: Setup Miniconda
         uses: conda-incubator/setup-miniconda@v3
         with:
-          auto-update-conda: true
+          # Pin a py312-base Miniconda and do NOT auto-update conda: the
+          # runner's bundled conda moved its base to Python 3.14
+          # (2026-07-30), which crashes conda-build
+          # (execute_download_actions IndexError). See CI/ci-deps.sh.
+          auto-update-conda: false
+          miniconda-version: 'py312_24.11.1-0'
           python-version: '3.12'
           # conda-forge only. The Anaconda `defaults` channels (pkgs/main,
           # pkgs/r behind repo.anaconda.com) now 403 for CI use without a
