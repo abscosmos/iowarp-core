@@ -702,7 +702,7 @@ class Client : public clio::run::ContainerClient {
       return clio::run::Future<PutBlobTask>();
     }
 
-    if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
+    if (CLIO_RUNTIME_MANAGER->IsRuntime() && !NoPrivPutEnv()) {
       // Co-located daemon: read directly from the private buffer. The null
       // AllocatorId marks the offset as an absolute process address, so the
       // bdev write pulls the source bytes straight out of `priv_data`.
@@ -718,7 +718,8 @@ class Client : public clio::run::ContainerClient {
       return ipc_manager->Send(task);
     }
 
-    // Client: stage through an SHM buffer, copying the private bytes in ONCE.
+    // Client (or CLIO_CTE_NO_PRIV_PUT): stage through an SHM buffer, copying
+    // the private bytes in ONCE.
     ctp::ipc::FullPtr<char> staging = ipc_manager->AllocateBuffer(size);
     if (staging.IsNull()) {
       return clio::run::Future<PutBlobTask>();
@@ -732,6 +733,15 @@ class Client : public clio::run::ContainerClient {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count();
+    if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      // Co-located (CLIO_CTE_NO_PRIV_PUT staging): client and daemon share this
+      // ONE task object — nothing is serialized, so the flag never "ships", and
+      // setting it after Send would race the worker's task_flags_ reads. Set it
+      // BEFORE Send; the single ~PutBlobTask frees the staging buffer exactly
+      // once, after the future completes.
+      t->SetFlags(TASK_DATA_OWNER);
+      return ipc_manager->Send(task);
+    }
     auto fut = ipc_manager->Send(task);
     // Mark ownership only AFTER Send has serialized the task: Task::SerializeIn
     // ships task_flags_, so setting TASK_DATA_OWNER earlier would hand the flag
@@ -786,6 +796,20 @@ class Client : public clio::run::ContainerClient {
   static bool ForceNetEnv() {
     static const bool v = [] {
       const char *e = std::getenv("CLIO_FORCE_NET");
+      return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
+    }();
+    return v;
+  }
+
+  /** True when CLIO_CTE_NO_PRIV_PUT is set: the private-memory AsyncPutBlob
+   * stands down its runtime-mode zero-copy branch (null-allocator ShmPtr over
+   * the caller's buffer) and every put goes through the plain staged path —
+   * allocate SHM, copy once, send — exactly like a pure client. Benchmarking
+   * knob (issue #862): isolates what the #830 zero-copy path buys co-located
+   * writers. Read once. */
+  static bool NoPrivPutEnv() {
+    static const bool v = [] {
+      const char *e = std::getenv("CLIO_CTE_NO_PRIV_PUT");
       return e != nullptr && e[0] != '\0' && !(e[0] == '0' && e[1] == '\0');
     }();
     return v;
