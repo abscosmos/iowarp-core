@@ -1,6 +1,6 @@
 # YCSB benchmark config (issue #862): identical to the built-in defaults
 # (clio_bdev allocator pool + CTE core) except the CTE RAM tier is capped at
-# 256MB instead of 100MB so the default YCSB dataset (100k x ~1.1KB = ~112MB)
+# 256MB instead of 100MB so the default YCSB dataset (workload D grows it to ~200k records = ~300MB at dense blocks)
 # is fully memory-resident -- RocksDB's working set is likewise fully
 # memory-resident (memtable + page cache). Nothing else is tuned.
 runtime:
@@ -22,7 +22,7 @@ compose:
     storage:
       - path: "ram::cte_ram_tier1"
         bdev_type: "ram"
-        capacity_limit: "256MB"
+        capacity_limit: "512MB"
         score: 1.0
     dpe:
       dpe_type: "max_bw"

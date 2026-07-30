@@ -25,9 +25,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <clio_runtime/clio_runtime.h>
@@ -63,12 +65,31 @@ int g_init_rc = -100;  // set by the once-body; <0 means init failed
 // reap. g_runtime_mode selects the ownership scheme.
 struct InflightPut {
   clio::run::Future<clio::cte::core::PutBlobTask> fut_;
-  char *owned_buf_;  // runtime mode only; nullptr in client mode
+  char *owned_buf_;   // runtime mode only; nullptr in client mode
+  const void *src_;   // source buffer the in-flight put may still read
+  size_t size_;       // payload bytes (in-flight accounting)
 };
 std::mutex g_win_mtx;
 std::deque<InflightPut> g_inflight;
+size_t g_inflight_bytes = 0;  // guarded by g_win_mtx
+// Puts whose bdev write may still READ a given source address (runtime-mode
+// direct buffers). A ring slot must not be reused as a put source while a
+// prior put on the same address is in flight.
+std::unordered_map<const void *, clio::run::u32> g_addr_inflight;  // guarded
 std::atomic<int> g_async_err{0};
-size_t g_window = 64;
+// Window modes (CLIO_YCSB_WINDOW):
+//   unset -> CAPACITY mode (default): submit async until shared memory is
+//            actually exhausted — a client-mode staging allocation failure
+//            (empty future) reaps the oldest in-flight puts one at a time,
+//            freeing their staging buffers, until the submit succeeds ("await
+//            as many buffers as necessary to make commensurate space").
+//            CLIO_YCSB_WINDOW_BYTES optionally caps total in-flight payload.
+//   0     -> synchronous (wait per put)
+//   N>0   -> legacy fixed-depth window
+size_t g_window = 0;
+bool g_sync_mode = false;
+bool g_depth_mode = false;
+size_t g_window_bytes = std::numeric_limits<size_t>::max();
 bool g_runtime_mode = false;
 
 // ---- scan key index (workloads D/E) ---------------------------------------
@@ -130,28 +151,77 @@ void InitOnce() {
   }
   if (const char *w = std::getenv("CLIO_YCSB_WINDOW")) {
     g_window = static_cast<size_t>(std::strtoul(w, nullptr, 10));
+    g_sync_mode = (g_window == 0);
+    g_depth_mode = (g_window > 0);
+  }
+  if (const char *b = std::getenv("CLIO_YCSB_WINDOW_BYTES")) {
+    g_window_bytes = static_cast<size_t>(std::strtoull(b, nullptr, 10));
+    if (g_window_bytes == 0) {
+      g_window_bytes = std::numeric_limits<size_t>::max();
+    }
   }
   g_init_rc = 0;
 }
 
-// Reap futures until at most `keep` remain. Waits happen outside the lock so
-// submitting threads only contend on deque ops, not on put completion.
+// Reap the single oldest in-flight put (wait outside the lock). Returns false
+// if nothing was in flight.
+bool ReapOne() {
+  InflightPut entry;
+  {
+    std::lock_guard<std::mutex> lk(g_win_mtx);
+    if (g_inflight.empty()) return false;
+    entry = std::move(g_inflight.front());
+    g_inflight.pop_front();
+    g_inflight_bytes -= entry.size_;
+    auto it = g_addr_inflight.find(entry.src_);
+    if (it != g_addr_inflight.end() && --(it->second) == 0) {
+      g_addr_inflight.erase(it);
+    }
+  }
+  entry.fut_.Wait();
+  auto *t = entry.fut_.get();
+  if (t == nullptr || t->GetReturnCode() != 0) {
+    g_async_err.fetch_add(1);
+  }
+  std::free(entry.owned_buf_);  // no-op in client mode (nullptr)
+  return true;
+}
+
+// Reap futures until at most `keep` remain.
 void ReapDownTo(size_t keep) {
   while (true) {
-    InflightPut entry;
     {
       std::lock_guard<std::mutex> lk(g_win_mtx);
       if (g_inflight.size() <= keep) return;
-      entry = std::move(g_inflight.front());
-      g_inflight.pop_front();
     }
-    entry.fut_.Wait();
-    auto *t = entry.fut_.get();
-    if (t == nullptr || t->GetReturnCode() != 0) {
-      g_async_err.fetch_add(1);
-    }
-    std::free(entry.owned_buf_);  // no-op in client mode (nullptr)
+    if (!ReapOne()) return;
   }
+}
+
+// Pre-submit flow control: make room BEFORE a put is issued from `src`.
+//  - The bdev write of a prior put may still be reading `src` (runtime-mode
+//    direct ring buffers) — await those puts first.
+//  - Honor the optional in-flight payload cap.
+void WindowMakeRoom(const void *src, size_t len) {
+  while (true) {
+    bool need = false;
+    {
+      std::lock_guard<std::mutex> lk(g_win_mtx);
+      need = (g_addr_inflight.count(src) != 0) ||
+             (g_inflight_bytes + len > g_window_bytes &&
+              !g_inflight.empty());
+    }
+    if (!need || !ReapOne()) return;
+  }
+}
+
+// Post-submit bookkeeping for a successfully issued async put.
+void WindowTrack(clio::run::Future<clio::cte::core::PutBlobTask> &&fut,
+                 char *owned, const void *src, size_t len) {
+  std::lock_guard<std::mutex> lk(g_win_mtx);
+  g_inflight.push_back(InflightPut{std::move(fut), owned, src, len});
+  g_inflight_bytes += len;
+  g_addr_inflight[src]++;
 }
 
 }  // namespace
@@ -221,31 +291,40 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutAsync(
     std::memcpy(owned, src, static_cast<size_t>(len));
     src = owned;
   }
+  WindowMakeRoom(src, static_cast<size_t>(len));
   auto fut = cte_client->AsyncPutBlob(
       g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+  // CAPACITY mode: an empty future with a non-degenerate request means the
+  // client-mode SHM staging allocation failed — shared memory is genuinely
+  // full of in-flight puts. Await the oldest ones (freeing their staging)
+  // until the submit succeeds.
+  while (fut.IsNull() && !g_sync_mode && !g_depth_mode) {
+    if (!ReapOne()) break;  // nothing left to free -> hard failure below
+    fut = cte_client->AsyncPutBlob(
+        g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+  }
   // Client mode staged (copied) the bytes during the call; runtime mode uses
   // the owned copy above — either way the array can go now.
   env->ReleaseByteArrayElements(value, bytes, JNI_ABORT);
   if (fut.IsNull()) {
     std::free(owned);
-    return -11;  // degenerate request or staging alloc failed
+    return -11;  // degenerate request, or SHM exhausted with nothing in flight
   }
   {
     std::lock_guard<std::mutex> lk(g_keys_mtx);
     g_keys.insert(key_str);
   }
 
-  if (g_window == 0) {  // synchronous fallback (CLIO_YCSB_WINDOW=0)
+  if (g_sync_mode) {  // synchronous fallback (CLIO_YCSB_WINDOW=0)
     fut.Wait();
     auto *t = fut.get();
     std::free(owned);
     return (t == nullptr || t->GetReturnCode() != 0) ? -10 : 0;
   }
-  {
-    std::lock_guard<std::mutex> lk(g_win_mtx);
-    g_inflight.push_back(InflightPut{std::move(fut), owned});
+  WindowTrack(std::move(fut), owned, src, static_cast<size_t>(len));
+  if (g_depth_mode) {
+    ReapDownTo(g_window);
   }
-  ReapDownTo(g_window);
   return g_async_err.load() != 0 ? -12 : 0;
 }
 
@@ -302,23 +381,32 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutDirect(
   if (src == nullptr) return -3;
 
   auto *cte_client = CLIO_CTE_CLIENT;
+  // Runtime mode reads the ring slot's memory until the put completes, so any
+  // prior put on this slot must be awaited BEFORE reusing it as a source (this
+  // replaces the old ring-larger-than-window invariant and is what bounds the
+  // effective depth in capacity mode).
+  WindowMakeRoom(src, static_cast<size_t>(len));
   auto fut = cte_client->AsyncPutBlob(
       g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+  while (fut.IsNull() && !g_sync_mode && !g_depth_mode) {
+    if (!ReapOne()) break;  // SHM exhausted; free oldest staging and retry
+    fut = cte_client->AsyncPutBlob(
+        g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+  }
   if (fut.IsNull()) return -11;
   {
     std::lock_guard<std::mutex> lk(g_keys_mtx);
     g_keys.insert(key_str);
   }
-  if (g_window == 0) {
+  if (g_sync_mode) {
     fut.Wait();
     auto *t = fut.get();
     return (t == nullptr || t->GetReturnCode() != 0) ? -10 : 0;
   }
-  {
-    std::lock_guard<std::mutex> lk(g_win_mtx);
-    g_inflight.push_back(InflightPut{std::move(fut), nullptr});
+  WindowTrack(std::move(fut), nullptr, src, static_cast<size_t>(len));
+  if (g_depth_mode) {
+    ReapDownTo(g_window);
   }
-  ReapDownTo(g_window);
   return g_async_err.load() != 0 ? -12 : 0;
 }
 
