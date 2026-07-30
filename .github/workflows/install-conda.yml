@@ -36,7 +36,7 @@ jobs:
           # (2026-07-30), which crashes conda-build
           # (execute_download_actions IndexError). See CI/ci-deps.sh.
           auto-update-conda: false
-          miniconda-version: 'py312_24.11.1-0'
+          miniconda-version: 'py312_26.5.3-2'
           python-version: '3.12'
           # conda-forge only. The Anaconda `defaults` channels (pkgs/main,
           # pkgs/r behind repo.anaconda.com) now 403 for CI use without a
