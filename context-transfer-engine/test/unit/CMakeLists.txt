@@ -861,7 +861,11 @@ add_test(NAME cte_reorganize_all
 set_tests_properties(
     cte_reorganize_all
     PROPERTIES
-        TIMEOUT 300  # 5 minute timeout
+        # 600s: the #753 race tests seed a multi-chunk victim and fill the
+        # disk tier; Windows Debug runners need the headroom even with the
+        # in-test geometry scaling (cte_reorganize_all timed out at 300s on
+        # windows-2025).
+        TIMEOUT 600
         LABELS "unit;reorganize;cte"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )

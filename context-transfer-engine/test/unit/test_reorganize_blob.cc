@@ -520,14 +520,21 @@ TEST_CASE("ReorganizeBlob - Pipelined reads survive extent reuse (#753)",
   // bytes, hiding the bug.
   // Under CLIO_FORCE_NET every put/get is a ZMQ loopback round trip (~ms on
   // Windows CI), so the full 8MB/128-chunk geometry blows the 300s+ ctest
-  // budget on the slowest runners. The reader-pin logic under test is
-  // transport-independent — shrink the geometry, keep the shape.
+  // budget on the slowest runners — and the plain suite hits the same wall
+  // on Windows Debug builds (cte_reorganize_all timed out on windows-2025
+  // after this suite grew). The reader-pin logic under test is transport-
+  // and platform-independent: shrink the geometry, keep the shape.
   const bool kForceNet = []() {
     const char *e = std::getenv("CLIO_FORCE_NET");
     return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
   }();
+#ifdef _WIN32
+  const bool kScaleDown = true;
+#else
+  const bool kScaleDown = kForceNet;
+#endif
   const clio::run::u64 kVictimSize =
-      kForceNet ? 2 * 1024 * 1024 : 8 * 1024 * 1024;
+      kScaleDown ? 2 * 1024 * 1024 : 8 * 1024 * 1024;
   // ONE fully-armed round. Repeating the near-full churn cycle accumulates
   // tier capacity-accounting drift until ReorganizeBlob's re-place fails at
   // every score and takes its triple-failure exit — which LOSES the blob
@@ -535,7 +542,7 @@ TEST_CASE("ReorganizeBlob - Pipelined reads survive extent reuse (#753)",
   // tracked separately; this test's job is the reader-vs-reclaim race, and
   // round 0 arms it fully (fresh tiers, zero slack, mid-read clear).
   constexpr int kRounds = 1;
-  const int kDepth = kForceNet ? 2 : 4;  // pipelined victim-size reads in flight
+  const int kDepth = kScaleDown ? 2 : 4;  // pipelined victim-size reads in flight
   // Upper bound on fill blobs; the loop below stops at the tier's ACTUAL
   // remaining capacity instead of assuming it (earlier cases in this binary —
   // and their force_net variants — leave tier residue that shifts the number).
@@ -908,8 +915,13 @@ TEST_CASE("ReorganizeBlob - DelBlob under pipelined reads never yields garbage (
     const char *e = std::getenv("CLIO_FORCE_NET");
     return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
   }();
+#ifdef _WIN32
+  const bool kScaleDownB = true;
+#else
+  const bool kScaleDownB = kForceNet;
+#endif
   constexpr int kRounds = 1;
-  const int kDepth = kForceNet ? 3 : 6;
+  const int kDepth = kScaleDownB ? 3 : 6;
   constexpr int kChurn = 4;
 
   auto put_buffer = CLIO_IPC->AllocateBuffer(kBlobSize);
