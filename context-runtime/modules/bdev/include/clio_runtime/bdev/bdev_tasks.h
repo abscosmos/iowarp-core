@@ -94,7 +94,8 @@ enum class BdevType : clio::run::u32 {
 struct Block {
   clio::run::u64 offset_;      // Offset within file
   clio::run::u64 size_;        // Size of block
-  clio::run::u32 block_type_;  // Block size category (0=4KB, 1=64KB, 2=256KB, 3=1MB)
+  clio::run::u32 block_type_;  // Block size category (BlockSizeCategory:
+                               // 512B..1MB; see block_allocator.h)
 
   CTP_GPU_FUN Block() : offset_(0), size_(0), block_type_(0) {}
   CTP_GPU_FUN Block(clio::run::u64 offset, clio::run::u64 size, clio::run::u32 block_type)
