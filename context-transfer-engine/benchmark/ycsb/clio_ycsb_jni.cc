@@ -63,34 +63,31 @@ int g_init_rc = -100;  // set by the once-body; <0 means init failed
 // staging — the bdev write reads DIRECTLY from the caller's buffer until the
 // task completes — so the window must own a copy of the bytes and free it at
 // reap. g_runtime_mode selects the ownership scheme.
-struct InflightPut {
-  clio::run::Future<clio::cte::core::PutBlobTask> fut_;
-  char *owned_buf_;   // runtime mode only; nullptr in client mode
-  const void *src_;   // source buffer the in-flight put may still read
-  size_t size_;       // payload bytes (in-flight accounting)
-};
-std::mutex g_win_mtx;
-std::deque<InflightPut> g_inflight;
-size_t g_inflight_bytes = 0;  // guarded by g_win_mtx
-// Puts whose bdev write may still READ a given source address (runtime-mode
-// direct buffers). A ring slot must not be reused as a put source while a
-// prior put on the same address is in flight.
-std::unordered_map<const void *, clio::run::u32> g_addr_inflight;  // guarded
-std::atomic<int> g_async_err{0};
-// Window modes (CLIO_YCSB_WINDOW):
-//   unset -> CAPACITY mode (default): submit async until shared memory is
-//            actually exhausted — a client-mode staging allocation failure
-//            (empty future) reaps the oldest in-flight puts one at a time,
-//            freeing their staging buffers, until the submit succeeds ("await
-//            as many buffers as necessary to make commensurate space").
-//            CLIO_YCSB_WINDOW_BYTES optionally caps total in-flight payload.
-//   0     -> synchronous (wait per put)
-//   N>0   -> legacy fixed-depth window
+// Deferred-put pipeline now lives in the CTE client (AsyncPutBlobDefer /
+// AsyncGetBlobDefer / AwaitPutsUntilSpace, issue #862) — the shim only picks
+// the flow-control policy:
+//   CLIO_YCSB_WINDOW unset -> capacity mode: async until shared memory is
+//        genuinely exhausted (AsyncPutBlobDefer awaits oldest puts on staging
+//        exhaustion); ring-slot safety caps in-flight payload at
+//        (RING_SIZE - 8) slots' worth so a direct-buffer slot is never
+//        rewritten while a prior put may still read it (Java rotates 96).
+//   CLIO_YCSB_WINDOW=0   -> synchronous (drain after every put)
+//   CLIO_YCSB_WINDOW=N   -> classic depth-N window (N puts' worth of bytes)
+//   CLIO_YCSB_WINDOW_BYTES -> explicit in-flight payload cap (overrides)
 size_t g_window = 0;
 bool g_sync_mode = false;
 bool g_depth_mode = false;
-size_t g_window_bytes = std::numeric_limits<size_t>::max();
+size_t g_window_bytes = 0;  // 0 = not set
 bool g_runtime_mode = false;
+constexpr size_t kJavaWriteRingSlots = 96;  // must match ClioClient.RING_SIZE
+
+// In-flight byte budget for one more put of `len` bytes under the active
+// policy (SIZE_MAX = unbounded, capacity mode governs via staging).
+size_t PutBudget(size_t len) {
+  if (g_window_bytes != 0) return g_window_bytes;
+  if (g_depth_mode) return g_window * len;
+  return (kJavaWriteRingSlots - 8) * len;  // ring-reuse safety in capacity mode
+}
 
 // ---- scan key index (workloads D/E) ---------------------------------------
 // CTE has no ordered key scan, so the binding maintains its own sorted index
@@ -156,72 +153,8 @@ void InitOnce() {
   }
   if (const char *b = std::getenv("CLIO_YCSB_WINDOW_BYTES")) {
     g_window_bytes = static_cast<size_t>(std::strtoull(b, nullptr, 10));
-    if (g_window_bytes == 0) {
-      g_window_bytes = std::numeric_limits<size_t>::max();
-    }
   }
   g_init_rc = 0;
-}
-
-// Reap the single oldest in-flight put (wait outside the lock). Returns false
-// if nothing was in flight.
-bool ReapOne() {
-  InflightPut entry;
-  {
-    std::lock_guard<std::mutex> lk(g_win_mtx);
-    if (g_inflight.empty()) return false;
-    entry = std::move(g_inflight.front());
-    g_inflight.pop_front();
-    g_inflight_bytes -= entry.size_;
-    auto it = g_addr_inflight.find(entry.src_);
-    if (it != g_addr_inflight.end() && --(it->second) == 0) {
-      g_addr_inflight.erase(it);
-    }
-  }
-  entry.fut_.Wait();
-  auto *t = entry.fut_.get();
-  if (t == nullptr || t->GetReturnCode() != 0) {
-    g_async_err.fetch_add(1);
-  }
-  std::free(entry.owned_buf_);  // no-op in client mode (nullptr)
-  return true;
-}
-
-// Reap futures until at most `keep` remain.
-void ReapDownTo(size_t keep) {
-  while (true) {
-    {
-      std::lock_guard<std::mutex> lk(g_win_mtx);
-      if (g_inflight.size() <= keep) return;
-    }
-    if (!ReapOne()) return;
-  }
-}
-
-// Pre-submit flow control: make room BEFORE a put is issued from `src`.
-//  - The bdev write of a prior put may still be reading `src` (runtime-mode
-//    direct ring buffers) — await those puts first.
-//  - Honor the optional in-flight payload cap.
-void WindowMakeRoom(const void *src, size_t len) {
-  while (true) {
-    bool need = false;
-    {
-      std::lock_guard<std::mutex> lk(g_win_mtx);
-      need = (g_addr_inflight.count(src) != 0) ||
-             (g_inflight_bytes + len > g_window_bytes &&
-              !g_inflight.empty());
-    }
-    if (!need || !ReapOne()) return;
-  }
-}
-
-// Post-submit bookkeeping for a successfully issued async put.
-void WindowTrack(clio::run::Future<clio::cte::core::PutBlobTask> &&fut,
-                 char *owned, const void *src, size_t len) {
-  std::lock_guard<std::mutex> lk(g_win_mtx);
-  g_inflight.push_back(InflightPut{std::move(fut), owned, src, len});
-  g_inflight_bytes += len;
-  g_addr_inflight[src]++;
 }
 
 }  // namespace
@@ -278,60 +211,43 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutAsync(
 
   auto *cte_client = CLIO_CTE_CLIENT;
   const char *src = reinterpret_cast<const char *>(bytes);
-  char *owned = nullptr;
+  int rc;
   if (g_runtime_mode) {
-    // Co-located: the put reads the source buffer until completion — the JNI
-    // array cannot be released while the task is in flight, so the window
-    // owns a heap copy instead (freed at reap).
-    owned = static_cast<char *>(std::malloc(static_cast<size_t>(len)));
-    if (owned == nullptr) {
-      env->ReleaseByteArrayElements(value, bytes, JNI_ABORT);
-      return -13;
-    }
-    std::memcpy(owned, src, static_cast<size_t>(len));
-    src = owned;
-  }
-  WindowMakeRoom(src, static_cast<size_t>(len));
-  auto fut = cte_client->AsyncPutBlob(
-      g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
-  // CAPACITY mode: an empty future with a non-degenerate request means the
-  // client-mode SHM staging allocation failed — shared memory is genuinely
-  // full of in-flight puts. Await the oldest ones (freeing their staging)
-  // until the submit succeeds.
-  while (fut.IsNull() && !g_sync_mode && !g_depth_mode) {
-    if (!ReapOne()) break;  // nothing left to free -> hard failure below
-    fut = cte_client->AsyncPutBlob(
+    // Co-located byte[] path (cold; direct-buffer ring is the hot path): the
+    // put reads the source until completion and the JNI array must be
+    // released on return, so run it synchronously.
+    auto fut = cte_client->AsyncPutBlob(
         g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+    if (fut.IsNull()) {
+      rc = -11;
+    } else {
+      fut.Wait();
+      auto *t = fut.get();
+      rc = (t == nullptr || t->GetReturnCode() != 0) ? -10 : 0;
+    }
+  } else {
+    // Client mode stages (copies) during the call — defer freely.
+    clio::cte::core::Client::AwaitPutsUntilSpace(
+        PutBudget(static_cast<size_t>(len)));
+    rc = cte_client->AsyncPutBlobDefer(
+        g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+    if (rc == 0 && g_sync_mode) {
+      clio::cte::core::Client::AwaitPutsUntilSpace(0);
+    }
   }
-  // Client mode staged (copied) the bytes during the call; runtime mode uses
-  // the owned copy above — either way the array can go now.
   env->ReleaseByteArrayElements(value, bytes, JNI_ABORT);
-  if (fut.IsNull()) {
-    std::free(owned);
-    return -11;  // degenerate request, or SHM exhausted with nothing in flight
-  }
+  if (rc != 0) return rc;
   {
     std::lock_guard<std::mutex> lk(g_keys_mtx);
     g_keys.insert(key_str);
   }
-
-  if (g_sync_mode) {  // synchronous fallback (CLIO_YCSB_WINDOW=0)
-    fut.Wait();
-    auto *t = fut.get();
-    std::free(owned);
-    return (t == nullptr || t->GetReturnCode() != 0) ? -10 : 0;
-  }
-  WindowTrack(std::move(fut), owned, src, static_cast<size_t>(len));
-  if (g_depth_mode) {
-    ReapDownTo(g_window);
-  }
-  return g_async_err.load() != 0 ? -12 : 0;
+  return clio::cte::core::Client::DeferErrorCount() != 0 ? -12 : 0;
 }
 
 JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativeDrain(JNIEnv *,
                                                                 jclass) {
-  ReapDownTo(0);
-  return g_async_err.load();
+  clio::cte::core::Client::AwaitPutsUntilSpace(0);
+  return static_cast<jint>(clio::cte::core::Client::DeferErrorCount());
 }
 
 JNIEXPORT jobjectArray JNICALL Java_site_ycsb_db_ClioClient_nativeScanKeys(
@@ -381,33 +297,23 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutDirect(
   if (src == nullptr) return -3;
 
   auto *cte_client = CLIO_CTE_CLIENT;
-  // Runtime mode reads the ring slot's memory until the put completes, so any
-  // prior put on this slot must be awaited BEFORE reusing it as a source (this
-  // replaces the old ring-larger-than-window invariant and is what bounds the
-  // effective depth in capacity mode).
-  WindowMakeRoom(src, static_cast<size_t>(len));
-  auto fut = cte_client->AsyncPutBlob(
+  // Ring-slot safety: bound in-flight payload below the Java ring's capacity
+  // so a slot is never rewritten while a prior put may still read it (FIFO
+  // await order guarantees anything older than the newest kRing-8 puts has
+  // completed). Sync/depth modes tighten the same budget.
+  clio::cte::core::Client::AwaitPutsUntilSpace(
+      PutBudget(static_cast<size_t>(len)));
+  int rc = cte_client->AsyncPutBlobDefer(
       g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
-  while (fut.IsNull() && !g_sync_mode && !g_depth_mode) {
-    if (!ReapOne()) break;  // SHM exhausted; free oldest staging and retry
-    fut = cte_client->AsyncPutBlob(
-        g_tag->GetTagId(), key_str, 0, static_cast<clio::run::u64>(len), src);
+  if (rc != 0) return rc == -1 ? -1 : -11;
+  if (g_sync_mode) {
+    clio::cte::core::Client::AwaitPutsUntilSpace(0);
   }
-  if (fut.IsNull()) return -11;
   {
     std::lock_guard<std::mutex> lk(g_keys_mtx);
     g_keys.insert(key_str);
   }
-  if (g_sync_mode) {
-    fut.Wait();
-    auto *t = fut.get();
-    return (t == nullptr || t->GetReturnCode() != 0) ? -10 : 0;
-  }
-  WindowTrack(std::move(fut), nullptr, src, static_cast<size_t>(len));
-  if (g_depth_mode) {
-    ReapDownTo(g_window);
-  }
-  return g_async_err.load() != 0 ? -12 : 0;
+  return clio::cte::core::Client::DeferErrorCount() != 0 ? -12 : 0;
 }
 
 // Direct-ByteBuffer read (item 2): copy the payload once, store -> the Java
@@ -423,6 +329,9 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativeGetDirect(
   char *dst = static_cast<char *>(env->GetDirectBufferAddress(buf));
   jlong cap = env->GetDirectBufferCapacity(buf);
   if (dst == nullptr) return -1;
+  // Read-after-write consistency: complete any deferred put(s) on this key
+  // before reading (no-op when none are pending).
+  clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
   try {
     clio::run::u64 size = g_tag->GetBlobSize(key_str);
     if (size == 0) return 0;
@@ -447,6 +356,9 @@ JNIEXPORT jobject JNICALL Java_site_ycsb_db_ClioClient_nativeGetView(
   env->ReleaseStringUTFChars(key, key_chars);
 
   auto *cte_client = CLIO_CTE_CLIENT;
+  // Read-after-write consistency: complete any deferred put(s) on this key
+  // before reading (no-op when none are pending).
+  clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
   const char *ptr = nullptr;
   clio::run::u64 size = 0, gen = 0;
   if (!cte_client->TryGetBlobViewShm(g_tag->GetTagId(), key_str, &ptr, &size,
@@ -481,6 +393,9 @@ JNIEXPORT jbyteArray JNICALL Java_site_ycsb_db_ClioClient_nativeGet(
   std::string key_str(key_chars);
   env->ReleaseStringUTFChars(key, key_chars);
 
+  // Read-after-write consistency: complete any deferred put(s) on this key
+  // before reading (no-op when none are pending).
+  clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
   clio::run::u64 size = 0;
   std::vector<char> buf;
   try {
