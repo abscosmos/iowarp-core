@@ -69,6 +69,10 @@ echo ""
 # the PYVER note above), and "Miniconda3-latest" now ships a 3.14 base — so
 # fresh installs must pin, and a detected system conda must be checked.
 MINICONDA_RELEASE="py312_26.5.3-2"
+# Anaconda stopped shipping macOS-Intel installers after this release
+# (Miniconda3-py312_26.5.3-2-MacOSX-x86_64.sh is a 404), so mac-Intel pins
+# the last release that has one.
+MINICONDA_RELEASE_MACOS_INTEL="py312_25.7.0-2"
 
 # Function to install Miniconda
 install_miniconda() {
@@ -94,7 +98,7 @@ install_miniconda() {
         PLATFORM="macOS"
         ARCH=$(uname -m)
         if [[ "$ARCH" == "x86_64" ]]; then
-            INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-$MINICONDA_RELEASE-MacOSX-x86_64.sh"
+            INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-$MINICONDA_RELEASE_MACOS_INTEL-MacOSX-x86_64.sh"
         elif [[ "$ARCH" == "arm64" ]]; then
             INSTALLER_URL="https://repo.anaconda.com/miniconda/Miniconda3-$MINICONDA_RELEASE-MacOSX-arm64.sh"
         else
@@ -110,10 +114,15 @@ install_miniconda() {
     echo -e "${BLUE}Installation directory: $MINICONDA_DIR${NC}"
     echo ""
 
-    # Download Miniconda installer
+    # Download Miniconda installer. -f: fail on HTTP errors instead of saving
+    # an HTML error page that bash then chokes on (`syntax error near
+    # unexpected token 'newline'`).
     INSTALLER_SCRIPT="/tmp/miniconda_installer.sh"
     echo -e "${BLUE}Downloading Miniconda installer...${NC}"
-    curl -L -o "$INSTALLER_SCRIPT" "$INSTALLER_URL"
+    if ! curl -fL -o "$INSTALLER_SCRIPT" "$INSTALLER_URL"; then
+        echo -e "${RED}Error: failed to download $INSTALLER_URL${NC}"
+        exit 1
+    fi
 
     # Install Miniconda (-u: proceed even if the directory already exists,
     # e.g. when replacing an unusable py3.14-base install)
