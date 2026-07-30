@@ -789,31 +789,66 @@ class Client : public clio::run::ContainerClient {
   // Completion failures are counted, not thrown: poll DeferErrorCount().
   struct DeferredPut {
     clio::run::Future<PutBlobTask> fut_;
-    std::string key_;
+    clio::run::u64 key_;  // DeferKeyHash of (tag, name)
     clio::run::u64 size_;
   };
+  // Keys are 64-bit FNV-1a hashes (no per-op allocation) and the per-key
+  // pending table is sharded 16 ways: a client-mode mixed workload keeps puts
+  // in flight nearly always, so EVERY read consults this table — a single
+  // global mutex + a heap-allocated string key per read collapsed the
+  // separated-runtime read throughput (~3x on YCSB B/D). A hash collision
+  // only causes a spurious same-shard await — harmless for correctness.
   struct DeferRegistry {
-    std::mutex mtx_;
+    static constexpr size_t kShards = 16;
+    struct Shard {
+      std::mutex mtx_;
+      std::unordered_map<clio::run::u64, clio::run::u32> per_key_;
+    };
+    Shard shards_[kShards];
+    std::mutex mtx_;  // guards fifo_ + inflight_bytes_
     std::deque<DeferredPut> fifo_;
-    std::unordered_map<std::string, clio::run::u32> per_key_;
     clio::run::u64 inflight_bytes_ = 0;
     // Lock-free emptiness signal: readers on the hot path check this before
-    // touching mtx_ — a pure-read phase pays one relaxed load per get, not a
-    // contended mutex (18% of workload C's throughput at 1M reads/s).
+    // touching any lock — a pure-read phase pays one relaxed load per get.
     std::atomic<clio::run::u64> pending_count_{0};
     std::atomic<clio::run::u64> errors_{0};
     static DeferRegistry &Get() {
       static DeferRegistry r;
       return r;
     }
+    Shard &ShardFor(clio::run::u64 key) { return shards_[key % kShards]; }
+    bool KeyPending(clio::run::u64 key) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      return sh.per_key_.find(key) != sh.per_key_.end();
+    }
+    void KeyAdd(clio::run::u64 key) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      sh.per_key_[key]++;
+    }
+    void KeyRelease(clio::run::u64 key) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      auto it = sh.per_key_.find(key);
+      if (it != sh.per_key_.end() && --(it->second) == 0) {
+        sh.per_key_.erase(it);
+      }
+    }
   };
 
-  static std::string DeferKey(const TagId &tag_id, const std::string &name) {
-    std::string k;
-    k.reserve(sizeof(tag_id) + name.size());
-    k.append(reinterpret_cast<const char *>(&tag_id), sizeof(tag_id));
-    k.append(name);
-    return k;
+  /** Allocation-free 64-bit key for (tag, blob name): FNV-1a. */
+  static clio::run::u64 DeferKeyHash(const TagId &tag_id,
+                                     const std::string &name) {
+    clio::run::u64 h = 1469598103934665603ull;
+    const auto *t = reinterpret_cast<const unsigned char *>(&tag_id);
+    for (size_t i = 0; i < sizeof(tag_id); ++i) {
+      h = (h ^ t[i]) * 1099511628211ull;
+    }
+    for (unsigned char c : name) {
+      h = (h ^ c) * 1099511628211ull;
+    }
+    return h;
   }
 
   /** Await the single oldest deferred put. @return false if none was
@@ -847,11 +882,8 @@ class Client : public clio::run::ContainerClient {
       std::lock_guard<std::mutex> lk(reg.mtx_);
       reg.pending_count_.fetch_sub(1, std::memory_order_relaxed);
       reg.inflight_bytes_ -= entry.size_;
-      auto it = reg.per_key_.find(entry.key_);
-      if (it != reg.per_key_.end() && --(it->second) == 0) {
-        reg.per_key_.erase(it);
-      }
     }
+    reg.KeyRelease(entry.key_);
     return true;
   }
 
@@ -887,12 +919,16 @@ class Client : public clio::run::ContainerClient {
                          context, flags, pool_query);
     }
     DeferRegistry &reg = DeferRegistry::Get();
-    std::string key = DeferKey(tag_id, blob_name);
-    std::lock_guard<std::mutex> lk(reg.mtx_);
-    reg.fifo_.push_back(DeferredPut{std::move(fut), key, size});
-    reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
-    reg.inflight_bytes_ += size;
-    reg.per_key_[std::move(key)]++;
+    clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
+    // Key entry FIRST: a reader must never see the fifo entry claimable while
+    // the key looks not-pending.
+    reg.KeyAdd(key);
+    {
+      std::lock_guard<std::mutex> lk(reg.mtx_);
+      reg.fifo_.push_back(DeferredPut{std::move(fut), key, size});
+      reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
+      reg.inflight_bytes_ += size;
+    }
     return 0;
   }
 
@@ -904,13 +940,10 @@ class Client : public clio::run::ContainerClient {
     if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
       return;  // nothing deferred anywhere -> no key can be pending
     }
-    std::string key = DeferKey(tag_id, blob_name);
+    clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
     while (true) {
-      {
-        std::lock_guard<std::mutex> lk(reg.mtx_);
-        if (reg.per_key_.find(key) == reg.per_key_.end()) {
-          return;
-        }
+      if (!reg.KeyPending(key)) {
+        return;
       }
       if (!DeferAwaitOldest()) {
         // Nothing claimable, but the key is still accounted: another thread
