@@ -1658,8 +1658,20 @@ void Worker::ProcessEventQueue() {
     // Skipping is safe: FUTURE_COMPLETE was already set above, so when the
     // parent's own await reaches this future it completes without suspending,
     // and the future the parent IS waiting on delivers its own event.
+    //
+    // The match must be EXACT — including when awaited is null (issue #856).
+    // Null means the parent is not suspended on any future right now: it is
+    // either running or cooperatively yielded (a periodic task, e.g.
+    // HeartbeatProbe, parked in the periodic queue between cycles). Resuming
+    // it here executes the fiber while it is still queued, so the periodic
+    // pop later resumes the same fiber a second time — two executions share
+    // one fiber stack and its frame locals are freed twice (the recovery
+    // leader's free(): invalid pointer abort in TriggerRecovery during
+    // leader-election). Both await paths record the awaited future before
+    // suspending, and a future with a null FutureShm matches null == null,
+    // so exact equality cannot strand a legitimate waiter.
     const void* awaited = parent->AwaitedFshm();
-    if (awaited != nullptr && awaited != future.GetFutureShm().ptr_) {
+    if (awaited != future.GetFutureShm().ptr_) {
       continue;
     }
     parent->SetAwaitedFshm(nullptr);
