@@ -329,9 +329,17 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativeGetDirect(
   char *dst = static_cast<char *>(env->GetDirectBufferAddress(buf));
   jlong cap = env->GetDirectBufferCapacity(buf);
   if (dst == nullptr) return -1;
-  // Read-after-write consistency: complete any deferred put(s) on this key
-  // before reading (no-op when none are pending).
-  clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
+  // Read-after-write WITHOUT blocking: serve straight from the in-flight
+  // deferred put when one covers this key; await only the unservable corner.
+  {
+    long long served = CLIO_CTE_CLIENT->TryGetPendingPut(
+        g_tag->GetTagId(), key_str, 0, dst, static_cast<clio::run::u64>(cap));
+    if (served > 0) return static_cast<jint>(served);
+    if (served == -2) return -2;
+    if (served == -1) {
+      clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
+    }
+  }
   try {
     clio::run::u64 size = g_tag->GetBlobSize(key_str);
     if (size == 0) return 0;
@@ -356,9 +364,12 @@ JNIEXPORT jobject JNICALL Java_site_ycsb_db_ClioClient_nativeGetView(
   env->ReleaseStringUTFChars(key, key_chars);
 
   auto *cte_client = CLIO_CTE_CLIENT;
-  // Read-after-write consistency: complete any deferred put(s) on this key
-  // before reading (no-op when none are pending).
-  clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
+  // A pending deferred put means the SHM record may be stale; return null so
+  // the caller falls to nativeGetDirect, which serves from the pending put
+  // WITHOUT blocking.
+  if (clio::cte::core::Client::HasPendingPut(g_tag->GetTagId(), key_str)) {
+    return nullptr;
+  }
   const char *ptr = nullptr;
   clio::run::u64 size = 0, gen = 0;
   if (!cte_client->TryGetBlobViewShm(g_tag->GetTagId(), key_str, &ptr, &size,
@@ -393,9 +404,22 @@ JNIEXPORT jbyteArray JNICALL Java_site_ycsb_db_ClioClient_nativeGet(
   std::string key_str(key_chars);
   env->ReleaseStringUTFChars(key, key_chars);
 
-  // Read-after-write consistency: complete any deferred put(s) on this key
-  // before reading (no-op when none are pending).
-  clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
+  // Read-after-write WITHOUT blocking (see nativeGetDirect).
+  {
+    thread_local std::vector<char> scratch(1 << 20);
+    long long served = CLIO_CTE_CLIENT->TryGetPendingPut(
+        g_tag->GetTagId(), key_str, 0, scratch.data(), scratch.size());
+    if (served > 0) {
+      jbyteArray out = env->NewByteArray(static_cast<jsize>(served));
+      if (out == nullptr) return nullptr;
+      env->SetByteArrayRegion(out, 0, static_cast<jsize>(served),
+                              reinterpret_cast<const jbyte *>(scratch.data()));
+      return out;
+    }
+    if (served == -1) {
+      clio::cte::core::Client::AwaitPendingPuts(g_tag->GetTagId(), key_str);
+    }
+  }
   clio::run::u64 size = 0;
   std::vector<char> buf;
   try {

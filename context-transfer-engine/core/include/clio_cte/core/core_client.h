@@ -791,6 +791,7 @@ class Client : public clio::run::ContainerClient {
     clio::run::Future<PutBlobTask> fut_;
     clio::run::u64 key_;  // DeferKeyHash of (tag, name)
     clio::run::u64 size_;
+    clio::run::u64 seq_;  // submission order; identifies the key's LATEST put
   };
   // Keys are 64-bit FNV-1a hashes (no per-op allocation) and the per-key
   // pending table is sharded 16 ways: a client-mode mixed workload keeps puts
@@ -800,9 +801,23 @@ class Client : public clio::run::ContainerClient {
   // only causes a spurious same-shard await — harmless for correctness.
   struct DeferRegistry {
     static constexpr size_t kShards = 16;
+    // Per-key pending state. Besides the count, it records WHERE the latest
+    // pending put's bytes live so reads can be served straight from the
+    // in-flight put without waiting for it (read-your-writes): data_ points at
+    // the put task's source — the staged SHM buffer in client mode, the
+    // caller's pinned buffer in runtime zero-copy mode — and stays valid for
+    // exactly as long as this entry references it (the reaper nulls data_
+    // under the shard lock BEFORE the task/staging is freed).
+    struct KeyPending {
+      clio::run::u32 count_ = 0;
+      clio::run::u64 seq_ = 0;          // seq of the put data_ points into
+      const char *data_ = nullptr;       // null -> serve via await fallback
+      clio::run::u64 offset_ = 0;
+      clio::run::u64 size_ = 0;
+    };
     struct Shard {
       std::mutex mtx_;
-      std::unordered_map<clio::run::u64, clio::run::u32> per_key_;
+      std::unordered_map<clio::run::u64, KeyPending> per_key_;
     };
     Shard shards_[kShards];
     std::mutex mtx_;  // guards fifo_ + inflight_bytes_
@@ -816,24 +831,60 @@ class Client : public clio::run::ContainerClient {
       static DeferRegistry r;
       return r;
     }
+    std::atomic<clio::run::u64> seq_gen_{0};
     Shard &ShardFor(clio::run::u64 key) { return shards_[key % kShards]; }
-    bool KeyPending(clio::run::u64 key) {
+    bool IsKeyPending(clio::run::u64 key) {
       Shard &sh = ShardFor(key);
       std::lock_guard<std::mutex> lk(sh.mtx_);
       return sh.per_key_.find(key) != sh.per_key_.end();
     }
-    void KeyAdd(clio::run::u64 key) {
+    void KeyAdd(clio::run::u64 key, clio::run::u64 seq, const char *data,
+                clio::run::u64 offset, clio::run::u64 size) {
       Shard &sh = ShardFor(key);
       std::lock_guard<std::mutex> lk(sh.mtx_);
-      sh.per_key_[key]++;
+      KeyPending &kp = sh.per_key_[key];
+      kp.count_++;
+      if (seq >= kp.seq_) {  // newest submission wins the serve pointer
+        kp.seq_ = seq;
+        kp.data_ = data;
+        kp.offset_ = offset;
+        kp.size_ = size;
+      }
     }
-    void KeyRelease(clio::run::u64 key) {
+    void KeyRelease(clio::run::u64 key, clio::run::u64 seq) {
       Shard &sh = ShardFor(key);
       std::lock_guard<std::mutex> lk(sh.mtx_);
       auto it = sh.per_key_.find(key);
-      if (it != sh.per_key_.end() && --(it->second) == 0) {
+      if (it == sh.per_key_.end()) return;
+      // If the retiring put is the one the serve pointer references (possible
+      // with concurrent reapers even though claims are FIFO), null it BEFORE
+      // its buffer is freed — readers then take the await fallback.
+      if (it->second.seq_ == seq) {
+        it->second.data_ = nullptr;
+      }
+      if (--(it->second.count_) == 0) {
         sh.per_key_.erase(it);
       }
+    }
+    /** Copy from the latest pending put if it fully covers
+     *  [offset, offset+size). 1 = served; 0 = no pending put for the key;
+     *  -1 = pending, but not servable (uncovered range / no data pointer) —
+     *  the caller must fall back to awaiting. The copy runs under the shard
+     *  lock, which is what keeps the source buffer alive for its duration. */
+    int TryServe(clio::run::u64 key, clio::run::u64 offset, char *dst,
+                 clio::run::u64 size, clio::run::u64 *served_size) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      auto it = sh.per_key_.find(key);
+      if (it == sh.per_key_.end()) return 0;
+      const KeyPending &kp = it->second;
+      if (kp.data_ == nullptr || offset < kp.offset_ ||
+          offset + size > kp.offset_ + kp.size_) {
+        return -1;
+      }
+      std::memcpy(dst, kp.data_ + (offset - kp.offset_), size);
+      if (served_size != nullptr) *served_size = kp.size_;
+      return 1;
     }
   };
 
@@ -883,7 +934,7 @@ class Client : public clio::run::ContainerClient {
       reg.pending_count_.fetch_sub(1, std::memory_order_relaxed);
       reg.inflight_bytes_ -= entry.size_;
     }
-    reg.KeyRelease(entry.key_);
+    reg.KeyRelease(entry.key_, entry.seq_);
     return true;
   }
 
@@ -906,6 +957,7 @@ class Client : public clio::run::ContainerClient {
     if (size == 0 || priv_data == nullptr) {
       return -1;
     }
+    auto *ipc_manager = CLIO_CPU_IPC;
     auto fut = AsyncPutBlob(tag_id, blob_name, offset, size, priv_data, score,
                             context, flags, pool_query);
     // Empty future with a non-degenerate request = client-mode staging
@@ -920,12 +972,25 @@ class Client : public clio::run::ContainerClient {
     }
     DeferRegistry &reg = DeferRegistry::Get();
     clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
+    clio::run::u64 seq = reg.seq_gen_.fetch_add(1) + 1;
+    // The put task's source bytes: the staged SHM buffer in client mode, the
+    // caller's (pinned) buffer in runtime zero-copy mode. Registered so reads
+    // can serve read-your-writes from the in-flight put without waiting.
+    const char *task_data = nullptr;
+    {
+      auto *t = fut.get();
+      if (t != nullptr && !t->blob_data_.IsNull()) {
+        task_data =
+            ipc_manager->ToFullPtr<char>(t->blob_data_.template Cast<char>())
+                .ptr_;
+      }
+    }
     // Key entry FIRST: a reader must never see the fifo entry claimable while
     // the key looks not-pending.
-    reg.KeyAdd(key);
+    reg.KeyAdd(key, seq, task_data, offset, size);
     {
       std::lock_guard<std::mutex> lk(reg.mtx_);
-      reg.fifo_.push_back(DeferredPut{std::move(fut), key, size});
+      reg.fifo_.push_back(DeferredPut{std::move(fut), key, size, seq});
       reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
       reg.inflight_bytes_ += size;
     }
@@ -942,7 +1007,7 @@ class Client : public clio::run::ContainerClient {
     }
     clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
     while (true) {
-      if (!reg.KeyPending(key)) {
+      if (!reg.IsKeyPending(key)) {
         return;
       }
       if (!DeferAwaitOldest()) {
@@ -963,9 +1028,81 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 size, char *priv_data, clio::run::u32 flags = 0,
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
       const Context &context = Context()) {
-    AwaitPendingPuts(tag_id, blob_name);
+    // Read-your-writes WITHOUT blocking: if the latest pending deferred put
+    // fully covers the requested range, copy straight from the in-flight
+    // put's bytes and return an already-COMPLETE future (same synthesized-
+    // task contract as the TryShmGet fast path). Only when a pending put
+    // exists but cannot serve the range (partial overlap, data pointer
+    // retired mid-reap) do we fall back to awaiting it.
+    if (priv_data != nullptr && flags == 0) {
+      DeferRegistry &reg = DeferRegistry::Get();
+      if (reg.pending_count_.load(std::memory_order_relaxed) != 0) {
+        clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
+        int served = reg.TryServe(key, offset, priv_data, size, nullptr);
+        if (served > 0) {
+          auto *ipc_manager = CLIO_CPU_IPC;
+          auto task = ipc_manager->NewTask<GetBlobTask>(
+              clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+              blob_name, offset, size, flags, ctp::ipc::ShmPtr<>(), context);
+          auto fut = clio::run::Future<GetBlobTask>(task->pool_id_,
+                                                    task->method_, task);
+          fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+          task->return_code_ = 0;
+          task->SetComplete();
+          return fut;
+        }
+        if (served < 0) {
+          AwaitPendingPuts(tag_id, blob_name);
+        }
+      }
+    } else {
+      AwaitPendingPuts(tag_id, blob_name);
+    }
     return AsyncGetBlob(tag_id, blob_name, offset, size, flags, priv_data,
                         pool_query, context);
+  }
+
+  /**
+   * Serve a whole-value read of (tag, blob) straight from the LATEST pending
+   * deferred put, without waiting for it. Intended for callers whose puts are
+   * whole-blob overwrites (the deferred pipeline's primary use): when the
+   * pending put covers `offset`, its bytes from `offset` to its end ARE the
+   * current value tail.
+   * @return >0: bytes copied into dst; 0: no pending put for this blob;
+   *         -1: pending put cannot serve (range/retired) — caller should
+   *             AwaitPendingPuts then read normally; -2: dst too small.
+   */
+  long long TryGetPendingPut(const TagId &tag_id, const std::string &blob_name,
+                             clio::run::u64 offset, char *dst,
+                             clio::run::u64 dst_cap) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
+      return 0;
+    }
+    clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
+    DeferRegistry::Shard &sh = reg.ShardFor(key);
+    std::lock_guard<std::mutex> lk(sh.mtx_);
+    auto it = sh.per_key_.find(key);
+    if (it == sh.per_key_.end()) return 0;
+    const DeferRegistry::KeyPending &kp = it->second;
+    if (kp.data_ == nullptr || offset < kp.offset_ ||
+        offset >= kp.offset_ + kp.size_) {
+      return -1;
+    }
+    clio::run::u64 tail = kp.offset_ + kp.size_ - offset;
+    if (tail > dst_cap) return -2;
+    std::memcpy(dst, kp.data_ + (offset - kp.offset_), tail);
+    return static_cast<long long>(tail);
+  }
+
+  /** True iff a deferred put for (tag, blob) is still pending. */
+  static bool HasPendingPut(const TagId &tag_id,
+                            const std::string &blob_name) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
+      return false;
+    }
+    return reg.IsKeyPending(DeferKeyHash(tag_id, blob_name));
   }
 
   /**
