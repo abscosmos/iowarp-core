@@ -79,14 +79,22 @@ bool g_sync_mode = false;
 bool g_depth_mode = false;
 size_t g_window_bytes = 0;  // 0 = not set
 bool g_runtime_mode = false;
-constexpr size_t kJavaWriteRingSlots = 96;  // must match ClioClient.RING_SIZE
+// Must match ClioClient.RING_SIZE (overridable there via CLIO_YCSB_RING).
+size_t JavaWriteRingSlots() {
+  static const size_t v = [] {
+    const char *e = std::getenv("CLIO_YCSB_RING");
+    size_t n = (e && *e) ? std::strtoul(e, nullptr, 10) : 96;
+    return n < 16 ? 16 : n;
+  }();
+  return v;
+}
 
 // In-flight byte budget for one more put of `len` bytes under the active
 // policy (SIZE_MAX = unbounded, capacity mode governs via staging).
 size_t PutBudget(size_t len) {
   if (g_window_bytes != 0) return g_window_bytes;
   if (g_depth_mode) return g_window * len;
-  return (kJavaWriteRingSlots - 8) * len;  // ring-reuse safety in capacity mode
+  return (JavaWriteRingSlots() - 8) * len;  // ring-reuse safety, capacity mode
 }
 
 // ---- scan key index (workloads D/E) ---------------------------------------

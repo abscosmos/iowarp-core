@@ -64,7 +64,11 @@ public class ClioClient extends DB {
   // submit). Reads: one per-thread direct buffer for copying reads, and a
   // zero-copy view path over the blob's RAM extent, gen-validated after the
   // row is built (fall back to the copying read on mismatch).
-  private static final int RING_SIZE = 96;
+  // Ring depth bounds the async put pipeline (the shim's in-flight budget is
+  // (RING_SIZE - 8) slots' worth of bytes). Overridable to probe whether a
+  // workload is pipeline-depth-limited or server-throughput-limited.
+  private static final int RING_SIZE =
+      Integer.parseInt(System.getenv().getOrDefault("CLIO_YCSB_RING", "96"));
   private static final int BUF_CAP = 64 * 1024;
 
   private static final class WriteRing {
