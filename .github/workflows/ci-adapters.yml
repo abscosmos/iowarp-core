@@ -231,22 +231,26 @@ jobs:
           git pull
           .\bootstrap-vcpkg.bat
       - name: Configure CMake (hdf5_vol + WinFsp fuse)
-        # X_VCPKG_APPLOCAL_DEPS_SERIALIZED=ON serializes vcpkg's per-target
-        # post-build "z-applocal" DLL deployment. With HDF5_VOL=ON this job
-        # links hdf5/szip/zd/zmq + the clio runtime DLLs into many parallel
-        # test-exe targets, and under `-j` two targets would occasionally copy
-        # the SAME shared DLL into build/bin/ at once -> intermittent
+        # VCPKG_APPLOCAL_DEPS=OFF disables vcpkg's per-target post-build
+        # "z-applocal" DLL copy into build/bin/ altogether. With HDF5_VOL=ON
+        # this job links hdf5/szip/zstd/zmq into many parallel test-exe
+        # targets, and the copy step intermittently died with
         # `error MSB3073: vcpkg z-applocal ... exited with code 32`
-        # (ERROR_SHARING_VIOLATION). Serializing the applocal step removes the
-        # race. ci-windows.yml doesn't hit this because it builds HDF5_VOL=OFF
-        # (far fewer shared DLLs). See issue: flaky windows-adapters build.
+        # (ERROR_SHARING_VIOLATION) -- even AFTER
+        # X_VCPKG_APPLOCAL_DEPS_SERIALIZED=ON serialized the copies against
+        # each other (2026-07-31, twice in one day: something else, likely
+        # Defender scanning the freshly linked exe, still held the file).
+        # Instead of copying, the test step below puts the vcpkg installed
+        # bin dir on PATH so the exes resolve those DLLs in place.
+        # ci-windows.yml doesn't hit this because it builds HDF5_VOL=OFF
+        # (far fewer shared DLLs). See issue #848 (flake log).
         run: |
           cmake -B build -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET="x64-windows" `
             -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
             -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
-            -DX_VCPKG_APPLOCAL_DEPS_SERIALIZED=ON `
+            -DVCPKG_APPLOCAL_DEPS=OFF `
             -DCMAKE_BUILD_TYPE=Debug `
             -DSITE="windows-2025" `
             -DBUILDNAME="adapters/msvc/x64/d" `
@@ -283,4 +287,8 @@ jobs:
         # as the VOL — impractical on Windows (debug/release CRT split + DLL
         # discovery). The MSVC-built C++ VOL unit tests (cte_hdf5_vol_*) above are
         # the Windows VOL coverage; exclude the compat suite here.
-        run: ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite" -LE "docker|ollama"
+        run: |
+          # VCPKG_APPLOCAL_DEPS=OFF above means dependency DLLs were never
+          # copied next to the exes -- resolve them from the vcpkg tree.
+          $env:PATH = "${{ github.workspace }}\build\vcpkg_installed\x64-windows\debug\bin;${{ github.workspace }}\build\vcpkg_installed\x64-windows\bin;$env:PATH"
+          ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite" -LE "docker|ollama"
