@@ -891,6 +891,13 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       auto typed = task.template Cast<GetBlobSizeTask>();
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
+    case Method::kMultiPutBlob: {
+      // Route by the FIRST put's blob (single-node/local semantics — see the
+      // task's doc comment; all puts in a batch must map to one container).
+      auto typed = task.template Cast<MultiPutBlobTask>();
+      return HashBlobToContainer(typed->route_tag_id_,
+                                 typed->route_blob_.str());
+    }
     case Method::kGetBlobInfo: {
       auto typed = task.template Cast<GetBlobInfoTask>();
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
@@ -2725,6 +2732,58 @@ clio::run::TaskResume Runtime::Evict(clio::run::shared_ptr<EvictTask> &task) {
        task->blobs_evicted_);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+
+clio::run::TaskResume Runtime::MultiPutBlob(
+    clio::run::shared_ptr<MultiPutBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // Batched multi-blob put (issue #862): execute each put as a NESTED PutBlob
+  // call on this fiber. One scheduled task, one completion, one staging
+  // buffer — the per-put task machinery is amortized across the batch.
+  task->num_ok_ = 0;
+  task->first_rc_ = 0;
+  std::vector<MultiPutDesc> descs;
+  {
+    std::string raw = task->descs_.str();
+    std::vector<char> buf(raw.begin(), raw.end());
+    ctp::ipc::GlobalDeserialize<std::vector<char>> ar(buf);
+    ar(descs);
+  }
+  auto *ipc_manager = CLIO_CPU_IPC;
+  char *base = task->data_.IsNull()
+                   ? nullptr
+                   : ipc_manager->ToFullPtr<char>(
+                         task->data_.template Cast<char>()).ptr_;
+  if (base == nullptr || descs.empty()) {
+    task->SetReturnCode(descs.empty() ? 0 : 1);
+    CLIO_CO_RETURN;
+  }
+  for (const auto &d : descs) {
+    if (d.payload_off_ + d.size_ > task->data_len_) {
+      if (task->first_rc_ == 0) task->first_rc_ = 2;  // malformed batch entry
+      continue;
+    }
+    // Null-allocator ShmPtr = absolute in-process address of the slice; the
+    // put's bdev write reads it directly (same contract as the private put's
+    // co-located zero-copy path).
+    ctp::ipc::ShmPtr<> slice =
+        ctp::ipc::ShmPtr<>::FromRaw(base + d.payload_off_);
+    auto sub = ipc_manager->NewTask<PutBlobTask>(
+        clio::run::CreateTaskId(), task->pool_id_,
+        clio::run::PoolQuery::Local(), d.tag_id_, d.blob_name_, d.offset_,
+        d.size_, slice, /*score=*/-1.0f, Context(), /*flags=*/0);
+    sub.get()->BeginRunContext();
+    CLIO_CO_AWAIT(PutBlob(sub));
+    int rc = sub->GetReturnCode();
+    if (rc == 0) {
+      task->num_ok_++;
+    } else if (task->first_rc_ == 0) {
+      task->first_rc_ = rc;
+    }
+  }
+  task->SetReturnCode(task->first_rc_ == 0 ? 0 : task->first_rc_);
+  CLIO_CO_RETURN;
 }
 
 clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTask> &task) {

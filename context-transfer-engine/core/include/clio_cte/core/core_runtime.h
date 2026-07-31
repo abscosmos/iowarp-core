@@ -159,6 +159,8 @@ public:
   /** Evict lowest-score blobs off a tier until a byte budget is reclaimed
    *  (Method::kEvict). Broadcast; each shard reports its share. */
   clio::run::TaskResume Evict(clio::run::shared_ptr<EvictTask> &task);
+  clio::run::TaskResume MultiPutBlob(
+      clio::run::shared_ptr<MultiPutBlobTask> &task);
 
   /**
    * Rescore-and-move one blob without spawning a ReorganizeBlobTask (issue

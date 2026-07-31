@@ -44,6 +44,9 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
+#include <mutex>
+#include <memory>
+#include <deque>
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -80,6 +83,7 @@ struct PyCteFuture {
     return extract_ ? extract_(fut_) : nb::none();
   }
 };
+
 }  // namespace
 
 NB_MODULE(clio_cte_core_ext, m) {
@@ -368,6 +372,56 @@ NB_MODULE(clio_cte_core_ext, m) {
          "tag_id"_a, "blob_name"_a, "data_size"_a, "off"_a = 0,
          "Asynchronously get blob data into a private buffer (issue #823). "
          "Returns a Future; .result() -> bytes.")
+     .def("AsyncPutBlobDefer",
+         [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
+            const std::string &blob_name, nb::bytes data, size_t off,
+            clio::run::u64 max_inflight_bytes) {
+           // The client stages its own SHM copy at submit — `data` is free
+           // the moment this returns, in every mode.
+           return self.AsyncPutBlobDefer(
+               tag_id, blob_name, off, data.size(),
+               static_cast<const char *>(data.c_str()), -1.0f,
+               clio::cte::core::Context(), 0,
+               clio::run::PoolQuery::Dynamic(), max_inflight_bytes);
+         },
+         "tag_id"_a, "blob_name"_a, "data"_a, "off"_a = 0,
+         "max_inflight_bytes"_a = 0,
+         "Deferred async put (issue #862): stages an SHM copy and registers "
+         "the put in the client's pending registry; grows until shared memory "
+         "is exhausted, then awaits oldest puts (max_inflight_bytes adds an "
+         "optional pacing wall; 0 = none). 0 = submitted; poll "
+         "DeferErrorCount() for completion failures.")
+     .def("AsyncGetBlobDefer",
+         [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
+            const std::string &blob_name, size_t data_size, size_t off) {
+           auto buf = std::make_shared<std::string>(data_size, '\0');
+           auto fut = self.AsyncGetBlobDefer(tag_id, blob_name, off, data_size,
+                                             buf->data());
+           PyCteFuture pf;
+           pf.fut_ = fut.Cast<clio::run::Task>();
+           pf.extract_ = [buf](clio::run::Future<clio::run::Task> &) {
+             return nb::bytes(buf->data(), buf->size());
+           };
+           return pf;
+         },
+         "tag_id"_a, "blob_name"_a, "data_size"_a, "off"_a = 0,
+         "Read-after-write-consistent async get: completes any pending "
+         "deferred put(s) for this blob first, then reads. Returns a Future; "
+         ".result() -> bytes.")
+     .def("AwaitPutsUntilSpace",
+         [](clio::cte::core::Client &,
+            clio::run::u64 max_inflight_bytes) {
+           return clio::cte::core::Client::AwaitPutsUntilSpace(
+               max_inflight_bytes);
+         },
+         "max_inflight_bytes"_a,
+         "Await oldest deferred puts until at most max_inflight_bytes of "
+         "payload remain in flight (0 = drain all). Returns in-flight bytes.")
+     .def("DeferErrorCount",
+         [](clio::cte::core::Client &) {
+           return clio::cte::core::Client::DeferErrorCount();
+         },
+         "Deferred puts that completed with a nonzero return code (sticky).")
      .def("AsyncDelBlob",
          [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
             const std::string &blob_name) {
