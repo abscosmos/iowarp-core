@@ -842,9 +842,12 @@ class Client : public clio::run::ContainerClient {
     // pipeline's output): puts bump-copy into a staging chunk and register
     // their extents immediately (reads serve from them pre-flush); the chunk
     // ships as ONE MultiPutBlobTask when kBatchMax puts accumulate, the chunk
-    // fills, or an await needs it flushed.
+    // fills, or an await needs it flushed. kBatchChunk caps how many payload
+    // bytes a batch accumulates AND is the large-value bypass threshold: a
+    // single value this size or larger skips batching entirely (one direct
+    // put), so batches only ever aggregate values smaller than it.
     static constexpr clio::run::u64 kBatchMax = 64;
-    static constexpr clio::run::u64 kBatchChunk = 256 * 1024;
+    static constexpr clio::run::u64 kBatchChunk = 128 * 1024;
     std::mutex batch_mtx_;
     std::atomic<Client *> flush_client_{nullptr};  // for static await entries
     ctp::ipc::FullPtr<char> batch_chunk_{};
