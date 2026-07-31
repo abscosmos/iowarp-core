@@ -1027,16 +1027,21 @@ class Client : public clio::run::ContainerClient {
       const Context &context = Context(), clio::run::u32 flags = 0,
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
       clio::run::u64 max_inflight_bytes = 0) {
-    (void)score;
-    (void)context;
-    (void)flags;
-    (void)pool_query;
     if (size == 0 || priv_data == nullptr) {
       return -1;
     }
     if (max_inflight_bytes != 0) {
       AwaitPutsUntilSpace(max_inflight_bytes);
     }
+    if (size >= DeferRegistry::kBatchChunk) {
+      return DeferPutLarge(tag_id, blob_name, offset, size, priv_data, [&] {
+        return AsyncPutBlob(tag_id, blob_name, offset, size, priv_data, score,
+                            context, flags, pool_query);
+      });
+    }
+    (void)score;
+    (void)context;
+    (void)flags;
     DeferRegistry &reg = DeferRegistry::Get();
     reg.flush_client_.store(this, std::memory_order_release);
     clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
@@ -1105,11 +1110,19 @@ class Client : public clio::run::ContainerClient {
     if (max_inflight_bytes != 0) {
       AwaitPutsUntilSpace(max_inflight_bytes);
     }
+    const clio::run::u64 front_off = segments.front().blob_off_;
+    if (total >= DeferRegistry::kBatchChunk) {
+      // Multi-extent source: register count-only (no served extent) — a read
+      // of a still-pending large record awaits it instead of composing.
+      return DeferPutLarge(tag_id, blob_name, front_off, total, nullptr, [&] {
+        return AsyncPutBlobVectored(tag_id, blob_name, segments);
+      });
+    }
     DeferRegistry &reg = DeferRegistry::Get();
     reg.flush_client_.store(this, std::memory_order_release);
     clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
     clio::run::u64 seq = reg.seq_gen_.fetch_add(1) + 1;
-    const clio::run::u64 offset = segments.front().blob_off_;
+    const clio::run::u64 offset = front_off;
     const char *copied = nullptr;
     {
       std::unique_lock<std::mutex> lk(reg.batch_mtx_);
@@ -1137,6 +1150,59 @@ class Client : public clio::run::ContainerClient {
       std::lock_guard<std::mutex> lk(reg.mtx_);
       reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
       reg.inflight_bytes_ += total;
+    }
+    return 0;
+  }
+
+  /**
+   * LARGE-value deferred put: values at or above kBatchChunk bypass the
+   * accumulating batch entirely. Batching a multi-MB value degenerates into a
+   * one-put batch that re-arms the chunk and copies UNDER the global
+   * batch_mtx_ (serializing every submitting thread), the copy first-touch
+   * faults a fresh SHM chunk per put, and MultiPutBlob-written blobs skip the
+   * zero-IPC read mirror — measured 20x slower puts and 3x slower reads on
+   * 3.7MB LMCache records. Instead the value ships as ONE private put and is
+   * registered in the registry, so FIFO awaits, flow control, and per-key
+   * pending checks all still hold.
+   *
+   * OWNERSHIP CAVEAT (differs from the batched small-value path): the private
+   * put is zero-copy with a co-located runtime, so THERE the caller must keep
+   * the source buffer(s) stable until this put is awaited (AwaitPendingPuts /
+   * AwaitPutsUntilSpace / a same-key AsyncGetBlobDefer). Client mode stages
+   * at submit as always, and buffers are free on return.
+   *
+   * @param runtime_extent When non-null and co-located, registered as the
+   *        put's served extent for read-your-writes; null registers the key
+   *        count-only (pending reads await instead of composing).
+   * @param submit Submits the put; retried after awaiting the oldest deferred
+   *        put whenever it returns an empty future (SHM exhaustion).
+   */
+  template <typename SubmitFn>
+  int DeferPutLarge(const TagId &tag_id, const std::string &blob_name,
+                    clio::run::u64 offset, clio::run::u64 size,
+                    const char *runtime_extent, SubmitFn &&submit) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    reg.flush_client_.store(this, std::memory_order_release);
+    auto fut = submit();
+    while (fut.IsNull()) {
+      if (!DeferAwaitOldest()) {
+        return -2;
+      }
+      fut = submit();
+    }
+    clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
+    clio::run::u64 seq = reg.seq_gen_.fetch_add(1) + 1;
+    const char *ext =
+        CLIO_RUNTIME_MANAGER->IsRuntime() ? runtime_extent : nullptr;
+    reg.KeyAdd(key, seq, ext, offset, size);
+    DeferredPut rec;
+    rec.fut_ = fut.template Cast<clio::run::Task>();
+    rec.ents_.push_back(DeferredPut::Ent{key, seq, size});
+    {
+      std::lock_guard<std::mutex> lk(reg.mtx_);
+      reg.fifo_.push_back(std::move(rec));
+      reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
+      reg.inflight_bytes_ += size;
     }
     return 0;
   }
