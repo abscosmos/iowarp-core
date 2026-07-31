@@ -2744,7 +2744,16 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
  * there is name-hash luck, not coverage. Skip them; single-node suites keep
  * the full assertions. */
 static bool SkipShmCacheTestOnMultiNode(const char *test) {
-  if (CLIO_IPC->GetNumHosts() <= 1) return false;
+  size_t hosts = CLIO_IPC->GetNumHosts();
+  if (hosts <= 1) {
+    // The external test client never loads the cluster hostfile (its
+    // GetNumHosts() is 1 even on the 4-node suite), so fall back to the
+    // harness's own signal: the distributed docker-compose exports
+    // CTE_NUM_NODES, which this file already consults elsewhere.
+    const char *n = std::getenv("CTE_NUM_NODES");
+    if (n != nullptr) hosts = static_cast<size_t>(std::atoi(n));
+  }
+  if (hosts <= 1) return false;
   HLOG(kWarning,
        "[#879] {}: node-local SHM-cache test SKIPPED on multi-node deployment",
        test);
