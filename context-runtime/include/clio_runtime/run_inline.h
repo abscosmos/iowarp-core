@@ -74,6 +74,10 @@ template <typename TaskT>
 inline clio::run::Future<TaskT> RunInlineOrSend(
     clio::run::shared_ptr<TaskT> &task) {
   auto *ipc_manager = CLIO_CPU_IPC;
+#if CTP_IS_HOST
+  // Host-only: Container::Run / TaskResume / the RunContext accessors are
+  // host-side types (the CUDA device pass sees only forward declarations), so
+  // the device pass compiles just the Send fallback below.
   if (InlineRunEnvEnabled() && ipc_manager != nullptr &&
       CLIO_RUNTIME_MANAGER != nullptr && CLIO_RUNTIME_MANAGER->IsRuntime() &&
       ipc_manager->GetNumHosts() <= 1 && CLIO_CUR_WORKER != nullptr) {
@@ -96,6 +100,7 @@ inline clio::run::Future<TaskT> RunInlineOrSend(
       return fut;
     }
   }
+#endif  // CTP_IS_HOST
   return ipc_manager->Send(task);
 }
 
