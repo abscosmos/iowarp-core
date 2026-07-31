@@ -792,6 +792,7 @@ class Client : public clio::run::ContainerClient {
     clio::run::u64 key_;  // DeferKeyHash of (tag, name)
     clio::run::u64 size_;
     clio::run::u64 seq_;  // submission order; identifies the key's LATEST put
+    const void *src_;     // caller source buffer (zero-copy liveness tracking)
   };
   // Keys are 64-bit FNV-1a hashes (no per-op allocation) and the per-key
   // pending table is sharded 16 ways: a client-mode mixed workload keeps puts
@@ -818,6 +819,12 @@ class Client : public clio::run::ContainerClient {
     struct Shard {
       std::mutex mtx_;
       std::unordered_map<clio::run::u64, KeyPending> per_key_;
+      // Source buffers still readable by an in-flight put (runtime zero-copy
+      // mode reads the caller's buffer until completion). Callers that
+      // recycle buffers (the YCSB write ring) probe this and GROW their pool
+      // instead of overwriting a live source — extensible-queue semantics,
+      // puts bounded only by memory/SHM capacity.
+      std::unordered_map<const void *, clio::run::u32> addr_pending_;
     };
     Shard shards_[kShards];
     std::mutex mtx_;  // guards fifo_ + inflight_bytes_
@@ -838,8 +845,16 @@ class Client : public clio::run::ContainerClient {
       std::lock_guard<std::mutex> lk(sh.mtx_);
       return sh.per_key_.find(key) != sh.per_key_.end();
     }
+    Shard &ShardForAddr(const void *p) {
+      return shards_[(reinterpret_cast<uintptr_t>(p) >> 6) % kShards];
+    }
     void KeyAdd(clio::run::u64 key, clio::run::u64 seq, const char *data,
-                clio::run::u64 offset, clio::run::u64 size) {
+                clio::run::u64 offset, clio::run::u64 size, const void *src) {
+      if (src != nullptr) {
+        Shard &ash = ShardForAddr(src);
+        std::lock_guard<std::mutex> lk(ash.mtx_);
+        ash.addr_pending_[src]++;
+      }
       Shard &sh = ShardFor(key);
       std::lock_guard<std::mutex> lk(sh.mtx_);
       KeyPending &kp = sh.per_key_[key];
@@ -851,7 +866,15 @@ class Client : public clio::run::ContainerClient {
         kp.size_ = size;
       }
     }
-    void KeyRelease(clio::run::u64 key, clio::run::u64 seq) {
+    void KeyRelease(clio::run::u64 key, clio::run::u64 seq, const void *src) {
+      if (src != nullptr) {
+        Shard &ash = ShardForAddr(src);
+        std::lock_guard<std::mutex> lk(ash.mtx_);
+        auto ait = ash.addr_pending_.find(src);
+        if (ait != ash.addr_pending_.end() && --(ait->second) == 0) {
+          ash.addr_pending_.erase(ait);
+        }
+      }
       Shard &sh = ShardFor(key);
       std::lock_guard<std::mutex> lk(sh.mtx_);
       auto it = sh.per_key_.find(key);
@@ -934,7 +957,7 @@ class Client : public clio::run::ContainerClient {
       reg.pending_count_.fetch_sub(1, std::memory_order_relaxed);
       reg.inflight_bytes_ -= entry.size_;
     }
-    reg.KeyRelease(entry.key_, entry.seq_);
+    reg.KeyRelease(entry.key_, entry.seq_, entry.src_);
     return true;
   }
 
@@ -985,12 +1008,20 @@ class Client : public clio::run::ContainerClient {
                 .ptr_;
       }
     }
+    // The zero-copy (runtime) path reads the CALLER's buffer until the put
+    // completes; track that address so the caller can probe liveness before
+    // recycling it (IsSourcePending). Client mode stages a copy, so the
+    // caller buffer is free immediately and is not tracked.
+    const void *src_tracked =
+        CLIO_RUNTIME_MANAGER->IsRuntime() && !NoPrivPutEnv() ? priv_data
+                                                             : nullptr;
     // Key entry FIRST: a reader must never see the fifo entry claimable while
     // the key looks not-pending.
-    reg.KeyAdd(key, seq, task_data, offset, size);
+    reg.KeyAdd(key, seq, task_data, offset, size, src_tracked);
     {
       std::lock_guard<std::mutex> lk(reg.mtx_);
-      reg.fifo_.push_back(DeferredPut{std::move(fut), key, size, seq});
+      reg.fifo_.push_back(
+          DeferredPut{std::move(fut), key, size, seq, src_tracked});
       reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
       reg.inflight_bytes_ += size;
     }
@@ -1093,6 +1124,19 @@ class Client : public clio::run::ContainerClient {
     if (tail > dst_cap) return -2;
     std::memcpy(dst, kp.data_ + (offset - kp.offset_), tail);
     return static_cast<long long>(tail);
+  }
+
+  /** True iff an in-flight zero-copy put may still READ `src` — callers
+   *  recycling source buffers must not overwrite it while true; grow the
+   *  buffer pool instead (extensible-queue recycling). */
+  static bool IsSourcePending(const void *src) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
+      return false;
+    }
+    DeferRegistry::Shard &sh = reg.ShardForAddr(src);
+    std::lock_guard<std::mutex> lk(sh.mtx_);
+    return sh.addr_pending_.find(src) != sh.addr_pending_.end();
   }
 
   /** True iff a deferred put for (tag, blob) is still pending. */

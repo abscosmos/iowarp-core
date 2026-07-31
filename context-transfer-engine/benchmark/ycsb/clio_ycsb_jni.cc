@@ -90,11 +90,20 @@ size_t JavaWriteRingSlots() {
 }
 
 // In-flight byte budget for one more put of `len` bytes under the active
-// policy (SIZE_MAX = unbounded, capacity mode governs via staging).
+// policy. Capacity mode is UNBOUNDED: puts grow until shared memory is
+// genuinely exhausted (AsyncPutBlobDefer then awaits the oldest puts to make
+// space); ring-slot safety is handled by liveness probing + pool growth on
+// the Java side (nativeBufBusy), not by a depth cap.
 size_t PutBudget(size_t len) {
   if (g_window_bytes != 0) return g_window_bytes;
   if (g_depth_mode) return g_window * len;
-  return (JavaWriteRingSlots() - 8) * len;  // ring-reuse safety, capacity mode
+  // Capacity-mode wall: submission outruns the server ~30x, so a literal
+  // no-limit pipeline eats a resource wall within seconds (measured: the
+  // JVM direct-buffer ceiling at 3.1GB, thread-killing OOM). 256MB of
+  // in-flight payload IS the graceful shared-memory wall: deep enough that
+  // the server is always the limiter, bounded enough that hitting it means
+  // awaiting the oldest put, never an allocation failure.
+  return 256ull << 20;
 }
 
 // ---- scan key index (workloads D/E) ---------------------------------------
@@ -234,7 +243,8 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutAsync(
       rc = (t == nullptr || t->GetReturnCode() != 0) ? -10 : 0;
     }
   } else {
-    // Client mode stages (copies) during the call — defer freely.
+    // Client mode stages (copies) during the call — defer freely up to the
+    // mode's byte wall.
     clio::cte::core::Client::AwaitPutsUntilSpace(
         PutBudget(static_cast<size_t>(len)));
     rc = cte_client->AsyncPutBlobDefer(
@@ -294,6 +304,15 @@ JNIEXPORT jobjectArray JNICALL Java_site_ycsb_db_ClioClient_nativeScanKeys(
 // reap guarantees a slot is complete before its buffer is reused. No JNI
 // array copy, no owned-buffer copy: runtime mode reads the buffer directly;
 // client mode stages at submit as before.
+// True iff a zero-copy put may still be reading this direct buffer — the
+// Java write ring grows a fresh buffer instead of overwriting a live source.
+JNIEXPORT jboolean JNICALL Java_site_ycsb_db_ClioClient_nativeBufBusy(
+    JNIEnv *env, jclass, jobject buf) {
+  const void *src = env->GetDirectBufferAddress(buf);
+  if (src == nullptr) return JNI_FALSE;
+  return clio::cte::core::Client::IsSourcePending(src) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutDirect(
     JNIEnv *env, jclass, jstring key, jobject buf, jint len) {
   if (g_tag == nullptr || len <= 0) return -1;
@@ -305,10 +324,8 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutDirect(
   if (src == nullptr) return -3;
 
   auto *cte_client = CLIO_CTE_CLIENT;
-  // Ring-slot safety: bound in-flight payload below the Java ring's capacity
-  // so a slot is never rewritten while a prior put may still read it (FIFO
-  // await order guarantees anything older than the newest kRing-8 puts has
-  // completed). Sync/depth modes tighten the same budget.
+  // Pace at the mode's byte wall (capacity mode: 256MB of in-flight
+  // payload; ring-slot liveness handled by nativeBufBusy-driven growth).
   clio::cte::core::Client::AwaitPutsUntilSpace(
       PutBudget(static_cast<size_t>(len)));
   int rc = cte_client->AsyncPutBlobDefer(

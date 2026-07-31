@@ -47,6 +47,7 @@ public class ClioClient extends DB {
   private static native byte[] nativeGet(String key);
   private static native String[] nativeScanKeys(String startKey, int count);
   private static native int nativePutDirect(String key, java.nio.ByteBuffer buf, int len);
+  private static native boolean nativeBufBusy(java.nio.ByteBuffer buf);
   private static native int nativeGetDirect(String key, java.nio.ByteBuffer buf);
   private static native java.nio.ByteBuffer nativeGetView(String key, long[] genOut);
   private static native boolean nativeValidateGen(String key, long gen);
@@ -69,18 +70,33 @@ public class ClioClient extends DB {
   // workload is pipeline-depth-limited or server-throughput-limited.
   private static final int RING_SIZE =
       Integer.parseInt(System.getenv().getOrDefault("CLIO_YCSB_RING", "96"));
-  private static final int BUF_CAP = 64 * 1024;
+  // Right-sized for YCSB records (~1.1KB); 64KB slabs made the extensible
+  // ring hit the JVM direct-memory ceiling at ~48k buffers (3.1GB OOM).
+  private static final int BUF_CAP =
+      Integer.parseInt(System.getenv().getOrDefault("CLIO_YCSB_BUFCAP", "4096"));
 
   private static final class WriteRing {
-    final java.nio.ByteBuffer[] bufs = new java.nio.ByteBuffer[RING_SIZE];
+    // Extensible: starts at RING_SIZE buffers and GROWS whenever the next
+    // slot's buffer may still be feeding an in-flight zero-copy put
+    // (nativeBufBusy). Puts are then bounded only by memory / shared-memory
+    // capacity, never by ring depth, and a live source is never overwritten.
+    final java.util.ArrayList<java.nio.ByteBuffer> bufs =
+        new java.util.ArrayList<>(RING_SIZE);
     int next;
     java.nio.ByteBuffer take() {
-      java.nio.ByteBuffer b = bufs[next];
-      if (b == null) {
+      java.nio.ByteBuffer b;
+      if (bufs.size() < RING_SIZE) {
         b = java.nio.ByteBuffer.allocateDirect(BUF_CAP);
-        bufs[next] = b;
+        bufs.add(b);
+        next = 0;
+      } else {
+        b = bufs.get(next);
+        if (nativeBufBusy(b)) {
+          b = java.nio.ByteBuffer.allocateDirect(BUF_CAP);
+          bufs.add(next, b);  // grow in place; cursor stays on the new buffer
+        }
+        next = (next + 1) % bufs.size();
       }
-      next = (next + 1) % RING_SIZE;
       b.clear();
       return b;
     }
