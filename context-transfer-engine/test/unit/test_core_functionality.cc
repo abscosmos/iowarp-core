@@ -2735,8 +2735,25 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
  * authoritative RPC read. A fast path that returns the wrong bytes is far
  * worse than no fast path, so correctness is asserted before speed.
  */
+
+/** The SHM-cache direct-read fast path is node-local by definition, and the
+ * isolated pools the payload/transform/W-T-R tests build pair a Dynamic
+ * (every-node) CTE pool with a RAM target registered ONLY on this node. On
+ * multi-node deployments a put whose blob name hashes to a remote container
+ * has no reachable target and fails (#879) -- whether a given test survives
+ * there is name-hash luck, not coverage. Skip them; single-node suites keep
+ * the full assertions. */
+static bool SkipShmCacheTestOnMultiNode(const char *test) {
+  if (CLIO_IPC->GetNumHosts() <= 1) return false;
+  HLOG(kWarning,
+       "[#879] {}: node-local SHM-cache test SKIPPED on multi-node deployment",
+       test);
+  return true;
+}
+
 TEST_CASE("CTE SHM cache direct payload read",
           "[cte][core][shm_cache][payload][noleak]") {
+  if (SkipShmCacheTestOnMultiNode("payload")) return;
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
   clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   clio::cte::core::CreateParams params;
@@ -2917,6 +2934,7 @@ TEST_CASE("CTE SHM cache direct payload read",
  */
 TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
           "[cte][core][shm_cache][transform][noleak]") {
+  if (SkipShmCacheTestOnMultiNode("transform")) return;
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
   clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   clio::cte::core::CreateParams params;
@@ -3068,6 +3086,7 @@ TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
  */
 TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
           "[cte][core][shm_cache][bench][wtr][noleak]") {
+  if (SkipShmCacheTestOnMultiNode("W-T-R")) return;
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
   clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   clio::cte::core::CreateParams params;
