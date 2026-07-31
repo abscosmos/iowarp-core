@@ -472,12 +472,18 @@ def _run_c_tests():
     """Compile + run the isolated C tests through the VOL. Returns
     {name: {"pass": bool}}; each C program exits 0 on pass. These cover ops h5py
     cannot exercise well via a non-native VOL: modern-API iteration
-    (c_iteration), Safe-mode H5Fflush durability (c_safeflush), and
-    selection-aware read caching + partial-write invalidation (c_selection)."""
+    (c_iteration), Safe-mode H5Fflush durability (c_safeflush),
+    selection-aware read caching + partial-write invalidation (c_selection), and
+    the cache-identity regressions (c_cache_identity): mem/file datatype
+    mismatch, a cache surviving H5F_ACC_TRUNC of its file, and H5Dflush as a
+    barrier. Each of those three returned wrong data with a success status."""
     src_dir = os.path.dirname(os.path.abspath(__file__))
     tests = {"c_iteration": "vol_c_iteration_test.c",
              "c_safeflush": "vol_c_safeflush_test.c",
-             "c_selection": "vol_c_selection_test.c"}
+             "c_selection": "vol_c_selection_test.c",
+             "c_cache_identity": "vol_c_cache_identity_test.c",
+             "c_error_propagation": "vol_c_error_propagation_test.c",
+             "c_passthrough_ops": "vol_c_passthrough_ops_test.c"}
     out = {}
     for name, src in tests.items():
         binp = os.path.join(TMP, name)
