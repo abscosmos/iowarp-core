@@ -2502,8 +2502,36 @@ TEST_CASE("FUNCTIONAL - Distributed Execution Validation",
  *   - a miss must be reported as "not cached", never as "blob does not exist";
  *   - cached metadata must AGREE with the authoritative RPC answer.
  */
+/** The SHM-cache fast paths are node-local by definition: a blob's cached
+ * metadata/payload live in the SHM segment of the node that owns its
+ * container. The shm_cache tests assert those paths HIT, and the isolated
+ * pools some of them build pair a Dynamic (every-node) CTE pool with a RAM
+ * target registered ONLY on this node. On multi-node deployments both halves
+ * break by container placement: a put routed to a remote container either
+ * has no reachable target (isolated pools -> rc != 0) or succeeds but leaves
+ * its record in the REMOTE node's SHM (shared pool -> local Try*Shm miss),
+ * so whether a given test survives is placement luck, not coverage (#879).
+ * Skip them on multi-node; single-node suites keep the full assertions. */
+static bool SkipShmCacheTestOnMultiNode(const char *test) {
+  size_t hosts = CLIO_IPC->GetNumHosts();
+  if (hosts <= 1) {
+    // The external test client never loads the cluster hostfile (its
+    // GetNumHosts() is 1 even on the 4-node suite), so fall back to the
+    // harness's own signal: the distributed docker-compose exports
+    // CTE_NUM_NODES, which this file already consults elsewhere.
+    const char *n = std::getenv("CTE_NUM_NODES");
+    if (n != nullptr) hosts = static_cast<size_t>(std::atoi(n));
+  }
+  if (hosts <= 1) return false;
+  HLOG(kWarning,
+       "[#879] {}: node-local SHM-cache test SKIPPED on multi-node deployment",
+       test);
+  return true;
+}
+
 TEST_CASE("CTE SHM cache write-then-read",
           "[cte][core][shm_cache][functional]") {
+  if (SkipShmCacheTestOnMultiNode("functional")) return;
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
   clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   clio::cte::core::CreateParams params;
@@ -2627,6 +2655,7 @@ TEST_CASE("CTE SHM cache write-then-read",
  */
 TEST_CASE("CTE SHM cache metadata read benchmark",
           "[cte][core][shm_cache][bench][noleak]") {
+  if (SkipShmCacheTestOnMultiNode("metadata-bench")) return;
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
   clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   clio::cte::core::CreateParams params;
@@ -2735,30 +2764,6 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
  * authoritative RPC read. A fast path that returns the wrong bytes is far
  * worse than no fast path, so correctness is asserted before speed.
  */
-
-/** The SHM-cache direct-read fast path is node-local by definition, and the
- * isolated pools the payload/transform/W-T-R tests build pair a Dynamic
- * (every-node) CTE pool with a RAM target registered ONLY on this node. On
- * multi-node deployments a put whose blob name hashes to a remote container
- * has no reachable target and fails (#879) -- whether a given test survives
- * there is name-hash luck, not coverage. Skip them; single-node suites keep
- * the full assertions. */
-static bool SkipShmCacheTestOnMultiNode(const char *test) {
-  size_t hosts = CLIO_IPC->GetNumHosts();
-  if (hosts <= 1) {
-    // The external test client never loads the cluster hostfile (its
-    // GetNumHosts() is 1 even on the 4-node suite), so fall back to the
-    // harness's own signal: the distributed docker-compose exports
-    // CTE_NUM_NODES, which this file already consults elsewhere.
-    const char *n = std::getenv("CTE_NUM_NODES");
-    if (n != nullptr) hosts = static_cast<size_t>(std::atoi(n));
-  }
-  if (hosts <= 1) return false;
-  HLOG(kWarning,
-       "[#879] {}: node-local SHM-cache test SKIPPED on multi-node deployment",
-       test);
-  return true;
-}
 
 TEST_CASE("CTE SHM cache direct payload read",
           "[cte][core][shm_cache][payload][noleak]") {
