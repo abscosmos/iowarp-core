@@ -47,10 +47,18 @@
 
 namespace clio::run::detail {
 
-/** Static (process-wide) part of the inline-eligibility check. */
+/** Static (process-wide) part of the inline-eligibility check.
+ *
+ *  OPT-IN (CLIO_ENABLE_INLINE_RUN=1): inline execution measured
+ *  throughput-neutral on the YCSB workloads at every pipeline depth, and the
+ *  always-on first cut broke the file-bdev/adapters paths in CI
+ *  (ModifyExistingData "wrote 0 bytes" — Catch2 test processes do not carry
+ *  the simple_test CLIO_UNIT_TEST marker, and the file-backed bdev write
+ *  handler is not yet validated under nested execution). The mechanism stays
+ *  for latency-sensitive callers to enable deliberately. */
 inline bool InlineRunEnvEnabled() {
   static const bool v = [] {
-    if (std::getenv("CLIO_DISABLE_INLINE_RUN") != nullptr) return false;
+    if (std::getenv("CLIO_ENABLE_INLINE_RUN") == nullptr) return false;
     if (std::getenv("CLIO_UNIT_TEST") != nullptr) return false;
     return true;
   }();
