@@ -861,7 +861,11 @@ add_test(NAME cte_reorganize_all
 set_tests_properties(
     cte_reorganize_all
     PROPERTIES
-        TIMEOUT 300  # 5 minute timeout
+        # 600s: the #753 race tests seed a multi-chunk victim and fill the
+        # disk tier; Windows Debug runners need the headroom even with the
+        # in-test geometry scaling (cte_reorganize_all timed out at 300s on
+        # windows-2025).
+        TIMEOUT 600
         LABELS "unit;reorganize;cte"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
@@ -926,7 +930,11 @@ clio_add_force_net_test(NAME cte_tag_force_net
     COMMAND test_tag_operations ENVIRONMENT "${_cte_fn_env_data}")
 clio_add_force_net_test(NAME cte_query_force_net
     COMMAND test_query ENVIRONMENT "${_cte_fn_env_data}")
-clio_add_force_net_test(NAME cte_reorganize_force_net
+# 600s: the #753 race tests seed a multi-chunk victim + fill the disk tier,
+# and every one of those ops is a loopback net round trip in this variant —
+# the geometry already shrinks under CLIO_FORCE_NET (see the test), but the
+# slowest Windows runners still need headroom over the 300s default.
+clio_add_force_net_test(NAME cte_reorganize_force_net TIMEOUT 600
     COMMAND test_reorganize_blob ENVIRONMENT "${_cte_fn_env_data}")
 # Put(1MB)+DelBlob exercises the 1 MiB-bulk + free-to-partition net round-trip.
 # The full 1024-cycle regression is ~300 ms/cycle over the loopback net path
