@@ -378,8 +378,11 @@ class CTECoreFunctionalTestFixture {
   /**
    * Async helper: Get or create tag
    */
-  clio::cte::core::TagId GetOrCreateTagAsync(const std::string& tag_name) {
-    auto task = core_client_->AsyncGetOrCreateTag(tag_name);
+  clio::cte::core::TagId GetOrCreateTagAsync(
+      const std::string& tag_name,
+      const clio::run::PoolQuery& pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto task = core_client_->AsyncGetOrCreateTag(
+        tag_name, clio::cte::core::TagId::GetNull(), pool_query);
     task.Wait();
     clio::cte::core::TagId tag_id = task->tag_id_;
     return tag_id;
@@ -2502,6 +2505,19 @@ TEST_CASE("FUNCTIONAL - Distributed Execution Validation",
  *   - a miss must be reported as "not cached", never as "blob does not exist";
  *   - cached metadata must AGREE with the authoritative RPC answer.
  */
+/** The SHM-cache fast paths are node-local BY DESIGN: a blob's cached
+ * metadata/payload live in the SHM segment of the node that owns its
+ * container, and the cache exists to accelerate access to LOCAL data — on
+ * every deployment size, multi-node included. These tests therefore pin
+ * every tag and blob task to the LOCAL container (PoolQuery::Local()): the
+ * puts land on this node's target, the records publish into this node's
+ * SHM, and the assertions hold identically on single-node and multi-node
+ * suites (#879). A REMOTE blob is simply a clean cache miss served by RPC;
+ * that fallback is what the distributed suites cover. */
+static clio::run::PoolQuery ShmCacheLocalQuery() {
+  return clio::run::PoolQuery::Local();
+}
+
 TEST_CASE("CTE SHM cache write-then-read",
           "[cte][core][shm_cache][functional]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
@@ -2530,7 +2546,7 @@ TEST_CASE("CTE SHM cache write-then-read",
   }
 
   const std::string tag_name = "shm_rw_tag";
-  clio::cte::core::TagId tag_id = fixture->GetOrCreateTagAsync(tag_name);
+  clio::cte::core::TagId tag_id = fixture->GetOrCreateTagAsync(tag_name, ShmCacheLocalQuery());
   REQUIRE(!tag_id.IsNull());
 
   SECTION("A miss is reported as not-cached, never as absent") {
@@ -2559,7 +2575,7 @@ TEST_CASE("CTE SHM cache write-then-read",
 
     auto put_task = fixture->core_client_->AsyncPutBlob(
         tag_id, blob_name, 0, blob_size, blob_data_ptr, 0.5f,
-        clio::cte::core::Context(), 0);
+        clio::cte::core::Context(), 0, ShmCacheLocalQuery());
     REQUIRE(!put_task.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));
     REQUIRE(put_task->return_code_ == 0);
@@ -2573,7 +2589,7 @@ TEST_CASE("CTE SHM cache write-then-read",
 
     // The cached answer must AGREE with the authoritative RPC answer. A cache
     // that is fast but disagrees is worse than no cache at all.
-    auto size_task = fixture->core_client_->AsyncGetBlobSize(tag_id, blob_name);
+    auto size_task = fixture->core_client_->AsyncGetBlobSize(tag_id, blob_name, ShmCacheLocalQuery());
     REQUIRE(fixture->WaitForTaskCompletion(size_task, 10000));
     REQUIRE(rec.total_size_ == size_task->size_);
 
@@ -2596,7 +2612,7 @@ TEST_CASE("CTE SHM cache write-then-read",
       REQUIRE(fixture->CopyToSharedMemory(fp, data));
       auto t = fixture->core_client_->AsyncPutBlob(
           tag_id, blob_name, 0, sz, fp.shm_.template Cast<void>(), 0.5f,
-          clio::cte::core::Context(), 0);
+          clio::cte::core::Context(), 0, ShmCacheLocalQuery());
       REQUIRE(!t.IsNull());
       REQUIRE(fixture->WaitForTaskCompletion(t, 10000));
       REQUIRE(t->return_code_ == 0);
@@ -2608,7 +2624,7 @@ TEST_CASE("CTE SHM cache write-then-read",
     clio::cte::core::ShmBlobRecord rec;
     REQUIRE(fixture->core_client_->TryGetBlobRecordShm(tag_id, blob_name,
                                                        &rec));
-    auto size_task = fixture->core_client_->AsyncGetBlobSize(tag_id, blob_name);
+    auto size_task = fixture->core_client_->AsyncGetBlobSize(tag_id, blob_name, ShmCacheLocalQuery());
     REQUIRE(fixture->WaitForTaskCompletion(size_task, 10000));
     REQUIRE(rec.total_size_ == size_task->size_);
   }
@@ -2649,7 +2665,7 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
     return;
   }
 
-  clio::cte::core::TagId tag_id = fixture->GetOrCreateTagAsync("shm_bench_tag");
+  clio::cte::core::TagId tag_id = fixture->GetOrCreateTagAsync("shm_bench_tag", ShmCacheLocalQuery());
   REQUIRE(!tag_id.IsNull());
 
   // Populate a working set.
@@ -2665,7 +2681,7 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
     REQUIRE(fixture->CopyToSharedMemory(fp, data));
     auto t = fixture->core_client_->AsyncPutBlob(
         tag_id, bn, 0, kBlobSize, fp.shm_.template Cast<void>(), 0.5f,
-        clio::cte::core::Context(), 0);
+        clio::cte::core::Context(), 0, ShmCacheLocalQuery());
     REQUIRE(!t.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(t, 10000));
     REQUIRE(t->return_code_ == 0);
@@ -2700,8 +2716,8 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
   clio::run::u64 rpc_checksum = 0;
   auto rpc_t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < kRpcIters; ++i) {
-    auto t = fixture->core_client_->AsyncGetBlobSize(tag_id,
-                                                     names[i % kBlobs]);
+    auto t = fixture->core_client_->AsyncGetBlobSize(
+        tag_id, names[i % kBlobs], ShmCacheLocalQuery());
     t.Wait();
     rpc_checksum += t->size_;
   }
@@ -2735,6 +2751,7 @@ TEST_CASE("CTE SHM cache metadata read benchmark",
  * authoritative RPC read. A fast path that returns the wrong bytes is far
  * worse than no fast path, so correctness is asserted before speed.
  */
+
 TEST_CASE("CTE SHM cache direct payload read",
           "[cte][core][shm_cache][payload][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
@@ -2773,7 +2790,9 @@ TEST_CASE("CTE SHM cache direct payload read",
 
   clio::cte::core::TagId tag_id;
   {
-    auto t = client.AsyncGetOrCreateTag("shm_payload_tag");
+    auto t = client.AsyncGetOrCreateTag(
+        "shm_payload_tag", clio::cte::core::TagId::GetNull(),
+        ShmCacheLocalQuery());
     t.Wait();
     tag_id = t->tag_id_;
   }
@@ -2788,7 +2807,7 @@ TEST_CASE("CTE SHM cache direct payload read",
   REQUIRE(fixture->CopyToSharedMemory(fp, test_data));
   auto put = client.AsyncPutBlob(
       tag_id, blob_name, 0, blob_size, fp.shm_.template Cast<void>(), 0.9f,
-      clio::cte::core::Context(), 0);
+      clio::cte::core::Context(), 0, ShmCacheLocalQuery());
   REQUIRE(!put.IsNull());
   REQUIRE(fixture->WaitForTaskCompletion(put, 10000));
   REQUIRE(put->return_code_ == 0);
@@ -2824,7 +2843,7 @@ TEST_CASE("CTE SHM cache direct payload read",
     REQUIRE(!rd.IsNull());
     auto get = client.AsyncGetBlob(
         tag_id, blob_name.c_str(), 0, blob_size, 0,
-        rd.shm_.template Cast<void>());
+        rd.shm_.template Cast<void>(), ShmCacheLocalQuery());
     REQUIRE(!get.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(get, 10000));
     REQUIRE(get->return_code_ == 0);
@@ -2868,7 +2887,7 @@ TEST_CASE("CTE SHM cache direct payload read",
     for (int i = 0; i < kRpcIters; ++i) {
       auto g = client.AsyncGetBlob(
           tag_id, blob_name.c_str(), 0, blob_size, 0,
-          rd.shm_.template Cast<void>());
+          rd.shm_.template Cast<void>(), ShmCacheLocalQuery());
       g.Wait();
     }
     auto rpc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2953,7 +2972,9 @@ TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
 
   clio::cte::core::TagId tag_id;
   {
-    auto t = client.AsyncGetOrCreateTag("shm_transform_tag");
+    auto t = client.AsyncGetOrCreateTag(
+        "shm_transform_tag", clio::cte::core::TagId::GetNull(),
+        ShmCacheLocalQuery());
     t.Wait();
     tag_id = t->tag_id_;
   }
@@ -2972,7 +2993,7 @@ TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
     clio::cte::core::Context ctx;
     ctx.transform_flags_ = transform;
     auto put = client.AsyncPutBlob(tag_id, name, 0, blob_size,
-                                   fp.shm_.template Cast<void>(), 0.9f, ctx, 0);
+                                   fp.shm_.template Cast<void>(), 0.9f, ctx, 0, ShmCacheLocalQuery());
     REQUIRE(!put.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(put, 10000));
     REQUIRE(put->return_code_ == 0);
@@ -3031,7 +3052,7 @@ TEST_CASE("CTE SHM cache refuses direct reads of transformed blobs",
     auto rd = CLIO_IPC->AllocateBuffer(blob_size);
     REQUIRE(!rd.IsNull());
     auto g = client.AsyncGetBlob(tag_id, "transformed_blob", 0, blob_size, 0,
-                                 rd.shm_.template Cast<void>());
+                                 rd.shm_.template Cast<void>(), ShmCacheLocalQuery());
     g.Wait();
     REQUIRE(g->return_code_ == 0);
     REQUIRE(std::memcmp(test_data.data(), rd.ptr_, blob_size) == 0);
@@ -3095,7 +3116,9 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
 
   clio::cte::core::TagId tag_id;
   {
-    auto t = client.AsyncGetOrCreateTag("shm_wtr_tag");
+    auto t = client.AsyncGetOrCreateTag(
+        "shm_wtr_tag", clio::cte::core::TagId::GetNull(),
+        ShmCacheLocalQuery());
     t.Wait();
     tag_id = t->tag_id_;
   }
@@ -3114,7 +3137,7 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
   auto do_write = [&]() {
     auto t = client.AsyncPutBlob(tag_id, blob_name, 0, kSize,
                                  wbuf.shm_.template Cast<void>(), 0.9f,
-                                 clio::cte::core::Context(), 0);
+                                 clio::cte::core::Context(), 0, ShmCacheLocalQuery());
     t.Wait();
     return t->return_code_;
   };
@@ -3160,7 +3183,7 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
   auto b0 = std::chrono::steady_clock::now();
   for (int i = 0; i < kIters; ++i) {
     REQUIRE(do_write() == 0);
-    auto g = client.AsyncGetBlobSize(tag_id, blob_name);
+    auto g = client.AsyncGetBlobSize(tag_id, blob_name, ShmCacheLocalQuery());
     g.Wait();
     sink += g->size_;
   }
@@ -3186,7 +3209,7 @@ TEST_CASE("CTE SHM cache write-then-read cycle benchmark",
   for (int i = 0; i < kIters; ++i) {
     REQUIRE(do_write() == 0);
     auto g = client.AsyncGetBlob(tag_id, blob_name.c_str(), 0, kSize, 0,
-                                 rd.shm_.template Cast<void>());
+                                 rd.shm_.template Cast<void>(), ShmCacheLocalQuery());
     g.Wait();
   }
   double cycle_rpc_data_us =
