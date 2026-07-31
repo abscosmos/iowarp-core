@@ -35,6 +35,7 @@
 #define BDEV_CLIENT_H_
 
 #include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/run_inline.h>
 
 #include "bdev_tasks.h"
 
@@ -107,7 +108,8 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<AllocateBlocksTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, size);
 
-    return ipc_manager->Send(task);
+    // issue #862: see AsyncWrite.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -121,7 +123,8 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<clio::run::bdev::FreeBlocksTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, blocks);
 
-    return ipc_manager->Send(task);
+    // issue #862: see AsyncWrite.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -135,7 +138,8 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<clio::run::bdev::FreeBlocksTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, blocks);
 
-    return ipc_manager->Send(task);
+    // issue #862: see AsyncWrite.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -154,7 +158,9 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<clio::run::bdev::WriteTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, blocks, data, length);
 
-    return ipc_manager->Send(task);
+    // issue #862: a local (co-located, single-node) bdev write is a memcpy;
+    // run the handler inline instead of paying a task round trip for it.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -174,7 +180,8 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<clio::run::bdev::ReadTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, blocks, data, buffer_size);
 
-    return ipc_manager->Send(task);
+    // issue #862: see AsyncWrite.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
