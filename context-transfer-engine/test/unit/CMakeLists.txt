@@ -870,6 +870,30 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
+# Deferred-put pipeline + multiput batches (issue #862)
+add_executable(test_multiput_defer test_multiput_defer.cc)
+target_link_libraries(test_multiput_defer
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_multiput_defer
+    COMMAND test_multiput_defer)
+
+set_tests_properties(
+    cte_multiput_defer
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;multiput;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
 # Add score-driven eviction tests (Method::kEvict)
 add_test(NAME cte_evict
     COMMAND test_evict)

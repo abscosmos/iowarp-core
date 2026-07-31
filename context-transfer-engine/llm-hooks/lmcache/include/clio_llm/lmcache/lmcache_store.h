@@ -113,10 +113,11 @@ class LMCacheStore {
    * Store multiple opaque byte blobs through the CTE deferred-put pipeline.
    *
    * Every put is submitted via AsyncPutBlobDefer (issue #862); the CTE
-   * client's registry owns the futures and self-throttles on shared-memory
-   * capacity. With a co-located runtime the batch is awaited before this call
-   * returns (the zero-copy writes read the caller's payloads); in client mode
-   * payloads are staged at submit and the puts stay deferred past the call.
+   * client's registry owns the futures, stages its own copy of the payload at
+   * submit (so caller buffers are free on return in every mode), batches puts
+   * into MultiPutBlob tasks, and self-throttles on shared-memory capacity.
+   * Puts stay deferred past the call; reads through this store are
+   * read-after-write consistent (served from the pending puts when needed).
    *
    * @param blob_names CTE blob names.
    * @param payloads Blob bytes to write, one per blob name.
@@ -133,9 +134,9 @@ class LMCacheStore {
    *
    * Each stored blob uses the stable CLIOKV1 record layout: fixed header,
    * metadata JSON bytes, then payload bytes, submitted as one deferred
-   * vectored put (issues #830/#862). An in-process local runtime reads caller
-   * buffers directly and the batch is awaited before this call returns; in
-   * client mode the segments are staged at submit and stay deferred.
+   * vectored put (issues #830/#862): the record is assembled directly into
+   * the CTE's accumulating deferred batch at submit, caller buffers are free
+   * on return in every mode, and the puts stay deferred past the call.
    *
    * @param blob_names CTE blob names.
    * @param metadata_jsons Metadata JSON bytes, one per blob name.

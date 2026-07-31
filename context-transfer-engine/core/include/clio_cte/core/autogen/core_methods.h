@@ -60,7 +60,12 @@ GLOBAL_CROSS_CONST clio::run::u32 kDynamicReorganize = 46;
 // (targets with score >= min) until a byte budget is reclaimed.
 GLOBAL_CROSS_CONST clio::run::u32 kEvict = 47;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 48;
+// Batched multi-blob put (issue #862): one task carrying up to ~64 puts to
+// DIFFERENT blobs, executed as nested PutBlob calls — amortizes per-task
+// scheduling/completion and staging allocation across the batch.
+GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob = 48;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 49;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -102,6 +107,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[45] = "PodReorganizeBlob";
     v[46] = "DynamicReorganize";
     v[47] = "Evict";
+    v[48] = "MultiPutBlob";
     return v;
   }();
   return names;

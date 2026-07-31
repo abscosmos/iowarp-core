@@ -84,28 +84,6 @@ struct PyCteFuture {
   }
 };
 
-// ---- Deferred-put support (issue #862) -------------------------------------
-// AsyncPutBlobDefer hands the future to the client's process-wide registry, so
-// in RUNTIME (embedded) mode the source bytes must stay alive until that put
-// is awaited. Retain a copy per deferred put and trim the retention FIFO to
-// the registry's depth after every await — valid because deferred puts are
-// awaited strictly FIFO (assumes this process defers puts only via these
-// bindings).
-static std::deque<std::shared_ptr<std::string>> g_defer_retained;
-static std::mutex g_defer_retained_mtx;
-static void TrimDeferRetained() {
-  size_t depth;
-  {
-    auto &reg = clio::cte::core::Client::DeferRegistry::Get();
-    std::lock_guard<std::mutex> lk(reg.mtx_);
-    depth = reg.fifo_.size();
-  }
-  std::lock_guard<std::mutex> lk(g_defer_retained_mtx);
-  while (g_defer_retained.size() > depth) {
-    g_defer_retained.pop_front();
-  }
-}
-
 }  // namespace
 
 NB_MODULE(clio_cte_core_ext, m) {
@@ -396,30 +374,29 @@ NB_MODULE(clio_cte_core_ext, m) {
          "Returns a Future; .result() -> bytes.")
      .def("AsyncPutBlobDefer",
          [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
-            const std::string &blob_name, nb::bytes data, size_t off) {
-           auto buf = std::make_shared<std::string>(
-               static_cast<const char *>(data.c_str()), data.size());
-           int rc = self.AsyncPutBlobDefer(tag_id, blob_name, off, buf->size(),
-                                           buf->data());
-           if (rc == 0) {
-             std::lock_guard<std::mutex> lk(g_defer_retained_mtx);
-             g_defer_retained.push_back(std::move(buf));
-           }
-           TrimDeferRetained();
-           return rc;
+            const std::string &blob_name, nb::bytes data, size_t off,
+            clio::run::u64 max_inflight_bytes) {
+           // The client stages its own SHM copy at submit — `data` is free
+           // the moment this returns, in every mode.
+           return self.AsyncPutBlobDefer(
+               tag_id, blob_name, off, data.size(),
+               static_cast<const char *>(data.c_str()), -1.0f,
+               clio::cte::core::Context(), 0,
+               clio::run::PoolQuery::Dynamic(), max_inflight_bytes);
          },
          "tag_id"_a, "blob_name"_a, "data"_a, "off"_a = 0,
-         "Deferred async put (issue #862): submits and registers the put in "
-         "the client's pending registry. Awaits oldest pending puts if shared "
-         "memory is exhausted. 0 = submitted; poll DeferErrorCount() for "
-         "completion failures.")
+         "max_inflight_bytes"_a = 0,
+         "Deferred async put (issue #862): stages an SHM copy and registers "
+         "the put in the client's pending registry; grows until shared memory "
+         "is exhausted, then awaits oldest puts (max_inflight_bytes adds an "
+         "optional pacing wall; 0 = none). 0 = submitted; poll "
+         "DeferErrorCount() for completion failures.")
      .def("AsyncGetBlobDefer",
          [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
             const std::string &blob_name, size_t data_size, size_t off) {
            auto buf = std::make_shared<std::string>(data_size, '\0');
            auto fut = self.AsyncGetBlobDefer(tag_id, blob_name, off, data_size,
                                              buf->data());
-           TrimDeferRetained();
            PyCteFuture pf;
            pf.fut_ = fut.Cast<clio::run::Task>();
            pf.extract_ = [buf](clio::run::Future<clio::run::Task> &) {
@@ -434,10 +411,8 @@ NB_MODULE(clio_cte_core_ext, m) {
      .def("AwaitPutsUntilSpace",
          [](clio::cte::core::Client &,
             clio::run::u64 max_inflight_bytes) {
-           clio::run::u64 left =
-               clio::cte::core::Client::AwaitPutsUntilSpace(max_inflight_bytes);
-           TrimDeferRetained();
-           return left;
+           return clio::cte::core::Client::AwaitPutsUntilSpace(
+               max_inflight_bytes);
          },
          "max_inflight_bytes"_a,
          "Await oldest deferred puts until at most max_inflight_bytes of "

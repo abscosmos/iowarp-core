@@ -77,6 +77,7 @@ using namespace std::chrono_literals;
 
 // Include bdev client and tasks
 #include <clio_runtime/bdev/bdev_client.h>
+#include <clio_runtime/bdev/transports/block_allocator.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
 // Include the allocator WAL directly for the compaction test (drives the log
 // without a runtime).
@@ -402,8 +403,15 @@ TEST_CASE("bdev_block_allocation_4kb", "[bdev][allocate][4kb]") {
 
       clio::run::bdev::Block block = alloc_task->blocks_[0];
       REQUIRE(block.size_ >= k4KB);
-      REQUIRE(block.block_type_ == 0);     // 4KB category
-      REQUIRE(block.offset_ % 4096 == 0);  // Aligned
+      // Category is derived from the request size against the live block-size
+      // table (issue #862 added 512B/1KB/2KB classes below 4KB, shifting the
+      // ordinals) — assert the mapping, not a magic index.
+      REQUIRE(block.block_type_ ==
+              static_cast<clio::run::u32>(
+                  clio::run::bdev::GlobalBlockMap::FindBlockType(k4KB)));
+      // RAM bdevs allocate at 512B granularity (byte-addressable; issue
+      // #862); device-aligned tiers still round to 4KB.
+      REQUIRE(block.offset_ % 512 == 0);
 
       // Verify that completer matches expected value based on DirectHash
       // Formula: expected_container_id = hash_value % num_containers

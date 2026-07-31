@@ -2123,6 +2123,116 @@ struct EvictTask : public clio::run::Task {
   }
 };
 
+/**
+ * MultiPutBlobTask (issue #862) - batched multi-blob put.
+ *
+ * Carries up to ~64 whole-value puts to DIFFERENT blobs in ONE task: all
+ * payloads live in a single staged buffer (data_), and descs_ is a
+ * GlobalSerialize'd std::vector<MultiPutDesc> naming each put's tag, blob,
+ * offset, size, and payload offset within data_. The handler executes each
+ * put as a NESTED PutBlob call, so per-task scheduling, completion
+ * signalling, and staging allocation are amortized across the batch.
+ *
+ * Routing uses route_tag_id_/route_blob_ (the first put) — callers are
+ * single-node/local (the deferred pipeline); multi-node callers must ensure
+ * every put maps to the same container.
+ *
+ * The destructor frees data_ when TASK_DATA_OWNER is set (client-side
+ * staging ownership, same contract as PutBlobTask).
+ */
+struct MultiPutDesc {
+  TagId tag_id_;
+  std::string blob_name_;
+  clio::run::u64 offset_ = 0;
+  clio::run::u64 size_ = 0;
+  clio::run::u64 payload_off_ = 0;
+
+  template <typename Ar>
+  void serialize(Ar &ar) {
+    ar(tag_id_, blob_name_, offset_, size_, payload_off_);
+  }
+};
+
+struct MultiPutBlobTask : public clio::run::Task {
+  IN TagId route_tag_id_;                    // routing key (first put)
+  IN clio::run::priv::string route_blob_;    // routing key (first put)
+  IN ctp::ipc::ShmPtr<> data_;               // all payloads, one staging
+  IN clio::run::u64 data_len_;
+  IN clio::run::priv::string descs_;         // serialized vector<MultiPutDesc>
+  OUT clio::run::u32 num_ok_;
+  OUT int first_rc_;                         // first nonzero put rc (0 = all ok)
+
+  MultiPutBlobTask()
+      : clio::run::Task(),
+        route_blob_(CLIO_PRIV_ALLOC),
+        data_len_(0),
+        descs_(CLIO_PRIV_ALLOC),
+        num_ok_(0),
+        first_rc_(0) {}
+
+  CTP_CROSS_FUN explicit MultiPutBlobTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &route_tag_id,
+      const std::string &route_blob, ctp::ipc::ShmPtr<> data,
+      clio::run::u64 data_len, const std::string &descs)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiPutBlob),
+        route_tag_id_(route_tag_id),
+        route_blob_(CLIO_PRIV_ALLOC, route_blob),
+        data_(data),
+        data_len_(data_len),
+        descs_(CLIO_PRIV_ALLOC, descs),
+        num_ok_(0),
+        first_rc_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kMultiPutBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  CTP_CROSS_FUN ~MultiPutBlobTask() {
+#if !CTP_IS_DEVICE_PASS
+    if (task_flags_.Any(TASK_DATA_OWNER) && !data_.IsNull()) {
+      auto *ipc_manager = CLIO_CPU_IPC;
+      if (ipc_manager) {
+        ipc_manager->FreeBuffer(data_.template Cast<char>());
+      }
+    }
+#endif
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(route_tag_id_, route_blob_, data_, data_len_, descs_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_ok_, first_rc_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<MultiPutBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    route_tag_id_ = other->route_tag_id_;
+    route_blob_ = other->route_blob_;
+    data_ = other->data_;
+    data_len_ = other->data_len_;
+    descs_ = other->descs_;
+    num_ok_ = other->num_ok_;
+    first_rc_ = other->first_rc_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<MultiPutBlobTask>();
+    num_ok_ += other->num_ok_;
+    if (first_rc_ == 0) first_rc_ = other->first_rc_;
+  }
+};
+
+
 // ===========================================================================
 // Fully-POD, GPU-compatible blob tasks (issue #556).
 //

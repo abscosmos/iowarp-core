@@ -310,41 +310,6 @@ struct GetInFlight {
 };
 
 /**
- * End-of-batch barrier for deferred puts (issue #862).
- *
- * With a co-located runtime the deferred private-memory puts read the caller's
- * buffers zero-copy until they complete, and every buffer a put batch hands to
- * the CTE (payload strings, record headers, metadata) lives only for the
- * duration of the store call — so this batch's puts must land before the call
- * returns. Awaiting per key (rather than draining the whole process-wide
- * registry to zero) waits on exactly this batch even while other threads keep
- * submitting. In client mode the CTE stages every payload at submit time, so
- * the puts stay deferred past the call and the registry's own
- * staging-exhaustion backoff is the only flow control needed.
- *
- * @param tag_id Tag the batch wrote to.
- * @param blob_names Batch blob names.
- * @param accepted Per-blob submit status; only accepted puts are awaited.
- * @param profile Optional profile accumulator (wait time).
- */
-void AwaitBatchPuts(const clio::cte::core::TagId &tag_id,
-                    const std::vector<std::string> &blob_names,
-                    const std::vector<bool> &accepted, BatchProfile *profile) {
-  if (!CLIO_RUNTIME_MANAGER->IsRuntime()) {
-    return;
-  }
-  const auto begin = Clock::now();
-  for (std::size_t i = 0; i < blob_names.size(); ++i) {
-    if (accepted[i]) {
-      clio::cte::core::Client::AwaitPendingPuts(tag_id, blob_names[i]);
-    }
-  }
-  if (profile != nullptr) {
-    profile->wait += Clock::now() - begin;
-  }
-}
-
-/**
  * Log deferred-put completion failures observed since `errors_before`.
  *
  * Deferred puts report completion failures through the CTE client's sticky
@@ -540,9 +505,8 @@ bool LMCacheStore::PutBytes(const std::string &blob_name,
   if (rc != 0) {
     return false;
   }
-  // Single-blob put: await it so the return value is a real commit status
-  // (which also satisfies the runtime-mode contract that `data` outlive the
-  // zero-copy write).
+  // Single-blob put: await it so the return value is a real commit status.
+  // (The client staged its own copy at submit; `data` is already free.)
   clio::cte::core::Client::AwaitPendingPuts(tag_id_, blob_name);
   return clio::cte::core::Client::DeferErrorCount() == errors_before;
 }
@@ -587,8 +551,6 @@ std::vector<bool> LMCacheStore::PutMany(
     }
   }
 
-  AwaitBatchPuts(tag_id_, blob_names, results,
-                 profile_enabled ? &profile : nullptr);
   WarnDeferErrors("PutMany", errors_before);
   if (profile_enabled) {
     LogBatchProfile("PutMany", profile, max_inflight);
@@ -608,12 +570,11 @@ std::vector<bool> LMCacheStore::PutManyRecords(
     return results;
   }
 
-  // One DEFERRED private-memory vectored put per record (issues #830/#862):
-  // the header/metadata/payload segments reference caller memory directly —
-  // zero-copy with a co-located runtime, staged through one internal buffer in
-  // client mode — and the CTE client's defer registry owns the futures. The
-  // headers vector below is the only store-side storage: pre-sized so the
-  // segment pointers stay stable, alive until AwaitBatchPuts lands the batch.
+  // One DEFERRED vectored put per record (issues #830/#862): the CTE bump-
+  // copies the header/metadata/payload segments contiguously into its
+  // accumulating deferred batch (the CLIOKV1 assembly IS the staging copy)
+  // and ships 64-put MultiPutBlob batches. Every source buffer — including
+  // the headers vector below — is free the moment the submit returns.
   const bool profile_enabled = ProfileEnabled();
   BatchProfile profile;
   profile.requested = blob_names.size();
@@ -636,9 +597,8 @@ std::vector<bool> LMCacheStore::PutManyRecords(
     auto segments = MakeRecordSegments(&headers[i], metadata_jsons[i],
                                        payloads[i], payload_sizes[i]);
     const auto begin = Clock::now();
-    const int rc = cte_client->AsyncPutBlobVectoredDefer(
-        tag_id_, blob_names[i], segments, 1.0f, clio::cte::core::Context(), 0,
-        pool_query_);
+    const int rc =
+        cte_client->AsyncPutBlobVectoredDefer(tag_id_, blob_names[i], segments);
     if (profile_enabled) {
       profile.submit += Clock::now() - begin;
       profile.bytes += *record_size;
@@ -650,8 +610,6 @@ std::vector<bool> LMCacheStore::PutManyRecords(
     }
   }
 
-  AwaitBatchPuts(tag_id_, blob_names, results,
-                 profile_enabled ? &profile : nullptr);
   WarnDeferErrors("PutManyRecords", errors_before);
   if (profile_enabled) {
     LogBatchProfile("PutManyRecords", profile, max_inflight);

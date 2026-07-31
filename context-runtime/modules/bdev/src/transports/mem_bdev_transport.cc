@@ -23,8 +23,18 @@ bool MemBdevTransport::Init(const CreateParams& params,
   force_sync_gpu_ = (std::getenv("CLIO_BDEV_FORCE_SYNC") != nullptr);
 
   clio::run::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
-  size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
-  allocator_.Init(num_workers, ram_capacity_, params.alignment_);
+  size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() :
+                                           16;
+  // RAM is byte-addressable — the alignment quantum here is only allocation
+  // granularity, not a device requirement. At the 4096 default a ~1KB blob
+  // pins a whole 4KB block (measured 3.6x capacity amplification, issue #862:
+  // a 256MB tier "filled" at 65,536 small blobs). Drop the DEFAULT to 512 so
+  // the new sub-4KB buckets (block_allocator.h) are actually reachable; an
+  // explicit non-default config value is honored unchanged.
+  clio::run::u32 align =
+      (params.alignment_ == 0 || params.alignment_ == 4096) ? 512
+                                                            : params.alignment_;
+  allocator_.Init(num_workers, ram_capacity_, align);
 
   // issue #783: back a plain RAM device with shared memory so client processes
   // can read blob payloads directly.
