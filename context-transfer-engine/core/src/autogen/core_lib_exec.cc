@@ -137,6 +137,11 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(Evict(typed_task));
       break;
     }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiPutBlobTask>();
+      CLIO_CO_AWAIT(MultiPutBlob(typed_task));
+      break;
+    }
     case Method::kTruncateBlob: {
       auto& typed_task = task_ptr.template Cast<TruncateBlobTask>();
       CLIO_CO_AWAIT(TruncateBlob(typed_task));
@@ -348,6 +353,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiPutBlobTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kTruncateBlob: {
       auto& typed_task = task_ptr.template Cast<TruncateBlobTask>();
       archive << *typed_task;
@@ -540,6 +550,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kEvict: {
       auto& typed_task = task_ptr.template Cast<EvictTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiPutBlobTask>();
       archive >> *typed_task;
       break;
     }
@@ -755,6 +770,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kEvict: {
       auto& typed_task = task_ptr.template Cast<EvictTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiPutBlobTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -987,6 +1008,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kEvict: {
       auto& typed_task = task_ptr.template Cast<EvictTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiPutBlobTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1298,6 +1325,15 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kMultiPutBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<MultiPutBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<MultiPutBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<MultiPutBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kTruncateBlob: {
       auto new_task_ptr = ipc_manager->NewTask<TruncateBlobTask>();
       if (!new_task_ptr.IsNull()) {
@@ -1596,6 +1632,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<EvictTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kMultiPutBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<MultiPutBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kTruncateBlob: {
       auto new_task_ptr = ipc_manager->NewTask<TruncateBlobTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -1768,6 +1808,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kEvict: {
       auto& typed_task = orig_task.template Cast<EvictTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = orig_task.template Cast<MultiPutBlobTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
