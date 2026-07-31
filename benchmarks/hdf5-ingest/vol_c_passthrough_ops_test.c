@@ -141,9 +141,31 @@ static int case_direct_chunk_io(void) {
   int32_t back[N / 4];
   memset(back, 0, sizeof(back));
   uint32_t filters = 0;
+  /* H5Dread_chunk is a VERSIONED API symbol, and the two forms differ in
+   * arity. H5version.h resolves it through H5Dread_chunk_vers: version 2
+   * (HDF5 2.x, which added a buffer-size argument) or version 1 (the 5-argument
+   * form, which is all that exists on 1.14). CI builds against both -- HDF5
+   * 2.1.1 in deps-cpu on Linux, conda-forge 1.14.6 on macOS -- and the project
+   * supports HDF5 >= 1.14, so this has to compile either way.
+   *
+   * Branch on H5Dread_chunk_vers rather than on the library version: the API
+   * version is set independently (H5_USE_114_API on a 2.x library selects
+   * version 1), so the library version does not tell you which form you get.
+   * Do NOT instead pin this to version 1 to get a single code path -- the
+   * version-1 declaration lives inside #ifndef H5_NO_DEPRECATED_SYMBOLS, so a
+   * 2.x build with deprecated symbols disabled would not have it.
+   *
+   * Both forms read the same chunk; version 2's extra argument is a bounds
+   * check on the destination, so nothing this test asserts depends on which
+   * one ran. */
+#if defined(H5Dread_chunk_vers) && H5Dread_chunk_vers >= 2
   size_t back_size = sizeof(back);
   if (H5Dread_chunk(d, H5P_DEFAULT, off, &filters, back, &back_size) < 0)
     return fail("H5Dread_chunk");
+#else
+  if (H5Dread_chunk(d, H5P_DEFAULT, off, &filters, back) < 0)
+    return fail("H5Dread_chunk");
+#endif
   if (memcmp(back, raw, sizeof(raw)) != 0)
     return fail("a chunk did not survive a direct write/read");
 
