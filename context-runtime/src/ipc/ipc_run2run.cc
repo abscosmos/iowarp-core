@@ -222,7 +222,19 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
         HLOG(kWarning,
              "[SendIn] Task {} target node {} is dead, net_timeout=0 -> skip",
              origin_task->task_id_, target_node_id);
-        origin_task->CompletedReplicas()++;
+        // Issue #856: if this skip is the LAST replica to be accounted (every
+        // other replica already responded), nobody else will ever observe
+        // completed == size — the origin would never complete and its awaiting
+        // client/fiber parks forever (the 15-minute leader-election step
+        // timeout). Check for completion here like every other counting path.
+        // Reaching size mid-loop is only possible when every replica has
+        // already contributed, so no later iteration touches Subtasks() after
+        // RecvOutCompleteOriginTask clears it.
+        clio::run::u32 completed =
+            origin_task->CompletedReplicas().fetch_add(1) + 1;
+        if (completed == origin_task->Subtasks().size()) {
+          RecvOutCompleteOriginTask(send_map_key, origin_task);
+        }
         continue;
       }
       HLOG(kWarning,
@@ -606,10 +618,29 @@ int IpcManagerRun2Run::RecvOutAggregate(
   return 0;
 }
 
+bool IpcManagerRun2Run::ClaimOrigin(size_t net_key) {
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  bool present = (send_map_.find(net_key) != nullptr);
+  if (present) {
+    send_map_.erase(net_key);
+  }
+  progress_map_.erase(net_key);  // #628: drop task-progress tracking
+  return present;
+}
+
 void IpcManagerRun2Run::RecvOutCompleteOriginTask(
     size_t net_key,
     clio::run::shared_ptr<clio::run::Task> origin_task) {
   auto *ipc_manager = CLIO_IPC;
+
+  // Exactly-once (issue #856): completion is legal only for the path that
+  // erases the origin from send_map_. If the dead-node timeout scan (or any
+  // other completer) got here first, this origin is already finalized —
+  // touching it again would EndTask a task whose first completion freed its
+  // RunContext.
+  if (!ClaimOrigin(net_key)) {
+    return;
+  }
 
   clio::run::DynamicContainer container =
       CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_);
@@ -623,12 +654,6 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
   // Clearing the vector drops the last shared_ptr owner of each replica subtask,
   // freeing them via RAII (replaces the former per-subtask DelTask).
   origin_task->Subtasks().clear();
-
-  {
-    std::lock_guard<std::mutex> lk(send_map_mutex_);
-    send_map_.erase(net_key);
-    progress_map_.erase(net_key);  // #628: drop task-progress tracking
-  }
 
   auto *worker = CLIO_CUR_WORKER;
   if (worker == nullptr) {
@@ -996,29 +1021,13 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
          "[ScanSendMapTimeouts] Task {} timed out waiting for dead node",
          origin_task->task_id_);
     origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
-    // Fix B (#628): this runs on the net worker's periodic tick, where
-    // CLIO_CUR_WORKER can be null. Fall back to the net-recv worker rather than
-    // dereferencing null (mirrors RecvOutCompleteOriginTask).
-    auto *worker = CLIO_CUR_WORKER;
-    if (worker == nullptr) {
-      auto *scheduler = CLIO_IPC->GetScheduler();
-      worker = scheduler ? scheduler->GetNetRecvWorker() : nullptr;
-    }
-    if (worker != nullptr) {
-      worker->EndTask(origin_task, true);
-    } else {
-      HLOG(kError,
-           "[ScanSendMapTimeouts] No worker available to complete task {}",
-           origin_task->task_id_);
-    }
-  }
-
-  if (!to_complete.empty()) {
-    std::lock_guard<std::mutex> lk(send_map_mutex_);
-    for (auto &entry : to_complete) {
-      send_map_.erase(entry.first);
-      progress_map_.erase(entry.first);  // #628: drop task-progress tracking
-    }
+    // Exactly-once (issue #856): funnel through RecvOutCompleteOriginTask,
+    // whose ClaimOrigin() erases the send_map_ entry BEFORE completing. The
+    // old order (EndTask first, erase in a second pass) left a window where a
+    // late replica response found the origin still in send_map_, aggregated
+    // into the completed task, and completed it a second time — the double
+    // EndTask heap corruption behind the leader-election crashes.
+    RecvOutCompleteOriginTask(entry.first, origin_task);
   }
 }
 
@@ -1027,6 +1036,12 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
 // =============================================================================
 
 void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
+  // Origins whose flushed retry was the last unaccounted replica; completed
+  // OUTSIDE retry_queues_mutex_ (EndTask is heavyweight and must not run
+  // under the retry lock).
+  std::vector<std::pair<size_t, clio::run::shared_ptr<clio::run::Task>>>
+      to_complete;
+  {
   std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
 
   for (auto it = send_in_retry_.begin(); it != send_in_retry_.end();) {
@@ -1044,7 +1059,13 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
       }
     }
     if (!origin.IsNull()) {
-      origin->CompletedReplicas()++;
+      // Issue #856: same last-replica rule as the SendIn dead-skip — if this
+      // flush accounts the final replica, the origin must complete here or it
+      // never will.
+      clio::run::u32 completed = origin->CompletedReplicas().fetch_add(1) + 1;
+      if (completed == origin->Subtasks().size()) {
+        to_complete.emplace_back(net_key, origin);
+      }
     }
     HLOG(kInfo,
          "[FlushStale] Discarding SendIn retry for restarted node {}",
@@ -1061,6 +1082,11 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
          "[FlushStale] Discarding SendOut retry for restarted node {}",
          node_id);
     it = send_out_retry_.erase(it);
+  }
+  }  // release retry_queues_mutex_ before completing origins
+
+  for (auto &entry : to_complete) {
+    RecvOutCompleteOriginTask(entry.first, entry.second);
   }
 }
 
