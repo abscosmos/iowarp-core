@@ -47,7 +47,6 @@ public class ClioClient extends DB {
   private static native byte[] nativeGet(String key);
   private static native String[] nativeScanKeys(String startKey, int count);
   private static native int nativePutDirect(String key, java.nio.ByteBuffer buf, int len);
-  private static native boolean nativeBufBusy(java.nio.ByteBuffer buf);
   private static native int nativeGetDirect(String key, java.nio.ByteBuffer buf);
   private static native java.nio.ByteBuffer nativeGetView(String key, long[] genOut);
   private static native boolean nativeValidateGen(String key, long gen);
@@ -65,44 +64,12 @@ public class ClioClient extends DB {
   // submit). Reads: one per-thread direct buffer for copying reads, and a
   // zero-copy view path over the blob's RAM extent, gen-validated after the
   // row is built (fall back to the copying read on mismatch).
-  // Ring depth bounds the async put pipeline (the shim's in-flight budget is
-  // (RING_SIZE - 8) slots' worth of bytes). Overridable to probe whether a
-  // workload is pipeline-depth-limited or server-throughput-limited.
-  private static final int RING_SIZE =
-      Integer.parseInt(System.getenv().getOrDefault("CLIO_YCSB_RING", "96"));
-  // Right-sized for YCSB records (~1.1KB); 64KB slabs made the extensible
-  // ring hit the JVM direct-memory ceiling at ~48k buffers (3.1GB OOM).
-  private static final int BUF_CAP =
-      Integer.parseInt(System.getenv().getOrDefault("CLIO_YCSB_BUFCAP", "4096"));
-
-  private static final class WriteRing {
-    // Extensible: starts at RING_SIZE buffers and GROWS whenever the next
-    // slot's buffer may still be feeding an in-flight zero-copy put
-    // (nativeBufBusy). Puts are then bounded only by memory / shared-memory
-    // capacity, never by ring depth, and a live source is never overwritten.
-    final java.util.ArrayList<java.nio.ByteBuffer> bufs =
-        new java.util.ArrayList<>(RING_SIZE);
-    int next;
-    java.nio.ByteBuffer take() {
-      java.nio.ByteBuffer b;
-      if (bufs.size() < RING_SIZE) {
-        b = java.nio.ByteBuffer.allocateDirect(BUF_CAP);
-        bufs.add(b);
-        next = 0;
-      } else {
-        b = bufs.get(next);
-        if (nativeBufBusy(b)) {
-          b = java.nio.ByteBuffer.allocateDirect(BUF_CAP);
-          bufs.add(next, b);  // grow in place; cursor stays on the new buffer
-        }
-        next = (next + 1) % bufs.size();
-      }
-      b.clear();
-      return b;
-    }
-  }
-  private static final ThreadLocal<WriteRing> WRITE_RING =
-      ThreadLocal.withInitial(WriteRing::new);
+  // AsyncPutBlobDefer owns a copy of the bytes at submit, so one reusable
+  // per-thread direct buffer is all the write path needs — no ring, no
+  // lifetime coupling, no knobs.
+  private static final int BUF_CAP = 64 * 1024;
+  private static final ThreadLocal<java.nio.ByteBuffer> WRITE_BUF =
+      ThreadLocal.withInitial(() -> java.nio.ByteBuffer.allocateDirect(BUF_CAP));
   private static final ThreadLocal<java.nio.ByteBuffer> READ_BUF =
       ThreadLocal.withInitial(() -> java.nio.ByteBuffer.allocateDirect(1024 * 1024));
   private static final ThreadLocal<long[]> GEN_OUT =
@@ -268,7 +235,7 @@ public class ClioClient extends DB {
   public Status insert(String table, String key,
       Map<String, ByteIterator> values) {
     try {
-      java.nio.ByteBuffer wb = WRITE_RING.get().take();
+      java.nio.ByteBuffer wb = (java.nio.ByteBuffer) WRITE_BUF.get().clear();
       int len = serializeInto(wb, values);
       int rc = nativePutDirect(blobName(table, key), wb, len);
       return rc == 0 ? Status.OK : Status.ERROR;
