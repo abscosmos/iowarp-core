@@ -904,7 +904,11 @@ u32 Worker::DrainMyShard() {
   // not: the lane carries internal and re-routed work that other in-flight
   // tasks may be synchronously waiting on, so holding one back can deadlock.
   // Freshly ingested client requests have no such dependents yet.
-  constexpr u32 kShardDrainBudget = 16;
+  // Raised 16 -> 256 (issue #862 experiment): with inline execution per
+  // ingested task, a larger quantum amortizes the drain loop; fairness to the
+  // lane is preserved because each ingested task still runs to completion (or
+  // routes away) before the next pop.
+  constexpr u32 kShardDrainBudget = 256;
   TaskLane *my_lane = assigned_lane_.load(std::memory_order_acquire);
   if (!BatchingEnabled()) {
     u32 n = 0;
