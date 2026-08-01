@@ -3880,8 +3880,20 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
         // per unroutable task there, and ServerInit's handful of exhausted
         // retries alone exceeded a 300s ctest window.
         constexpr auto kInlineRetryBudget = std::chrono::seconds(5);
+        // Admin-pool tasks get a longer leash (issue #883): the admin
+        // container is GUARANTEED to register (ServerInit creates it), but on
+        // loaded CI runners (Windows icx Debug, 2 vCPU) its worker-side
+        // registration has been observed to outlast 5 s, terminally failing
+        // embedded ClientInit -- and the whole test -- for a wedge that
+        // clears moments later (3 distinct tests on 2026-07-31, all rerun
+        // green). Waiting longer here cannot reintroduce the #849
+        // recovery-test time burn: those exhausted retries target non-admin
+        // pools and keep the 5 s deadline.
+        const auto inline_retry_budget = (task_ptr->pool_id_ == kAdminPoolId)
+                                             ? std::chrono::seconds(30)
+                                             : kInlineRetryBudget;
         const auto deadline =
-            std::chrono::steady_clock::now() + kInlineRetryBudget;
+            std::chrono::steady_clock::now() + inline_retry_budget;
         while (!task_ptr->IsPeriodic() &&
                (result == RouteResult::Retry || result == RouteResult::Dne) &&
                std::chrono::steady_clock::now() < deadline) {
@@ -3903,7 +3915,7 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
                "RouteTask: inline retry exhausted ({} ms) on non-worker "
                "thread; failing task pool={} method={}",
                std::chrono::duration_cast<std::chrono::milliseconds>(
-                   kInlineRetryBudget).count(),
+                   inline_retry_budget).count(),
                task_ptr->pool_id_, task_ptr->method_);
           task_ptr->SetReturnCode(static_cast<u32>(-1));
           task_ptr->SetComplete();
