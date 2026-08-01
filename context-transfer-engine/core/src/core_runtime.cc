@@ -1630,7 +1630,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       clio::run::u32 rep_result = 0;
       CLIO_CO_AWAIT(WriteReplicaData(task, *blob_info_ptr, blob_name, tag_id,
                               task->context_.replica_, offset, size,
-                              blob_score, rep_result));
+                              task->score_, blob_score, rep_result));
       if (rep_result != 0) {
         task->return_code_ = rep_result;
         CLIO_CO_RETURN;
@@ -1813,7 +1813,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         clio::run::u32 rep_result = 0;
         CLIO_CO_AWAIT(WriteReplicaData(task, *blob_info_ptr, blob_name, tag_id,
                                 static_cast<int>(rep_i), offset, size,
-                                blob_score, rep_result));
+                                /*requested_score=*/-1.0f, blob_score,
+                                rep_result));
         if (rep_result != 0) {
           task->return_code_ = rep_result;
           CLIO_CO_RETURN;
@@ -1930,19 +1931,32 @@ template <typename TaskT>
 clio::run::TaskResume Runtime::WriteReplicaData(
     clio::run::shared_ptr<TaskT> &task, BlobInfo &blob_info,
     const std::string &blob_name, TagId tag_id, int replica_idx,
-    clio::run::u64 offset, clio::run::u64 size, float blob_score,
-    clio::run::u32 &error_code) {
+    clio::run::u64 offset, clio::run::u64 size, float requested_score,
+    float fallback_score, clio::run::u32 &error_code) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   error_code = 0;
   BlobInfo staging;
+  float rep_score = requested_score;
+  int rep_min_pers = task->context_.min_persistence_level_;
   {
     Replica *rep = blob_info.GetReplica(replica_idx, /*create=*/true);
     if (rep == nullptr) {
       error_code = 8;
       CLIO_CO_RETURN;
+    }
+    // Flags first (sticky-OR), THEN derive the placement constraints from
+    // the merged bits — a put that both marks REPLICA_PERSISTENT and writes
+    // bytes must already place those bytes off volatile tiers.
+    rep->flags_ |= task->context_.replica_flags_;
+    rep_min_pers = rep->MinPersistenceLevel(rep_min_pers);
+    // Per-replica score: an explicit put score targets THIS replica; -1
+    // keeps the replica's own score (write-through path), seeding a
+    // never-scored replica from the resolved primary score.
+    if (rep_score < 0.0f) {
+      rep_score = (rep->score_ >= 0.0f) ? rep->score_ : fallback_score;
     }
     // Lend the replica's layout to ExtendBlob/ModifyExistingData through a
     // staging BlobInfo (the ReorganizeBlob pattern): every placement and I/O
@@ -1954,7 +1968,7 @@ clio::run::TaskResume Runtime::WriteReplicaData(
     // co_awaits below — a write-through loop never grows replicas_ mid-write,
     // but re-fetching after the awaits costs nothing and cannot dangle.
     staging.blob_name_ = blob_info.blob_name_;
-    staging.score_ = blob_score;
+    staging.score_ = rep_score;
     staging.blocks_ = std::move(rep->blocks_);
     rep->blocks_.clear();
     rep->total_size_cache_ = 0;
@@ -1963,8 +1977,8 @@ clio::run::TaskResume Runtime::WriteReplicaData(
   {
     clio::run::u64 old_size = staging.GetTotalSize();
     clio::run::u32 step_result = 0;
-    CLIO_CO_AWAIT(ExtendBlob(staging, offset, size, blob_score, step_result,
-                        task->context_.min_persistence_level_,
+    CLIO_CO_AWAIT(ExtendBlob(staging, offset, size, rep_score, step_result,
+                        rep_min_pers,
                         task->context_.preallocate_));
     if (step_result != 0) {
       error_code = 10 + step_result;
@@ -2027,6 +2041,9 @@ clio::run::TaskResume Runtime::WriteReplicaData(
     Replica *rep = blob_info.GetReplica(replica_idx, /*create=*/true);
     rep->blocks_ = std::move(staging.blocks_);
     rep->total_size_cache_ = staging.total_size_cache_;
+    if (error_code == 0) {
+      rep->score_ = rep_score;
+    }
 
     // WAL: full-replacement record of this replica's layout.
     if (error_code == 0 && !task->context_.emulate_ &&
@@ -2038,6 +2055,8 @@ clio::run::TaskResume Runtime::WriteReplicaData(
       txn.blob_name_ = blob_name;
       txn.replica_ = static_cast<clio::run::u32>(replica_idx);
       txn.replica_name_ = rep->name_.str();
+      txn.score_ = rep->score_;
+      txn.flags_ = rep->flags_;
       for (const auto &blk : rep->blocks_) {
         TxnExtendBlobBlock tb;
         tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
@@ -2602,6 +2621,214 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
+    const TagId &tag_id, const std::string &blob_name, int replica_idx,
+    float new_score, clio::run::u32 &rc) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    rc = 0;
+    if (blob_name.empty() || replica_idx <= 0 || new_score < 0.0f ||
+        new_score > 1.0f) {
+      rc = 1;
+      CLIO_CO_RETURN;
+    }
+    const Config &config = GetConfig();
+    float score_difference_threshold =
+        config.performance_.score_difference_threshold_;
+
+    std::shared_ptr<BlobInfo> blob_info_ptr = CheckBlobExists(blob_name, tag_id);
+    if (blob_info_ptr == nullptr) {
+      rc = 3;  // Blob not found
+      CLIO_CO_RETURN;
+    }
+    BlobInfo &blob_info = *blob_info_ptr;
+
+    // Same serialization story as the primary flow: the whole move runs
+    // under the blob's #680 write token, via the internal helpers — never
+    // via Put/Del sub-tasks, which would deadlock on this same token.
+    clio::run::u64 lock_tok =
+        reinterpret_cast<clio::run::u64>(clio::run::GetCurrentTask().get());
+    if (lock_tok == 0) {
+      lock_tok = reinterpret_cast<clio::run::u64>(&rc);
+    }
+    while (!blob_info.TryLockWrite(lock_tok)) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+    BlobWriteLockGuard blob_write_guard(&blob_info, lock_tok);
+
+    // The replica must already exist — a reorganize moves bytes, it does
+    // not create copies (that is a replica-targeted put's job).
+    Replica *rep = blob_info.GetReplica(replica_idx, /*create=*/false);
+    if (rep == nullptr) {
+      rc = 3;  // Replica not found
+      CLIO_CO_RETURN;
+    }
+    if (rep->flags_ & REPLICA_FIXED) {
+      // Pinned: the reorganizer must not touch this replica. Success, not an
+      // error — organizer sweeps call in blindly and FIXED is the filter.
+      HLOG(kDebug, "ReorganizeReplica: blob={} replica={} is FIXED, skipping",
+           blob_name, replica_idx);
+      rc = 0;
+      CLIO_CO_RETURN;
+    }
+    // The replica's OWN score decides whether the move is worth it; a
+    // never-scored replica falls back to the primary's.
+    float current_score =
+        (rep->score_ >= 0.0f) ? rep->score_ : blob_info.score_;
+    if (std::abs(new_score - current_score) < score_difference_threshold) {
+      rc = 0;
+      CLIO_CO_RETURN;
+    }
+    clio::run::u64 rep_size = rep->total_size_cache_;
+    if (rep_size == 0) {
+      // Nothing to move; still adopt the score so organizer decisions
+      // converge instead of re-triggering forever.
+      rep->score_ = new_score;
+      rc = 0;
+      CLIO_CO_RETURN;
+    }
+
+    auto *ipc_manager = CLIO_IPC;
+    ctp::ipc::FullPtr<char> data_buffer = ipc_manager->AllocateBuffer(rep_size);
+    if (data_buffer.IsNull()) {
+      rc = 5;  // Buffer allocation failed
+      CLIO_CO_RETURN;
+    }
+
+    // Read the replica's bytes inline (not GetBlob): no writer can race us
+    // under the token, and the move must not perturb access stats.
+    {
+      clio::run::u32 read_rc = 0;
+      CLIO_CO_AWAIT(ReadData(rep->blocks_,
+                             data_buffer.shm_.template Cast<void>(), rep_size,
+                             0, read_rc));
+      if (read_rc != 0) {
+        // LCOV_EXCL_START error path: needs a bdev read failure mid-move.
+        ipc_manager->FreeBuffer(data_buffer);
+        rc = 6;  // Read failed; replica untouched
+        CLIO_CO_RETURN;
+        // LCOV_EXCL_STOP
+      }
+    }
+
+    // Drain in-flight readers before freeing the old extents — replica
+    // readers pin the same read_state_ as primary readers (issue #753).
+    blob_info.BeginDrainReaders();
+    BlobReaderDrainGuard reader_drain_guard(&blob_info);
+    while (blob_info.HasReadPins()) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+
+    // Free the OLD placement before re-placing (same transient-2x-capacity
+    // reasoning as the primary flow). While the blocks sit in staging the
+    // replica reads as size 0 + write-locked, which the GetBlob replica
+    // torn-layout guard treats as mid-mutation.
+    rep = blob_info.GetReplica(replica_idx, /*create=*/false);
+    BlobInfo staging;
+    staging.blocks_ = std::move(rep->blocks_);
+    rep->blocks_.clear();
+    rep->total_size_cache_ = 0;
+    staging.RecomputeTotalSize();
+    {
+      clio::run::u32 free_rc = 0;
+      CLIO_CO_AWAIT(FreeAllBlobBlocks(staging, free_rc));
+    }
+
+    // Re-place at the new score. REPLICA_PERSISTENT keeps the placement off
+    // volatile tiers even when the new score points at one — the durability
+    // contract survives migration. Last attempt falls back to the old score
+    // into the just-freed capacity, like the primary flow.
+    const int min_pers = rep->MinPersistenceLevel(0);
+    bool placed = false;
+    float placed_score = new_score;
+    int attempt = 0;
+    for (attempt = 0; attempt < 3; ++attempt) {
+      placed_score = (attempt < 2) ? new_score : current_score;
+      clio::run::u32 place_rc = 0;
+      CLIO_CO_AWAIT(ExtendBlob(staging, 0, rep_size, placed_score, place_rc,
+                               min_pers, /*preallocate=*/0));
+      if (place_rc == 0) {
+        clio::run::u32 write_rc = 0;
+        CLIO_CO_AWAIT(ModifyExistingData(
+            staging.blocks_, data_buffer.shm_.template Cast<void>(), rep_size,
+            0, write_rc, 0, 0));
+        if (write_rc == 0) {
+          placed = true;
+          break;
+        }
+      }
+      // LCOV_EXCL_START error-recovery, same shape as the primary flow.
+      clio::run::u32 free_rc = 0;
+      CLIO_CO_AWAIT(FreeAllBlobBlocks(staging, free_rc));
+      // LCOV_EXCL_STOP
+    }
+
+    if (!placed) {
+      // LCOV_EXCL_START three placement failures in a row.
+      HLOG(kError,
+           "ReorganizeReplica: re-place failed: blob={} replica={} — replica "
+           "data LOST (entry kept, size 0)",
+           blob_name, replica_idx);
+      ipc_manager->FreeBuffer(data_buffer);
+      rc = 7;
+      CLIO_CO_RETURN;
+      // LCOV_EXCL_STOP
+    }
+
+    // Publish (co_await-free). No SHM mirror / placement-gen churn: the
+    // mirror publishes the PRIMARY's layout, which this move never touched.
+    rep = blob_info.GetReplica(replica_idx, /*create=*/false);
+    rep->blocks_ = std::move(staging.blocks_);
+    rep->total_size_cache_ = staging.total_size_cache_;
+    rep->score_ = placed_score;
+
+    // WAL: one kExtendReplica record captures the whole move (logged after
+    // the publish; a crash mid-move replays the pre-move layout).
+    if (!blob_txn_logs_.empty()) {
+      clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+      TxnExtendReplica txn;
+      txn.tag_major_ = tag_id.major_;
+      txn.tag_minor_ = tag_id.minor_;
+      txn.blob_name_ = blob_name;
+      txn.replica_ = static_cast<clio::run::u32>(replica_idx);
+      txn.replica_name_ = rep->name_.str();
+      txn.score_ = rep->score_;
+      txn.flags_ = rep->flags_;
+      for (const auto &blk : rep->blocks_) {
+        TxnExtendBlobBlock tb;
+        tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
+        tb.bdev_minor_ = blk.bdev_client_.pool_id_.minor_;
+        tb.target_query_ = blk.target_query_;
+        tb.target_offset_ = blk.target_offset_;
+        tb.size_ = blk.size_;
+        txn.new_blocks_.push_back(tb);
+      }
+      blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendReplica,
+                                                       txn);
+    }
+
+    ipc_manager->FreeBuffer(data_buffer);
+
+    if (attempt == 2) {
+      // LCOV_EXCL_START restored at the original score after a failed move.
+      rc = 7;
+      CLIO_CO_RETURN;
+      // LCOV_EXCL_STOP
+    }
+    rc = 0;
+    HLOG(kDebug, "ReorganizeReplica completed: blob={} replica={} score={}",
+         blob_name, replica_idx, placed_score);
+  } catch (const std::exception &e) {
+    HLOG(kError, "ReorganizeReplica failed: {}", e.what());
+    rc = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 // Thin task-handler wrapper over ReorganizeBlobInternal. Written once as a
 // member template so both the priv::string task and its fixed_string POD
 // variant (issue #556) share it; the internal data organizers (issue #738)
@@ -2612,8 +2839,20 @@ clio::run::TaskResume Runtime::ReorganizeBlobImpl(
     clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
   clio::run::u32 rc = 0;
-  CLIO_CO_AWAIT(ReorganizeBlobInternal(task->tag_id_, task->blob_name_.str(),
-                                       task->new_score_, rc));
+  if (task->replica_ > 0) {
+    // issue #886: migrate ONE replica's blocks by its own score. Negative
+    // selectors are meaningless here (a reorganize needs one concrete
+    // layout to move), so anything but 0/N>0 is rejected below.
+    CLIO_CO_AWAIT(ReorganizeReplicaInternal(task->tag_id_,
+                                            task->blob_name_.str(),
+                                            task->replica_, task->new_score_,
+                                            rc));
+  } else if (task->replica_ < 0) {
+    rc = 1;
+  } else {
+    CLIO_CO_AWAIT(ReorganizeBlobInternal(task->tag_id_, task->blob_name_.str(),
+                                         task->new_score_, rc));
+  }
   task->return_code_ = rc;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -4149,6 +4388,8 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
         uint8_t rep_entry_type = 3;
         uint32_t rep_idx = static_cast<uint32_t>(rep_i + 1);
         uint32_t rep_name_len = static_cast<uint32_t>(rep.name_.size());
+        float rep_score = rep.score_;
+        uint32_t rep_flags = rep.flags_;
         uint32_t rep_num_blocks = static_cast<uint32_t>(rep.blocks_.size());
         ofs.write(reinterpret_cast<const char *>(&rep_entry_type),
                   sizeof(rep_entry_type));
@@ -4158,6 +4399,10 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
         ofs.write(reinterpret_cast<const char *>(&rep_name_len),
                   sizeof(rep_name_len));
         ofs.write(rep.name_.data(), rep_name_len);
+        ofs.write(reinterpret_cast<const char *>(&rep_score),
+                  sizeof(rep_score));
+        ofs.write(reinterpret_cast<const char *>(&rep_flags),
+                  sizeof(rep_flags));
         ofs.write(reinterpret_cast<const char *>(&rep_num_blocks),
                   sizeof(rep_num_blocks));
         for (const auto &block : rep.blocks_) {
@@ -4607,6 +4852,10 @@ void Runtime::RestoreMetadataFromLog() {
       ifs.read(reinterpret_cast<char *>(&rep_name_len), sizeof(rep_name_len));
       std::string rep_name(rep_name_len, '\0');
       ifs.read(rep_name.data(), rep_name_len);
+      float rep_score;
+      ifs.read(reinterpret_cast<char *>(&rep_score), sizeof(rep_score));
+      uint32_t rep_flags;
+      ifs.read(reinterpret_cast<char *>(&rep_flags), sizeof(rep_flags));
       uint32_t num_blocks;
       ifs.read(reinterpret_cast<char *>(&num_blocks), sizeof(num_blocks));
 
@@ -4619,6 +4868,8 @@ void Runtime::RestoreMetadataFromLog() {
         rep = blob_info_ptr->GetReplica(static_cast<int>(rep_idx),
                                         /*create=*/true);
         rep->name_ = rep_name;
+        rep->score_ = rep_score;
+        rep->flags_ = rep_flags;
         rep->blocks_.clear();
         rep->total_size_cache_ = 0;
       }
@@ -4819,6 +5070,8 @@ void Runtime::ReplayTransactionLogs() {
           Replica *rep = blob_info_ptr->GetReplica(
               static_cast<int>(txn.replica_), /*create=*/true);
           rep->name_ = txn.replica_name_;
+          rep->score_ = txn.score_;
+          rep->flags_ = txn.flags_;
           rep->blocks_.clear();
           rep->total_size_cache_ = 0;
           for (const auto &tb : txn.new_blocks_) {

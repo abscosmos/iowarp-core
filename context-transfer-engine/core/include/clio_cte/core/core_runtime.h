@@ -159,6 +159,13 @@ public:
    * pattern), then publishes the layout back and logs a kExtendReplica WAL
    * record. error_code uses PutBlob's return-code space (10+x alloc,
    * 20+x write).
+   *
+   * Score resolution: requested_score >= 0 sets the REPLICA's score (the
+   * primary's is untouched); -1 keeps the replica's own score, falling back
+   * to fallback_score for a replica this write creates. The write-through
+   * loop always passes -1 — an explicit put score is for the primary, not a
+   * blanket rescore of every copy. Context::replica_flags_ is OR'd in first,
+   * and REPLICA_PERSISTENT tightens the placement's min persistence level.
    */
   template <typename TaskT>
   clio::run::TaskResume WriteReplicaData(clio::run::shared_ptr<TaskT> &task,
@@ -166,8 +173,23 @@ public:
                                          const std::string &blob_name,
                                          TagId tag_id, int replica_idx,
                                          clio::run::u64 offset,
-                                         clio::run::u64 size, float blob_score,
+                                         clio::run::u64 size,
+                                         float requested_score,
+                                         float fallback_score,
                                          clio::run::u32 &error_code);
+
+  /**
+   * Migrate one REPLICA's blocks to the tier its new score selects (issue
+   * #886) — the replica half of ReorganizeBlobInternal, sharing its
+   * read→free→re-place→publish shape and rc space. REPLICA_FIXED makes this
+   * a no-op (rc 0); REPLICA_PERSISTENT keeps the re-place off volatile
+   * tiers. The primary's blocks, score and mirror are untouched.
+   */
+  clio::run::TaskResume ReorganizeReplicaInternal(const TagId &tag_id,
+                                                  const std::string &blob_name,
+                                                  int replica_idx,
+                                                  float new_score,
+                                                  clio::run::u32 &rc);
 
   /** Put blob (Method::kPutBlob) - allocates and writes data to blob. */
   clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);

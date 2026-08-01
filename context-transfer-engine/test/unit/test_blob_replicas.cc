@@ -51,9 +51,11 @@ static constexpr clio::run::u64 kValSize = 4096;
 class BlobReplicasFixture {
  public:
   std::string config_path_;
+  std::string file_storage_path_;
 
   BlobReplicasFixture() {
     config_path_ = chi_test_data_dir() + "/blob_replicas_config.yaml";
+    file_storage_path_ = chi_test_data_dir() + "/blob_replicas_file.dat";
     Cleanup();
     CreateConfigFile();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
@@ -70,13 +72,19 @@ class BlobReplicasFixture {
 
   void Cleanup() {
     if (fs::exists(config_path_)) fs::remove(config_path_);
+    if (fs::exists(file_storage_path_)) fs::remove(file_storage_path_);
   }
 
   void CreateConfigFile() {
     std::ofstream config_file(config_path_);
     REQUIRE(config_file.is_open());
+    // Two tiers: a fast VOLATILE RAM tier and a small non-volatile file
+    // tier. The file tier is deliberately tiny (1MB) so the
+    // REPLICA_PERSISTENT test can prove enforcement by exhaustion: a
+    // persistent replica larger than 1MB has nowhere legal to go and must
+    // fail, while the same payload without the flag lands in RAM.
     config_file << R"(
-# Blob replica test configuration - single 64MB DRAM tier
+# Blob replica test configuration - RAM (volatile) + small file (temporary)
 runtime:
   num_threads: 2
   queue_depth: 1024
@@ -99,6 +107,12 @@ compose:
         bdev_type: "ram"
         capacity_limit: "64MB"
         score: 1.0
+
+      - path: ")" << file_storage_path_ << R"("
+        bdev_type: "file"
+        capacity_limit: "1MB"
+        score: 0.2
+        persistence_level: "temporary"
 
     dpe:
       dpe_type: "max_bw"
@@ -218,6 +232,141 @@ TEST_CASE("BlobReplicas - delete destroys replicas with the blob",
   std::vector<char> got;
   REQUIRE(GetFrom(client, tag_id, "del_blob", &got, 0) != 0);
   REQUIRE(GetFrom(client, tag_id, "del_blob", &got, 1) != 0);
+}
+
+TEST_CASE("BlobReplicas - per-replica score drives reorganizer migration",
+          "[cte][replicas][reorganize][886]") {
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("replica_reorg_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  const std::string primary_val(kValSize, 'p');
+  const std::string replica_val(kValSize, 'r');
+  PutTo(client, tag_id, "reorg_blob", primary_val, 0);
+  PutTo(client, tag_id, "reorg_blob", replica_val, 1);
+
+  // Migrate the REPLICA to the slow tier by its own score; the primary's
+  // score and placement are untouched.
+  auto move_down = client->AsyncReorganizeBlob(
+      tag_id, "reorg_blob", 0.2f, clio::run::PoolQuery::Dynamic(), /*replica=*/1);
+  move_down.Wait();
+  REQUIRE(move_down->GetReturnCode() == 0);
+
+  std::vector<char> got;
+  REQUIRE(GetFrom(client, tag_id, "reorg_blob", &got, 1) == 0);
+  REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
+  REQUIRE(GetFrom(client, tag_id, "reorg_blob", &got, 0) == 0);
+  REQUIRE(std::memcmp(got.data(), primary_val.data(), kValSize) == 0);
+
+  // The replica remembers ITS score: the same target score again is a
+  // below-threshold no-op, and moving back up works.
+  auto again = client->AsyncReorganizeBlob(
+      tag_id, "reorg_blob", 0.2f, clio::run::PoolQuery::Dynamic(), 1);
+  again.Wait();
+  REQUIRE(again->GetReturnCode() == 0);
+  auto move_up = client->AsyncReorganizeBlob(
+      tag_id, "reorg_blob", 1.0f, clio::run::PoolQuery::Dynamic(), 1);
+  move_up.Wait();
+  REQUIRE(move_up->GetReturnCode() == 0);
+  REQUIRE(GetFrom(client, tag_id, "reorg_blob", &got, 1) == 0);
+  REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
+
+  // Reorganizing a replica no write created fails cleanly.
+  auto absent = client->AsyncReorganizeBlob(
+      tag_id, "reorg_blob", 0.5f, clio::run::PoolQuery::Dynamic(), 7);
+  absent.Wait();
+  REQUIRE(absent->GetReturnCode() != 0);
+}
+
+TEST_CASE("BlobReplicas - REPLICA_FIXED pins a replica against the organizer",
+          "[cte][replicas][reorganize][886]") {
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("replica_fixed_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  const std::string replica_val(kValSize, 'F');
+  PutTo(client, tag_id, "fixed_blob", std::string(kValSize, 'p'), 0);
+  {
+    clio::cte::core::Context ctx = ReplicaCtx(1);
+    ctx.replica_flags_ = clio::cte::core::REPLICA_FIXED;
+    auto fut = client->AsyncPutBlob(tag_id, "fixed_blob", 0, kValSize,
+                                    replica_val.data(), /*score=*/-1.0f, ctx);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+  }
+
+  // The reorganizer must not touch a FIXED replica: success (the organizer
+  // sweeps blindly; FIXED is the filter), bytes stay put.
+  auto fut = client->AsyncReorganizeBlob(
+      tag_id, "fixed_blob", 0.2f, clio::run::PoolQuery::Dynamic(), 1);
+  fut.Wait();
+  REQUIRE(fut->GetReturnCode() == 0);
+  std::vector<char> got;
+  REQUIRE(GetFrom(client, tag_id, "fixed_blob", &got, 1) == 0);
+  REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
+}
+
+TEST_CASE("BlobReplicas - REPLICA_PERSISTENT excludes volatile tiers",
+          "[cte][replicas][persistence][886]") {
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("replica_persist_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  // A payload bigger than the ONLY non-volatile tier (1MB file): as a plain
+  // replica it lands in RAM; as a PERSISTENT replica it has nowhere legal
+  // to go and the put must fail — proof the flag really excludes the
+  // volatile tier rather than merely preferring the file one.
+  const clio::run::u64 kBig = 4ULL * 1024 * 1024;
+  const std::string big(kBig, 'B');
+  {
+    auto fut = client->AsyncPutBlob(tag_id, "persist_blob", 0, kBig,
+                                    big.data(), -1.0f, ReplicaCtx(1));
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+  }
+  {
+    clio::cte::core::Context ctx = ReplicaCtx(2);
+    ctx.replica_flags_ = clio::cte::core::REPLICA_PERSISTENT;
+    auto fut = client->AsyncPutBlob(tag_id, "persist_blob", 0, kBig,
+                                    big.data(), -1.0f, ctx);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() != 0);
+  }
+
+  // A small PERSISTENT replica fits the file tier; seed it with a LOW score,
+  // then reorganize it toward the volatile tier's score — the move must
+  // succeed while staying on non-volatile storage (rc 0, bytes intact).
+  const clio::run::u64 kSmall = 64 * 1024;
+  const std::string small_val(kSmall, 'S');
+  PutTo(client, tag_id, "persist_small", std::string(kSmall, 'p'), 0);
+  {
+    clio::cte::core::Context ctx = ReplicaCtx(1);
+    ctx.replica_flags_ = clio::cte::core::REPLICA_PERSISTENT;
+    auto fut = client->AsyncPutBlob(tag_id, "persist_small", 0, kSmall,
+                                    small_val.data(), /*score=*/0.2f, ctx);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+  }
+  {
+    auto fut = client->AsyncReorganizeBlob(
+        tag_id, "persist_small", 1.0f, clio::run::PoolQuery::Dynamic(), 1);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+    std::vector<char> got(kSmall, 0);
+    auto get = client->AsyncGetBlob(tag_id, "persist_small", 0, kSmall,
+                                    /*flags=*/0, got.data(),
+                                    clio::run::PoolQuery::Dynamic(),
+                                    ReplicaCtx(1));
+    get.Wait();
+    REQUIRE(get->GetReturnCode() == 0);
+    REQUIRE(std::memcmp(got.data(), small_val.data(), kSmall) == 0);
+  }
 }
 
 TEST_CASE("BlobReplicas - replication module ReplicateBlob and FlushTag",

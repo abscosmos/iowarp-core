@@ -1862,14 +1862,19 @@ class Client : public clio::run::ContainerClient {
    * @param new_score New placement score
    * @param pool_query Pool query for task routing (default: Dynamic)
    */
+  /**
+   * @param replica 0 (default) reorganizes the primary; N > 0 migrates
+   *        replica N by ITS score (issue #886; REPLICA_FIXED = no-op).
+   */
   clio::run::Future<ReorganizeBlobTask> AsyncReorganizeBlob(
       const TagId &tag_id, const std::string &blob_name, float new_score,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      int replica = 0) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<ReorganizeBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
-        blob_name, new_score);
+        blob_name, new_score, replica);
 
     return ipc_manager->Send(task);
   }
