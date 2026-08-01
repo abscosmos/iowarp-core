@@ -68,6 +68,20 @@ enum class TxnType : uint8_t {
    * this record existed.
    */
   kSetBlobTransform = 6,
+  /**
+   * Replace one replica's block layout (issue #886).
+   *
+   * A separate record from kExtendBlob for the same appending-is-safe reason
+   * as kSetBlobTransform: an older runtime replaying a newer WAL skips the
+   * unknown type, losing only replica layouts it could not have addressed
+   * anyway -- the primary's kExtendBlob records replay untouched. Folding a
+   * replica index into kExtendBlob instead would make every old record
+   * unreadable.
+   *
+   * Semantics mirror kExtendBlob: the record holds the replica's FULL block
+   * layout at log time (full replacement on replay, not a delta).
+   */
+  kExtendReplica = 7,
 };
 
 /** A single block entry within TxnExtendBlob */
@@ -92,6 +106,16 @@ struct TxnExtendBlob {
   clio::run::u32 tag_major_;
   clio::run::u32 tag_minor_;
   std::string blob_name_;
+  std::vector<TxnExtendBlobBlock> new_blocks_;
+};
+
+/** Payload: replace one replica's block layout (issue #886) */
+struct TxnExtendReplica {
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
+  std::string blob_name_;
+  clio::run::u32 replica_;  // 1-based, Context::replica_ semantics
+  std::string replica_name_;
   std::vector<TxnExtendBlobBlock> new_blocks_;
 };
 
@@ -170,6 +194,24 @@ class TransactionLog {
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
     WriteString(buffer_, txn.blob_name_);
+    WriteU32(buffer_, static_cast<clio::run::u32>(txn.new_blocks_.size()));
+    for (const auto &blk : txn.new_blocks_) {
+      WriteU32(buffer_, blk.bdev_major_);
+      WriteU32(buffer_, blk.bdev_minor_);
+      WriteRaw(buffer_, &blk.target_query_, sizeof(clio::run::PoolQuery));
+      WriteU64(buffer_, blk.target_offset_);
+      WriteU64(buffer_, blk.size_);
+    }
+    WriteRecord(type, buffer_);
+  }
+
+  void Log(TxnType type, const TxnExtendReplica &txn) {
+    buffer_.clear();
+    WriteU32(buffer_, txn.tag_major_);
+    WriteU32(buffer_, txn.tag_minor_);
+    WriteString(buffer_, txn.blob_name_);
+    WriteU32(buffer_, txn.replica_);
+    WriteString(buffer_, txn.replica_name_);
     WriteU32(buffer_, static_cast<clio::run::u32>(txn.new_blocks_.size()));
     for (const auto &blk : txn.new_blocks_) {
       WriteU32(buffer_, blk.bdev_major_);
@@ -306,6 +348,28 @@ class TransactionLog {
     txn.tag_major_ = ReadU32(data, off);
     txn.tag_minor_ = ReadU32(data, off);
     txn.blob_name_ = ReadString(data, off);
+    clio::run::u32 num_blocks = ReadU32(data, off);
+    txn.new_blocks_.resize(num_blocks);
+    for (clio::run::u32 i = 0; i < num_blocks; ++i) {
+      txn.new_blocks_[i].bdev_major_ = ReadU32(data, off);
+      txn.new_blocks_[i].bdev_minor_ = ReadU32(data, off);
+      ReadRaw(data, off, &txn.new_blocks_[i].target_query_,
+              sizeof(clio::run::PoolQuery));
+      txn.new_blocks_[i].target_offset_ = ReadU64(data, off);
+      txn.new_blocks_[i].size_ = ReadU64(data, off);
+    }
+    return txn;
+  }
+
+  static TxnExtendReplica DeserializeExtendReplica(
+      const std::vector<char> &data) {
+    TxnExtendReplica txn;
+    size_t off = 0;
+    txn.tag_major_ = ReadU32(data, off);
+    txn.tag_minor_ = ReadU32(data, off);
+    txn.blob_name_ = ReadString(data, off);
+    txn.replica_ = ReadU32(data, off);
+    txn.replica_name_ = ReadString(data, off);
     clio::run::u32 num_blocks = ReadU32(data, off);
     txn.new_blocks_.resize(num_blocks);
     for (clio::run::u32 i = 0; i < num_blocks; ++i) {

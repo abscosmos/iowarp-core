@@ -1530,8 +1530,11 @@ class Client : public clio::run::ContainerClient {
     // and flagged gets keep full RPC semantics. CLIO_FORCE_NET exists to push
     // every op through the network path (the force_net test suites); serving
     // reads client-side would silently turn those suites into no-ops.
+    // Replica-targeted reads (issue #886, context.replica_ != 0) must also
+    // reach the runtime: the SHM mirror publishes the PRIMARY's block layout
+    // only, so serving them here would silently return primary bytes.
     if (dst == nullptr || size == 0 || flags != 0 || context.emulate_ ||
-        ForceNetEnv()) {
+        context.replica_ != 0 || ForceNetEnv()) {
       return false;
     }
     if (!HasShmCache() && !AttachShmCache()) {

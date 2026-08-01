@@ -150,6 +150,25 @@ public:
   template <typename TaskT>
   clio::run::TaskResume ReorganizeBlobImpl(clio::run::shared_ptr<TaskT> &task);
 
+  /**
+   * Write one replica's bytes for a Put task (issue #886). Called from
+   * PutBlobImpl UNDER the blob's write token, for Context::replica_ > 0
+   * (replica-targeted put) and for each replica of a kAllReplicas
+   * write-through. Lends the replica's block layout to the primary
+   * extend/write machinery via a staging BlobInfo (the ReorganizeBlob
+   * pattern), then publishes the layout back and logs a kExtendReplica WAL
+   * record. error_code uses PutBlob's return-code space (10+x alloc,
+   * 20+x write).
+   */
+  template <typename TaskT>
+  clio::run::TaskResume WriteReplicaData(clio::run::shared_ptr<TaskT> &task,
+                                         BlobInfo &blob_info,
+                                         const std::string &blob_name,
+                                         TagId tag_id, int replica_idx,
+                                         clio::run::u64 offset,
+                                         clio::run::u64 size, float blob_score,
+                                         clio::run::u32 &error_code);
+
   /** Put blob (Method::kPutBlob) - allocates and writes data to blob. */
   clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
   /** Get blob (Method::kGetBlob) - reads data from existing blob. */

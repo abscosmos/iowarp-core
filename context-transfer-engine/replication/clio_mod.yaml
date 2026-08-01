@@ -1,0 +1,17 @@
+# Replication ChiMod (issue #886) — policy layer over the CTE core's blob
+# replicas. The core stores replicas and addresses them (Context::replica_);
+# this module decides WHAT gets copied WHERE: ReplicateBlob copies one blob's
+# primary into a chosen replica, FlushTag sweeps a tag's qualifying blobs.
+# Pair with a Context whose min_persistence_level_ pins replica blocks to
+# persistent tiers to make a RAM-cached dataset durable without demoting it.
+module_name: replication
+namespace: clio::cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+# Replication operations
+kReplicateBlob: 10
+kFlushTag: 11

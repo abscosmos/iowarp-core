@@ -809,11 +809,41 @@ struct BlobBlock {
 };
 
 /**
+ * One replica of a blob's data (issue #886): an independent block list,
+ * placed by the same DPE/persistence machinery as the primary. A replica is
+ * PURE MECHANISM — the CTE stores and addresses it (Context::replica_
+ * selects it on put/get); which blobs get replicas, where, and when is the
+ * replication chimod's policy. The name is a free-form label for operators
+ * ("nvme", "pfs", ...); addressing is by index (replica N == replicas_[N-1]).
+ */
+struct Replica {
+  clio::run::priv::string name_;
+  clio::run::priv::vector<BlobBlock> blocks_;
+  // Mirror of sum(blocks_[i].size_), same contract as
+  // BlobInfo::total_size_cache_ but for this replica's layout.
+  clio::run::u64 total_size_cache_;
+
+  CTP_CROSS_FUN Replica()
+      : name_(CLIO_PRIV_ALLOC), blocks_(CLIO_PRIV_ALLOC),
+        total_size_cache_(0) {}
+};
+
+/** Context::replica_ value meaning "write through to primary + every
+ *  existing replica" (writes only; a read needs one concrete source). */
+static constexpr int kAllReplicas = -1;
+
+/**
  * Blob information structure with block-based management
  */
 struct BlobInfo {
   clio::run::priv::string blob_name_;
   clio::run::priv::vector<BlobBlock> blocks_;
+  // Replicas of this blob's data (issue #886). Empty unless the replication
+  // module (or a caller using Context::replica_) created some — the common
+  // no-replica blob pays only an empty vector. Replica block lifecycles are
+  // owned here exactly like blocks_: DelBlob frees them, and their layouts
+  // persist through kExtendReplica WAL records.
+  clio::run::priv::vector<Replica> replicas_;
   float score_;  // 0-1 score for reorganization
   Timestamp last_modified_;
   Timestamp last_read_;
@@ -913,9 +943,28 @@ struct BlobInfo {
   }
 #endif
 
+  /** Fetch replica by 1-based index (Context::replica_ semantics).
+   *  create=true grows replicas_ as needed (write paths); create=false
+   *  returns nullptr for an absent replica (read paths). */
+  CTP_CROSS_FUN Replica *GetReplica(int idx, bool create) {
+    if (idx <= 0) {
+      return nullptr;
+    }
+    if (static_cast<size_t>(idx) > replicas_.size()) {
+      if (!create) {
+        return nullptr;
+      }
+      while (replicas_.size() < static_cast<size_t>(idx)) {
+        replicas_.push_back(Replica());
+      }
+    }
+    return &replicas_[static_cast<size_t>(idx) - 1];
+  }
+
   CTP_CROSS_FUN BlobInfo()
       : blob_name_(CLIO_PRIV_ALLOC),
         blocks_(CLIO_PRIV_ALLOC),
+        replicas_(CLIO_PRIV_ALLOC),
         score_(0.0f),
         last_modified_(0),
         last_read_(0),
@@ -935,6 +984,7 @@ struct BlobInfo {
   CTP_CROSS_FUN BlobInfo(const clio::run::priv::string &blob_name, float score)
       : blob_name_(blob_name),
         blocks_(CLIO_PRIV_ALLOC),
+        replicas_(CLIO_PRIV_ALLOC),
         score_(score),
         last_modified_(0),
         last_read_(0),
@@ -955,6 +1005,7 @@ struct BlobInfo {
   BlobInfo(const std::string &blob_name, float score)
       : blob_name_(CLIO_PRIV_ALLOC, blob_name),
         blocks_(CLIO_PRIV_ALLOC),
+        replicas_(CLIO_PRIV_ALLOC),
         score_(score),
         last_modified_(GetCurrentTimeNs()),
         last_read_(GetCurrentTimeNs()),
@@ -975,6 +1026,7 @@ struct BlobInfo {
   CTP_CROSS_FUN BlobInfo(const BlobInfo &other)
       : blob_name_(other.blob_name_),
         blocks_(other.blocks_),
+        replicas_(other.replicas_),
         score_(other.score_),
         last_modified_(other.last_modified_),
         last_read_(other.last_read_),
@@ -995,6 +1047,7 @@ struct BlobInfo {
     if (this != &other) {
       blob_name_ = other.blob_name_;
       blocks_ = other.blocks_;
+      replicas_ = other.replicas_;
       score_ = other.score_;
       last_modified_ = other.last_modified_;
       last_read_ = other.last_read_;
@@ -1258,6 +1311,17 @@ struct Context {
   // goes missing.
   clio::run::u32 transform_flags_;
 
+  // Which copy of the blob this operation addresses (issue #886):
+  //   0            — the primary (default; today's behavior, bit for bit)
+  //   N > 0        — replica N (lazily created by writes; reads of an absent
+  //                  replica fail cleanly)
+  //   kAllReplicas — writes only: write through to the primary AND every
+  //                  existing replica
+  // Composes with persistence_target_/min_persistence_level_, so "durable
+  // replica of a RAM-cached blob" is just {replica_=1, min_persistence=2}.
+  // OUTSIDE the #if below for the same ABI reason as transform_flags_.
+  int replica_;
+
 #if CTP_ENABLE_COMPRESS
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
   int compress_lib_;      // The compression library to apply (0-10)
@@ -1290,7 +1354,8 @@ struct Context {
         preallocate_(0),
         emulate_(false),
         emulated_time_ns_(0),
-        transform_flags_(kBlobTransformNone)
+        transform_flags_(kBlobTransformNone),
+        replica_(0)
 #if CTP_ENABLE_COMPRESS
         ,
         dynamic_compress_(0),
@@ -1316,7 +1381,7 @@ struct Context {
   template <class Archive>
   CTP_CROSS_FUN void serialize(Archive &ar) {
     ar.range(persistence_target_, min_persistence_level_, preallocate_,
-             emulate_, emulated_time_ns_, transform_flags_);
+             emulate_, emulated_time_ns_, transform_flags_, replica_);
 #if CTP_ENABLE_COMPRESS
     ar.range(dynamic_compress_, compress_lib_, compress_preset_, target_psnr_,
              psnr_chance_, max_performance_, consumer_node_, data_type_,

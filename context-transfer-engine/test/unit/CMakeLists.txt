@@ -894,6 +894,40 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
+# Blob replicas + replication chimod (issue #886). Gated on the module: the
+# mechanism tests also exercise the policy verbs, and the module is ON by
+# default, so the gate only matters for trimmed builds.
+if(TARGET clio_cte_replication_client)
+add_executable(test_blob_replicas test_blob_replicas.cc)
+target_include_directories(test_blob_replicas PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/replication/include
+)
+target_link_libraries(test_blob_replicas
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_replication_runtime
+    clio_cte_replication_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_blob_replicas
+    COMMAND test_blob_replicas)
+
+set_tests_properties(
+    cte_blob_replicas
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;replicas;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # TARGET clio_cte_replication_client
+
 # Add score-driven eviction tests (Method::kEvict)
 add_test(NAME cte_evict
     COMMAND test_evict)
