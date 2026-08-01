@@ -3482,6 +3482,8 @@ struct GetBlobScoreTask : public clio::run::Task {
 struct GetBlobSizeTask : public clio::run::Task {
   IN TagId tag_id_;                 // Tag ID for blob lookup
   IN clio::run::priv::string blob_name_;  // Blob name (required)
+  IN int replica_;                  // 0 = primary; N > 0 = replica N's size
+                                    // (issue #886; absent replica = error)
   OUT clio::run::u64 size_;               // Blob size in bytes
 
   // SHM constructor
@@ -3489,6 +3491,7 @@ struct GetBlobSizeTask : public clio::run::Task {
       : clio::run::Task(),
         tag_id_(TagId::GetNull()),
         blob_name_(CLIO_PRIV_ALLOC),
+        replica_(0),
         size_(0) {}
 
   // Emplace constructor
@@ -3496,10 +3499,12 @@ struct GetBlobSizeTask : public clio::run::Task {
                                           const clio::run::PoolId &pool_id,
                                           const clio::run::PoolQuery &pool_query,
                                           const TagId &tag_id,
-                                          const std::string &blob_name)
+                                          const std::string &blob_name,
+                                          int replica = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetBlobSize),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        replica_(replica),
         size_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -3514,7 +3519,7 @@ struct GetBlobSizeTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_);
+    ar(tag_id_, blob_name_, replica_);
   }
 
   /**
@@ -3534,6 +3539,7 @@ struct GetBlobSizeTask : public clio::run::Task {
     Task::Copy(other.template Cast<Task>());
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
+    replica_ = other->replica_;
     size_ = other->size_;
   }
 

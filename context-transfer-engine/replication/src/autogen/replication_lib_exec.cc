@@ -18,7 +18,9 @@ namespace clio::cte::replication {
   X(kDestroy, DestroyTask, Destroy)                \
   X(kMonitor, MonitorTask, Monitor)                \
   X(kReplicateBlob, ReplicateBlobTask, ReplicateBlob) \
-  X(kFlushTag, FlushTagTask, FlushTag)
+  X(kFlushTag, FlushTagTask, FlushTag)             \
+  X(kCachedPut, CachedPutTask, CachedPut)          \
+  X(kCachedGet, CachedGetTask, CachedGet)
 
 void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
                    clio::run::u32 container_id) {

@@ -24,8 +24,10 @@ GLOBAL_CROSS_CONST clio::run::u32 kMonitor = 9;
 // replication-specific methods
 GLOBAL_CROSS_CONST clio::run::u32 kReplicateBlob = 10;
 GLOBAL_CROSS_CONST clio::run::u32 kFlushTag = 11;
+GLOBAL_CROSS_CONST clio::run::u32 kCachedPut = 12;
+GLOBAL_CROSS_CONST clio::run::u32 kCachedGet = 13;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 12;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 14;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -35,6 +37,8 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[9] = "Monitor";
     v[10] = "ReplicateBlob";
     v[11] = "FlushTag";
+    v[12] = "CachedPut";
+    v[13] = "CachedGet";
     return v;
   }();
   return names;

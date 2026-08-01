@@ -191,6 +191,10 @@ public:
                                                   float new_score,
                                                   clio::run::u32 &rc);
 
+  /** True when any of the replica's blocks sit on a target the health
+   *  predictor marks failing (the REPLICA_FIXED evacuation override). */
+  bool ReplicaBlocksOnFailingTarget(const Replica &rep);
+
   /** Put blob (Method::kPutBlob) - allocates and writes data to blob. */
   clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
   /** Get blob (Method::kGetBlob) - reads data from existing blob. */

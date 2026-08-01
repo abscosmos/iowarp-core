@@ -2412,6 +2412,73 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
       CLIO_CO_RETURN;
     }
 
+    // issue #886 cache policy: when the primary is being rescored BELOW the
+    // best persistent replica's score, migrating it is pure waste — a
+    // REPLICA_PERSISTENT copy already holds these bytes on storage at least
+    // that good. Drop the primary (it is the temporary/cache copy in the
+    // caching model) instead of moving it: free its blocks, keep the
+    // metadata entry and every replica. A later CachedGet re-populates the
+    // fast copy from a persistent replica.
+    {
+      float best_persistent = -1.0f;
+      for (size_t ri = 0; ri < blob_info.replicas_.size(); ++ri) {
+        const Replica &r = blob_info.replicas_[ri];
+        if ((r.flags_ & REPLICA_PERSISTENT) && !r.blocks_.empty()) {
+          float s = (r.score_ >= 0.0f) ? r.score_ : 0.0f;
+          if (s > best_persistent) {
+            best_persistent = s;
+          }
+        }
+      }
+      if (best_persistent >= 0.0f && new_score < best_persistent) {
+        // Same reader-drain-then-free discipline as the move path: a pinned
+        // reader's snapshot may still reference these extents.
+        blob_info.BeginDrainReaders();
+        BlobReaderDrainGuard drop_drain_guard(&blob_info);
+        while (blob_info.HasReadPins()) {
+          CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+        }
+        clio::run::u32 free_rc = 0;
+        CLIO_CO_AWAIT(FreeAllBlobBlocks(blob_info, free_rc));
+        blob_info.score_ = new_score;
+        // The primary's bytes leave the tag (same bookkeeping as DelBlob):
+        // GetTagSize stays equal to the sum of primary sizes.
+        {
+          std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
+          if (tag_info_ptr != nullptr) {
+            if (blob_size <= tag_info_ptr->total_size_) {
+              tag_info_ptr->total_size_ -= blob_size;
+            } else {
+              tag_info_ptr->total_size_ = 0;
+            }
+          }
+        }
+        // WAL: kClearBlob replays as "primary emptied"; the replica records
+        // replay separately and rebuild the persistent copies.
+        if (!blob_txn_logs_.empty()) {
+          clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+          TxnClearBlob txn;
+          txn.tag_major_ = tag_id.major_;
+          txn.tag_minor_ = tag_id.minor_;
+          txn.blob_name_ = blob_name;
+          blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kClearBlob,
+                                                           txn);
+        }
+        {
+          std::string shm_key = std::to_string(tag_id.major_) + "." +
+                                std::to_string(tag_id.minor_) + "." + blob_name;
+          MirrorBlobToShm(shm_key, blob_info);
+        }
+        GpuCacheOnDelBlob(tag_id, blob_name);
+        HLOG(kDebug,
+             "ReorganizeBlob: dropped primary of blob={} (new_score={} < "
+             "persistent replica score {})",
+             blob_name, new_score, best_persistent);
+        rc = 0;
+        CLIO_CO_RETURN;
+      }
+    }
+
     // Step 5: Allocate buffer for blob data
     auto *ipc_manager = CLIO_IPC;
     ctp::ipc::FullPtr<char> blob_data_buffer =
@@ -2621,6 +2688,30 @@ clio::run::TaskResume Runtime::ReorganizeBlobInternal(
   CLIO_TASK_BODY_END
 }
 
+bool Runtime::ReplicaBlocksOnFailingTarget(const Replica &rep) {
+  // Same degraded-health predicate as the StatTargets evacuation sweep:
+  // predicted TTL below a day, or a long-term tier within its 7-day warning
+  // window. LCOV_EXCL_LINE rationale for the true-branch: TTL predictions
+  // come from live bdev stats and cannot be forced from a unit test.
+  clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+  for (size_t i = 0; i < rep.blocks_.size(); ++i) {
+    TargetInfo *target_info =
+        registered_targets_.find(rep.blocks_[i].bdev_client_.pool_id_);
+    if (target_info == nullptr) {
+      continue;
+    }
+    clio::run::u32 ttl = target_info->expected_ttl_days_;
+    if (ttl < 1 ||
+        (ttl <= 7 && target_info->persistence_level_ ==
+                         clio::run::bdev::PersistenceLevel::kLongTerm)) {
+      // LCOV_EXCL_START — see rationale above.
+      return true;
+      // LCOV_EXCL_STOP
+    }
+  }
+  return false;
+}
+
 clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
     const TagId &tag_id, const std::string &blob_name, int replica_idx,
     float new_score, clio::run::u32 &rc) {
@@ -2666,19 +2757,32 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
       rc = 3;  // Replica not found
       CLIO_CO_RETURN;
     }
+    bool evacuating = false;
     if (rep->flags_ & REPLICA_FIXED) {
-      // Pinned: the reorganizer must not touch this replica. Success, not an
-      // error — organizer sweeps call in blindly and FIXED is the filter.
-      HLOG(kDebug, "ReorganizeReplica: blob={} replica={} is FIXED, skipping",
+      // Pinned: the reorganizer must not touch this replica — UNLESS its
+      // blocks sit on storage the health predictor expects to fail. A pin
+      // protects placement intent; it must not ride the copy down with a
+      // dying disk. Same TTL predicate the StatTargets evacuation uses.
+      evacuating = ReplicaBlocksOnFailingTarget(*rep);
+      if (!evacuating) {
+        HLOG(kDebug,
+             "ReorganizeReplica: blob={} replica={} is FIXED, skipping",
+             blob_name, replica_idx);
+        rc = 0;
+        CLIO_CO_RETURN;
+      }
+      HLOG(kWarning,
+           "ReorganizeReplica: blob={} replica={} is FIXED but on failing "
+           "storage — evacuating",
            blob_name, replica_idx);
-      rc = 0;
-      CLIO_CO_RETURN;
     }
     // The replica's OWN score decides whether the move is worth it; a
-    // never-scored replica falls back to the primary's.
+    // never-scored replica falls back to the primary's. A health evacuation
+    // moves regardless of score delta.
     float current_score =
         (rep->score_ >= 0.0f) ? rep->score_ : blob_info.score_;
-    if (std::abs(new_score - current_score) < score_difference_threshold) {
+    if (!evacuating &&
+        std::abs(new_score - current_score) < score_difference_threshold) {
       rc = 0;
       CLIO_CO_RETURN;
     }
@@ -6453,8 +6557,23 @@ clio::run::TaskResume Runtime::GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask
       CLIO_CO_RETURN;
     }
 
-    // Step 2: Calculate and return the blob size
-    task->size_ = blob_info_ptr->GetTotalSize();
+    // Step 2: Calculate and return the blob size. replica_ > 0 reports the
+    // REPLICA's size (issue #886) — the caching layer keys "is the DRAM copy
+    // usable / how many bytes must a re-cache copy" off this.
+    if (task->replica_ > 0) {
+      Replica *rep =
+          blob_info_ptr->GetReplica(task->replica_, /*create=*/false);
+      if (rep == nullptr) {
+        task->return_code_ = 1;  // Replica not found
+        CLIO_CO_RETURN;
+      }
+      task->size_ = rep->total_size_cache_;
+    } else if (task->replica_ < 0) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    } else {
+      task->size_ = blob_info_ptr->GetTotalSize();
+    }
 
     // Step 3: Update timestamps and log telemetry
     auto now = GetCurrentTimeNs();

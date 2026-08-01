@@ -38,6 +38,8 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume ReplicateBlob(
       clio::run::shared_ptr<ReplicateBlobTask> &task);
   clio::run::TaskResume FlushTag(clio::run::shared_ptr<FlushTagTask> &task);
+  clio::run::TaskResume CachedPut(clio::run::shared_ptr<CachedPutTask> &task);
+  clio::run::TaskResume CachedGet(clio::run::shared_ptr<CachedGetTask> &task);
 
   // ---- Container virtuals (defined in autogen/replication_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
@@ -79,6 +81,19 @@ class Runtime : public clio::run::Container {
                                      const Context &context,
                                      clio::run::u64 &bytes_copied,
                                      clio::run::u32 &rc);
+
+  /**
+   * Copy replica `replica_idx`'s FULL contents back into the primary,
+   * sequentially from offset 0 in bounded chunks, so an interruption leaves
+   * a valid prefix (future CachedGets treat uncovered ranges as misses).
+   * Best-effort: a failed chunk stops the copy without failing the read that
+   * triggered it. recached reports bytes restored.
+   */
+  clio::run::TaskResume RecachePrimary(const TagId &tag_id,
+                                       const std::string &blob_name,
+                                       int replica_idx,
+                                       clio::run::u64 rep_size,
+                                       clio::run::u64 &recached);
 
   /** Lazily bind the core client (compose next_pool_id, default kCtePoolId) */
   clio::cte::core::Client *GetCoreClient();

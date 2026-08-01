@@ -445,4 +445,162 @@ TEST_CASE("BlobReplicas - replication module ReplicateBlob and FlushTag",
   }
 }
 
+TEST_CASE("BlobReplicas - reorganizer drops the cache copy below a "
+          "persistent replica",
+          "[cte][replicas][cache][886]") {
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("replica_drop_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  const std::string primary_val(kValSize, 'p');
+  const std::string replica_val(kValSize, 'q');
+  PutTo(client, tag_id, "drop_blob", primary_val, 0);
+  {
+    // Persistent copy at a modest score — the organizer's drop threshold.
+    clio::cte::core::Context ctx = ReplicaCtx(1);
+    ctx.replica_flags_ = clio::cte::core::REPLICA_PERSISTENT;
+    auto fut = client->AsyncPutBlob(tag_id, "drop_blob", 0, kValSize,
+                                    replica_val.data(), /*score=*/0.5f, ctx);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+  }
+
+  // Rescoring the primary BELOW the persistent replica must DROP it (free
+  // its blocks) rather than migrate it — a durable copy already exists.
+  {
+    auto fut = client->AsyncReorganizeBlob(tag_id, "drop_blob", 0.1f);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+  }
+  {
+    auto sz = client->AsyncGetBlobSize(tag_id, "drop_blob");
+    sz.Wait();
+    REQUIRE(sz->GetReturnCode() == 0);
+    REQUIRE(sz->size_ == 0);  // primary dropped
+    auto rsz = client->AsyncGetBlobSize(tag_id, "drop_blob",
+                                        clio::run::PoolQuery::Dynamic(), 1);
+    rsz.Wait();
+    REQUIRE(rsz->GetReturnCode() == 0);
+    REQUIRE(rsz->size_ == kValSize);  // replica untouched
+    std::vector<char> got;
+    REQUIRE(GetFrom(client, tag_id, "drop_blob", &got, 1) == 0);
+    REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
+  }
+
+  // Re-scoring the (now empty) primary is a clean no-op.
+  {
+    auto fut = client->AsyncReorganizeBlob(tag_id, "drop_blob", 0.9f);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+  }
+}
+
+TEST_CASE("BlobReplicas - CachedPut/CachedGet write-through cache model",
+          "[cte][replicas][replication][cache][886]") {
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+  auto *ipc_manager = CLIO_CPU_IPC;
+
+  // Bind the replication pool (GetOrCreatePool is idempotent; the module
+  // test earlier created it with default params: num_replicas=1,
+  // cache_score=1.0, replica_score=0.2).
+  clio::cte::replication::Client repl(
+      clio::cte::replication::kReplicationPoolId, clio::cte::core::kCtePoolId);
+  {
+    clio::cte::replication::ReplicationConfig params;
+    params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    auto create = repl.AsyncCreateReplication(
+        clio::run::PoolQuery::Local(),
+        clio::cte::replication::kReplicationPoolName,
+        clio::cte::replication::kReplicationPoolId, params);
+    create.Wait();
+    REQUIRE(create->GetReturnCode() == 0);
+  }
+
+  clio::cte::core::Tag tag("cache_model_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  // Stage the payload in SHM for the cached verbs.
+  const std::string val(kValSize, 'C');
+  ctp::ipc::FullPtr<char> put_buf = ipc_manager->AllocateBuffer(kValSize);
+  REQUIRE(!put_buf.IsNull());
+  std::memcpy(put_buf.ptr_, val.data(), kValSize);
+
+  // 1. Write-through: one CachedPut updates the DRAM primary AND the fixed
+  //    persistent set.
+  {
+    auto fut = repl.AsyncCachedPut(tag_id, "cache_blob", 0, kValSize,
+                                   ctp::ipc::ShmPtr<>(put_buf.shm_));
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+    REQUIRE(fut->replicas_written_ == 1);
+  }
+  {
+    auto psz = client->AsyncGetBlobSize(tag_id, "cache_blob");
+    psz.Wait();
+    REQUIRE(psz->size_ == kValSize);
+    auto rsz = client->AsyncGetBlobSize(tag_id, "cache_blob",
+                                        clio::run::PoolQuery::Dynamic(), 1);
+    rsz.Wait();
+    REQUIRE(rsz->GetReturnCode() == 0);
+    REQUIRE(rsz->size_ == kValSize);
+  }
+
+  // 2. Cache hit: served from the primary.
+  ctp::ipc::FullPtr<char> get_buf = ipc_manager->AllocateBuffer(kValSize);
+  REQUIRE(!get_buf.IsNull());
+  {
+    std::memset(get_buf.ptr_, 0, kValSize);
+    auto fut = repl.AsyncCachedGet(tag_id, "cache_blob", 0, kValSize,
+                                   ctp::ipc::ShmPtr<>(get_buf.shm_));
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+    REQUIRE(fut->from_replica_ == 0);
+    REQUIRE(std::memcmp(get_buf.ptr_, val.data(), kValSize) == 0);
+  }
+
+  // 3. The organizer drops the cache copy (primary score sinks below the
+  //    persistent replica's replica_score).
+  {
+    auto fut = client->AsyncReorganizeBlob(tag_id, "cache_blob", 0.05f);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+    auto psz = client->AsyncGetBlobSize(tag_id, "cache_blob");
+    psz.Wait();
+    REQUIRE(psz->size_ == 0);
+  }
+
+  // 4. Cache miss: served from the persistent replica, and the DRAM primary
+  //    is re-populated in full.
+  {
+    std::memset(get_buf.ptr_, 0, kValSize);
+    auto fut = repl.AsyncCachedGet(tag_id, "cache_blob", 0, kValSize,
+                                   ctp::ipc::ShmPtr<>(get_buf.shm_));
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+    REQUIRE(fut->from_replica_ == 1);
+    REQUIRE(fut->recached_bytes_ == kValSize);
+    REQUIRE(std::memcmp(get_buf.ptr_, val.data(), kValSize) == 0);
+  }
+
+  // 5. Fast path restored: the next read is a primary hit again.
+  {
+    auto psz = client->AsyncGetBlobSize(tag_id, "cache_blob");
+    psz.Wait();
+    REQUIRE(psz->size_ == kValSize);
+    std::memset(get_buf.ptr_, 0, kValSize);
+    auto fut = repl.AsyncCachedGet(tag_id, "cache_blob", 0, kValSize,
+                                   ctp::ipc::ShmPtr<>(get_buf.shm_));
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+    REQUIRE(fut->from_replica_ == 0);
+    REQUIRE(std::memcmp(get_buf.ptr_, val.data(), kValSize) == 0);
+  }
+
+  ipc_manager->FreeBuffer(put_buf);
+  ipc_manager->FreeBuffer(get_buf);
+}
+
 SIMPLE_TEST_MAIN()

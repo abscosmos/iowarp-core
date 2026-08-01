@@ -2215,12 +2215,13 @@ class Client : public clio::run::ContainerClient {
   clio::run::Future<GetBlobSizeTask> AsyncGetBlobSize(
       const TagId &tag_id,
       const std::string &blob_name,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      int replica = 0) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<GetBlobSizeTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
-        blob_name);
+        blob_name, replica);
 
     return ipc_manager->Send(task);
   }
