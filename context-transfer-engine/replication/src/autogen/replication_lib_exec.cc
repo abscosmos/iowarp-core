@@ -27,6 +27,7 @@ namespace clio::cte::replication {
   X(kMonitor, MonitorTask, Monitor)                \
   X(kReplicateBlob, ReplicateBlobTask, ReplicateBlob) \
   X(kFlushTag, FlushTagTask, FlushTag)             \
+  X(kReplicateSweep, ReplicateSweepTask, ReplicateSweep) \
   X(kPutBlob, clio::cte::core::PutBlobTask, PutBlob) \
   X(kGetBlob, clio::cte::core::GetBlobTask, GetBlob) \
   X(kGetBlobSize, clio::cte::core::GetBlobSizeTask, GetBlobSize) \

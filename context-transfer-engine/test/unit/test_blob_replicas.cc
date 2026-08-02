@@ -548,17 +548,28 @@ TEST_CASE("BlobReplicas - transparent interposition on the core Put/Get",
   const std::string val(kValSize, 'C');
 
   // 1. Write-through: one DEFAULT put through the interposer updates the
-  //    DRAM primary AND the fixed persistent set.
+  //    DRAM primary NOW and the fixed persistent set ASYNCHRONOUSLY (the
+  //    put acks after the primary; the periodic sweep replicates within
+  //    replicate_period_ms). Primary is checked immediately, the replica by
+  //    bounded poll.
   PutTo(&repl_io, tag_id, "cache_blob", val, 0);
   {
     auto psz = client->AsyncGetBlobSize(tag_id, "cache_blob");
     psz.Wait();
     REQUIRE(psz->size_ == kValSize);
-    auto rsz = client->AsyncGetBlobSize(tag_id, "cache_blob",
-                                        clio::run::PoolQuery::Dynamic(), 1);
-    rsz.Wait();
-    REQUIRE(rsz->GetReturnCode() == 0);
-    REQUIRE(rsz->size_ == kValSize);  // replica created by the plain put
+  }
+  {
+    bool replicated = false;
+    for (int attempt = 0; attempt < 200 && !replicated; ++attempt) {
+      auto rsz = client->AsyncGetBlobSize(tag_id, "cache_blob",
+                                          clio::run::PoolQuery::Dynamic(), 1);
+      rsz.Wait();
+      replicated = rsz->GetReturnCode() == 0 && rsz->size_ == kValSize;
+      if (!replicated) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+    }
+    REQUIRE(replicated);  // replica created by the async sweep
   }
 
   // 2. Cache hit: served from the primary through the interposer.

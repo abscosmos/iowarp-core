@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unistd.h>
 
 #include <clio_ctp/util/logging.h>
 #include <clio_runtime/clio_runtime.h>
@@ -78,18 +79,29 @@ static int PutBlobs() {
     }
   }
 
-  // Both copies of every blob must exist before the reboot.
+  // Both copies of every blob must exist before the reboot. The primary is
+  // synchronous; the replicas are written by the ASYNC sweep, so poll with
+  // a bound — this is the async write-through path under test.
   for (int i = 0; i < kNumBlobs; ++i) {
     auto psz = cte.AsyncGetBlobSize(tag_id, BlobName(i));
     psz.Wait();
-    auto rsz = cte.AsyncGetBlobSize(tag_id, BlobName(i),
-                                    clio::run::PoolQuery::Dynamic(), 1);
-    rsz.Wait();
-    if (psz->GetReturnCode() != 0 || psz->size_ != kBlobSize ||
-        rsz->GetReturnCode() != 0 || rsz->size_ != kBlobSize) {
-      HLOG(kError,
-           "Phase 1: size check failed for blob {} primary={} replica={}",
-           i, psz->size_, rsz->size_);
+    if (psz->GetReturnCode() != 0 || psz->size_ != kBlobSize) {
+      HLOG(kError, "Phase 1: primary size check failed for blob {} size={}",
+           i, psz->size_);
+      return 1;
+    }
+    bool replicated = false;
+    for (int attempt = 0; attempt < 500 && !replicated; ++attempt) {
+      auto rsz = cte.AsyncGetBlobSize(tag_id, BlobName(i),
+                                      clio::run::PoolQuery::Dynamic(), 1);
+      rsz.Wait();
+      replicated = rsz->GetReturnCode() == 0 && rsz->size_ == kBlobSize;
+      if (!replicated) {
+        usleep(20000);
+      }
+    }
+    if (!replicated) {
+      HLOG(kError, "Phase 1: blob {} replica never appeared (async sweep)", i);
       return 1;
     }
   }

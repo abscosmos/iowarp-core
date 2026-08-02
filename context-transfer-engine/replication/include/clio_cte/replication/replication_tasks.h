@@ -49,6 +49,12 @@ struct ReplicationConfig {
   /// is dropped rather than migrated. Modest by default — it should mirror
   /// the slow tier the durable copies live on, not the cache's.
   float replica_score_ = 0.2f;
+  /// Asynchronous write-through (issue #886): a put acks after the PRIMARY
+  /// write; the replicas are brought up to date by a periodic sweep that
+  /// re-copies each dirty blob's CURRENT primary bytes (rapid overwrites
+  /// coalesce into one replica write). 0 = synchronous write-through (the
+  /// put blocks until every replica is written).
+  int replicate_period_ms_ = 50;
 
   ReplicationConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   ReplicationConfig(const clio::run::PoolId &pool_id,
@@ -56,13 +62,15 @@ struct ReplicationConfig {
       : next_pool_id_(other.next_pool_id_),
         num_replicas_(other.num_replicas_),
         cache_score_(other.cache_score_),
-        replica_score_(other.replica_score_) {
+        replica_score_(other.replica_score_),
+        replicate_period_ms_(other.replicate_period_ms_) {
     (void)pool_id;
   }
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(next_pool_id_, num_replicas_, cache_score_, replica_score_);
+    ar(next_pool_id_, num_replicas_, cache_score_, replica_score_,
+       replicate_period_ms_);
   }
 
   /** Load configuration from compose YAML (next_pool_id: "major.minor",
@@ -88,6 +96,9 @@ struct ReplicationConfig {
         }
         if (node["replica_score"]) {
           replica_score_ = node["replica_score"].as<float>();
+        }
+        if (node["replicate_period_ms"]) {
+          replicate_period_ms_ = node["replicate_period_ms"].as<int>();
         }
       } catch (...) {
         // Config parsing is best-effort
@@ -123,6 +134,46 @@ struct DestroyTask : public clio::run::Task {
   // convention). Same for every task below.
   template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
+/**
+ * ReplicateSweepTask (Method::kReplicateSweep) — the periodic driver of the
+ * ASYNC write-through: drains the runtime's pending-replication set by
+ * copying each dirty blob's current primary into the persistent replica
+ * set. Spawned by Create with SetPeriod(replicate_period_ms_); runtime-
+ * internal (never sent by user clients).
+ */
+struct ReplicateSweepTask : public clio::run::Task {
+  OUT clio::run::u64 blobs_swept_;
+
+  ReplicateSweepTask() : clio::run::Task(), blobs_swept_(0) {}
+
+  explicit ReplicateSweepTask(const clio::run::TaskId &task_id,
+                              const clio::run::PoolId &pool_id,
+                              const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kReplicateSweep),
+        blobs_swept_(0) {}
+
+  template <typename Ar>
+  void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  template <typename Ar>
+  void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar);
+    ar(blobs_swept_);
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<ReplicateSweepTask>());
+  }
+
+  void Copy(const ctp::ipc::FullPtr<ReplicateSweepTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+    blobs_swept_ = other->blobs_swept_;
+  }
 };
 
 using MonitorTask = clio::run::admin::MonitorTask;

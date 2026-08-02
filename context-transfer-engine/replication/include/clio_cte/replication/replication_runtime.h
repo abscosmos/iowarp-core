@@ -6,7 +6,11 @@
 #define CLIO_CTE_REPLICATION_REPLICATION_RUNTIME_H_
 
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
@@ -58,6 +62,11 @@ class Runtime : public clio::run::Container {
    *  so size-then-read callers still reach the replica-serving GetBlob. */
   clio::run::TaskResume GetBlobSize(
       clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task);
+  /** Periodic async write-through driver (Method::kReplicateSweep): drains
+   *  the pending-replication set by re-copying each dirty blob's CURRENT
+   *  primary into the persistent replica set (ReplicateOne per blob). */
+  clio::run::TaskResume ReplicateSweep(
+      clio::run::shared_ptr<ReplicateSweepTask> &task);
   /** Interposed batched put (Method::kMultiPutBlob): the batch runs on the
    *  core verbatim (primaries), then each record is written through to the
    *  persistent replica set — the deferred-put pipeline (#862/#878) ships
@@ -105,7 +114,8 @@ class Runtime : public clio::run::Container {
                                      int replica_idx,
                                      const Context &context,
                                      clio::run::u64 &bytes_copied,
-                                     clio::run::u32 &rc);
+                                     clio::run::u32 &rc,
+                                     float put_score = -1.0f);
 
   /**
    * Copy replica `replica_idx`'s FULL contents back into the primary,
@@ -154,8 +164,19 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume ForwardToCore(clio::run::u32 method,
                                       clio::run::shared_ptr<clio::run::Task> task);
 
+  /** Mark a blob dirty for the async write-through (deduped by key). */
+  void EnqueueReplication(const TagId &tag_id, const std::string &blob_name);
+
   ReplicationConfig config_;
   std::unique_ptr<clio::cte::core::Client> core_client_;
+
+  /** Async write-through state (issue #886): blobs whose primary is newer
+   *  than their replicas, keyed "major.minor.blob" so rapid overwrites of
+   *  one blob coalesce into a single pending entry. The sweep swaps the map
+   *  out under the lock and replicates outside it; a put racing the sweep
+   *  simply re-inserts and is caught next period. */
+  std::mutex pending_mtx_;
+  std::unordered_map<std::string, std::pair<TagId, std::string>> pending_;
 };
 
 }  // namespace clio::cte::replication

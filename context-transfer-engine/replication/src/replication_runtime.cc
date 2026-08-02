@@ -24,6 +24,20 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     core_client_ =
         std::make_unique<clio::cte::core::Client>(config_.next_pool_id_);
   }
+  // Async write-through (issue #886): spawn the periodic sweep that brings
+  // replicas up to date with acked primaries. Fire-and-forget like the
+  // core's periodic StatTargets/FlushMetadata drivers.
+  if (config_.num_replicas_ > 0 && config_.replicate_period_ms_ > 0) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto sweep = ipc->NewTask<ReplicateSweepTask>(
+        clio::run::CreateTaskId(), pool_id_, clio::run::PoolQuery::Local());
+    sweep->SetPeriod(static_cast<double>(config_.replicate_period_ms_),
+                     clio::run::kMilli);
+    sweep->SetFlags(TASK_PERIODIC);  // SetPeriod alone does not mark it
+    ipc->Send(sweep);
+    HLOG(kInfo, "replication: async write-through sweep every {} ms",
+         config_.replicate_period_ms_);
+  }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -79,10 +93,72 @@ clio::run::TaskResume Runtime::ForwardToCore(
   CLIO_TASK_BODY_END
 }
 
+void Runtime::EnqueueReplication(const TagId &tag_id,
+                                 const std::string &blob_name) {
+  std::string key = std::to_string(tag_id.major_) + "." +
+                    std::to_string(tag_id.minor_) + "." + blob_name;
+  std::lock_guard<std::mutex> lk(pending_mtx_);
+  pending_[std::move(key)] = std::make_pair(tag_id, blob_name);
+}
+
+clio::run::TaskResume Runtime::ReplicateSweep(
+    clio::run::shared_ptr<ReplicateSweepTask> &task) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  task->blobs_swept_ = 0;
+  {
+    // Swap the dirty set out under the lock; replicate outside it. A put
+    // racing the sweep re-inserts its key and is caught next period —
+    // removal-before-replication is what makes that safe.
+    std::unordered_map<std::string, std::pair<TagId, std::string>> batch;
+    {
+      std::lock_guard<std::mutex> lk(pending_mtx_);
+      batch.swap(pending_);
+    }
+    for (auto it = batch.begin(); it != batch.end(); ++it) {
+      const TagId &tag_id = it->second.first;
+      const std::string &blob_name = it->second.second;
+      Context rep_ctx;
+      rep_ctx.replica_flags_ = clio::cte::core::REPLICA_FIXED |
+                               clio::cte::core::REPLICA_PERSISTENT;
+      rep_ctx.min_persistence_level_ = 1;
+      bool failed = false;
+      for (int r = 1; r <= config_.num_replicas_; ++r) {
+        clio::run::u64 bytes = 0;
+        clio::run::u32 rc = 0;
+        CLIO_CO_AWAIT(ReplicateOne(tag_id, blob_name, r, rep_ctx, bytes, rc,
+                              config_.replica_score_));
+        if (rc == 11) {
+          // Blob deleted between the put and this sweep — nothing to keep
+          // durable; drop the entry.
+          rc = 0;
+        }
+        if (rc != 0) {
+          failed = true;
+          break;
+        }
+      }
+      if (failed) {
+        // Leave it dirty for the next period; sweeping is best-effort and
+        // periodic, so there is no retry loop to spin here.
+        std::lock_guard<std::mutex> lk(pending_mtx_);
+        pending_[it->first] = it->second;
+      } else {
+        task->blobs_swept_++;
+      }
+    }
+  }
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::ReplicateOne(
     const TagId &tag_id, const std::string &blob_name,
     int replica_idx, const Context &context,
-    clio::run::u64 &bytes_copied, clio::run::u32 &rc) {
+    clio::run::u64 &bytes_copied, clio::run::u32 &rc, float put_score) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -130,7 +206,7 @@ clio::run::TaskResume Runtime::ReplicateOne(
     Context put_ctx = context;
     put_ctx.replica_ = replica_idx;
     auto put_task = cte->AsyncPutBlob(tag_id, blob_name, off, len, buf_ptr,
-                                      /*score=*/-1.0f, put_ctx);
+                                      put_score, put_ctx);
     CLIO_CO_AWAIT(put_task);
     CLIO_IPC->FreeBuffer(buf);
     if (put_task->GetReturnCode() != 0) {
@@ -244,8 +320,18 @@ clio::run::TaskResume Runtime::PutBlob(
     auto *cte = GetCoreClient();
     std::string blob_name = task->blob_name_.str();
 
-    // Write through to the fixed persistent set. Each copy is pinned
-    // (REPLICA_FIXED) and volatile-banned (REPLICA_PERSISTENT); the
+    // ASYNC write-through (replicate_period_ms_ > 0, the default): the put
+    // acks NOW, after the primary; the blob is marked dirty and the
+    // periodic sweep copies its then-current primary bytes into the
+    // replica set. Rapid overwrites coalesce into one replica write.
+    if (config_.replicate_period_ms_ > 0) {
+      EnqueueReplication(task->tag_id_, blob_name);
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+
+    // Synchronous write-through (replicate_period_ms_ == 0). Each copy is
+    // pinned (REPLICA_FIXED) and volatile-banned (REPLICA_PERSISTENT); the
     // configured replica_score_ keeps the durable copies scored for the
     // slow tier they live on. Vectored puts replay their segments in list
     // order (same last-writer-wins rule as the core's primary path).
@@ -473,7 +559,13 @@ clio::run::TaskResume Runtime::MultiPutBlob(
                      ? nullptr
                      : ipc_manager->ToFullPtr<char>(
                            task->data_.template Cast<char>()).ptr_;
-    if (base != nullptr) {
+    if (base != nullptr && config_.replicate_period_ms_ > 0) {
+      // ASYNC write-through: mark every record dirty for the periodic sweep
+      // and ack the batch now (see PutBlob).
+      for (size_t d = 0; d < descs.size(); ++d) {
+        EnqueueReplication(descs[d].tag_id_, descs[d].blob_name_);
+      }
+    } else if (base != nullptr) {
       for (size_t d = 0; d < descs.size(); ++d) {
         const auto &desc = descs[d];
         if (desc.payload_off_ + desc.size_ > task->data_len_) {

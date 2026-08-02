@@ -41,8 +41,9 @@ GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob =
 // replication-specific methods (above the core's id space; see header note)
 GLOBAL_CROSS_CONST clio::run::u32 kReplicateBlob = 100;
 GLOBAL_CROSS_CONST clio::run::u32 kFlushTag = 101;
+GLOBAL_CROSS_CONST clio::run::u32 kReplicateSweep = 102;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 102;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 103;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -56,6 +57,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kMultiPutBlob] = "MultiPutBlob";
     v[100] = "ReplicateBlob";
     v[101] = "FlushTag";
+    v[102] = "ReplicateSweep";
     return v;
   }();
   return names;
