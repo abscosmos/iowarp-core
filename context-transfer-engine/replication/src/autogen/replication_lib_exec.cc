@@ -29,7 +29,8 @@ namespace clio::cte::replication {
   X(kFlushTag, FlushTagTask, FlushTag)             \
   X(kPutBlob, clio::cte::core::PutBlobTask, PutBlob) \
   X(kGetBlob, clio::cte::core::GetBlobTask, GetBlob) \
-  X(kGetBlobSize, clio::cte::core::GetBlobSizeTask, GetBlobSize)
+  X(kGetBlobSize, clio::cte::core::GetBlobSizeTask, GetBlobSize) \
+  X(kMultiPutBlob, clio::cte::core::MultiPutBlobTask, MultiPutBlob)
 
 void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
                    clio::run::u32 container_id) {

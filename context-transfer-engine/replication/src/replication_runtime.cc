@@ -447,6 +447,62 @@ clio::run::TaskResume Runtime::GetBlob(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::MultiPutBlob(
+    clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // Primary batch on the core, verbatim (zero-copy slices, one completion).
+  CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
+                         task.template Cast<clio::run::Task>()));
+  if (task->GetReturnCode() != 0) {
+    CLIO_CO_RETURN;
+  }
+  {
+    auto *cte = GetCoreClient();
+    // Same batch decode as the core's handler; the slices stay zero-copy —
+    // the batch buffer outlives this task, and each replica put completes
+    // before the next is issued.
+    std::vector<clio::cte::core::MultiPutDesc> descs;
+    {
+      std::string raw = task->descs_.str();
+      std::vector<char> buf(raw.begin(), raw.end());
+      ctp::ipc::GlobalDeserialize<std::vector<char>> ar(buf);
+      ar(descs);
+    }
+    auto *ipc_manager = CLIO_CPU_IPC;
+    char *base = task->data_.IsNull()
+                     ? nullptr
+                     : ipc_manager->ToFullPtr<char>(
+                           task->data_.template Cast<char>()).ptr_;
+    if (base != nullptr) {
+      for (size_t d = 0; d < descs.size(); ++d) {
+        const auto &desc = descs[d];
+        if (desc.payload_off_ + desc.size_ > task->data_len_) {
+          continue;  // malformed entry — already counted by the core batch
+        }
+        ctp::ipc::ShmPtr<> slice =
+            ctp::ipc::ShmPtr<>::FromRaw(base + desc.payload_off_);
+        for (int r = 1; r <= config_.num_replicas_; ++r) {
+          Context rep_ctx;
+          rep_ctx.replica_ = r;
+          rep_ctx.replica_flags_ = clio::cte::core::REPLICA_FIXED |
+                                   clio::cte::core::REPLICA_PERSISTENT;
+          rep_ctx.min_persistence_level_ = 1;
+          auto put = cte->AsyncPutBlob(desc.tag_id_, desc.blob_name_,
+                                       desc.offset_, desc.size_, slice,
+                                       config_.replica_score_, rep_ctx);
+          CLIO_CO_AWAIT(put);
+          if (put->GetReturnCode() != 0 && task->first_rc_ == 0) {
+            task->first_rc_ = 30 + put->GetReturnCode();
+            task->SetReturnCode(task->first_rc_);
+          }
+        }
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::GetBlobSize(
     clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task) {
   CLIO_TASK_BODY_BEGIN

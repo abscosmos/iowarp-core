@@ -58,6 +58,13 @@ class Runtime : public clio::run::Container {
    *  so size-then-read callers still reach the replica-serving GetBlob. */
   clio::run::TaskResume GetBlobSize(
       clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task);
+  /** Interposed batched put (Method::kMultiPutBlob): the batch runs on the
+   *  core verbatim (primaries), then each record is written through to the
+   *  persistent replica set — the deferred-put pipeline (#862/#878) ships
+   *  small records this way, and letting it bypass the write-through would
+   *  silently strip durability from every async caller. */
+  clio::run::TaskResume MultiPutBlob(
+      clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
 
   // ---- Container virtuals (defined in autogen/replication_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,

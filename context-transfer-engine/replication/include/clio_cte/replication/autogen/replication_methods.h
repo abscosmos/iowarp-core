@@ -35,6 +35,8 @@ GLOBAL_CROSS_CONST clio::run::u32 kPutBlob = clio::cte::core::Method::kPutBlob;
 GLOBAL_CROSS_CONST clio::run::u32 kGetBlob = clio::cte::core::Method::kGetBlob;
 GLOBAL_CROSS_CONST clio::run::u32 kGetBlobSize =
     clio::cte::core::Method::kGetBlobSize;
+GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob =
+    clio::cte::core::Method::kMultiPutBlob;
 
 // replication-specific methods (above the core's id space; see header note)
 GLOBAL_CROSS_CONST clio::run::u32 kReplicateBlob = 100;
@@ -51,6 +53,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kPutBlob] = "PutBlob";
     v[kGetBlob] = "GetBlob";
     v[kGetBlobSize] = "GetBlobSize";
+    v[kMultiPutBlob] = "MultiPutBlob";
     v[100] = "ReplicateBlob";
     v[101] = "FlushTag";
     return v;
