@@ -107,12 +107,21 @@ struct DestroyTask : public clio::run::Task {
                        const clio::run::PoolQuery &pool_query)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kDestroy) {}
 
-  void Copy(const ctp::ipc::FullPtr<DestroyTask>& other) {
-    (void)other;  // no fields beyond clio::run::Task
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<DestroyTask>());
   }
 
-  template <typename Ar> void SerializeStart(Ar &ar) { task_serialize<Ar>(ar); }
-  template <typename Ar> void SerializeEnd(Ar &ar) {}
+  void Copy(const ctp::ipc::FullPtr<DestroyTask>& other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+  }
+
+  // SerializeIn/SerializeOut, NOT the compressor's SerializeStart/End: the
+  // client-mode transport drives In/Out, and a chimod meant to be called
+  // from a separate client process must speak it (the filesystem chimod
+  // convention). Same for every task below.
+  template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
 
 using MonitorTask = clio::run::admin::MonitorTask;
@@ -144,7 +153,13 @@ struct ReplicateBlobTask : public clio::run::Task {
         tag_id_(tag_id), blob_name_(CTP_MALLOC, blob_name), replica_(replica),
         context_(context), bytes_copied_(0) {}
 
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<ReplicateBlobTask>());
+  }
+
   void Copy(const ctp::ipc::FullPtr<ReplicateBlobTask>& other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
     replica_ = other->replica_;
@@ -153,13 +168,14 @@ struct ReplicateBlobTask : public clio::run::Task {
   }
 
   template <typename Ar>
-  void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar);
-    ar(tag_id_, blob_name_, replica_, context_, bytes_copied_);
+  void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, replica_, context_);
   }
 
   template <typename Ar>
-  void SerializeEnd(Ar &ar) {
+  void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar);
     ar(bytes_copied_);
   }
 };
@@ -191,7 +207,13 @@ struct FlushTagTask : public clio::run::Task {
         tag_id_(tag_id), replica_(replica), min_score_(min_score),
         context_(context), blobs_replicated_(0), bytes_copied_(0) {}
 
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<FlushTagTask>());
+  }
+
   void Copy(const ctp::ipc::FullPtr<FlushTagTask>& other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
     tag_id_ = other->tag_id_;
     replica_ = other->replica_;
     min_score_ = other->min_score_;
@@ -201,14 +223,14 @@ struct FlushTagTask : public clio::run::Task {
   }
 
   template <typename Ar>
-  void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar);
-    ar(tag_id_, replica_, min_score_, context_, blobs_replicated_,
-       bytes_copied_);
+  void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, replica_, min_score_, context_);
   }
 
   template <typename Ar>
-  void SerializeEnd(Ar &ar) {
+  void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar);
     ar(blobs_replicated_, bytes_copied_);
   }
 };
@@ -249,7 +271,13 @@ struct CachedPutTask : public clio::run::Task {
         size_(size), blob_data_(blob_data), score_(score), context_(context),
         replicas_written_(0) {}
 
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<CachedPutTask>());
+  }
+
   void Copy(const ctp::ipc::FullPtr<CachedPutTask>& other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
     offset_ = other->offset_;
@@ -261,15 +289,15 @@ struct CachedPutTask : public clio::run::Task {
   }
 
   template <typename Ar>
-  void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar);
-    ar(tag_id_, blob_name_, offset_, size_, score_, context_,
-       replicas_written_);
+  void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, offset_, size_, blob_data_, score_, context_);
     ar.bulk(blob_data_, size_, BULK_XFER);
   }
 
   template <typename Ar>
-  void SerializeEnd(Ar &ar) {
+  void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar);
     ar(replicas_written_);
   }
 };
@@ -310,7 +338,13 @@ struct CachedGetTask : public clio::run::Task {
         size_(size), blob_data_(blob_data), context_(context),
         from_replica_(0), recached_bytes_(0) {}
 
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<CachedGetTask>());
+  }
+
   void Copy(const ctp::ipc::FullPtr<CachedGetTask>& other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
     offset_ = other->offset_;
@@ -322,16 +356,17 @@ struct CachedGetTask : public clio::run::Task {
   }
 
   template <typename Ar>
-  void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar);
-    ar(tag_id_, blob_name_, offset_, size_, context_, from_replica_,
-       recached_bytes_);
+  void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, offset_, size_, blob_data_, context_);
     ar.bulk(blob_data_, size_, BULK_EXPOSE);
   }
 
   template <typename Ar>
-  void SerializeEnd(Ar &ar) {
+  void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar);
     ar(from_replica_, recached_bytes_);
+    ar.bulk(blob_data_, size_, BULK_XFER);
   }
 };
 

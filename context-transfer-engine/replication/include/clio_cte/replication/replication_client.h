@@ -54,7 +54,7 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<ReplicateBlobTask> AsyncReplicateBlob(
       const TagId &tag_id, const std::string &blob_name,
       int replica, const Context &context = Context(),
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ReplicateBlobTask>(
         clio::run::CreateTaskId(), replication_pool_id_, pool_query, tag_id,
@@ -71,7 +71,7 @@ class Client : public clio::cte::core::Client {
       const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
       clio::run::u64 size, ctp::ipc::ShmPtr<> blob_data, float score = -1.0f,
       const Context &context = Context(),
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<CachedPutTask>(
         clio::run::CreateTaskId(), replication_pool_id_, pool_query, tag_id,
@@ -88,7 +88,7 @@ class Client : public clio::cte::core::Client {
       const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
       clio::run::u64 size, ctp::ipc::ShmPtr<> blob_data,
       const Context &context = Context(),
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<CachedGetTask>(
         clio::run::CreateTaskId(), replication_pool_id_, pool_query, tag_id,
@@ -100,7 +100,7 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<FlushTagTask> AsyncFlushTag(
       const TagId &tag_id, int replica, float min_score = 0.0f,
       const Context &context = Context(),
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<FlushTagTask>(
         clio::run::CreateTaskId(), replication_pool_id_, pool_query, tag_id,
