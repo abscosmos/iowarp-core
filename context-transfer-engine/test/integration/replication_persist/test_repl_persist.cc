@@ -22,8 +22,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <string>
-#include <unistd.h>
+#include <thread>
 
 #include <clio_ctp/util/logging.h>
 #include <clio_runtime/clio_runtime.h>
@@ -97,7 +98,7 @@ static int PutBlobs() {
       rsz.Wait();
       replicated = rsz->GetReturnCode() == 0 && rsz->size_ == kBlobSize;
       if (!replicated) {
-        usleep(20000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
       }
     }
     if (!replicated) {
