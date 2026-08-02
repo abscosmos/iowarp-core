@@ -603,4 +603,40 @@ TEST_CASE("BlobReplicas - CachedPut/CachedGet write-through cache model",
   ipc_manager->FreeBuffer(get_buf);
 }
 
+TEST_CASE("BlobReplicas - RegisterReplicaContainer coherence smoke",
+          "[cte][replicas][coherence][886]") {
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("replica_coherence_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  // Registering against a blob that does not exist is rejected — there is
+  // nothing to be coherent with.
+  {
+    auto reg = client->AsyncRegisterReplicaContainer(tag_id, "no_such_blob",
+                                                     /*node_id=*/12345);
+    reg.Wait();
+    REQUIRE(reg->GetReturnCode() != 0);
+  }
+
+  const std::string v1(kValSize, '1');
+  PutTo(client, tag_id, "coherent_blob", v1, 0);
+
+  // The owner's OWN node registering is accepted as a no-op: a registered
+  // self would make the next put's invalidation delete the authoritative
+  // blob. The subsequent put must therefore leave the blob fully intact.
+  {
+    auto reg = client->AsyncRegisterReplicaContainer(
+        tag_id, "coherent_blob", CLIO_CPU_IPC->GetNodeId());
+    reg.Wait();
+    REQUIRE(reg->GetReturnCode() == 0);
+  }
+  const std::string v2(kValSize, '2');
+  PutTo(client, tag_id, "coherent_blob", v2, 0);
+  std::vector<char> got;
+  REQUIRE(GetFrom(client, tag_id, "coherent_blob", &got, 0) == 0);
+  REQUIRE(std::memcmp(got.data(), v2.data(), kValSize) == 0);
+}
+
 SIMPLE_TEST_MAIN()

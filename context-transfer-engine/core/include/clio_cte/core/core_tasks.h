@@ -865,6 +865,60 @@ struct Replica {
 static constexpr int kAllReplicas = -1;
 
 /**
+ * RegisterReplicaContainerTask (issue #886, Method::kRegisterReplicaContainer)
+ * — tell the blob's OWNER container that `node_id_` holds a cached or
+ * replicated copy of the blob. Routed like any blob op (Dynamic → the owner
+ * by DirectHash). The next primary write invalidates every registered
+ * node's copy (write-invalidate coherence) and clears the set.
+ */
+struct RegisterReplicaContainerTask : public clio::run::Task {
+  IN TagId tag_id_;
+  IN clio::run::priv::string blob_name_;
+  IN clio::run::u64 node_id_;  // the node holding the copy
+
+  RegisterReplicaContainerTask()
+      : clio::run::Task(), tag_id_(TagId::GetNull()),
+        blob_name_(CLIO_PRIV_ALLOC), node_id_(0) {}
+
+  CTP_CROSS_FUN explicit RegisterReplicaContainerTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &tag_id,
+      const std::string &blob_name, clio::run::u64 node_id)
+      : clio::run::Task(task_id, pool_id, pool_query,
+                        Method::kRegisterReplicaContainer),
+        tag_id_(tag_id), blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        node_id_(node_id) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kRegisterReplicaContainer;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, node_id_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<RegisterReplicaContainerTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    node_id_ = other->node_id_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+  }
+};
+
+/**
  * Blob information structure with block-based management
  */
 struct BlobInfo {
@@ -876,6 +930,13 @@ struct BlobInfo {
   // owned here exactly like blocks_: DelBlob frees them, and their layouts
   // persist through kExtendReplica WAL records.
   clio::run::priv::vector<Replica> replicas_;
+  // Nodes that registered a cached/replicated copy of this blob (issue #886
+  // distributed coherence; kRegisterReplicaContainer). The next primary
+  // write invalidates each registered node's copy and clears the list —
+  // caches re-register when they re-populate. Deliberately NOT persisted:
+  // remote caches are volatile, so a rebooted owner starts with no
+  // registrations and no stale invalidation targets.
+  clio::run::priv::vector<clio::run::u64> replica_nodes_;
   float score_;  // 0-1 score for reorganization
   Timestamp last_modified_;
   Timestamp last_read_;
@@ -997,6 +1058,7 @@ struct BlobInfo {
       : blob_name_(CLIO_PRIV_ALLOC),
         blocks_(CLIO_PRIV_ALLOC),
         replicas_(CLIO_PRIV_ALLOC),
+        replica_nodes_(CLIO_PRIV_ALLOC),
         score_(0.0f),
         last_modified_(0),
         last_read_(0),
@@ -1017,6 +1079,7 @@ struct BlobInfo {
       : blob_name_(blob_name),
         blocks_(CLIO_PRIV_ALLOC),
         replicas_(CLIO_PRIV_ALLOC),
+        replica_nodes_(CLIO_PRIV_ALLOC),
         score_(score),
         last_modified_(0),
         last_read_(0),
@@ -1038,6 +1101,7 @@ struct BlobInfo {
       : blob_name_(CLIO_PRIV_ALLOC, blob_name),
         blocks_(CLIO_PRIV_ALLOC),
         replicas_(CLIO_PRIV_ALLOC),
+        replica_nodes_(CLIO_PRIV_ALLOC),
         score_(score),
         last_modified_(GetCurrentTimeNs()),
         last_read_(GetCurrentTimeNs()),
@@ -1059,6 +1123,7 @@ struct BlobInfo {
       : blob_name_(other.blob_name_),
         blocks_(other.blocks_),
         replicas_(other.replicas_),
+        replica_nodes_(other.replica_nodes_),
         score_(other.score_),
         last_modified_(other.last_modified_),
         last_read_(other.last_read_),
@@ -1080,6 +1145,7 @@ struct BlobInfo {
       blob_name_ = other.blob_name_;
       blocks_ = other.blocks_;
       replicas_ = other.replicas_;
+      replica_nodes_ = other.replica_nodes_;
       score_ = other.score_;
       last_modified_ = other.last_modified_;
       last_read_ = other.last_read_;

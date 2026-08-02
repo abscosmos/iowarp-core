@@ -320,10 +320,38 @@ clio::run::TaskResume Runtime::CachedGet(
     auto *cte = GetCoreClient();
     std::string blob_name = task->blob_name_.str();
     const clio::run::u64 end = task->offset_ + task->size_;
+    clio::run::u64 served_total = 0;  // full blob size of whatever copy served
 
-    // Cache hit iff the primary COVERS the requested range. A dropped
-    // primary reads as size 0; an interrupted re-cache leaves a prefix that
-    // still hits for ranges inside it.
+    // 0. NODE-LOCAL cache first (issue #886 distributed coherence): a copy
+    //    this node cached earlier lives in the LOCAL container. On the
+    //    blob's owner node Local and Dynamic resolve to the same container,
+    //    so this doubles as the primary probe there. Registered copies are
+    //    invalidated by the owner's next primary write, so a covering local
+    //    copy is never stale.
+    {
+      auto lsize = cte->AsyncGetBlobSize(task->tag_id_, blob_name,
+                                         clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(lsize);
+      if (lsize->GetReturnCode() == 0 && lsize->size_ >= end) {
+        Context get_ctx = task->context_;
+        get_ctx.replica_ = 0;
+        auto get_task = cte->AsyncGetBlob(task->tag_id_, blob_name,
+                                          task->offset_, task->size_,
+                                          /*flags=*/0, task->blob_data_,
+                                          clio::run::PoolQuery::Local(),
+                                          get_ctx);
+        CLIO_CO_AWAIT(get_task);
+        if (get_task->GetReturnCode() == 0) {
+          task->from_replica_ = 0;
+          task->return_code_ = 0;
+          CLIO_CO_RETURN;
+        }
+      }
+    }
+
+    // 1. Owner's primary: cache hit iff it COVERS the requested range. A
+    //    dropped primary reads as size 0; an interrupted re-cache leaves a
+    //    prefix that still hits for ranges inside it.
     clio::run::u64 primary_size = 0;
     {
       auto size_task = cte->AsyncGetBlobSize(task->tag_id_, blob_name);
@@ -334,6 +362,7 @@ clio::run::TaskResume Runtime::CachedGet(
       }
       primary_size = size_task->size_;
     }
+    bool served = false;
     if (primary_size >= end) {
       Context get_ctx = task->context_;
       get_ctx.replica_ = 0;
@@ -343,46 +372,122 @@ clio::run::TaskResume Runtime::CachedGet(
                                         clio::run::PoolQuery::Dynamic(),
                                         get_ctx);
       CLIO_CO_AWAIT(get_task);
-      task->return_code_ = get_task->GetReturnCode();
+      if (get_task->GetReturnCode() != 0) {
+        task->return_code_ = get_task->GetReturnCode();
+        CLIO_CO_RETURN;
+      }
+      served = true;
+      served_total = primary_size;
+    }
+
+    // 2. Miss: serve from the first persistent replica that covers the
+    //    range, then restore the owner's DRAM fast path by copying the
+    //    WHOLE replica back into the primary (best-effort).
+    if (!served) {
+      for (int r = 1; r <= config_.num_replicas_; ++r) {
+        clio::run::u64 rep_size = 0;
+        {
+          auto size_task = cte->AsyncGetBlobSize(
+              task->tag_id_, blob_name, clio::run::PoolQuery::Dynamic(), r);
+          CLIO_CO_AWAIT(size_task);
+          if (size_task->GetReturnCode() != 0) {
+            continue;
+          }
+          rep_size = size_task->size_;
+        }
+        if (rep_size < end) {
+          continue;
+        }
+        Context get_ctx = task->context_;
+        get_ctx.replica_ = r;
+        auto get_task = cte->AsyncGetBlob(task->tag_id_, blob_name,
+                                          task->offset_, task->size_,
+                                          /*flags=*/0, task->blob_data_,
+                                          clio::run::PoolQuery::Dynamic(),
+                                          get_ctx);
+        CLIO_CO_AWAIT(get_task);
+        if (get_task->GetReturnCode() != 0) {
+          continue;
+        }
+        task->from_replica_ = r;
+        CLIO_CO_AWAIT(RecachePrimary(task->tag_id_, blob_name, r, rep_size,
+                                task->recached_bytes_));
+        served = true;
+        served_total = rep_size;
+        break;
+      }
+    }
+    if (!served) {
+      task->return_code_ = 3;  // No copy covers the requested range
       CLIO_CO_RETURN;
     }
 
-    // Miss: serve from the first persistent replica that covers the range,
-    // then restore the DRAM fast path by copying the WHOLE replica back
-    // into the primary (best-effort).
-    for (int r = 1; r <= config_.num_replicas_; ++r) {
-      clio::run::u64 rep_size = 0;
-      {
-        auto size_task = cte->AsyncGetBlobSize(
-            task->tag_id_, blob_name, clio::run::PoolQuery::Dynamic(), r);
-        CLIO_CO_AWAIT(size_task);
-        if (size_task->GetReturnCode() != 0) {
-          continue;
+    // 3. Populate this node's local cache. Re-probe first: on the owner
+    //    node (or after a successful re-cache into a local primary) the
+    //    local copy now covers, and copying onto ourselves would be a
+    //    pointless duplicate write. Only a genuinely remote reader falls
+    //    through to CacheLocalCopy + registration.
+    {
+      auto lsize = cte->AsyncGetBlobSize(task->tag_id_, blob_name,
+                                         clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(lsize);
+      if (!(lsize->GetReturnCode() == 0 && lsize->size_ >= served_total)) {
+        bool cached = false;
+        CLIO_CO_AWAIT(CacheLocalCopy(task->tag_id_, blob_name, served_total,
+                                cached));
+        if (cached) {
+          auto reg = cte->AsyncRegisterReplicaContainer(
+              task->tag_id_, blob_name, CLIO_IPC->GetNodeId());
+          CLIO_CO_AWAIT(reg);
         }
-        rep_size = size_task->size_;
       }
-      if (rep_size < end) {
-        continue;
-      }
-      Context get_ctx = task->context_;
-      get_ctx.replica_ = r;
-      auto get_task = cte->AsyncGetBlob(task->tag_id_, blob_name,
-                                        task->offset_, task->size_,
-                                        /*flags=*/0, task->blob_data_,
-                                        clio::run::PoolQuery::Dynamic(),
-                                        get_ctx);
-      CLIO_CO_AWAIT(get_task);
-      if (get_task->GetReturnCode() != 0) {
-        continue;
-      }
-      task->from_replica_ = r;
-      CLIO_CO_AWAIT(RecachePrimary(task->tag_id_, blob_name, r, rep_size,
-                              task->recached_bytes_));
-      task->return_code_ = 0;
+    }
+    task->return_code_ = 0;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::CacheLocalCopy(const TagId &tag_id,
+                                              const std::string &blob_name,
+                                              clio::run::u64 total,
+                                              bool &cached) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  cached = false;
+  auto *cte = GetCoreClient();
+  for (clio::run::u64 off = 0; off < total; off += kReplicateChunkBytes) {
+    clio::run::u64 len = std::min(kReplicateChunkBytes, total - off);
+    auto buf = CLIO_IPC->AllocateBuffer(len);
+    if (buf.IsNull()) {
       CLIO_CO_RETURN;
     }
-    task->return_code_ = 3;  // No copy covers the requested range
+    ctp::ipc::ShmPtr<> buf_ptr = buf.shm_.template Cast<void>();
+
+    auto get_task = cte->AsyncGetBlob(tag_id, blob_name, off, len,
+                                      /*flags=*/0, buf_ptr);
+    CLIO_CO_AWAIT(get_task);
+    if (get_task->GetReturnCode() != 0) {
+      CLIO_IPC->FreeBuffer(buf);
+      CLIO_CO_RETURN;
+    }
+
+    Context put_ctx;
+    put_ctx.replica_ = 0;
+    put_ctx.min_persistence_level_ = 0;
+    auto put_task = cte->AsyncPutBlob(tag_id, blob_name, off, len, buf_ptr,
+                                      config_.cache_score_, put_ctx,
+                                      /*flags=*/0,
+                                      clio::run::PoolQuery::Local());
+    CLIO_CO_AWAIT(put_task);
+    CLIO_IPC->FreeBuffer(buf);
+    if (put_task->GetReturnCode() != 0) {
+      CLIO_CO_RETURN;  // abandon; partial local copies are never served
+    }
   }
+  cached = true;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

@@ -206,6 +206,10 @@ public:
   clio::run::TaskResume Evict(clio::run::shared_ptr<EvictTask> &task);
   clio::run::TaskResume MultiPutBlob(
       clio::run::shared_ptr<MultiPutBlobTask> &task);
+  /** Record that a node holds a cached/replicated copy of a blob
+   *  (Method::kRegisterReplicaContainer, issue #886 coherence). */
+  clio::run::TaskResume RegisterReplicaContainer(
+      clio::run::shared_ptr<RegisterReplicaContainerTask> &task);
 
   /**
    * Rescore-and-move one blob without spawning a ReorganizeBlobTask (issue

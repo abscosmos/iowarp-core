@@ -2248,6 +2248,22 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Register `node_id` as holding a cached/replicated copy of the blob
+   * (issue #886 coherence). Routed to the blob's owner container; the next
+   * primary write there invalidates the copy before completing.
+   */
+  clio::run::Future<RegisterReplicaContainerTask> AsyncRegisterReplicaContainer(
+      const TagId &tag_id, const std::string &blob_name,
+      clio::run::u64 node_id,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<RegisterReplicaContainerTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        node_id);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous get contained blobs - returns immediately
    * @param tag_id Tag ID
    * @param pool_query Pool query for task routing (default: Dynamic)

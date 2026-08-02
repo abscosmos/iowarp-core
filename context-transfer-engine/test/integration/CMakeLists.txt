@@ -4,6 +4,13 @@ cmake_minimum_required(VERSION 3.10)
 # Restart integration test (no Docker required)
 add_subdirectory(restart)
 
+# Replication persistence test (#886, no Docker required): 50 CachedPuts
+# (DRAM primary + disk replica), runtime reboot, disk replicas verified.
+# Gated on the replication chimod (default ON).
+if(TARGET clio_cte_replication_client)
+    add_subdirectory(replication_persist)
+endif()
+
 # Multi-node GPU blob exchange (no Docker: driven by a batch script on a real
 # multi-node GPU allocation). Self-gates on CLIO_CORE_ENABLE_MPI + _CUDA.
 add_subdirectory(xnode_gpu)

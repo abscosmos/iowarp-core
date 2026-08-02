@@ -95,6 +95,22 @@ class Runtime : public clio::run::Container {
                                        clio::run::u64 rep_size,
                                        clio::run::u64 &recached);
 
+  /**
+   * Populate THIS node's local cache copy of a remote blob (issue #886
+   * distributed coherence): chunked copy of the owner's primary into the
+   * LOCAL container (PoolQuery::Local puts), then register this node with
+   * the owner (RegisterReplicaContainer) so the next primary write
+   * invalidates the copy. Best-effort — a failed chunk abandons the local
+   * copy without failing the read that triggered it, and registration only
+   * happens after a COMPLETE copy (a partial local copy is never served
+   * because CachedGet requires coverage, but registering it would earn a
+   * pointless invalidation).
+   */
+  clio::run::TaskResume CacheLocalCopy(const TagId &tag_id,
+                                       const std::string &blob_name,
+                                       clio::run::u64 total,
+                                       bool &cached);
+
   /** Lazily bind the core client (compose next_pool_id, default kCtePoolId) */
   clio::cte::core::Client *GetCoreClient();
 

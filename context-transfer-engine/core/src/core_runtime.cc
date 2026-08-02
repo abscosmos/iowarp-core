@@ -1918,6 +1918,39 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                             std::to_string(tag_id.minor_) + "." + blob_name;
       MirrorBlobToShm(shm_key, *blob_info_ptr);
     }
+
+    // issue #886 distributed coherence: a primary write invalidates every
+    // registered remote cached copy BEFORE the put completes, so after an
+    // acked write no node can serve its stale cache — its next read misses
+    // and refetches the new bytes. The registration list is snapshotted
+    // (a re-registration during the awaits below must not dangle this
+    // iteration) and cleared: caches re-register when they re-populate.
+    if (!blob_info_ptr->replica_nodes_.empty() && !task->context_.emulate_) {
+      std::vector<clio::run::u64> inval_nodes;
+      for (size_t ni = 0; ni < blob_info_ptr->replica_nodes_.size(); ++ni) {
+        inval_nodes.push_back(blob_info_ptr->replica_nodes_[ni]);
+      }
+      blob_info_ptr->replica_nodes_.clear();
+      const clio::run::u64 self_node = CLIO_IPC->GetNodeId();
+      for (size_t ni = 0; ni < inval_nodes.size(); ++ni) {
+        if (inval_nodes[ni] == self_node) {
+          continue;  // this container IS the owner; nothing cached here
+        }
+        auto inval = client_.AsyncDelBlob(
+            tag_id, blob_name,
+            clio::run::PoolQuery::Physical(
+                static_cast<clio::run::u32>(inval_nodes[ni])));
+        CLIO_CO_AWAIT(inval);
+        if (inval->GetReturnCode() != 0) {
+          // Best-effort: "not found" just means the cache was already gone,
+          // and a dead node's cache dies with it either way.
+          HLOG(kDebug,
+               "PutBlob: cache invalidation on node {} returned rc={}",
+               inval_nodes[ni], inval->GetReturnCode());
+        }
+      }
+    }
+
     task->return_code_ = 0;
   } catch (const std::exception &e) {
     HLOG(kError, "PutBlob failed with exception: {}", e.what());
@@ -2319,6 +2352,50 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
 
     task->return_code_ = 0;
 
+  } catch (const std::exception &e) {
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RegisterReplicaContainer(
+    clio::run::shared_ptr<RegisterReplicaContainerTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  try {
+    std::string blob_name = task->blob_name_.str();
+    if (blob_name.empty()) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
+    std::shared_ptr<BlobInfo> blob_info_ptr =
+        CheckBlobExists(blob_name, task->tag_id_);
+    if (blob_info_ptr == nullptr) {
+      task->return_code_ = 1;  // Nothing to be coherent WITH
+      CLIO_CO_RETURN;
+    }
+    // The owner's own node never registers: its copy IS the primary, and a
+    // registered self would make the next put's invalidation delete the
+    // authoritative blob (replicas included).
+    if (task->node_id_ == CLIO_IPC->GetNodeId()) {
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+    // Dedup append. No co_await from the check to the push, so this is
+    // atomic w.r.t. every other task on this worker; PutBlob's invalidation
+    // loop snapshots before it awaits, so a concurrent registration can
+    // never dangle its iteration.
+    bool present = false;
+    for (size_t i = 0; i < blob_info_ptr->replica_nodes_.size(); ++i) {
+      if (blob_info_ptr->replica_nodes_[i] == task->node_id_) {
+        present = true;
+        break;
+      }
+    }
+    if (!present) {
+      blob_info_ptr->replica_nodes_.push_back(task->node_id_);
+    }
+    task->return_code_ = 0;
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }

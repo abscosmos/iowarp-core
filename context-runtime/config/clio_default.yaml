@@ -117,11 +117,32 @@ compose:
     # Each entry creates a block device for CTE to buffer data onto.
     # score: 0.0 = slowest/cheapest, 1.0 = fastest/most expensive
     #        -1.0 = automatic scoring
+    # persistence_level: "volatile" (default), "temporary", or "long_term".
+    #        Placement filters (Context::min_persistence_level_) and replica
+    #        durability (REPLICA_PERSISTENT, issue #886) key off this — a
+    #        tier left at "volatile" can never satisfy a persistence request.
     storage:
       - path: "ram::cte_ram_tier1"       # "ram::<name>" for DRAM, filesystem path for disk
         bdev_type: "ram"                 # Options: file, ram, hbm, pinned, noop
         capacity_limit: "0g"             # 0/0g = default to 80% of total system DRAM
         score: 1.0                       # DRAM = highest-performance tier
+
+      # Persistent disk tier: where the replication chimod (below) keeps the
+      # durable copies of DRAM-cached data. Grows lazily (1GB units), so the
+      # capacity_limit is a cap, not an upfront allocation.
+      - path: "${HOME}/.clio/cte_disk_tier.dat"
+        bdev_type: "file"
+        capacity_limit: "10GB"
+        score: 0.2
+        persistence_level: "temporary"
+
+    # Metadata durability ---------------------------------------------------
+    # Write-ahead log + periodic snapshots for tag/blob metadata. Required
+    # for data to survive a runtime reboot: without it the disk tier's bytes
+    # persist but nothing remembers which blob they belong to.
+    performance:
+      metadata_log_path: "${HOME}/.clio/cte_metadata_log"
+      transaction_log_capacity: "32MB"
 
     # Data Placement Engine ------------------------------------------------
     dpe:
@@ -144,6 +165,23 @@ compose:
     #   flush_data_period_ms: 10000      # Data flush interval (ms)
     #   flush_data_min_persistence: 1    # Min persistence level (1=temp-nonvolatile)
     #   transaction_log_capacity: "32MB" # Write-ahead log capacity
+
+  # === Replication (cached durability, issue #886) ===
+  # The recommended entrypoint for cached-with-persistence data. CachedPut
+  # writes a fast DRAM copy (the CTE primary) AND writes through to a fixed
+  # set of persistent replicas on the disk tier above (REPLICA_FIXED |
+  # REPLICA_PERSISTENT: the organizer never migrates them and never places
+  # them on volatile storage). CachedGet reads the DRAM copy when present
+  # and transparently re-caches from a disk replica when the organizer (or a
+  # reboot) dropped it. Must come AFTER the CTE core entry above.
+  - mod_name: clio_cte_replication
+    pool_name: clio_cte_replication
+    pool_query: local
+    pool_id: "561.0"
+    next_pool_id: "512.0"               # CTE core pool — see entry above
+    num_replicas: 1                     # persistent copies per CachedPut
+    cache_score: 1.0                    # DRAM copy placement score
+    replica_score: 0.2                  # disk copies' score = drop threshold
 
   # === Context Filesystem (CFS) ===
   # POSIX-style filesystem chimod that the libfuse / POSIX adapters drive. It
