@@ -84,7 +84,18 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
       unsigned major = 0, minor = 0;
       if (std::sscanf(pool_env, "%u.%u", &major, &minor) == 2) {
         cte_client->Init(clio::run::PoolId(major, minor));
-        if (!cte_client->AttachShmCache()) {
+        // Zero-IPC reads through an interposer: the interposer pool
+        // publishes no mirror of its own, so fall back to the CANONICAL
+        // core pool's mirror — the pool every shipped interposer sits over.
+        // Correct because interposed writes update the primary
+        // synchronously and drops re-mirror empty (see AttachShmCacheOf).
+        if (cte_client->AttachShmCache()) {
+          HLOG(kInfo, "CTE ClientInit: SHM fast path via pool {}.{}'s mirror",
+               major, minor);
+        } else if (cte_client->AttachShmCacheOf(clio::cte::core::kCtePoolId)) {
+          HLOG(kInfo,
+               "CTE ClientInit: SHM fast path via the core pool's mirror");
+        } else {
           HLOG(kDebug,
                "CTE ClientInit: SHM metadata cache unavailable; using RPC");
         }

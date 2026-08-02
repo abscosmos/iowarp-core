@@ -128,6 +128,28 @@ class Client : public clio::run::ContainerClient {
     return AttachShmCache(dir->FindRoot(pool_id_.ToU64()));
   }
 
+  /**
+   * Attach a DIFFERENT pool's mirror — the interposition case (issue #886).
+   * A client bound to an interposer pool (e.g. replication at 561.0) reads
+   * primaries that the CORE pool mirrors, so the zero-IPC fast path must
+   * attach the core's directory slot. Safe under the replication interposer
+   * because writes update the primary synchronously in the put path (the
+   * mirror is never stale) and a dropped primary is re-mirrored EMPTY, so
+   * the fast path misses and falls back to the task path — which is the
+   * interposer's replica-serving ladder.
+   */
+  bool AttachShmCacheOf(const clio::run::PoolId &mirror_pool) {
+    auto *ipc = CLIO_CPU_IPC;
+    if (ipc == nullptr) {
+      return false;
+    }
+    auto *dir = ipc->GetMetadataDirectory();
+    if (dir == nullptr) {
+      return false;
+    }
+    return AttachShmCache(dir->FindRoot(mirror_pool.ToU64()));
+  }
+
   /** Convenience: attach from a completed CreateTask, falling back to the
    *  directory when the task carries no offset (i.e. the pool already
    *  existed, which is the common case). */
