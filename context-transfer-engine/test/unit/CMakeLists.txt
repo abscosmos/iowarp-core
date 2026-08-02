@@ -1013,6 +1013,13 @@ clio_add_force_net_test(NAME cte_config_dpe_force_net
 clio_add_force_net_test(NAME cte_bdev_leak_stress_force_net
     COMMAND test_bdev_leak_stress
     ENVIRONMENT "${_cte_fn_env_data};CTE_LEAK_STRESS_SECONDS=20" TIMEOUT 180)
+# Blob replicas (issue #886) over the loopback net path: the only variant that
+# serializes the replication chimod's tasks (CachedPut/CachedGet/
+# ReplicateBlob/FlushTag) through their autogen Save/Load wire path.
+if(TARGET clio_cte_replication_client)
+clio_add_force_net_test(NAME cte_blob_replicas_force_net
+    COMMAND test_blob_replicas ENVIRONMENT "${_cte_fn_env_data}" TIMEOUT 600)
+endif()
 
 # NOTE: the legacy GPU CTE tests cte_gpu_coroutine / cte_gpu_core_all /
 # cte_gpu_create were removed — their executables (test_cte_gpu_coroutine /

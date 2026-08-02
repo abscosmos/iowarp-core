@@ -52,10 +52,12 @@ class BlobReplicasFixture {
  public:
   std::string config_path_;
   std::string file_storage_path_;
+  std::string metadata_log_path_;
 
   BlobReplicasFixture() {
     config_path_ = chi_test_data_dir() + "/blob_replicas_config.yaml";
     file_storage_path_ = chi_test_data_dir() + "/blob_replicas_file.dat";
+    metadata_log_path_ = chi_test_data_dir() + "/blob_replicas_meta.log";
     Cleanup();
     CreateConfigFile();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
@@ -73,6 +75,16 @@ class BlobReplicasFixture {
   void Cleanup() {
     if (fs::exists(config_path_)) fs::remove(config_path_);
     if (fs::exists(file_storage_path_)) fs::remove(file_storage_path_);
+    // The WAL is a file family: the snapshot plus per-shard .blob.N logs.
+    std::error_code ec;
+    for (const auto &entry :
+         fs::directory_iterator(fs::path(metadata_log_path_).parent_path(),
+                                ec)) {
+      const std::string name = entry.path().filename().string();
+      if (name.rfind("blob_replicas_meta.log", 0) == 0) {
+        fs::remove(entry.path(), ec);
+      }
+    }
   }
 
   void CreateConfigFile() {
@@ -116,6 +128,15 @@ compose:
 
     dpe:
       dpe_type: "max_bw"
+
+    # WAL on (issue #886): replica writes append kExtendReplica records and
+    # the explicit FlushMetadata below snapshots replica layouts (entry type
+    # 3). Periodic flushing off so the only snapshot is the test's own.
+    performance:
+      metadata_log_path: )" << metadata_log_path_ << R"(
+      transaction_log_capacity: 4MB
+      flush_metadata_period_ms: 0
+      flush_data_period_ms: 0
 )";
     config_file.close();
   }
@@ -637,6 +658,79 @@ TEST_CASE("BlobReplicas - RegisterReplicaContainer coherence smoke",
   std::vector<char> got;
   REQUIRE(GetFrom(client, tag_id, "coherent_blob", &got, 0) == 0);
   REQUIRE(std::memcmp(got.data(), v2.data(), kValSize) == 0);
+}
+
+TEST_CASE("BlobReplicas - metadata snapshot covers replica layouts",
+          "[cte][replicas][wal][886]") {
+  // The fixture's config enables the WAL, so every replica write in this
+  // suite has been appending kExtendReplica records. This case drives the
+  // OTHER half of durability: FlushMetadata's snapshot, which must emit the
+  // per-replica entries (type 3) alongside the tag/blob entries — the WAL is
+  // truncated after a snapshot, so a snapshot that skipped replicas would
+  // lose every replica layout on restart.
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("replica_snapshot_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  const std::string primary_val(kValSize, 's');
+  const std::string replica_val(kValSize, 't');
+  PutTo(client, tag_id, "snap_blob", primary_val, 0);
+  PutTo(client, tag_id, "snap_blob", replica_val, 1);
+
+  auto fut = client->AsyncFlushMetadata(clio::run::PoolQuery::Local(), 0);
+  fut.Wait();
+  REQUIRE(fut->GetReturnCode() == 0);
+  // At minimum: this case's tag entry, its blob entry, and its replica entry.
+  REQUIRE(fut->entries_flushed_ >= 3);
+
+  // The snapshot is a read-only pass: both copies still serve their bytes.
+  std::vector<char> got;
+  REQUIRE(GetFrom(client, tag_id, "snap_blob", &got, 0) == 0);
+  REQUIRE(std::memcmp(got.data(), primary_val.data(), kValSize) == 0);
+  REQUIRE(GetFrom(client, tag_id, "snap_blob", &got, 1) == 0);
+  REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
+}
+
+TEST_CASE("BlobReplicas - ReplicationConfig parses compose YAML",
+          "[cte][replicas][replication][886]") {
+  // The chimod's LoadConfig is what turns a clio_cte_replication compose
+  // entry (clio_default.yaml ships one) into runtime parameters.
+  using clio::cte::replication::ReplicationConfig;
+  {
+    clio::run::PoolConfig pool_config;
+    pool_config.config_ =
+        "next_pool_id: \"512.7\"\n"
+        "num_replicas: 3\n"
+        "cache_score: 0.9\n"
+        "replica_score: 0.35\n";
+    ReplicationConfig config;
+    config.LoadConfig(pool_config);
+    REQUIRE(config.next_pool_id_ == clio::run::PoolId(512, 7));
+    REQUIRE(config.num_replicas_ == 3);
+    REQUIRE(config.cache_score_ == 0.9f);
+    REQUIRE(config.replica_score_ == 0.35f);
+  }
+  // Empty config: every default survives.
+  {
+    clio::run::PoolConfig pool_config;
+    ReplicationConfig config;
+    ReplicationConfig defaults;
+    config.LoadConfig(pool_config);
+    REQUIRE(config.num_replicas_ == defaults.num_replicas_);
+    REQUIRE(config.cache_score_ == defaults.cache_score_);
+    REQUIRE(config.replica_score_ == defaults.replica_score_);
+  }
+  // Malformed YAML: best-effort parsing keeps the defaults, no throw.
+  {
+    clio::run::PoolConfig pool_config;
+    pool_config.config_ = "num_replicas: [unclosed\n  ::: garbage";
+    ReplicationConfig config;
+    ReplicationConfig defaults;
+    config.LoadConfig(pool_config);
+    REQUIRE(config.num_replicas_ == defaults.num_replicas_);
+  }
 }
 
 SIMPLE_TEST_MAIN()

@@ -137,6 +137,70 @@ TEST_CASE("TransactionLog - ExtendBlob roundtrip with blocks", "[cte][txnlog]") 
   TxnRemove(path);
 }
 
+TEST_CASE("TransactionLog - ExtendReplica roundtrip", "[cte][txnlog]") {
+  // issue #886: the record that persists a replica's block layout between the
+  // replica write that produced it and the next metadata flush. A separate
+  // appended type (not a replica index folded into kExtendBlob) so old replay
+  // chains skip it instead of misparsing the record.
+  std::string path = TxnTempFile("txn_extend_replica");
+  TxnRemove(path);
+
+  TransactionLog log;
+  log.Open(path, 4096);
+
+  TxnExtendReplica txn;
+  txn.tag_major_ = 5;
+  txn.tag_minor_ = 6;
+  txn.blob_name_ = "replicated";
+  txn.replica_ = 2;
+  txn.replica_name_ = "replicated#2";
+  txn.score_ = 0.25f;
+  txn.flags_ = 3;  // REPLICA_FIXED | REPLICA_PERSISTENT
+  TxnExtendBlobBlock blk0;
+  blk0.bdev_major_ = 512;
+  blk0.bdev_minor_ = 1;
+  blk0.target_query_ = clio::run::PoolQuery::Local();
+  blk0.target_offset_ = 4096;
+  blk0.size_ = 1024;
+  TxnExtendBlobBlock blk1;
+  blk1.bdev_major_ = 513;
+  blk1.bdev_minor_ = 2;
+  blk1.target_query_ = clio::run::PoolQuery::Local();
+  blk1.target_offset_ = 8192;
+  blk1.size_ = 2048;
+  txn.new_blocks_.push_back(blk0);
+  txn.new_blocks_.push_back(blk1);
+  log.Log(TxnType::kExtendReplica, txn);
+  log.Sync();
+
+  auto entries = log.Load();
+  REQUIRE(entries.size() == 1);
+  REQUIRE(entries[0].first == TxnType::kExtendReplica);
+  TxnExtendReplica out =
+      TransactionLog::DeserializeExtendReplica(entries[0].second);
+  REQUIRE(out.tag_major_ == 5);
+  REQUIRE(out.tag_minor_ == 6);
+  REQUIRE(out.blob_name_ == "replicated");
+  REQUIRE(out.replica_ == 2);
+  REQUIRE(out.replica_name_ == "replicated#2");
+  REQUIRE(out.score_ == 0.25f);
+  REQUIRE(out.flags_ == 3);
+  REQUIRE(out.new_blocks_.size() == 2);
+  REQUIRE(out.new_blocks_[0].bdev_major_ == 512);
+  REQUIRE(out.new_blocks_[0].bdev_minor_ == 1);
+  REQUIRE(out.new_blocks_[0].target_offset_ == 4096);
+  REQUIRE(out.new_blocks_[0].size_ == 1024);
+  REQUIRE(out.new_blocks_[1].bdev_major_ == 513);
+  REQUIRE(out.new_blocks_[1].bdev_minor_ == 2);
+  REQUIRE(out.new_blocks_[1].target_offset_ == 8192);
+  REQUIRE(out.new_blocks_[1].size_ == 2048);
+  REQUIRE(std::memcmp(&out.new_blocks_[0].target_query_,
+                      &blk0.target_query_, sizeof(clio::run::PoolQuery)) == 0);
+
+  log.Close();
+  TxnRemove(path);
+}
+
 TEST_CASE("TransactionLog - ClearBlob DelBlob roundtrip", "[cte][txnlog]") {
   std::string path = TxnTempFile("txn_clear_del");
   TxnRemove(path);
