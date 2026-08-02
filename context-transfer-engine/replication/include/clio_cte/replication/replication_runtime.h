@@ -17,12 +17,16 @@ namespace clio::cte::replication {
 
 /**
  * Replication chimod runtime (issue #886). The CTE core stores replicas and
- * addresses them (Context::replica_); this module owns the POLICY of keeping
- * copies of cached data on persistent tiers: ReplicateBlob copies one blob's
- * primary bytes into a chosen replica, FlushTag sweeps a whole tag. Both go
- * through the public core client API (GetBlob → PutBlob with
- * Context::replica_ set), so replica placement obeys the same DPE and
- * persistence constraints as any put.
+ * addresses them (Context::replica_); this module owns ALL replica policy —
+ * and it INTERPOSES on the core's own task interface so callers need no new
+ * client: point a clio::cte::core::Client at this pool (or set
+ * CLIO_CTE_POOL=561.0) and every op keeps working. PutBlob/GetBlob carry
+ * the CORE's task structs and method ids: the interposed PutBlob forwards
+ * the primary write to the core pool and writes through to num_replicas
+ * FIXED|PERSISTENT replicas; the interposed GetBlob serves a dropped
+ * primary from a covering replica and re-caches it. Every other core
+ * method is forwarded to the next pool untouched. ReplicateBlob/FlushTag
+ * remain the explicit verbs, numbered above the core's method space.
  */
 class Runtime : public clio::run::Container {
  public:
@@ -38,8 +42,22 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume ReplicateBlob(
       clio::run::shared_ptr<ReplicateBlobTask> &task);
   clio::run::TaskResume FlushTag(clio::run::shared_ptr<FlushTagTask> &task);
-  clio::run::TaskResume CachedPut(clio::run::shared_ptr<CachedPutTask> &task);
-  clio::run::TaskResume CachedGet(clio::run::shared_ptr<CachedGetTask> &task);
+  /** Interposed core put (Method::kPutBlob, core task struct): primary
+   *  forwarded to the core pool, then written through to the module's fixed
+   *  persistent replica set. Explicit Context::replica_ != 0 passes through
+   *  untouched. */
+  clio::run::TaskResume PutBlob(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task);
+  /** Interposed core get (Method::kGetBlob, core task struct): local/primary
+   *  probe, replica fallback for a dropped primary, then best-effort
+   *  primary re-cache and node-local cache population. */
+  clio::run::TaskResume GetBlob(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task);
+  /** Interposed size probe (Method::kGetBlobSize): reports the blob's
+   *  LOGICAL size — a dropped primary answers with its best replica's size,
+   *  so size-then-read callers still reach the replica-serving GetBlob. */
+  clio::run::TaskResume GetBlobSize(
+      clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task);
 
   // ---- Container virtuals (defined in autogen/replication_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
@@ -113,6 +131,21 @@ class Runtime : public clio::run::Container {
 
   /** Lazily bind the core client (compose next_pool_id, default kCtePoolId) */
   clio::cte::core::Client *GetCoreClient();
+
+  /** The core pool this module interposes on. */
+  clio::run::PoolId CorePoolId() const;
+
+  /** The local core container for direct forwarding (null before the core
+   *  pool is composed — compose order requires core BEFORE this module). */
+  clio::run::ContainerHold CoreContainer();
+
+  /**
+   * Forward a task to the core container's Run verbatim — the generic
+   * interposition escape: any core method this module does not override
+   * executes exactly as if the task had been addressed to the core pool.
+   */
+  clio::run::TaskResume ForwardToCore(clio::run::u32 method,
+                                      clio::run::shared_ptr<clio::run::Task> task);
 
   ReplicationConfig config_;
   std::unique_ptr<clio::cte::core::Client> core_client_;

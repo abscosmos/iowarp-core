@@ -62,39 +62,11 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
-  /**
-   * Write-through cached put: primary DRAM copy + the module's fixed set of
-   * persistent (FIXED|PERSISTENT) replicas, all updated in one call.
-   * @param score cache-copy score; -1 = the pool's configured cache_score_
-   */
-  clio::run::Future<CachedPutTask> AsyncCachedPut(
-      const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
-      clio::run::u64 size, ctp::ipc::ShmPtr<> blob_data, float score = -1.0f,
-      const Context &context = Context(),
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<CachedPutTask>(
-        clio::run::CreateTaskId(), replication_pool_id_, pool_query, tag_id,
-        blob_name, offset, size, blob_data, score, context);
-    return ipc->Send(task);
-  }
-
-  /**
-   * Cached read: primary if it covers the range, else a persistent replica —
-   * re-populating the DRAM primary afterwards (from_replica_/recached_bytes_
-   * report what happened).
-   */
-  clio::run::Future<CachedGetTask> AsyncCachedGet(
-      const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
-      clio::run::u64 size, ctp::ipc::ShmPtr<> blob_data,
-      const Context &context = Context(),
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<CachedGetTask>(
-        clio::run::CreateTaskId(), replication_pool_id_, pool_query, tag_id,
-        blob_name, offset, size, blob_data, context);
-    return ipc->Send(task);
-  }
+  // NOTE (issue #886 interposition): there are deliberately NO cached
+  // put/get wrappers here. The pool speaks the CTE core's own task
+  // interface — point a clio::cte::core::Client at kReplicationPoolId (or
+  // set CLIO_CTE_POOL=561.0 before CLIO_CTE_CLIENT_INIT) and plain
+  // PutBlob/GetBlob get write-through durability and replica-served reads.
 
   /** ReplicateBlob every blob in the tag with score >= min_score. */
   clio::run::Future<FlushTagTask> AsyncFlushTag(

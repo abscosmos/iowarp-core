@@ -3,6 +3,14 @@
  * Load / NewTask / Aggregate), switch-case over Method ids. Hand-maintained
  * to match clio_mod.yaml + replication_methods.h (mirrors the filesystem
  * chimod's autogen/filesystem_lib_exec.cc).
+ *
+ * INTERPOSITION (issue #886): this pool speaks the CTE core's task
+ * interface. The X-macro lists the methods this module implements —
+ * including the core's own kPutBlob/kGetBlob/kGetBlobSize ids with the
+ * core's task structs — and every DEFAULT case delegates to the core
+ * container, so any core method this module does not override behaves
+ * exactly as if the task had been addressed to the core pool (including
+ * wire serialization: Save/Load/NewTask for forwarded ids are the core's).
  */
 #include "clio_cte/replication/replication_runtime.h"
 #include "clio_cte/replication/autogen/replication_methods.h"
@@ -19,8 +27,9 @@ namespace clio::cte::replication {
   X(kMonitor, MonitorTask, Monitor)                \
   X(kReplicateBlob, ReplicateBlobTask, ReplicateBlob) \
   X(kFlushTag, FlushTagTask, FlushTag)             \
-  X(kCachedPut, CachedPutTask, CachedPut)          \
-  X(kCachedGet, CachedGetTask, CachedGet)
+  X(kPutBlob, clio::cte::core::PutBlobTask, PutBlob) \
+  X(kGetBlob, clio::cte::core::GetBlobTask, GetBlob) \
+  X(kGetBlobSize, clio::cte::core::GetBlobSizeTask, GetBlobSize)
 
 void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
                    clio::run::u32 container_id) {
@@ -44,6 +53,9 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method,
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
     default:
+      // Interposition escape: execute any other (core) method on the core
+      // container, verbatim.
+      CLIO_CO_AWAIT(ForwardToCore(method, task_ptr));
       break;
   }
   CLIO_CO_RETURN;
@@ -59,8 +71,13 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archiv
       break;
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default:
+    default: {
+      clio::run::ContainerHold core = CoreContainer();
+      if (core != nullptr) {
+        core->SaveTask(method, archive, task_ptr);
+      }
       break;
+    }
   }
 }
 
@@ -73,8 +90,13 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archiv
       break;
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default:
+    default: {
+      clio::run::ContainerHold core = CoreContainer();
+      if (core != nullptr) {
+        core->LoadTask(method, archive, task_ptr);
+      }
       break;
+    }
   }
 }
 
@@ -96,8 +118,13 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       break;
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default:
+    default: {
+      clio::run::ContainerHold core = CoreContainer();
+      if (core != nullptr) {
+        core->LocalLoadTask(method, archive, task_ptr);
+      }
       break;
+    }
   }
 }
 
@@ -119,8 +146,13 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
       break;
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default:
+    default: {
+      clio::run::ContainerHold core = CoreContainer();
+      if (core != nullptr) {
+        core->LocalSaveTask(method, archive, task_ptr);
+      }
       break;
+    }
   }
 }
 
@@ -130,7 +162,6 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(
   if (!ipc_manager) {
     return clio::run::shared_ptr<clio::run::Task>();
   }
-  (void)deep;
   switch (method) {
 #define X(MID, TASK, HANDLER)                                            \
     case Method::MID: {                                                  \
@@ -145,10 +176,9 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
     default: {
-      auto new_task = ipc_manager->NewTask<clio::run::Task>();
-      if (!new_task.IsNull()) {
-        new_task->Copy(ctp::ipc::FullPtr<clio::run::Task>(orig_task_ptr.get()));
-        return new_task;
+      clio::run::ContainerHold core = CoreContainer();
+      if (core != nullptr) {
+        return core->NewCopyTask(method, orig_task_ptr, deep);
       }
       break;
     }
@@ -167,8 +197,13 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       return ipc_manager->NewTask<TASK>().template Cast<clio::run::Task>();
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default:
+    default: {
+      clio::run::ContainerHold core = CoreContainer();
+      if (core != nullptr) {
+        return core->NewTask(method);
+      }
       return clio::run::shared_ptr<clio::run::Task>();
+    }
   }
 }
 
@@ -182,19 +217,26 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
       break;
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default:
-      orig_task->AggregateOut(
-          ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+    default: {
+      clio::run::ContainerHold core = CoreContainer();
+      if (core != nullptr) {
+        core->AggregateOut(method, orig_task, replica_task);
+      } else {
+        orig_task->AggregateOut(
+            ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      }
       break;
+    }
   }
 }
 
 void Runtime::AggregateIn(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &agg_task,
                           const clio::run::shared_ptr<clio::run::Task> &member_task) {
-  // No ManyToOne methods; the aggregate stays a copy of the first member.
-  (void)method;
-  (void)agg_task;
-  (void)member_task;
+  // No ManyToOne methods of our own; forwarded core methods delegate.
+  clio::run::ContainerHold core = CoreContainer();
+  if (core != nullptr) {
+    core->AggregateIn(method, agg_task, member_task);
+  }
 }
 
 #undef CLIO_REPL_FOR_EACH_METHOD

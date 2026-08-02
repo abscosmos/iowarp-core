@@ -8,14 +8,15 @@
  *
  * Two-mode program orchestrated by test_repl_persist.sh, which reboots the
  * runtime between phases:
- *   --put-blobs    Phase 1: CachedPut 50 blobs through the replication
- *                  chimod (DRAM primary + persistent disk replica each),
- *                  verify both copies, flush metadata.
+ *   --put-blobs    Phase 1: 50 PLAIN PutBlobs through the replication
+ *                  chimod's interposed pool (DRAM primary + persistent disk
+ *                  replica each), verify both copies, flush metadata.
  *   --verify-blobs Phase 2 (after runtime reboot): RestartContainers, then
  *                  verify the DRAM primaries are GONE (volatile blocks are
  *                  filtered at replay) while every disk replica is intact
- *                  and byte-correct — and that CachedGet transparently
- *                  serves from the replica and re-populates the DRAM cache.
+ *                  and byte-correct — and that a plain GetBlob through the
+ *                  interposer serves from the replica and re-populates the
+ *                  DRAM cache.
  */
 
 #include <cstdio>
@@ -41,16 +42,17 @@ static std::string BlobName(int i) {
 /** Deterministic per-blob fill byte. */
 static char PatternByte(int i) { return static_cast<char>('A' + (i % 26)); }
 
-/** Phase 1: CachedPut kNumBlobs blobs, verify both copies, flush. */
+/** Phase 1: put kNumBlobs blobs through the interposer, verify, flush. */
 static int PutBlobs() {
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
     HLOG(kError, "Phase 1: Failed to init client");
     return 1;
   }
 
-  clio::cte::replication::Client repl(
-      clio::cte::replication::kReplicationPoolId, clio::cte::core::kCtePoolId);
-  clio::cte::core::Client &cte = repl;  // inherited core API
+  // A PLAIN core client pointed at the replication pool — the whole point
+  // of the interposition (issue #886): no new client type, no new verbs.
+  clio::cte::core::Client repl_io(clio::cte::replication::kReplicationPoolId);
+  clio::cte::core::Client cte(clio::cte::core::kCtePoolId);  // raw core view
 
   auto tag_task = cte.AsyncGetOrCreateTag(kTagName);
   tag_task.Wait();
@@ -64,15 +66,14 @@ static int PutBlobs() {
     }
     memset(buf.ptr_, PatternByte(i), kBlobSize);
 
-    auto put = repl.AsyncCachedPut(tag_id, BlobName(i), 0, kBlobSize,
-                                   ctp::ipc::ShmPtr<>(buf.shm_));
+    auto put = repl_io.AsyncPutBlob(tag_id, BlobName(i), 0, kBlobSize,
+                                    ctp::ipc::ShmPtr<>(buf.shm_));
     put.Wait();
     clio::run::u32 rc = put->GetReturnCode();
-    clio::run::u32 reps = put->replicas_written_;
     CLIO_IPC->FreeBuffer(buf);
-    if (rc != 0 || reps != 1) {
-      HLOG(kError, "Phase 1: CachedPut failed for blob {} rc={} replicas={}",
-           i, rc, reps);
+    if (rc != 0) {
+      HLOG(kError, "Phase 1: interposed PutBlob failed for blob {} rc={}",
+           i, rc);
       return 1;
     }
   }
@@ -122,9 +123,8 @@ static int VerifyBlobs() {
   HLOG(kInfo, "Phase 2: RestartContainers restarted {} containers",
        restart_task->containers_restarted_);
 
-  clio::cte::replication::Client repl(
-      clio::cte::replication::kReplicationPoolId, clio::cte::core::kCtePoolId);
-  clio::cte::core::Client &cte = repl;
+  clio::cte::core::Client repl_io(clio::cte::replication::kReplicationPoolId);
+  clio::cte::core::Client cte(clio::cte::core::kCtePoolId);  // raw core view
 
   auto tag_task = cte.AsyncGetOrCreateTag(kTagName);
   tag_task.Wait();
@@ -178,20 +178,17 @@ static int VerifyBlobs() {
         }
       }
     }
-    // And the cache path heals itself: CachedGet serves from the replica
-    // and re-populates the DRAM primary.
+    // And the cache path heals itself: a plain GetBlob through the
+    // interposer serves from the replica and re-populates the DRAM primary.
     {
       memset(buf.ptr_, 0, kBlobSize);
-      auto get = repl.AsyncCachedGet(tag_id, BlobName(i), 0, kBlobSize,
-                                     ctp::ipc::ShmPtr<>(buf.shm_));
+      auto get = repl_io.AsyncGetBlob(tag_id, BlobName(i), 0, kBlobSize,
+                                      /*flags=*/0,
+                                      ctp::ipc::ShmPtr<>(buf.shm_));
       get.Wait();
-      if (get->GetReturnCode() != 0 || get->from_replica_ != 1 ||
-          get->recached_bytes_ != kBlobSize ||
-          buf.ptr_[0] != PatternByte(i)) {
-        HLOG(kError,
-             "Phase 2: blob {} CachedGet failed rc={} from={} recached={}",
-             i, get->GetReturnCode(), get->from_replica_,
-             get->recached_bytes_);
+      if (get->GetReturnCode() != 0 || buf.ptr_[0] != PatternByte(i)) {
+        HLOG(kError, "Phase 2: blob {} interposed GetBlob failed rc={}",
+             i, get->GetReturnCode());
         return 1;
       }
       auto psz2 = cte.AsyncGetBlobSize(tag_id, BlobName(i));

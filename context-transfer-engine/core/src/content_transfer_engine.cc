@@ -35,6 +35,8 @@
 #include <clio_cte/core/content_transfer_engine.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_config.h>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 // Define global pointer variable in source file (outside namespace)
@@ -67,6 +69,35 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
 
   // Initialize CTE core client
   auto *cte_client = CLIO_CTE_CLIENT;
+
+  // CLIO_CTE_POOL=major.minor (issue #886): bind this process's CTE client
+  // singleton to an INTERPOSING pool — e.g. the replication chimod at 561.0,
+  // which speaks the core task interface and forwards every method it does
+  // not override. Pure configuration: no caller changes, no create (the
+  // interposer is composed, and creating it needs its own params anyway).
+  // Deliberately ONLY here, never in Client::Init/ctor — runtime-internal
+  // module clients construct Client(next_pool_id) to reach the core, and
+  // redirecting those would make an interposer forward to itself.
+  {
+    const char *pool_env = std::getenv("CLIO_CTE_POOL");
+    if (pool_env != nullptr && *pool_env != '\0') {
+      unsigned major = 0, minor = 0;
+      if (std::sscanf(pool_env, "%u.%u", &major, &minor) == 2) {
+        cte_client->Init(clio::run::PoolId(major, minor));
+        if (!cte_client->AttachShmCache()) {
+          HLOG(kDebug,
+               "CTE ClientInit: SHM metadata cache unavailable; using RPC");
+        }
+        HLOG(kInfo, "CTE ClientInit: CLIO_CTE_POOL bound client to pool {}.{}",
+             major, minor);
+        is_initialized_ = true;
+        is_initializing_ = false;
+        return true;
+      }
+      HLOG(kError, "CTE ClientInit: ignoring malformed CLIO_CTE_POOL '{}'",
+           pool_env);
+    }
+  }
 
   // Create CreateParams without config - configuration is now provided via clio compose
   CreateParams params;

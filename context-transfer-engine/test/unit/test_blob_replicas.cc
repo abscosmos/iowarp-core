@@ -518,11 +518,10 @@ TEST_CASE("BlobReplicas - reorganizer drops the cache copy below a "
   }
 }
 
-TEST_CASE("BlobReplicas - CachedPut/CachedGet write-through cache model",
+TEST_CASE("BlobReplicas - transparent interposition on the core Put/Get",
           "[cte][replicas][replication][cache][886]") {
   auto *client = CLIO_CTE_CLIENT;
   REQUIRE(client != nullptr);
-  auto *ipc_manager = CLIO_CPU_IPC;
 
   // Bind the replication pool (GetOrCreatePool is idempotent; the module
   // test earlier created it with default params: num_replicas=1,
@@ -540,24 +539,17 @@ TEST_CASE("BlobReplicas - CachedPut/CachedGet write-through cache model",
     REQUIRE(create->GetReturnCode() == 0);
   }
 
+  // The whole point (issue #886): a PLAIN core client pointed at the
+  // replication pool — no new client type, no new verbs.
+  clio::cte::core::Client repl_io(clio::cte::replication::kReplicationPoolId);
+
   clio::cte::core::Tag tag("cache_model_tag");
   const clio::cte::core::TagId tag_id = tag.GetTagId();
-
-  // Stage the payload in SHM for the cached verbs.
   const std::string val(kValSize, 'C');
-  ctp::ipc::FullPtr<char> put_buf = ipc_manager->AllocateBuffer(kValSize);
-  REQUIRE(!put_buf.IsNull());
-  std::memcpy(put_buf.ptr_, val.data(), kValSize);
 
-  // 1. Write-through: one CachedPut updates the DRAM primary AND the fixed
-  //    persistent set.
-  {
-    auto fut = repl.AsyncCachedPut(tag_id, "cache_blob", 0, kValSize,
-                                   ctp::ipc::ShmPtr<>(put_buf.shm_));
-    fut.Wait();
-    REQUIRE(fut->GetReturnCode() == 0);
-    REQUIRE(fut->replicas_written_ == 1);
-  }
+  // 1. Write-through: one DEFAULT put through the interposer updates the
+  //    DRAM primary AND the fixed persistent set.
+  PutTo(&repl_io, tag_id, "cache_blob", val, 0);
   {
     auto psz = client->AsyncGetBlobSize(tag_id, "cache_blob");
     psz.Wait();
@@ -566,62 +558,58 @@ TEST_CASE("BlobReplicas - CachedPut/CachedGet write-through cache model",
                                         clio::run::PoolQuery::Dynamic(), 1);
     rsz.Wait();
     REQUIRE(rsz->GetReturnCode() == 0);
-    REQUIRE(rsz->size_ == kValSize);
+    REQUIRE(rsz->size_ == kValSize);  // replica created by the plain put
   }
 
-  // 2. Cache hit: served from the primary.
-  ctp::ipc::FullPtr<char> get_buf = ipc_manager->AllocateBuffer(kValSize);
-  REQUIRE(!get_buf.IsNull());
+  // 2. Cache hit: served from the primary through the interposer.
   {
-    std::memset(get_buf.ptr_, 0, kValSize);
-    auto fut = repl.AsyncCachedGet(tag_id, "cache_blob", 0, kValSize,
-                                   ctp::ipc::ShmPtr<>(get_buf.shm_));
-    fut.Wait();
-    REQUIRE(fut->GetReturnCode() == 0);
-    REQUIRE(fut->from_replica_ == 0);
-    REQUIRE(std::memcmp(get_buf.ptr_, val.data(), kValSize) == 0);
+    std::vector<char> got;
+    REQUIRE(GetFrom(&repl_io, tag_id, "cache_blob", &got, 0) == 0);
+    REQUIRE(std::memcmp(got.data(), val.data(), kValSize) == 0);
   }
 
   // 3. The organizer drops the cache copy (primary score sinks below the
-  //    persistent replica's replica_score).
+  //    persistent replica's replica_score). Raw core sizes show the drop;
+  //    the INTERPOSED size stays logical (the replica still has the bytes),
+  //    so size-then-read callers never see the blob vanish.
   {
     auto fut = client->AsyncReorganizeBlob(tag_id, "cache_blob", 0.05f);
     fut.Wait();
     REQUIRE(fut->GetReturnCode() == 0);
     auto psz = client->AsyncGetBlobSize(tag_id, "cache_blob");
     psz.Wait();
-    REQUIRE(psz->size_ == 0);
+    REQUIRE(psz->size_ == 0);  // raw primary really dropped
+    auto lsz = repl_io.AsyncGetBlobSize(tag_id, "cache_blob");
+    lsz.Wait();
+    REQUIRE(lsz->GetReturnCode() == 0);
+    REQUIRE(lsz->size_ == kValSize);  // logical size via the interposer
   }
 
-  // 4. Cache miss: served from the persistent replica, and the DRAM primary
-  //    is re-populated in full.
+  // 4. Cache miss: the interposed get serves from the persistent replica
+  //    and re-populates the DRAM primary in full.
   {
-    std::memset(get_buf.ptr_, 0, kValSize);
-    auto fut = repl.AsyncCachedGet(tag_id, "cache_blob", 0, kValSize,
-                                   ctp::ipc::ShmPtr<>(get_buf.shm_));
-    fut.Wait();
-    REQUIRE(fut->GetReturnCode() == 0);
-    REQUIRE(fut->from_replica_ == 1);
-    REQUIRE(fut->recached_bytes_ == kValSize);
-    REQUIRE(std::memcmp(get_buf.ptr_, val.data(), kValSize) == 0);
+    std::vector<char> got;
+    REQUIRE(GetFrom(&repl_io, tag_id, "cache_blob", &got, 0) == 0);
+    REQUIRE(std::memcmp(got.data(), val.data(), kValSize) == 0);
+    auto psz = client->AsyncGetBlobSize(tag_id, "cache_blob");
+    psz.Wait();
+    REQUIRE(psz->size_ == kValSize);  // primary restored by the re-cache
   }
 
   // 5. Fast path restored: the next read is a primary hit again.
   {
-    auto psz = client->AsyncGetBlobSize(tag_id, "cache_blob");
-    psz.Wait();
-    REQUIRE(psz->size_ == kValSize);
-    std::memset(get_buf.ptr_, 0, kValSize);
-    auto fut = repl.AsyncCachedGet(tag_id, "cache_blob", 0, kValSize,
-                                   ctp::ipc::ShmPtr<>(get_buf.shm_));
-    fut.Wait();
-    REQUIRE(fut->GetReturnCode() == 0);
-    REQUIRE(fut->from_replica_ == 0);
-    REQUIRE(std::memcmp(get_buf.ptr_, val.data(), kValSize) == 0);
+    std::vector<char> got;
+    REQUIRE(GetFrom(&repl_io, tag_id, "cache_blob", &got, 0) == 0);
+    REQUIRE(std::memcmp(got.data(), val.data(), kValSize) == 0);
   }
 
-  ipc_manager->FreeBuffer(put_buf);
-  ipc_manager->FreeBuffer(get_buf);
+  // 6. Metadata ops forward untouched: a tag op through the interposer
+  //    behaves exactly like the core pool's.
+  {
+    auto sz = repl_io.AsyncGetTagSize(tag_id);
+    sz.Wait();
+    REQUIRE(sz->GetReturnCode() == 0);
+  }
 }
 
 TEST_CASE("BlobReplicas - RegisterReplicaContainer coherence smoke",

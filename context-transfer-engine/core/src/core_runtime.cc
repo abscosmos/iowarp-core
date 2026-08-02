@@ -5194,6 +5194,14 @@ void Runtime::ReplayTransactionLogs() {
               tag_blob_name_to_info_.get(composite_key);
           if (existing) {
             blob_info.transform_flags_ = existing->transform_flags_;
+            // Carry the REPLICAS too (issue #886) — same outlives-the-flush
+            // hazard as the transform mark: the metadata snapshot (or an
+            // earlier WAL shard's kExtendReplica) restored this blob's
+            // replica layouts, and a kCreateNewBlob record surviving the
+            // flush would otherwise reset the blob and silently destroy
+            // them. Which shard a blob's records land in is per-worker, so
+            // the loss was nondeterministic (caught by the persist test).
+            blob_info.replicas_ = existing->replicas_;
           }
         }
         tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));

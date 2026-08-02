@@ -34,19 +34,20 @@ struct ReplicationConfig {
   static constexpr const char* chimod_lib_name = "clio_cte_replication";
 
   clio::run::PoolId next_pool_id_;  ///< CTE core pool id (e.g. 512.0)
-  /// The FIXED SET of persistent replicas the caching verbs maintain: every
-  /// CachedPut writes through to replicas 1..num_replicas_, each marked
-  /// REPLICA_FIXED | REPLICA_PERSISTENT so the organizer neither migrates
-  /// nor volatilizes them.
+  /// The FIXED SET of persistent replicas the interposed PutBlob maintains:
+  /// every default put through this pool writes through to replicas
+  /// 1..num_replicas_, each marked REPLICA_FIXED | REPLICA_PERSISTENT so
+  /// the organizer neither migrates nor volatilizes them.
   int num_replicas_ = 1;
-  /// Score for the primary (the DRAM cache copy) on CachedPut / re-cache.
-  /// High by default so the DPE pins the fast copy to the fast tier.
+  /// Score for the primary (the DRAM cache copy) on a replica → primary
+  /// re-cache. High by default so the DPE pins the fast copy to the fast
+  /// tier.
   float cache_score_ = 1.0f;
-  /// Score CachedPut stamps on the persistent replicas. This is also the
-  /// organizer's DROP threshold for the cache copy: when the primary's score
-  /// sinks below the best persistent replica's, the primary is dropped
-  /// rather than migrated. Modest by default — it should mirror the slow
-  /// tier the durable copies live on, not the cache's.
+  /// Score the write-through stamps on the persistent replicas. This is
+  /// also the organizer's DROP threshold for the cache copy: when the
+  /// primary's score sinks below the best persistent replica's, the primary
+  /// is dropped rather than migrated. Modest by default — it should mirror
+  /// the slow tier the durable copies live on, not the cache's.
   float replica_score_ = 0.2f;
 
   ReplicationConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
@@ -232,141 +233,6 @@ struct FlushTagTask : public clio::run::Task {
   void SerializeOut(Ar &ar) {
     Task::SerializeOut(ar);
     ar(blobs_replicated_, bytes_copied_);
-  }
-};
-
-/**
- * CachedPutTask — write-through cached put (issue #886 caching model).
- * Writes the primary (the DRAM cache copy, high score, volatile-ok) FIRST so
- * reads always see the newest bytes, then writes through to the module's
- * fixed set of persistent replicas (1..num_replicas from config), each
- * marked REPLICA_FIXED | REPLICA_PERSISTENT. Any copy failing surfaces in
- * the return code; the primary-first order means a reported failure can
- * leave durability lagging but never a stale cache.
- */
-struct CachedPutTask : public clio::run::Task {
-  IN TagId tag_id_;
-  IN clio::run::priv::string blob_name_;
-  IN clio::run::u64 offset_;
-  IN clio::run::u64 size_;
-  IN ctp::ipc::ShmPtr<> blob_data_;
-  IN float score_;        // Cache-copy score; -1 = config cache_score_
-  IN Context context_;    // Passed through (its replica fields are overridden)
-  OUT clio::run::u32 replicas_written_;  // Persistent copies updated
-
-  CachedPutTask()
-      : clio::run::Task(), tag_id_(TagId::GetNull()), blob_name_(CTP_MALLOC),
-        offset_(0), size_(0), blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
-        score_(-1.0f), context_(), replicas_written_(0) {}
-
-  explicit CachedPutTask(const clio::run::TaskId &task_id,
-                         const clio::run::PoolId &pool_id,
-                         const clio::run::PoolQuery &pool_query,
-                         const TagId &tag_id, const std::string &blob_name,
-                         clio::run::u64 offset, clio::run::u64 size,
-                         ctp::ipc::ShmPtr<> blob_data, float score,
-                         const Context &context)
-      : clio::run::Task(task_id, pool_id, pool_query, Method::kCachedPut),
-        tag_id_(tag_id), blob_name_(CTP_MALLOC, blob_name), offset_(offset),
-        size_(size), blob_data_(blob_data), score_(score), context_(context),
-        replicas_written_(0) {}
-
-  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
-    Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<CachedPutTask>());
-  }
-
-  void Copy(const ctp::ipc::FullPtr<CachedPutTask>& other) {
-    Task::Copy(other.template Cast<clio::run::Task>());
-    tag_id_ = other->tag_id_;
-    blob_name_ = other->blob_name_;
-    offset_ = other->offset_;
-    size_ = other->size_;
-    blob_data_ = other->blob_data_;
-    score_ = other->score_;
-    context_ = other->context_;
-    replicas_written_ = other->replicas_written_;
-  }
-
-  template <typename Ar>
-  void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_, offset_, size_, blob_data_, score_, context_);
-    ar.bulk(blob_data_, size_, BULK_XFER);
-  }
-
-  template <typename Ar>
-  void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar);
-    ar(replicas_written_);
-  }
-};
-
-/**
- * CachedGetTask — cached read (issue #886 caching model). Served from the
- * primary when it covers the range; otherwise (the organizer dropped the
- * cache copy) from the first persistent replica that covers it, after which
- * the WHOLE replica is copied back into the primary — sequentially from 0,
- * so an interrupted re-cache leaves a valid prefix, never a torn copy — to
- * restore the DRAM fast path. The re-populated primary is an ordinary
- * primary: no REPLICA_PERSISTENT anywhere near it, so the organizer remains
- * free to drop it again.
- */
-struct CachedGetTask : public clio::run::Task {
-  IN TagId tag_id_;
-  IN clio::run::priv::string blob_name_;
-  IN clio::run::u64 offset_;
-  IN clio::run::u64 size_;
-  IN ctp::ipc::ShmPtr<> blob_data_;  // Caller's destination buffer
-  IN Context context_;               // Passed through (replica overridden)
-  OUT int from_replica_;             // 0 = cache hit; N = served from replica N
-  OUT clio::run::u64 recached_bytes_;  // Bytes copied back into the primary
-
-  CachedGetTask()
-      : clio::run::Task(), tag_id_(TagId::GetNull()), blob_name_(CTP_MALLOC),
-        offset_(0), size_(0), blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
-        context_(), from_replica_(0), recached_bytes_(0) {}
-
-  explicit CachedGetTask(const clio::run::TaskId &task_id,
-                         const clio::run::PoolId &pool_id,
-                         const clio::run::PoolQuery &pool_query,
-                         const TagId &tag_id, const std::string &blob_name,
-                         clio::run::u64 offset, clio::run::u64 size,
-                         ctp::ipc::ShmPtr<> blob_data, const Context &context)
-      : clio::run::Task(task_id, pool_id, pool_query, Method::kCachedGet),
-        tag_id_(tag_id), blob_name_(CTP_MALLOC, blob_name), offset_(offset),
-        size_(size), blob_data_(blob_data), context_(context),
-        from_replica_(0), recached_bytes_(0) {}
-
-  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
-    Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<CachedGetTask>());
-  }
-
-  void Copy(const ctp::ipc::FullPtr<CachedGetTask>& other) {
-    Task::Copy(other.template Cast<clio::run::Task>());
-    tag_id_ = other->tag_id_;
-    blob_name_ = other->blob_name_;
-    offset_ = other->offset_;
-    size_ = other->size_;
-    blob_data_ = other->blob_data_;
-    context_ = other->context_;
-    from_replica_ = other->from_replica_;
-    recached_bytes_ = other->recached_bytes_;
-  }
-
-  template <typename Ar>
-  void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_, offset_, size_, blob_data_, context_);
-    ar.bulk(blob_data_, size_, BULK_EXPOSE);
-  }
-
-  template <typename Ar>
-  void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar);
-    ar(from_replica_, recached_bytes_);
-    ar.bulk(blob_data_, size_, BULK_XFER);
   }
 };
 

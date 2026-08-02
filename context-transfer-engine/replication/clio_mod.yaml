@@ -1,9 +1,12 @@
 # Replication ChiMod (issue #886) — policy layer over the CTE core's blob
-# replicas. The core stores replicas and addresses them (Context::replica_);
-# this module decides WHAT gets copied WHERE: ReplicateBlob copies one blob's
-# primary into a chosen replica, FlushTag sweeps a tag's qualifying blobs.
-# Pair with a Context whose min_persistence_level_ pins replica blocks to
-# persistent tiers to make a RAM-cached dataset durable without demoting it.
+# replicas, INTERPOSING on the core's own task interface. The core stores
+# replicas and addresses them (Context::replica_); this module decides WHAT
+# gets copied WHERE. It handles the core's kPutBlob/kGetBlob/kGetBlobSize
+# ids with the core task structs (write-through to persistent replicas,
+# replica-served reads + primary re-cache, logical sizes) and forwards
+# every other core method to next_pool_id — so a clio::cte::core::Client
+# pointed at this pool (CLIO_CTE_POOL=561.0) works unchanged. Its own verbs
+# (ReplicateBlob/FlushTag) are numbered above the core's method space.
 module_name: replication
 namespace: clio::cte
 version: 1.0.0
@@ -12,6 +15,11 @@ kCreate: 0
 kDestroy: 1
 kMonitor: 9
 
-# Replication operations
-kReplicateBlob: 10
-kFlushTag: 11
+# Interposed core data verbs (MUST equal the core's ids)
+kPutBlob: 15
+kGetBlob: 16
+kGetBlobSize: 23
+
+# Replication operations (above the core's method-id space)
+kReplicateBlob: 100
+kFlushTag: 101

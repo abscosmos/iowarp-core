@@ -6,6 +6,7 @@
 #define CLIO_CTE_REPLICATION_AUTOGEN_METHODS_H_
 
 #include <clio_runtime/clio_runtime.h>
+#include <clio_cte/core/autogen/core_methods.h>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,14 @@
  * Method ids for the replication chimod. Hand-maintained (same as the CTE
  * core, compressor and filesystem chimods). Keep in sync with clio_mod.yaml
  * and the switch cases in autogen/replication_lib_exec.cc.
+ *
+ * This chimod INTERPOSES on the CTE core's own task interface: a
+ * clio::cte::core::Client pointed at this pool keeps working unchanged.
+ * kPutBlob/kGetBlob therefore MUST carry the core's method ids (the client
+ * sends core ids), and every other core method id is forwarded verbatim to
+ * the next pool by the dispatch defaults — which is why the module's own
+ * verbs are numbered ABOVE the core's method space: a module id that
+ * collided with a core id would shadow the forwarded verb.
  */
 namespace clio::cte::replication {
 
@@ -21,13 +30,17 @@ GLOBAL_CROSS_CONST clio::run::u32 kCreate = 0;
 GLOBAL_CROSS_CONST clio::run::u32 kDestroy = 1;
 GLOBAL_CROSS_CONST clio::run::u32 kMonitor = 9;
 
-// replication-specific methods
-GLOBAL_CROSS_CONST clio::run::u32 kReplicateBlob = 10;
-GLOBAL_CROSS_CONST clio::run::u32 kFlushTag = 11;
-GLOBAL_CROSS_CONST clio::run::u32 kCachedPut = 12;
-GLOBAL_CROSS_CONST clio::run::u32 kCachedGet = 13;
+// Interposed core data verbs — same ids, same task structs as the core.
+GLOBAL_CROSS_CONST clio::run::u32 kPutBlob = clio::cte::core::Method::kPutBlob;
+GLOBAL_CROSS_CONST clio::run::u32 kGetBlob = clio::cte::core::Method::kGetBlob;
+GLOBAL_CROSS_CONST clio::run::u32 kGetBlobSize =
+    clio::cte::core::Method::kGetBlobSize;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 14;
+// replication-specific methods (above the core's id space; see header note)
+GLOBAL_CROSS_CONST clio::run::u32 kReplicateBlob = 100;
+GLOBAL_CROSS_CONST clio::run::u32 kFlushTag = 101;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 102;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -35,10 +48,11 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[0] = "Create";
     v[1] = "Destroy";
     v[9] = "Monitor";
-    v[10] = "ReplicateBlob";
-    v[11] = "FlushTag";
-    v[12] = "CachedPut";
-    v[13] = "CachedGet";
+    v[kPutBlob] = "PutBlob";
+    v[kGetBlob] = "GetBlob";
+    v[kGetBlobSize] = "GetBlobSize";
+    v[100] = "ReplicateBlob";
+    v[101] = "FlushTag";
     return v;
   }();
   return names;
