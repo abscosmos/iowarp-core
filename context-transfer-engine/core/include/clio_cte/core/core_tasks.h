@@ -808,12 +808,167 @@ struct BlobBlock {
         capacity_(capacity) {}
 };
 
+/** Replica flags (issue #886). OR'd into a replica via
+ *  Context::replica_flags_ on any replica-targeted write. */
+/// The reorganizer must not move this replica: ReorganizeBlob on it is a
+/// no-op. For copies pinned to a hand-picked tier.
+static constexpr clio::run::u32 REPLICA_FIXED = 0x1;
+/// This replica's blocks may never be placed on a volatile tier — every
+/// placement (write extend AND reorganize) runs with min persistence level
+/// kTemporaryNonVolatile or stronger. The durability contract of a replica
+/// that exists to survive a crash.
+static constexpr clio::run::u32 REPLICA_PERSISTENT = 0x2;
+
+/** This replica is a droppable CACHE copy (issue #886 cache chimod): it
+ *  holds the blob's UNTRANSFORMED bytes for fast (and zero-IPC) reads while
+ *  the authoritative data lives transformed further down the chain. Unlike
+ *  FIXED|PERSISTENT reliability replicas it is reclaimable: capacity
+ *  eviction may free its blocks under tier pressure, and the organizer may
+ *  rescore it only down to its min_score_ floor. */
+static constexpr clio::run::u32 REPLICA_CACHE = 0x4;
+
+/**
+ * One replica of a blob's data (issue #886): an independent block list,
+ * placed by the same DPE/persistence machinery as the primary. A replica is
+ * PURE MECHANISM — the CTE stores and addresses it (Context::replica_
+ * selects it on put/get); which blobs get replicas, where, and when is the
+ * replication chimod's policy. The name is a free-form label for operators
+ * ("nvme", "pfs", ...); addressing is by index (replica N == replicas_[N-1]).
+ *
+ * A replica carries its OWN score and flags: the organizer can migrate a
+ * replica across tiers independently of the primary (ReorganizeBlob with
+ * Context::replica_ set), unless REPLICA_FIXED pins it, and
+ * REPLICA_PERSISTENT constrains every placement to non-volatile tiers.
+ */
+struct Replica {
+  clio::run::priv::string name_;
+  clio::run::priv::vector<BlobBlock> blocks_;
+  // Mirror of sum(blocks_[i].size_), same contract as
+  // BlobInfo::total_size_cache_ but for this replica's layout.
+  clio::run::u64 total_size_cache_;
+  // This replica's own placement score. -1 = never explicitly scored: the
+  // first write that resolves it seeds it from the put's score (or the
+  // primary's). Distinct from BlobInfo::score_ by design — "primary hot in
+  // RAM, replica cold on disk" is the whole point.
+  float score_;
+  // REPLICA_* bits. Sticky-OR via Context::replica_flags_ (matching the
+  // transform_flags_ precedent); clearing is not supported yet.
+  clio::run::u32 flags_;
+  // THIS COPY's transform state (issue #886 cache/replication split). A
+  // blob's copies legitimately differ: the cache replica holds raw bytes
+  // while the primary and reliability replicas hold the transformed
+  // (compressed) form. Stamped from Context::transform_flags_ by every
+  // replica-targeted write (full-copy semantics: assignment, not OR — a
+  // replica write replaces the copy's content, so its transform state is
+  // whatever the writer declares). Replica-targeted reads report it OUT.
+  clio::run::u32 transform_flags_;
+  // Score floor for this replica (-1 = none). The organizer never rescores
+  // the replica below it; capacity eviction under genuine tier pressure may
+  // still reclaim a REPLICA_CACHE copy's blocks regardless. Propagated via
+  // Context::replica_min_score_.
+  float min_score_;
+
+  CTP_CROSS_FUN Replica()
+      : name_(CLIO_PRIV_ALLOC), blocks_(CLIO_PRIV_ALLOC),
+        total_size_cache_(0), score_(-1.0f), flags_(0),
+        transform_flags_(0), min_score_(-1.0f) {}
+
+  /** True when this copy's stored bytes are not the producer's bytes. */
+  CTP_CROSS_FUN bool IsTransformed() const { return transform_flags_ != 0; }
+
+  /** Effective min persistence level for placing this replica's blocks. */
+  CTP_CROSS_FUN int MinPersistenceLevel(int requested) const {
+    if ((flags_ & REPLICA_PERSISTENT) && requested < 1) {
+      return 1;  // kTemporaryNonVolatile: excludes volatile tiers
+    }
+    return requested;
+  }
+};
+
+/** Context::replica_ value meaning "write through to primary + every
+ *  existing replica" (writes only; a read needs one concrete source). */
+static constexpr int kAllReplicas = -1;
+
+/** Context::replica_ selector for THE cache replica — whichever slot
+ *  carries REPLICA_CACHE (issue #886 cache chimod). Writes find-or-create
+ *  it (with the flag set); reads and size probes of an absent cache copy
+ *  fail cleanly like any absent replica. Index-free addressing keeps the
+ *  cache slot from colliding with the reliability replicas at 1..N. */
+static constexpr int kCacheReplica = -2;
+
+/**
+ * RegisterReplicaContainerTask (issue #886, Method::kRegisterReplicaContainer)
+ * — tell the blob's OWNER container that `node_id_` holds a cached or
+ * replicated copy of the blob. Routed like any blob op (Dynamic → the owner
+ * by DirectHash). The next primary write invalidates every registered
+ * node's copy (write-invalidate coherence) and clears the set.
+ */
+struct RegisterReplicaContainerTask : public clio::run::Task {
+  IN TagId tag_id_;
+  IN clio::run::priv::string blob_name_;
+  IN clio::run::u64 node_id_;  // the node holding the copy
+
+  RegisterReplicaContainerTask()
+      : clio::run::Task(), tag_id_(TagId::GetNull()),
+        blob_name_(CLIO_PRIV_ALLOC), node_id_(0) {}
+
+  CTP_CROSS_FUN explicit RegisterReplicaContainerTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &tag_id,
+      const std::string &blob_name, clio::run::u64 node_id)
+      : clio::run::Task(task_id, pool_id, pool_query,
+                        Method::kRegisterReplicaContainer),
+        tag_id_(tag_id), blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        node_id_(node_id) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kRegisterReplicaContainer;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, node_id_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<RegisterReplicaContainerTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    node_id_ = other->node_id_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+  }
+};
+
 /**
  * Blob information structure with block-based management
  */
 struct BlobInfo {
   clio::run::priv::string blob_name_;
   clio::run::priv::vector<BlobBlock> blocks_;
+  // Replicas of this blob's data (issue #886). Empty unless the replication
+  // module (or a caller using Context::replica_) created some — the common
+  // no-replica blob pays only an empty vector. Replica block lifecycles are
+  // owned here exactly like blocks_: DelBlob frees them, and their layouts
+  // persist through kExtendReplica WAL records.
+  clio::run::priv::vector<Replica> replicas_;
+  // Nodes that registered a cached/replicated copy of this blob (issue #886
+  // distributed coherence; kRegisterReplicaContainer). The next primary
+  // write invalidates each registered node's copy and clears the list —
+  // caches re-register when they re-populate. Deliberately NOT persisted:
+  // remote caches are volatile, so a rebooted owner starts with no
+  // registrations and no stale invalidation targets.
+  clio::run::priv::vector<clio::run::u64> replica_nodes_;
   float score_;  // 0-1 score for reorganization
   Timestamp last_modified_;
   Timestamp last_read_;
@@ -913,9 +1068,87 @@ struct BlobInfo {
   }
 #endif
 
+  /** Fetch replica by 1-based index (Context::replica_ semantics).
+   *  create=true grows replicas_ as needed (write paths); create=false
+   *  returns nullptr for an absent replica (read paths). */
+  CTP_CROSS_FUN Replica *GetReplica(int idx, bool create) {
+    if (idx <= 0) {
+      return nullptr;
+    }
+    if (static_cast<size_t>(idx) > replicas_.size()) {
+      if (!create) {
+        return nullptr;
+      }
+      while (replicas_.size() < static_cast<size_t>(idx)) {
+        replicas_.push_back(Replica());
+      }
+    }
+    return &replicas_[static_cast<size_t>(idx) - 1];
+  }
+
+  /**
+   * Resolve the kCacheReplica sentinel to a concrete 1-based index: the
+   * first replica carrying REPLICA_CACHE, or (when create) a fresh slot
+   * appended with the flag pre-set. 0 = absent and not created.
+   */
+  CTP_CROSS_FUN int CacheReplicaIndex(bool create) {
+    for (size_t i = 0; i < replicas_.size(); ++i) {
+      if (replicas_[i].flags_ & REPLICA_CACHE) {
+        return static_cast<int>(i) + 1;
+      }
+    }
+    if (!create) {
+      return 0;
+    }
+    Replica rep;
+    rep.flags_ = REPLICA_CACHE;
+    replicas_.push_back(rep);
+    return static_cast<int>(replicas_.size());
+  }
+
+  /**
+   * Resolve a Context::replica_ SELECTOR to a raw 1-based replicas_ index.
+   * kCacheReplica -> the REPLICA_CACHE slot (CacheReplicaIndex); N > 0 ->
+   * the N-th NON-cache slot. The cache copy is an internal slot addressed
+   * only via its sentinel, so explicit replica numbering (e.g. the
+   * replication chimod's fixed 1..N) must never land on it — whichever
+   * write created its slot first, "replica 1" and "the cache replica" are
+   * different copies (a raw index would silently clobber one with the
+   * other). Returns 0 when the selected slot is absent and !create. Raw
+   * indices already resolved (WAL records, snapshot entries, internal
+   * replicas_ walks) must NOT come back through here.
+   */
+  CTP_CROSS_FUN int ResolveReplicaSel(int sel, bool create) {
+    if (sel == kCacheReplica) {
+      return CacheReplicaIndex(create);
+    }
+    if (sel <= 0) {
+      return 0;
+    }
+    int seen = 0;
+    for (size_t i = 0; i < replicas_.size(); ++i) {
+      if (replicas_[i].flags_ & REPLICA_CACHE) {
+        continue;
+      }
+      if (++seen == sel) {
+        return static_cast<int>(i) + 1;
+      }
+    }
+    if (!create) {
+      return 0;
+    }
+    while (seen < sel) {
+      replicas_.push_back(Replica());
+      ++seen;
+    }
+    return static_cast<int>(replicas_.size());
+  }
+
   CTP_CROSS_FUN BlobInfo()
       : blob_name_(CLIO_PRIV_ALLOC),
         blocks_(CLIO_PRIV_ALLOC),
+        replicas_(CLIO_PRIV_ALLOC),
+        replica_nodes_(CLIO_PRIV_ALLOC),
         score_(0.0f),
         last_modified_(0),
         last_read_(0),
@@ -935,6 +1168,8 @@ struct BlobInfo {
   CTP_CROSS_FUN BlobInfo(const clio::run::priv::string &blob_name, float score)
       : blob_name_(blob_name),
         blocks_(CLIO_PRIV_ALLOC),
+        replicas_(CLIO_PRIV_ALLOC),
+        replica_nodes_(CLIO_PRIV_ALLOC),
         score_(score),
         last_modified_(0),
         last_read_(0),
@@ -955,6 +1190,8 @@ struct BlobInfo {
   BlobInfo(const std::string &blob_name, float score)
       : blob_name_(CLIO_PRIV_ALLOC, blob_name),
         blocks_(CLIO_PRIV_ALLOC),
+        replicas_(CLIO_PRIV_ALLOC),
+        replica_nodes_(CLIO_PRIV_ALLOC),
         score_(score),
         last_modified_(GetCurrentTimeNs()),
         last_read_(GetCurrentTimeNs()),
@@ -975,6 +1212,8 @@ struct BlobInfo {
   CTP_CROSS_FUN BlobInfo(const BlobInfo &other)
       : blob_name_(other.blob_name_),
         blocks_(other.blocks_),
+        replicas_(other.replicas_),
+        replica_nodes_(other.replica_nodes_),
         score_(other.score_),
         last_modified_(other.last_modified_),
         last_read_(other.last_read_),
@@ -995,6 +1234,8 @@ struct BlobInfo {
     if (this != &other) {
       blob_name_ = other.blob_name_;
       blocks_ = other.blocks_;
+      replicas_ = other.replicas_;
+      replica_nodes_ = other.replica_nodes_;
       score_ = other.score_;
       last_modified_ = other.last_modified_;
       last_read_ = other.last_read_;
@@ -1258,7 +1499,38 @@ struct Context {
   // goes missing.
   clio::run::u32 transform_flags_;
 
-#if CTP_ENABLE_COMPRESS
+  // Which copy of the blob this operation addresses (issue #886):
+  //   0            — the primary (default; today's behavior, bit for bit)
+  //   N > 0        — replica N (lazily created by writes; reads of an absent
+  //                  replica fail cleanly)
+  //   kAllReplicas — writes only: write through to the primary AND every
+  //                  existing replica
+  // Composes with persistence_target_/min_persistence_level_, so "durable
+  // replica of a RAM-cached blob" is just {replica_=1, min_persistence=2}.
+  // OUTSIDE the #if below for the same ABI reason as transform_flags_.
+  int replica_;
+
+  // REPLICA_* bits OR'd into the targeted replica on a replica-targeted
+  // write (replica_ > 0 or kAllReplicas). 0 = leave flags untouched.
+  // OUTSIDE the #if below, same reason as above.
+  clio::run::u32 replica_flags_;
+
+  // Score floor stamped on the targeted replica by a replica-targeted write
+  // (issue #886 cache chimod): the organizer never rescores the replica
+  // below it. -1 = leave the replica's floor untouched. Unconditional, same
+  // ABI rule as every Context field.
+  float replica_min_score_;
+
+  // ---- Compression / tracing controls and stats -------------------------
+  // UNCONDITIONAL by design (issue #886 unified API): these fields exist in
+  // EVERY build so Context — and with it every Put/Get task — has exactly
+  // ONE layout and ONE wire format across core, replication, compressor,
+  // clients and tools, regardless of CTP_ENABLE_COMPRESS. That flag gates
+  // codec CODE (the compression factory, the compressor module), never
+  // structure: a layout that depends on a compile flag is a standing
+  // ABI-skew hazard (two of these bit this tree already — see the
+  // transform_flags_ note above and blob_transform.h). A build without
+  // codecs simply carries zeroed fields.
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
   int compress_lib_;      // The compression library to apply (0-10)
   int compress_preset_;   // Compression preset: 1=FAST, 2=BALANCED, 3=BEST
@@ -1282,7 +1554,6 @@ struct Context {
                                      // (original/compressed)
   double actual_compress_time_ms_;   // Actual compression time in milliseconds
   double actual_psnr_db_;  // Actual PSNR for lossy compression (0 if lossless)
-#endif
 
   CTP_CROSS_FUN Context()
       : persistence_target_(-1),
@@ -1290,9 +1561,10 @@ struct Context {
         preallocate_(0),
         emulate_(false),
         emulated_time_ns_(0),
-        transform_flags_(kBlobTransformNone)
-#if CTP_ENABLE_COMPRESS
-        ,
+        transform_flags_(kBlobTransformNone),
+        replica_(0),
+        replica_flags_(0),
+        replica_min_score_(-1.0f),
         dynamic_compress_(0),
         compress_lib_(0),
         compress_preset_(2),
@@ -1308,22 +1580,22 @@ struct Context {
         actual_compressed_size_(0),
         actual_compression_ratio_(1.0),
         actual_compress_time_ms_(0.0),
-        actual_psnr_db_(0.0)
-#endif
-  {
+        actual_psnr_db_(0.0) {
   }
 
   template <class Archive>
   CTP_CROSS_FUN void serialize(Archive &ar) {
+    // ONE unconditional range = ONE wire format in every build (see the
+    // field-block comment above).
     ar.range(persistence_target_, min_persistence_level_, preallocate_,
-             emulate_, emulated_time_ns_, transform_flags_);
-#if CTP_ENABLE_COMPRESS
-    ar.range(dynamic_compress_, compress_lib_, compress_preset_, target_psnr_,
-             psnr_chance_, max_performance_, consumer_node_, data_type_,
-             trace_, trace_key_, trace_node_, actual_original_size_,
-             actual_compressed_size_, actual_compression_ratio_,
-             actual_compress_time_ms_, actual_psnr_db_);
-#endif
+             emulate_, emulated_time_ns_, transform_flags_, replica_,
+             replica_flags_, replica_min_score_, dynamic_compress_,
+             compress_lib_,
+             compress_preset_, target_psnr_, psnr_chance_, max_performance_,
+             consumer_node_, data_type_, trace_, trace_key_, trace_node_,
+             actual_original_size_, actual_compressed_size_,
+             actual_compression_ratio_, actual_compress_time_ms_,
+             actual_psnr_db_);
   }
 
   CTP_CROSS_FUN static Context Preallocate(clio::run::u64 size) {
@@ -1981,13 +2253,16 @@ struct ReorganizeBlobTask : public clio::run::Task {
   IN TagId tag_id_;                 // Tag ID containing blob
   IN clio::run::priv::string blob_name_;  // Blob name to reorganize
   IN float new_score_;              // New score for the blob (0-1)
+  IN int replica_;                  // 0 = primary; N > 0 = migrate replica N
+                                    // (issue #886; REPLICA_FIXED = no-op)
 
   // SHM constructor
   ReorganizeBlobTask()
       : clio::run::Task(),
         tag_id_(TagId::GetNull()),
         blob_name_(CLIO_PRIV_ALLOC),
-        new_score_(0.0f) {}
+        new_score_(0.0f),
+        replica_(0) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit ReorganizeBlobTask(const clio::run::TaskId &task_id,
@@ -1995,11 +2270,13 @@ struct ReorganizeBlobTask : public clio::run::Task {
                                              const clio::run::PoolQuery &pool_query,
                                              const TagId &tag_id,
                                              const std::string &blob_name,
-                                             float new_score)
+                                             float new_score,
+                                             int replica = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kReorganizeBlob),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
-        new_score_(new_score) {
+        new_score_(new_score),
+        replica_(replica) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kReorganizeBlob;
@@ -2013,7 +2290,7 @@ struct ReorganizeBlobTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_, new_score_);
+    ar(tag_id_, blob_name_, new_score_, replica_);
   }
 
   /**
@@ -2034,6 +2311,7 @@ struct ReorganizeBlobTask : public clio::run::Task {
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
     new_score_ = other->new_score_;
+    replica_ = other->replica_;
   }
 
   /**
@@ -2159,6 +2437,13 @@ struct MultiPutBlobTask : public clio::run::Task {
   IN ctp::ipc::ShmPtr<> data_;               // all payloads, one staging
   IN clio::run::u64 data_len_;
   IN clio::run::priv::string descs_;         // serialized vector<MultiPutDesc>
+  /** Batch-wide put context, applied to EVERY record's nested put — a batch
+   *  must be able to express everything a scalar put can (replica
+   *  addressing, transform flags, persistence, score floors) or the
+   *  interposition chain cannot give batches scalar-equivalent semantics
+   *  (issue #886: batched puts silently bypassed the cache layer). Records
+   *  needing DIFFERENT contexts belong in different batches. */
+  IN Context context_;
   OUT clio::run::u32 num_ok_;
   OUT int first_rc_;                         // first nonzero put rc (0 = all ok)
 
@@ -2174,13 +2459,15 @@ struct MultiPutBlobTask : public clio::run::Task {
       const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
       const clio::run::PoolQuery &pool_query, const TagId &route_tag_id,
       const std::string &route_blob, ctp::ipc::ShmPtr<> data,
-      clio::run::u64 data_len, const std::string &descs)
+      clio::run::u64 data_len, const std::string &descs,
+      const Context &context = Context())
       : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiPutBlob),
         route_tag_id_(route_tag_id),
         route_blob_(CLIO_PRIV_ALLOC, route_blob),
         data_(data),
         data_len_(data_len),
         descs_(CLIO_PRIV_ALLOC, descs),
+        context_(context),
         num_ok_(0),
         first_rc_(0) {
     task_id_ = task_id;
@@ -2204,7 +2491,7 @@ struct MultiPutBlobTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(route_tag_id_, route_blob_, data_, data_len_, descs_);
+    ar(route_tag_id_, route_blob_, data_, data_len_, descs_, context_);
   }
 
   template <typename Archive>
@@ -2220,6 +2507,7 @@ struct MultiPutBlobTask : public clio::run::Task {
     data_ = other->data_;
     data_len_ = other->data_len_;
     descs_ = other->descs_;
+    context_ = other->context_;
     num_ok_ = other->num_ok_;
     first_rc_ = other->first_rc_;
   }
@@ -2498,13 +2786,15 @@ struct PodReorganizeBlobTask : public clio::run::Task {
   IN TagId tag_id_;
   IN PodBlobName blob_name_;
   IN float new_score_;
+  IN int replica_;  // 0 = primary; N > 0 = migrate replica N (issue #886)
 
   // SHM constructor
   CTP_CROSS_FUN PodReorganizeBlobTask()
       : clio::run::Task(),
         tag_id_(TagId::GetNull()),
         blob_name_(),
-        new_score_(0.0f) {}
+        new_score_(0.0f),
+        replica_(0) {}
 
   // GPU-compatible emplace constructor (const char* blob name, no allocator)
   CTP_CROSS_FUN explicit PodReorganizeBlobTask(
@@ -2515,7 +2805,8 @@ struct PodReorganizeBlobTask : public clio::run::Task {
                         Method::kPodReorganizeBlob),
         tag_id_(tag_id),
         blob_name_(blob_name),
-        new_score_(new_score) {
+        new_score_(new_score),
+        replica_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kPodReorganizeBlob;
@@ -2537,7 +2828,7 @@ struct PodReorganizeBlobTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_, new_score_);
+    ar(tag_id_, blob_name_, new_score_, replica_);
   }
 
   template <typename Archive>
@@ -2550,6 +2841,7 @@ struct PodReorganizeBlobTask : public clio::run::Task {
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
     new_score_ = other->new_score_;
+    replica_ = other->replica_;
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
@@ -3368,6 +3660,8 @@ struct GetBlobScoreTask : public clio::run::Task {
 struct GetBlobSizeTask : public clio::run::Task {
   IN TagId tag_id_;                 // Tag ID for blob lookup
   IN clio::run::priv::string blob_name_;  // Blob name (required)
+  IN int replica_;                  // 0 = primary; N > 0 = replica N's size
+                                    // (issue #886; absent replica = error)
   OUT clio::run::u64 size_;               // Blob size in bytes
 
   // SHM constructor
@@ -3375,6 +3669,7 @@ struct GetBlobSizeTask : public clio::run::Task {
       : clio::run::Task(),
         tag_id_(TagId::GetNull()),
         blob_name_(CLIO_PRIV_ALLOC),
+        replica_(0),
         size_(0) {}
 
   // Emplace constructor
@@ -3382,10 +3677,12 @@ struct GetBlobSizeTask : public clio::run::Task {
                                           const clio::run::PoolId &pool_id,
                                           const clio::run::PoolQuery &pool_query,
                                           const TagId &tag_id,
-                                          const std::string &blob_name)
+                                          const std::string &blob_name,
+                                          int replica = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetBlobSize),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        replica_(replica),
         size_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -3400,7 +3697,7 @@ struct GetBlobSizeTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_);
+    ar(tag_id_, blob_name_, replica_);
   }
 
   /**
@@ -3420,6 +3717,7 @@ struct GetBlobSizeTask : public clio::run::Task {
     Task::Copy(other.template Cast<Task>());
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
+    replica_ = other->replica_;
     size_ = other->size_;
   }
 

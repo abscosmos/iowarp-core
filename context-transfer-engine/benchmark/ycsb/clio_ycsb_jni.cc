@@ -110,16 +110,9 @@ void InitOnce() {
     g_init_rc = -3;
     return;
   }
-  cte_client->Init(clio::cte::core::kCtePoolId);
-  clio::cte::core::CreateParams params;
-  auto create_task = cte_client->AsyncCreate(
-      clio::run::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
-      clio::cte::core::kCtePoolId, params);
-  create_task.Wait();
-  if (create_task->GetReturnCode() != 0) {
-    g_init_rc = -4;
-    return;
-  }
+  // CLIO_CTE_CLIENT_INIT already bound the singleton's pool (and honored a
+  // CLIO_CTE_POOL interposer override, issue #886) and get-or-created the
+  // pool — re-binding here would undo the override.
   g_tag = new clio::cte::core::Tag("ycsb");
   g_runtime_mode = CLIO_RUNTIME_MANAGER->IsRuntime();
   {

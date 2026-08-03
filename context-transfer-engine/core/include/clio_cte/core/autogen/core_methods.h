@@ -65,7 +65,13 @@ GLOBAL_CROSS_CONST clio::run::u32 kEvict = 47;
 // scheduling/completion and staging allocation across the batch.
 GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob = 48;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 49;
+// Register a node as holding a cached/replicated copy of one blob (issue
+// #886 distributed coherence). The blob's OWNER container records the node
+// in BlobInfo::replica_nodes_; the next primary write invalidates every
+// registered node's copy (write-invalidate) before completing.
+GLOBAL_CROSS_CONST clio::run::u32 kRegisterReplicaContainer = 49;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 50;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -108,6 +114,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[46] = "DynamicReorganize";
     v[47] = "Evict";
     v[48] = "MultiPutBlob";
+    v[49] = "RegisterReplicaContainer";
     return v;
   }();
   return names;

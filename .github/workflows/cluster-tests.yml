@@ -235,6 +235,20 @@ jobs:
       # the daemon's key, and the client demux parked it) and no suite noticed
       # because cross-node blob assertions were disabled (#503) and every other
       # distributed test used TCP clients or the CFS adapter. Hard gate.
+      # Cache coherence (#886): 4-node cluster with the full chain (cache ->
+      # replication -> core) composed on EVERY node; every node runs the
+      # collective suite — put-once-read-many (reader-local DRAM copy after
+      # the first get), disjoint segmented writes to one blob, repeated
+      # rounds (owner-put invalidation of reader copies), and racing
+      # fragmented full-blob writes converging to one writer. All four
+      # nodes must exit 0.
+      - name: CTE cache coherence test (4-node, issue #886)
+        timeout-minutes: 20
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-transfer-engine/test/integration/coherence/run_tests.sh
+
       - name: CTE cross-node SHM client gate (2-node, issue #774)
         timeout-minutes: 15
         if: ${{ !cancelled() }}
@@ -266,6 +280,7 @@ jobs:
             context-runtime/test/integration/recovery/docker-compose.yml \
             context-transfer-engine/test/integration/distributed/docker-compose.yaml \
             context-transfer-engine/test/integration/cfs_distributed/docker-compose.yaml \
+            context-transfer-engine/test/integration/coherence/docker-compose.yaml \
             context-transfer-engine/test/integration/client_crash/docker-compose.yaml \
             context-transfer-engine/test/integration/fuse/docker-compose.yaml ; do
             docker compose -f "$f" down -v 2>/dev/null || true

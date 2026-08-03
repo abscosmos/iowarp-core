@@ -38,6 +38,7 @@
 #include <clio_ctp/util/singleton.h>
 #include <clio_cte/api.h>
 #include <clio_cte/core/core_tasks.h>
+#include <clio_cte/core/blob_batch.h>
 #include <clio_cte/core/shm_metadata_cache.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <atomic>
@@ -76,6 +77,7 @@ class Client : public clio::run::ContainerClient {
    */
   bool AttachShmCache(clio::run::u64 root_off) {
     shm_root_ = nullptr;
+    shm_replica_serving_ = false;
     if (root_off == 0) {
       HLOG(kDebug, "[#783] AttachShmCache: root_off=0 (runtime not caching)");
       return false;  // runtime is not caching -- not an error
@@ -126,6 +128,41 @@ class Client : public clio::run::ContainerClient {
     // Look up THIS client's pool. Using a shared slot would attach whichever
     // CTE pool cached last, silently reading another pool's metadata.
     return AttachShmCache(dir->FindRoot(pool_id_.ToU64()));
+  }
+
+  /**
+   * Attach a DIFFERENT pool's mirror — the interposition case (issue #886).
+   * A client bound to an interposer pool (e.g. replication at 561.0) reads
+   * primaries that the CORE pool mirrors, so the zero-IPC fast path must
+   * attach the core's directory slot. Safe under the replication interposer
+   * because writes update the primary synchronously in the put path (the
+   * mirror is never stale) and a dropped primary is re-mirrored EMPTY, so
+   * the fast path misses and falls back to the task path — which is the
+   * interposer's replica-serving ladder.
+   *
+   * This binding ALSO enables serving-replica reads (the untransformed
+   * cache copy): for a stack-bound client the task path would run the
+   * whole interposer chain and hand back PRODUCER bytes, so raw replica
+   * bytes are the correct answer. A client bound directly to the mirrored
+   * pool keeps the core's stored-bytes contract (#818: GetBlob returns
+   * STORED bytes) and must never be short-cut onto a raw copy — the
+   * replication sweep reads through exactly such a client, and copying raw
+   * bytes as if they were the stored form corrupts every replica.
+   */
+  bool AttachShmCacheOf(const clio::run::PoolId &mirror_pool) {
+    auto *ipc = CLIO_CPU_IPC;
+    if (ipc == nullptr) {
+      return false;
+    }
+    auto *dir = ipc->GetMetadataDirectory();
+    if (dir == nullptr) {
+      return false;
+    }
+    if (!AttachShmCache(dir->FindRoot(mirror_pool.ToU64()))) {
+      return false;
+    }
+    shm_replica_serving_ = (mirror_pool != pool_id_);
+    return true;
   }
 
   /** Convenience: attach from a completed CreateTask, falling back to the
@@ -189,22 +226,35 @@ class Client : public clio::run::ContainerClient {
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
       return false;
     }
-    if (!rec.IsDirectReadable()) {
-      return false;  // file/remote/GPU-tier blob
-    }
+    // Source selection (issue #886 cache/replication split): the primary when
+    // it is direct-readable and covers the range; otherwise the published
+    // serving replica — the UNTRANSFORMED node-local copy the cache chimod
+    // maintains while the authoritative bytes live transformed below. Both
+    // are guarded by the same placement generation.
+    //
     // Bound by the CACHED PREFIX, not by the blob's total size: a truncated
-    // record describes only its first kMaxInlineBlocks blocks, and a read past
-    // them has no block to resolve against. For an untruncated record the two
-    // are equal, so this is strictly the safer of the two bounds.
-    if (offset + size > rec.CoveredBytes()) {
-      return false;
+    // primary record describes only its first kMaxInlineBlocks blocks, and a
+    // read past them has no block to resolve against.
+    const bool primary_ok =
+        rec.IsDirectReadable() && offset + size <= rec.CoveredBytes();
+    // Serving-replica reads only for STACK-bound clients (AttachShmCacheOf):
+    // they alias the whole interposer chain, whose task path returns
+    // producer bytes. A direct core client keeps stored-bytes semantics.
+    const bool replica_ok = shm_replica_serving_ && !primary_ok &&
+                            rec.HasServableReplica() &&
+                            offset + size <= rec.RepCoveredBytes();
+    if (!primary_ok && !replica_ok) {
+      return false;  // transformed/file/remote/GPU-tier and no serving replica
     }
+    const ShmBlockDesc *src_blocks = primary_ok ? rec.blocks_ : rec.rep_blocks_;
+    const clio::run::u32 src_nblocks =
+        primary_ok ? rec.num_blocks_ : rec.rep_num_blocks_;
     const clio::run::u64 gen_before = rec.placement_gen_;
 
     size_t copied = 0;
     clio::run::u64 want_from = offset;
-    for (clio::run::u32 i = 0; i < rec.num_blocks_ && copied < size; ++i) {
-      const ShmBlockDesc &b = rec.blocks_[i];
+    for (clio::run::u32 i = 0; i < src_nblocks && copied < size; ++i) {
+      const ShmBlockDesc &b = src_blocks[i];
       if (b.size_ <= want_from) {
         want_from -= b.size_;  // this block is entirely before `offset`
         continue;
@@ -263,24 +313,31 @@ class Client : public clio::run::ContainerClient {
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
       return false;
     }
-    if (!rec.IsDirectReadable() || rec.num_blocks_ != 1 ||
-        (rec.flags_ & kShmBlobTruncated) != 0) {
+    // Source selection (issue #886): the primary when viewable, else the
+    // published serving replica (the untransformed cache copy) when it is a
+    // single extent. Same zero-size distrust and generation contract.
+    const bool primary_view = rec.IsDirectReadable() && rec.num_blocks_ == 1 &&
+                              (rec.flags_ & kShmBlobTruncated) == 0 &&
+                              rec.total_size_ != 0;
+    // Stack-bound clients only, same rule as TryReadBlobShm above.
+    const bool replica_view = shm_replica_serving_ && !primary_view &&
+                              rec.HasServableReplica() &&
+                              rec.rep_num_blocks_ == 1 &&
+                              rec.rep_total_size_ != 0;
+    if (!primary_view && !replica_view) {
+      // A zero-size record is untrustworthy, not "empty" (issue #862): a
+      // fresh blob's record can be mirrored before its completing put
+      // republishes the size. Refuse so the caller falls back to RPC.
       return false;
     }
-    // A zero-size record is untrustworthy, not "empty" (issue #862): a fresh
-    // blob's record can be mirrored before its completing put republishes the
-    // size, and a size-0 view reads as an absent/empty value to callers.
-    // Refuse the view so the caller falls back to the authoritative RPC path
-    // (same rule as Tag::GetBlobSize).
-    if (rec.total_size_ == 0) {
-      return false;
-    }
-    char *base = MapRamBdev(rec.blocks_[0].target_pool_);
+    const ShmBlockDesc &src =
+        primary_view ? rec.blocks_[0] : rec.rep_blocks_[0];
+    char *base = MapRamBdev(src.target_pool_);
     if (base == nullptr) {
       return false;
     }
-    *ptr = base + rec.blocks_[0].target_offset_;
-    *size = rec.total_size_;
+    *ptr = base + src.target_offset_;
+    *size = primary_view ? rec.total_size_ : rec.rep_total_size_;
     *gen = rec.placement_gen_;
     return true;
   }
@@ -1262,21 +1319,15 @@ class Client : public clio::run::ContainerClient {
   clio::run::Future<MultiPutBlobTask> AsyncMultiPutVectored(
       ctp::ipc::ShmPtr<> data, clio::run::u64 data_len,
       const std::vector<MultiPutDesc> &descs,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local(),
+      const Context &context = Context()) {
     auto *ipc_manager = CLIO_CPU_IPC;
-    std::string packed;
-    {
-      std::vector<char> buf;
-      ctp::ipc::GlobalSerialize<std::vector<char>> ar(buf);
-      ar(const_cast<std::vector<MultiPutDesc> &>(descs));
-      ar.Finalize();
-      packed.assign(buf.begin(), buf.end());
-    }
+    std::string packed = EncodeMultiPutDescs(descs);
     TagId rt = descs.empty() ? TagId::GetNull() : descs.front().tag_id_;
     const std::string rb = descs.empty() ? std::string() : descs.front().blob_name_;
     auto task = ipc_manager->NewTask<MultiPutBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, rt, rb, data,
-        data_len, packed);
+        data_len, packed, context);
     if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
       // One shared object; flag must be set before Send (see PutBlob staging).
       task.get()->SetFlags(TASK_DATA_OWNER);
@@ -1530,8 +1581,11 @@ class Client : public clio::run::ContainerClient {
     // and flagged gets keep full RPC semantics. CLIO_FORCE_NET exists to push
     // every op through the network path (the force_net test suites); serving
     // reads client-side would silently turn those suites into no-ops.
+    // Replica-targeted reads (issue #886, context.replica_ != 0) must also
+    // reach the runtime: the SHM mirror publishes the PRIMARY's block layout
+    // only, so serving them here would silently return primary bytes.
     if (dst == nullptr || size == 0 || flags != 0 || context.emulate_ ||
-        ForceNetEnv()) {
+        context.replica_ != 0 || ForceNetEnv()) {
       return false;
     }
     if (!HasShmCache() && !AttachShmCache()) {
@@ -1859,14 +1913,19 @@ class Client : public clio::run::ContainerClient {
    * @param new_score New placement score
    * @param pool_query Pool query for task routing (default: Dynamic)
    */
+  /**
+   * @param replica 0 (default) reorganizes the primary; N > 0 migrates
+   *        replica N by ITS score (issue #886; REPLICA_FIXED = no-op).
+   */
   clio::run::Future<ReorganizeBlobTask> AsyncReorganizeBlob(
       const TagId &tag_id, const std::string &blob_name, float new_score,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      int replica = 0) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<ReorganizeBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
-        blob_name, new_score);
+        blob_name, new_score, replica);
 
     return ipc_manager->Send(task);
   }
@@ -2207,12 +2266,13 @@ class Client : public clio::run::ContainerClient {
   clio::run::Future<GetBlobSizeTask> AsyncGetBlobSize(
       const TagId &tag_id,
       const std::string &blob_name,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      int replica = 0) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<GetBlobSizeTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
-        blob_name);
+        blob_name, replica);
 
     return ipc_manager->Send(task);
   }
@@ -2235,6 +2295,22 @@ class Client : public clio::run::ContainerClient {
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name);
 
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Register `node_id` as holding a cached/replicated copy of the blob
+   * (issue #886 coherence). Routed to the blob's owner container; the next
+   * primary write there invalidates the copy before completing.
+   */
+  clio::run::Future<RegisterReplicaContainerTask> AsyncRegisterReplicaContainer(
+      const TagId &tag_id, const std::string &blob_name,
+      clio::run::u64 node_id,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<RegisterReplicaContainerTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        node_id);
     return ipc_manager->Send(task);
   }
 
@@ -2411,6 +2487,10 @@ class Client : public clio::run::ContainerClient {
   // owns the segment and may drop the cache at any time, which is why every
   // read is validated rather than trusted.
   ShmMetadataCacheRoot *shm_root_ = nullptr;
+  // True only when the mirror was attached via AttachShmCacheOf for a pool
+  // OTHER than this client's own (interposition binding): gates the
+  // serving-replica fast path (see AttachShmCacheOf).
+  bool shm_replica_serving_ = false;
 
   /** One attached RAM-bdev segment, cached so a hot read does not re-attach. */
   struct RamBdevMap {
