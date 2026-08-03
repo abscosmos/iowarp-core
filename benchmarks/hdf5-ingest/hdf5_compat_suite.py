@@ -690,14 +690,52 @@ def w_external_link(path):
 
 
 def read_external_link(path):
-    """Traverse the link and read through it -- the traversal is the test."""
+    """Traverse the link and read through it -- the traversal is the test.
+
+    Reads with the CWD set to the file's own directory, and that is load-bearing
+    rather than tidiness. The link stores a RELATIVE target (an absolute one
+    would differ per arm and make h5diff report a difference that is an artifact
+    of where the test ran). HDF5 resolves a relative external link against
+    several candidate prefixes -- an explicit elink prefix, HDF5_EXT_PREFIX, the
+    parent file's own directory, and the working directory -- and which one wins
+    is exactly the kind of platform detail that made this case pass on Linux and
+    fail on macOS. Making the CWD equal to the parent file's directory collapses
+    those candidates onto the same location, so the result no longer depends on
+    which rule fires first.
+
+    The chdir is a hypothesis about WHY macOS differs, not a confirmed
+    cause, so the resolution facts it depends on are reported on stderr. stderr
+    is free here: the driver parses only the DIGEST line on stdout, and prints
+    what a worker wrote to stderr only when the case fails. Without this, a
+    traversal that resolves to the wrong file is indistinguishable in the output
+    from one that fails to resolve at all -- both are a bare FAIL.
+    """
     import h5py
+    prev = os.getcwd()
+    target_dir = os.path.dirname(os.path.abspath(path)) or "."
     h = hashlib.sha256()
-    with h5py.File(path, "r") as f:
-        h.update(f["near"][()].tobytes())
-        far = f["elink"]
-        h.update(("EL|%s|%s|" % (far.dtype, far.shape)).encode())
-        h.update(far[()].tobytes())
+    try:
+        os.chdir(target_dir)
+        print(f"elink: path={path} abspath={os.path.abspath(path)} "
+              f"cwd={os.getcwd()} realcwd={os.path.realpath(os.getcwd())}",
+              file=sys.stderr)
+        with h5py.File(os.path.abspath(path), "r") as f:
+            h.update(f["near"][()].tobytes())
+            # VOL-SAFE probes only. `f.get(name, getlink=True)` reads well but
+            # goes through H5Lget_info1, which HDF5 restricts to the native
+            # connector -- so as a diagnostic it does not report on the failure,
+            # it CAUSES one, in every arm running under a connector. Same family
+            # as the visititems()/keys()/dereference restriction this suite
+            # already keeps in C. `in` (H5Lexists) and .filename have no such
+            # limit.
+            print(f"elink: link_present={'elink' in f} "
+                  f"target_exists={os.path.exists(path + '.target')} "
+                  f"file.filename={f.filename}", file=sys.stderr)
+            far = f["elink"]
+            h.update(("EL|%s|%s|" % (far.dtype, far.shape)).encode())
+            h.update(far[()].tobytes())
+    finally:
+        os.chdir(prev)
     return h.hexdigest()
 
 
@@ -983,15 +1021,40 @@ def _env(mode):
         e["HDF5_DRIVER"] = "clio_vfd"
     return e
 
+# Worker stderr from the arms of the case currently being run, keyed by
+# "<action>/<mode> on <arm-dir>". A worker that RUNS but reads different bytes
+# leaves no trace at all in the columns -- the arm is just a FAIL -- so anything
+# it wrote to stderr is kept here and printed by run_connector if that case ends
+# up failing. Cleared per case; only the failing case pays the output.
+#
+# The arm DIRECTORY is part of the key on purpose: two of the four arms are
+# read/native, differing only in which file they read (the native oracle vs the
+# connector's output), and keying on action/mode alone would silently drop one.
+ARM_STDERR = {}
+
+
 def _run(case, action, path, mode):
     cmd = [sys.executable, os.path.abspath(__file__), "--worker",
            "--case", case, "--action", action, "--file", path]
     p = subprocess.run(cmd, capture_output=True, text=True, env=_env(mode), timeout=180)
+    if p.stderr.strip():
+        arm_dir = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        ARM_STDERR[f"{action}/{mode} on {arm_dir}"] = p.stderr.strip()
     for line in p.stdout.splitlines():
         if line.startswith("DIGEST:"):
             return line[7:], p.returncode
         if line == "WROTE":
             return "WROTE", p.returncode
+    # No output means the worker died, and the column it feeds then prints a
+    # bare FAIL with no reason -- which is how `external_link` reached CI as an
+    # unexplained platform difference. The traceback and the HDF5 error stack
+    # are the whole diagnosis; print them here rather than discarding them and
+    # inferring the cause from a boolean two screens later.
+    print(f"  {case:<22} ARM-CRASHED  {action}/{mode} rc={p.returncode}; "
+          f"worker output follows")
+    for stream, text in (("err", p.stderr), ("out", p.stdout)):
+        for line in text.strip().splitlines():
+            print(f"      {stream}| {line}")
     return None, p.returncode  # crash / no output
 
 def _h5diff(a, b):
@@ -1640,10 +1703,35 @@ def _run_libfree_check(mode, cases_with_paths):
         # Recorded under the key the summary matches on (trailing segment).
         _record_build_error("libfree_compile", comp)
         return {f"{mode}/libfree_compile": {"compiled": False}}
-    # Guard the central claim of this gate rather than trusting it.
-    ldd = subprocess.run(["ldd", binp], capture_output=True, text=True)
-    if "hdf5" in ldd.stdout.lower():
+    # Guard the central claim of this gate rather than trusting it: if this
+    # binary links libhdf5, it is not reading the file "without the library"
+    # and the whole §1.1(d) result would be worthless.
+    #
+    # The tool differs by platform -- ldd is Linux, macOS uses otool -L -- and
+    # calling the wrong one raises FileNotFoundError, which took the ENTIRE
+    # suite down on macOS rather than this one gate. A check that cannot run is
+    # reported as a check that did not run; it never crashes the run and never
+    # silently passes.
+    linkage_tool = ["otool", "-L"] if sys.platform == "darwin" else ["ldd"]
+    if shutil.which(linkage_tool[0]) is None:
+        print(f"  {'libfree':<22} SKIP  (no {linkage_tool[0]}: cannot verify the "
+              f"reader is libhdf5-free, so §1.1(d) is NOT measured here)")
+        return {}   # same shape as the "no gcc" skip above: loud, not fatal
+    link = subprocess.run(linkage_tool + [binp], capture_output=True, text=True)
+    # Match on the DEPENDENCY lines only, never on the whole output. `otool -L`
+    # echoes the binary's own path as an unindented first line, and this binary
+    # lives under TMP = /tmp/hdf5compat -- so a whole-output substring search
+    # matched the ARGUMENT rather than any library, and this gate reported
+    # "reader links libhdf5" on macOS for a path the suite had itself chosen.
+    # `ldd` does not echo the path, which is the only reason Linux never saw it.
+    # Both tools indent one dependency per line, so the indent is the shared
+    # discriminator between "what I asked about" and "what it links".
+    deps = [ln for ln in (link.stdout + link.stderr).splitlines() if ln[:1].isspace()]
+    if any("hdf5" in ln.lower() for ln in deps):
         print(f"  {'libfree':<22} FAIL  reader links libhdf5; it cannot test §1.1(d)")
+        for ln in deps:
+            if "hdf5" in ln.lower():
+                print(f"  {'':<22}       {ln.strip()}")
         return {f"{mode}/libfree_no_hdf5_linkage": {"unlinked": False}}
 
     results, n_ok, skips = {}, 0, {}
@@ -1796,6 +1884,7 @@ def run_connector(mode):
             if os.path.exists(f):
                 os.remove(f)
         # four arms
+        ARM_STDERR.clear()
         _run(case, "write", fn, "native")
         ref, _ = _run(case, "read", fn, "native")     # reference (native/native)
         _run(case, "write", fc, mode)
@@ -1822,6 +1911,18 @@ def run_connector(mode):
         print(f"  {case:<22} "
               + " ".join(f"{k}={mark(props[k])}" for k, _c, _m in COLUMNS)
               + detail)
+        # A failing digest column is otherwise a bare FAIL, which cannot
+        # distinguish "the arm crashed" (digest None -- see ARM-CRASHED above)
+        # from "the arm ran and read something else". Those need different
+        # investigations, so name which one it was at the point of failure.
+        if not all(props[k] for k in ("write_compat", "read_compat", "roundtrip")):
+            short = lambda d: "CRASHED" if d is None else str(d)[:16]
+            print(f"  {'':<22}   digests: native={short(ref)} "
+                  f"wc={short(d_wc)} rc={short(d_rc)} rt={short(d_rt)}")
+            for arm, err in sorted(ARM_STDERR.items()):
+                print(f"  {'':<22}   stderr[{arm}]:")
+                for line in err.splitlines():
+                    print(f"  {'':<22}     | {line}")
     return results
 
 

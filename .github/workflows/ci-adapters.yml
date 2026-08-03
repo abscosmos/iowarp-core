@@ -49,123 +49,19 @@ jobs:
           submodules: recursive
       - name: Build adapters + run adapter tests (inside deps-cpu)
         run: |
+          # The script lives in CI/adapters_linux.sh rather than inline here.
+          # An inline single-quoted shell body is one apostrophe away from
+          # silently ending early -- which is exactly what happened here, and it
+          # cost three CI rounds misdiagnosed as a deps-cpu image regression.
+          # See the header of that script.
+          #
           # --shm-size: docker's default /dev/shm is 64 MB; the clio runtime
           # places its GB-scale SHM segments there, so give it room (also lets
           # the FUSE runtime breathe under the xfstests gate).
           docker run --rm --shm-size=2g \
             -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
             --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
-            iowarp/deps-cpu:latest bash -c '
-              set -e
-              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
-              export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
-              git config --global --add safe.directory /workspace
-              # FUSE backend + ELF interception headers (libelf/HDF5 already in image)
-              apt-get update -qq
-              apt-get install -y -qq libfuse3-dev fuse3 pkg-config libelf-dev
-              # h5py for the VOL compat suite, SOURCE-built (--no-binary) against
-              # the image HDF5 (/usr/local, 2.1.1) so the connector loads into
-              # h5py. A PyPI wheel bundles its own libhdf5 and cannot load a VOL
-              # built against the system HDF5. Pin the suite to this interpreter
-              # via -DPython3_EXECUTABLE below.
-              HDF5_DIR=/usr/local /usr/bin/python3 -m pip install \
-                --break-system-packages --no-binary=h5py h5py numpy
-              cmake -B build-adapters \
-                -DPython3_EXECUTABLE=/usr/bin/python3 \
-                -DCMAKE_BUILD_TYPE=Debug \
-                -DCLIO_CORE_ENABLE_RUNTIME=ON \
-                -DCLIO_CORE_ENABLE_CTE=ON \
-                -DCLIO_CORE_ENABLE_CAE=OFF \
-                -DCLIO_CORE_ENABLE_CEE=OFF \
-                -DCLIO_CORE_ENABLE_TESTS=ON \
-                -DCLIO_CORE_ENABLE_BENCHMARKS=OFF \
-                -DCLIO_CORE_ENABLE_PYTHON=OFF \
-                -DCLIO_CORE_ENABLE_CONDA=OFF \
-                -DCLIO_CORE_ENABLE_ELF=ON \
-                -DCLIO_CTE_ENABLE_POSIX_ADAPTER=ON \
-                -DCLIO_CTE_ENABLE_STDIO_ADAPTER=ON \
-                -DCLIO_CTE_ENABLE_VFD=ON \
-                -DCLIO_CTE_ENABLE_HDF5_VOL=ON \
-                -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
-                -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
-                -DCLIO_CTE_ENABLE_COMPRESS=OFF \
-                -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
-                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-                -DCLIO_CTP_LOG_LEVEL=1
-              cmake --build build-adapters -j"$(nproc)"
-              # The HDF5 CLI tools are the differential oracle for both compat
-              # suites and for the VFD C suite's tool matrix. deps-cpu ships
-              # them, so a missing one is an image regression: fail here rather
-              # than let the suites take their (locally correct) skip path and
-              # report green without the evidence. h5stat/h5clear are required
-              # too -- they are what the §1.1(b)/(c) gates are measured with.
-              for t in h5dump h5ls h5diff h5stat h5clear h5repack h5cc; do
-                command -v "$t" >/dev/null 2>&1 || {
-                  echo "::error::required HDF5 tool missing from deps-cpu: $t"
-                  exit 1; }
-              done
-              # Make "tool absent -> skip" a failure inside the VFD C suite.
-              export CLIO_REQUIRE_HDF5_TOOLS=1
-              # Adapter unit/smoke tests. Exclude the docker-in-docker FUSE
-              # integration test (LABELS include "docker").
-              #
-              # compat_suite is excluded HERE and run explicitly below. Both
-              # suites match this -R by name -- cte_hdf5_vol_compat_suite on
-              # "hdf5_vol", cte_hdf5_vfd_compat_suite on "vfd" -- so without
-              # this they run twice each: once here and once in the
-              # skip-detection loop. They are RUN_SERIAL with TIMEOUT 900, and
-              # --repeat until-pass:2 can double a failing one again, so the
-              # duplicate is minutes of wall clock for no extra evidence. The
-              # windows job already excludes them for the same reason.
-              ctest --test-dir build-adapters --output-on-failure \
-                --timeout 180 --repeat until-pass:2 \
-                -R "posix|stdio|vfd|hdf5_vol|fuse" \
-                -E "copy_workspace|compat_suite" -LE "docker|ollama"
-              # The compat suites self-skip (exit 125 -> CTest "Skipped") when the
-              # toolchain is missing, which is right locally and WRONG here: a
-              # skipped differential suite is no evidence at all, and ctest above
-              # counts a skip as success. Assert both actually ran.
-              for t in cte_hdf5_vol_compat_suite cte_hdf5_vfd_compat_suite; do
-                if ctest --test-dir build-adapters -R "^${t}$" -N \
-                     | grep -q "$t"; then
-                  ctest --test-dir build-adapters -R "^${t}$" --output-on-failure \
-                    --timeout 900 2>&1 | tee /tmp/${t}.log
-                  if grep -qiE "Skipped|SKIP:" /tmp/${t}.log; then
-                    echo "::error::${t} was SKIPPED; the differential compat evidence did not run"
-                    exit 1
-                  fi
-                else
-                  echo "::error::${t} is not registered; expected it in this build"
-                  exit 1
-                fi
-              done
-              # Live end-to-end mount smoke (real libfuse3 mount + I/O).
-              chmod +x CI/fuse_mount_smoke.sh
-              CI/fuse_mount_smoke.sh build-adapters
-              # xfstests conformance gate (issue #677): install xfstests + its
-              # runtime deps, then run ONLY the tests known to pass against the
-              # clio FUSE fs (scripts/xfstests/ci_baseline_pass.txt -- the max
-              # passing set). Every baseline test must pass or the job fails.
-              # Currently-failing tests are tracked in a GitHub issue, not run.
-              bash scripts/xfstests/install_deps.sh
-              CLIO_BUILD_DIR="$PWD/build-adapters" \
-                bash scripts/xfstests/run_ci_xfstests.sh
-              # SCRATCH xfstests gate (issue #677): the tests above use only
-              # TEST_DIR; these need a second, isolated scratch device via two
-              # persistent clio runtimes + xfstests native fuse mount-helper.
-              # NON-BLOCKING for now: this driver is branch-only (not on dev) and
-              # has never passed in the deps-cpu docker -- the keeper runtimes
-              # come up but every test fails instantly at _scratch_mount (the
-              # native fuse mount-helper is not wired up in the container). It
-              # was silently masked until the embedded gate above started passing
-              # (set -e stopped the step first). Run it for visibility but do not
-              # fail the job on it until the mount-helper setup is made
-              # CI-ready; the embedded gate is the enforced signal. See
-              # scripts/xfstests/REMAINING_WORK.md.
-              CLIO_BUILD_DIR="$PWD/build-adapters" \
-                bash scripts/xfstests/run_ci_scratch_xfstests.sh \
-                || echo "::warning::scratch xfstests gate not yet CI-ready (branch-only, mount-helper unset in docker); non-blocking"
-            '
+            iowarp/deps-cpu:latest bash /workspace/CI/adapters_linux.sh
 
   # ---- macOS: hdf5_vol + libfuse (macFUSE) -----------------------------------
   # fuse_cte.cc carries the Darwin path (fuse_darwin_attr translation, darwin
