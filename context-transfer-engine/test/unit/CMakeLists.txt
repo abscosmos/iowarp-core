@@ -963,6 +963,44 @@ set_tests_properties(
 )
 endif()  # TARGET clio_cte_compressor_client
 
+# Full interposer stack (issue #886): compressor(562) -> replication(561) ->
+# core(512) under ONE plain core client with the SHM mirror attached —
+# fast path functional for raw blobs, REFUSED for compressed ones, and
+# drop+heal end to end. Needs both interposer modules.
+if(TARGET clio_cte_compressor_client AND TARGET clio_cte_replication_client)
+add_executable(test_interposer_stack test_interposer_stack.cc)
+target_include_directories(test_interposer_stack PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/replication/include
+)
+target_link_libraries(test_interposer_stack
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_compressor_runtime
+    clio_cte_compressor_client
+    clio_cte_replication_runtime
+    clio_cte_replication_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_interposer_stack
+    COMMAND test_interposer_stack)
+
+set_tests_properties(
+    cte_interposer_stack
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;compressor;replicas;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # full interposer stack
+
 # Add score-driven eviction tests (Method::kEvict)
 add_test(NAME cte_evict
     COMMAND test_evict)

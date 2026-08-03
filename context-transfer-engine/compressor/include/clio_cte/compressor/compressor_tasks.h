@@ -88,8 +88,13 @@ struct CompressorConfig {
 
   template <class Archive>
   void serialize(Archive &ar) {
+    // next_pool_id_ MUST round-trip: it is the interposition-chain target
+    // (issue #886) — omitting it silently rewired a programmatically
+    // created compressor pool straight to the default core, bypassing any
+    // interposer chained beneath it.
     ar(qtable_model_path_, linreg_model_path_, distribution_model_path_,
-       dnn_model_weights_path_, trace_folder_path_, tracking_enabled_);
+       dnn_model_weights_path_, trace_folder_path_, next_pool_id_,
+       tracking_enabled_);
   }
 
   /**
