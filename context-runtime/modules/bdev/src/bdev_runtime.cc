@@ -127,6 +127,17 @@ bool Runtime::LoadPerfStatsFile(const std::string &path, PerfMetrics &metrics,
 
 void Runtime::LoadPerfStats() {
   perf_stats_path_ = MakePerfStatsPath(pool_name_);
+  // Memory-class bdevs NEVER restore persisted perf stats. Their real
+  // performance is stable and high, so a persisted profile can only carry
+  // risk: one measurement taken through a contended/wedged window (observed:
+  // a RAM tier persisted at 0.098 MB/s write) is restored forever after and
+  // silently INVERTS tiering — max_bw then places every blob, cache copies
+  // included, on disk. Disk-class devices keep the warm start; their
+  // measured profiles vary for real reasons.
+  if (bdev_type_ == BdevType::kRam || bdev_type_ == BdevType::kHbm ||
+      bdev_type_ == BdevType::kPinned) {
+    return;
+  }
   PerfMetrics m;
   float wall_read = 0.0f;
   float wall_write = 0.0f;
