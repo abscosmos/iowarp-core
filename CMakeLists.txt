@@ -221,6 +221,15 @@ set(CLIO_CTP_ENABLE_OPENMP ${CLIO_CORE_ENABLE_OPENMP} CACHE BOOL "Enable OpenMP 
 set(CLIO_CTP_ENABLE_CEREAL ${CLIO_CORE_ENABLE_CEREAL} CACHE BOOL "Enable Cereal (controlled by CLIO_CORE_ENABLE_CEREAL)" FORCE)
 set(CLIO_CTP_ENABLE_DOXYGEN ${CLIO_CORE_ENABLE_DOXYGEN} CACHE BOOL "Enable Doxygen (controlled by CLIO_CORE_ENABLE_DOXYGEN)" FORCE)
 set(CLIO_CTP_ENABLE_COMPRESS ${CLIO_CTE_ENABLE_COMPRESS} CACHE BOOL "Enable Compress (controlled by CLIO_CTE_ENABLE_COMPRESS)" FORCE)
+# CTP_ENABLE_COMPRESS changes clio::cte::core::Context's LAYOUT (and with it
+# every Put/Get task). It must therefore be a TREE-WIDE definition: when only
+# the targets linking ctp::compress saw it, the compressor module compiled a
+# 440-byte PutBlobTask against a core/client world using the 344-byte one —
+# tasks silently misparse and puts vanish (the ABI-skew hazard documented in
+# core_tasks.h; previously bit the llama.cpp weight work the same way).
+if(CLIO_CTE_ENABLE_COMPRESS)
+    add_compile_definitions(CTP_ENABLE_COMPRESS=1)
+endif()
 set(CLIO_CTP_ENABLE_ENCRYPT ${CLIO_CORE_ENABLE_ENCRYPT} CACHE BOOL "Enable Encrypt (controlled by CLIO_CORE_ENABLE_ENCRYPT)" FORCE)
 set(CLIO_CTP_ENABLE_ELF ${CLIO_CORE_ENABLE_ELF} CACHE BOOL "Enable ELF (controlled by CLIO_CORE_ENABLE_ELF)" FORCE)
 set(CLIO_CTP_ENABLE_CUDA ${CLIO_CORE_ENABLE_CUDA} CACHE BOOL "Enable CUDA (controlled by CLIO_CORE_ENABLE_CUDA)" FORCE)

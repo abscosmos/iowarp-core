@@ -928,6 +928,41 @@ set_tests_properties(
 )
 endif()  # TARGET clio_cte_replication_client
 
+# Compressor interposition (issue #886). Gated on the module (build with
+# CLIO_CTE_ENABLE_COMPRESS=ON): a plain core client against the compressor
+# pool — transparent compress on whole-blob puts, decompress on reads incl.
+# partial/vectored, logical sizes, forwarded batches and metadata.
+if(TARGET clio_cte_compressor_client)
+add_executable(test_compressor_interpose test_compressor_interpose.cc)
+target_include_directories(test_compressor_interpose PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+)
+target_link_libraries(test_compressor_interpose
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_compressor_runtime
+    clio_cte_compressor_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_compressor_interpose
+    COMMAND test_compressor_interpose)
+
+set_tests_properties(
+    cte_compressor_interpose
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;compressor;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # TARGET clio_cte_compressor_client
+
 # Add score-driven eviction tests (Method::kEvict)
 add_test(NAME cte_evict
     COMMAND test_evict)
