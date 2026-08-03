@@ -195,6 +195,18 @@ public:
    *  predictor marks failing (the REPLICA_FIXED evacuation override). */
   bool ReplicaBlocksOnFailingTarget(const Replica &rep);
 
+  /**
+   * Free a REPLICA_CACHE replica's blocks under capacity pressure (issue
+   * #886 cache chimod): write token + reader drain, blocks freed via the
+   * staging/FreeAllBlobBlocks path, empty layout published + WAL'd. The
+   * slot's metadata (flags, min_score) survives so the next cache write
+   * refills it. freed_bytes reports the physical footprint returned.
+   */
+  clio::run::TaskResume ReclaimCacheReplica(const TagId &tag_id,
+                                            const std::string &blob_name,
+                                            clio::run::u64 &freed_bytes,
+                                            clio::run::u32 &rc);
+
   /** Put blob (Method::kPutBlob) - allocates and writes data to blob. */
   clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
   /** Get blob (Method::kGetBlob) - reads data from existing blob. */

@@ -156,6 +156,8 @@ TEST_CASE("TransactionLog - ExtendReplica roundtrip", "[cte][txnlog]") {
   txn.replica_name_ = "replicated#2";
   txn.score_ = 0.25f;
   txn.flags_ = 3;  // REPLICA_FIXED | REPLICA_PERSISTENT
+  txn.transform_flags_ = 2;  // this copy holds transformed bytes (#886)
+  txn.min_score_ = 0.4f;     // organizer rescore floor
   TxnExtendBlobBlock blk0;
   blk0.bdev_major_ = 512;
   blk0.bdev_minor_ = 1;
@@ -185,6 +187,8 @@ TEST_CASE("TransactionLog - ExtendReplica roundtrip", "[cte][txnlog]") {
   REQUIRE(out.replica_name_ == "replicated#2");
   REQUIRE(out.score_ == 0.25f);
   REQUIRE(out.flags_ == 3);
+  REQUIRE(out.transform_flags_ == 2);
+  REQUIRE(out.min_score_ == 0.4f);
   REQUIRE(out.new_blocks_.size() == 2);
   REQUIRE(out.new_blocks_[0].bdev_major_ == 512);
   REQUIRE(out.new_blocks_[0].bdev_minor_ == 1);

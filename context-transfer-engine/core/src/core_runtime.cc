@@ -1626,10 +1626,17 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // nothing). Runs under the same write token as any other mutation of
     // this blob. A first write to replica N creates it (and any lower
     // indices) lazily.
-    if (task->context_.replica_ > 0) {
+    int rep_target = task->context_.replica_;
+    if (rep_target == kCacheReplica) {
+      // Sentinel: THE cache replica — find-or-create the slot carrying
+      // REPLICA_CACHE (under the write token; the slot append is a
+      // replicas_ mutation).
+      rep_target = blob_info_ptr->CacheReplicaIndex(/*create=*/true);
+    }
+    if (rep_target > 0) {
       clio::run::u32 rep_result = 0;
       CLIO_CO_AWAIT(WriteReplicaData(task, *blob_info_ptr, blob_name, tag_id,
-                              task->context_.replica_, offset, size,
+                              rep_target, offset, size,
                               task->score_, blob_score, rep_result));
       if (rep_result != 0) {
         task->return_code_ = rep_result;
@@ -1983,6 +1990,14 @@ clio::run::TaskResume Runtime::WriteReplicaData(
     // the merged bits — a put that both marks REPLICA_PERSISTENT and writes
     // bytes must already place those bytes off volatile tiers.
     rep->flags_ |= task->context_.replica_flags_;
+    // THIS copy's transform state is whatever the writer declares (issue
+    // #886 cache/replication split): assignment, not OR — a replica write
+    // replaces the copy's content. The cache chimod writes raw bytes
+    // (flags 0); the replication sweep stamps the stored form's flags.
+    rep->transform_flags_ = task->context_.transform_flags_;
+    if (task->context_.replica_min_score_ >= 0.0f) {
+      rep->min_score_ = task->context_.replica_min_score_;
+    }
     rep_min_pers = rep->MinPersistenceLevel(rep_min_pers);
     // Per-replica score: an explicit put score targets THIS replica; -1
     // keeps the replica's own score (write-through path), seeding a
@@ -2089,6 +2104,8 @@ clio::run::TaskResume Runtime::WriteReplicaData(
       txn.replica_name_ = rep->name_.str();
       txn.score_ = rep->score_;
       txn.flags_ = rep->flags_;
+      txn.transform_flags_ = rep->transform_flags_;
+      txn.min_score_ = rep->min_score_;
       for (const auto &blk : rep->blocks_) {
         TxnExtendBlobBlock tb;
         tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
@@ -2229,7 +2246,16 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // this read from replica N's blocks instead of the primary's. A read
     // needs one concrete source, so kAllReplicas (a write-through selector)
     // and a replica that no write has created yet both fail cleanly here.
-    const int replica_sel = task->context_.replica_;
+    int replica_sel = task->context_.replica_;
+    if (replica_sel == kCacheReplica) {
+      // Sentinel resolution for reads: an absent cache copy fails cleanly
+      // below, like any absent replica.
+      replica_sel = blob_info_ptr->CacheReplicaIndex(/*create=*/false);
+      if (replica_sel == 0) {
+        task->return_code_ = 1;
+        CLIO_CO_RETURN;
+      }
+    }
     if (replica_sel < 0 ||
         (replica_sel > 0 &&
          blob_info_ptr->GetReplica(replica_sel, /*create=*/false) == nullptr)) {
@@ -2262,7 +2288,10 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // POD, and vectored all route through this Impl -- can detect that the
     // bytes it is about to receive are not the producer's bytes (issue #818;
     // GetBlob returns STORED bytes and does not undo transforms).
-    task->context_.transform_flags_ = blob_info_ptr->transform_flags_;
+    task->context_.transform_flags_ =
+        replica_sel > 0
+            ? blob_info_ptr->GetReplica(replica_sel, false)->transform_flags_
+            : blob_info_ptr->transform_flags_;
 
     // Use the pre-provided data pointer from the task
     ctp::ipc::ShmPtr<> blob_data_ptr = task->blob_data_;
@@ -2824,6 +2853,16 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
     while (!blob_info.TryLockWrite(lock_tok)) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
+    {
+      // min_score floor (issue #886 cache chimod): the organizer never
+      // rescores a replica below its declared floor — under-floor
+      // reclamation is capacity eviction's job, not rescoring's.
+      Replica *floor_rep = blob_info.GetReplica(replica_idx, /*create=*/false);
+      if (floor_rep != nullptr && floor_rep->min_score_ >= 0.0f &&
+          new_score < floor_rep->min_score_) {
+        new_score = floor_rep->min_score_;
+      }
+    }
     BlobWriteLockGuard blob_write_guard(&blob_info, lock_tok);
 
     // The replica must already exist — a reorganize moves bytes, it does
@@ -2977,6 +3016,8 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
       txn.replica_name_ = rep->name_.str();
       txn.score_ = rep->score_;
       txn.flags_ = rep->flags_;
+      txn.transform_flags_ = rep->transform_flags_;
+      txn.min_score_ = rep->min_score_;
       for (const auto &blk : rep->blocks_) {
         TxnExtendBlobBlock tb;
         tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
@@ -3257,6 +3298,81 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::ReclaimCacheReplica(const TagId &tag_id,
+                                                   const std::string &blob_name,
+                                                   clio::run::u64 &freed_bytes,
+                                                   clio::run::u32 &rc) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  freed_bytes = 0;
+  std::shared_ptr<BlobInfo> blob_info_ptr = CheckBlobExists(blob_name, tag_id);
+  if (blob_info_ptr == nullptr) {
+    rc = 1;
+    CLIO_CO_RETURN;
+  }
+  {
+    // Same write-token + reader-drain discipline as every extent-freeing
+    // mutator (#753): a pinned reader's snapshot may reference the blocks.
+    clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(&freed_bytes);
+    while (!blob_info_ptr->TryLockWrite(lock_tok)) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+    BlobWriteLockGuard guard(blob_info_ptr.get(), lock_tok);
+    int idx = blob_info_ptr->CacheReplicaIndex(/*create=*/false);
+    Replica *rep =
+        idx > 0 ? blob_info_ptr->GetReplica(idx, /*create=*/false) : nullptr;
+    if (rep == nullptr || rep->blocks_.empty()) {
+      CLIO_CO_RETURN;  // nothing to reclaim
+    }
+    blob_info_ptr->BeginDrainReaders();
+    BlobReaderDrainGuard drain_guard(blob_info_ptr.get());
+    while (blob_info_ptr->HasReadPins()) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+    for (const auto &blk : rep->blocks_) {
+      freed_bytes += blk.capacity_;
+    }
+    // Lend the replica's blocks to a staging BlobInfo so FreeAllBlobBlocks
+    // (which frees blocks_) can do the work — the WriteReplicaData pattern.
+    BlobInfo staging;
+    staging.blocks_ = std::move(rep->blocks_);
+    rep->blocks_.clear();
+    rep->total_size_cache_ = 0;
+    clio::run::u32 free_rc = 0;
+    CLIO_CO_AWAIT(FreeAllBlobBlocks(staging, free_rc));
+    if (free_rc != 0) {
+      rc = 10 + free_rc;
+    }
+    // WAL: full-replacement empty layout for the reclaimed cache copy.
+    if (!blob_txn_logs_.empty()) {
+      clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+      Replica *rep2 = blob_info_ptr->GetReplica(idx, /*create=*/false);
+      TxnExtendReplica txn;
+      txn.tag_major_ = tag_id.major_;
+      txn.tag_minor_ = tag_id.minor_;
+      txn.blob_name_ = blob_name;
+      txn.replica_ = static_cast<clio::run::u32>(idx);
+      txn.replica_name_ = rep2->name_.str();
+      txn.score_ = rep2->score_;
+      txn.flags_ = rep2->flags_;
+      txn.transform_flags_ = rep2->transform_flags_;
+      txn.min_score_ = rep2->min_score_;
+      blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendReplica,
+                                                       txn);
+    }
+    {
+      std::string shm_key = std::to_string(tag_id.major_) + "." +
+                            std::to_string(tag_id.minor_) + "." + blob_name;
+      MirrorBlobToShm(shm_key, *blob_info_ptr);
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::Evict(clio::run::shared_ptr<EvictTask> &task) {
   CLIO_TASK_BODY_BEGIN
   const float min_tier_score = task->min_tier_score_;
@@ -3287,6 +3403,77 @@ clio::run::TaskResume Runtime::Evict(clio::run::shared_ptr<EvictTask> &task) {
     }
     return false;
   };
+
+  // 1.5 Cache-replica reclaim FIRST (issue #886 cache chimod): droppable
+  //     uncompressed cache copies on the pressured tier are the cheapest
+  //     bytes to give back — they can always be refilled from the
+  //     authoritative chain. Reclaim lowest-score copies until the budget
+  //     is met before touching whole blobs.
+  {
+    struct CacheCandidate {
+      float score;
+      TagId tag_id;
+      std::string blob_name;
+    };
+    std::vector<CacheCandidate> cache_candidates;
+    tag_blob_name_to_info_.for_each(
+        [&](const std::string &composite_key,
+            const std::shared_ptr<BlobInfo> &blob_info_sp) {
+          const BlobInfo &blob_info = *blob_info_sp;
+          for (size_t ri = 0; ri < blob_info.replicas_.size(); ++ri) {
+            const Replica &rep = blob_info.replicas_[ri];
+            if (!(rep.flags_ & REPLICA_CACHE) || rep.blocks_.empty()) {
+              continue;
+            }
+            bool on_tier = false;
+            for (const auto &block : rep.blocks_) {
+              if (on_qualifying_target(block.bdev_client_.pool_id_)) {
+                on_tier = true;
+                break;
+              }
+            }
+            if (!on_tier) {
+              continue;
+            }
+            const size_t s1 = composite_key.find('.');
+            const size_t s2 = s1 == std::string::npos
+                                  ? std::string::npos
+                                  : composite_key.find('.', s1 + 1);
+            if (s2 == std::string::npos) {
+              continue;
+            }
+            TagId btid(static_cast<clio::run::u32>(
+                           std::stoul(composite_key.substr(0, s1))),
+                       static_cast<clio::run::u32>(std::stoul(
+                           composite_key.substr(s1 + 1, s2 - s1 - 1))));
+            cache_candidates.push_back(CacheCandidate{
+                rep.score_, btid, composite_key.substr(s2 + 1)});
+            break;  // one cache replica per blob by construction
+          }
+        },
+        ctp::priv::ForEachLock::kShared);
+    std::sort(cache_candidates.begin(), cache_candidates.end(),
+              [](const CacheCandidate &a, const CacheCandidate &b) {
+                return a.score < b.score;
+              });
+    for (const auto &c : cache_candidates) {
+      if (task->bytes_evicted_ >= target_bytes) {
+        break;
+      }
+      clio::run::u64 freed = 0;
+      clio::run::u32 rrc = 0;
+      CLIO_CO_AWAIT(ReclaimCacheReplica(c.tag_id, c.blob_name, freed, rrc));
+      if (rrc == 0 && freed > 0) {
+        task->bytes_evicted_ += freed;
+        task->blobs_evicted_ += 1;  // counts reclaimed copies too
+      }
+    }
+    if (task->bytes_evicted_ >= target_bytes) {
+      HLOG(kDebug, "Evict: budget met by cache-replica reclaim ({} bytes)",
+           task->bytes_evicted_);
+      CLIO_CO_RETURN;
+    }
+  }
 
   // 2. Rank this shard's blobs that occupy a qualifying tier by their own score
   //    (ascending) so the cheapest-to-lose data is evicted first. evict_bytes is
@@ -4575,6 +4762,12 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
                   sizeof(rep_score));
         ofs.write(reinterpret_cast<const char *>(&rep_flags),
                   sizeof(rep_flags));
+        uint32_t rep_transform = rep.transform_flags_;
+        float rep_min_score = rep.min_score_;
+        ofs.write(reinterpret_cast<const char *>(&rep_transform),
+                  sizeof(rep_transform));
+        ofs.write(reinterpret_cast<const char *>(&rep_min_score),
+                  sizeof(rep_min_score));
         ofs.write(reinterpret_cast<const char *>(&rep_num_blocks),
                   sizeof(rep_num_blocks));
         for (const auto &block : rep.blocks_) {
@@ -5028,6 +5221,12 @@ void Runtime::RestoreMetadataFromLog() {
       ifs.read(reinterpret_cast<char *>(&rep_score), sizeof(rep_score));
       uint32_t rep_flags;
       ifs.read(reinterpret_cast<char *>(&rep_flags), sizeof(rep_flags));
+      uint32_t rep_transform;
+      ifs.read(reinterpret_cast<char *>(&rep_transform),
+               sizeof(rep_transform));
+      float rep_min_score;
+      ifs.read(reinterpret_cast<char *>(&rep_min_score),
+               sizeof(rep_min_score));
       uint32_t num_blocks;
       ifs.read(reinterpret_cast<char *>(&num_blocks), sizeof(num_blocks));
 
@@ -5042,6 +5241,8 @@ void Runtime::RestoreMetadataFromLog() {
         rep->name_ = rep_name;
         rep->score_ = rep_score;
         rep->flags_ = rep_flags;
+        rep->transform_flags_ = rep_transform;
+        rep->min_score_ = rep_min_score;
         rep->blocks_.clear();
         rep->total_size_cache_ = 0;
       }
@@ -5252,6 +5453,8 @@ void Runtime::ReplayTransactionLogs() {
           rep->name_ = txn.replica_name_;
           rep->score_ = txn.score_;
           rep->flags_ = txn.flags_;
+          rep->transform_flags_ = txn.transform_flags_;
+          rep->min_score_ = txn.min_score_;
           rep->blocks_.clear();
           rep->total_size_cache_ = 0;
           for (const auto &tb : txn.new_blocks_) {
@@ -6636,15 +6839,23 @@ clio::run::TaskResume Runtime::GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask
     // Step 2: Calculate and return the blob size. replica_ > 0 reports the
     // REPLICA's size (issue #886) — the caching layer keys "is the DRAM copy
     // usable / how many bytes must a re-cache copy" off this.
-    if (task->replica_ > 0) {
+    int size_sel = task->replica_;
+    if (size_sel == kCacheReplica) {
+      size_sel = blob_info_ptr->CacheReplicaIndex(/*create=*/false);
+      if (size_sel == 0) {
+        task->return_code_ = 1;  // no cache replica
+        CLIO_CO_RETURN;
+      }
+    }
+    if (size_sel > 0) {
       Replica *rep =
-          blob_info_ptr->GetReplica(task->replica_, /*create=*/false);
+          blob_info_ptr->GetReplica(size_sel, /*create=*/false);
       if (rep == nullptr) {
         task->return_code_ = 1;  // Replica not found
         CLIO_CO_RETURN;
       }
       task->size_ = rep->total_size_cache_;
-    } else if (task->replica_ < 0) {
+    } else if (size_sel < 0) {
       task->return_code_ = 1;
       CLIO_CO_RETURN;
     } else {

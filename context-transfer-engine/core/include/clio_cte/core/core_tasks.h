@@ -819,6 +819,14 @@ static constexpr clio::run::u32 REPLICA_FIXED = 0x1;
 /// that exists to survive a crash.
 static constexpr clio::run::u32 REPLICA_PERSISTENT = 0x2;
 
+/** This replica is a droppable CACHE copy (issue #886 cache chimod): it
+ *  holds the blob's UNTRANSFORMED bytes for fast (and zero-IPC) reads while
+ *  the authoritative data lives transformed further down the chain. Unlike
+ *  FIXED|PERSISTENT reliability replicas it is reclaimable: capacity
+ *  eviction may free its blocks under tier pressure, and the organizer may
+ *  rescore it only down to its min_score_ floor. */
+static constexpr clio::run::u32 REPLICA_CACHE = 0x4;
+
 /**
  * One replica of a blob's data (issue #886): an independent block list,
  * placed by the same DPE/persistence machinery as the primary. A replica is
@@ -846,10 +854,27 @@ struct Replica {
   // REPLICA_* bits. Sticky-OR via Context::replica_flags_ (matching the
   // transform_flags_ precedent); clearing is not supported yet.
   clio::run::u32 flags_;
+  // THIS COPY's transform state (issue #886 cache/replication split). A
+  // blob's copies legitimately differ: the cache replica holds raw bytes
+  // while the primary and reliability replicas hold the transformed
+  // (compressed) form. Stamped from Context::transform_flags_ by every
+  // replica-targeted write (full-copy semantics: assignment, not OR — a
+  // replica write replaces the copy's content, so its transform state is
+  // whatever the writer declares). Replica-targeted reads report it OUT.
+  clio::run::u32 transform_flags_;
+  // Score floor for this replica (-1 = none). The organizer never rescores
+  // the replica below it; capacity eviction under genuine tier pressure may
+  // still reclaim a REPLICA_CACHE copy's blocks regardless. Propagated via
+  // Context::replica_min_score_.
+  float min_score_;
 
   CTP_CROSS_FUN Replica()
       : name_(CLIO_PRIV_ALLOC), blocks_(CLIO_PRIV_ALLOC),
-        total_size_cache_(0), score_(-1.0f), flags_(0) {}
+        total_size_cache_(0), score_(-1.0f), flags_(0),
+        transform_flags_(0), min_score_(-1.0f) {}
+
+  /** True when this copy's stored bytes are not the producer's bytes. */
+  CTP_CROSS_FUN bool IsTransformed() const { return transform_flags_ != 0; }
 
   /** Effective min persistence level for placing this replica's blocks. */
   CTP_CROSS_FUN int MinPersistenceLevel(int requested) const {
@@ -863,6 +888,13 @@ struct Replica {
 /** Context::replica_ value meaning "write through to primary + every
  *  existing replica" (writes only; a read needs one concrete source). */
 static constexpr int kAllReplicas = -1;
+
+/** Context::replica_ selector for THE cache replica — whichever slot
+ *  carries REPLICA_CACHE (issue #886 cache chimod). Writes find-or-create
+ *  it (with the flag set); reads and size probes of an absent cache copy
+ *  fail cleanly like any absent replica. Index-free addressing keeps the
+ *  cache slot from colliding with the reliability replicas at 1..N. */
+static constexpr int kCacheReplica = -2;
 
 /**
  * RegisterReplicaContainerTask (issue #886, Method::kRegisterReplicaContainer)
@@ -1052,6 +1084,26 @@ struct BlobInfo {
       }
     }
     return &replicas_[static_cast<size_t>(idx) - 1];
+  }
+
+  /**
+   * Resolve the kCacheReplica sentinel to a concrete 1-based index: the
+   * first replica carrying REPLICA_CACHE, or (when create) a fresh slot
+   * appended with the flag pre-set. 0 = absent and not created.
+   */
+  CTP_CROSS_FUN int CacheReplicaIndex(bool create) {
+    for (size_t i = 0; i < replicas_.size(); ++i) {
+      if (replicas_[i].flags_ & REPLICA_CACHE) {
+        return static_cast<int>(i) + 1;
+      }
+    }
+    if (!create) {
+      return 0;
+    }
+    Replica rep;
+    rep.flags_ = REPLICA_CACHE;
+    replicas_.push_back(rep);
+    return static_cast<int>(replicas_.size());
   }
 
   CTP_CROSS_FUN BlobInfo()
@@ -1425,6 +1477,12 @@ struct Context {
   // OUTSIDE the #if below, same reason as above.
   clio::run::u32 replica_flags_;
 
+  // Score floor stamped on the targeted replica by a replica-targeted write
+  // (issue #886 cache chimod): the organizer never rescores the replica
+  // below it. -1 = leave the replica's floor untouched. Unconditional, same
+  // ABI rule as every Context field.
+  float replica_min_score_;
+
   // ---- Compression / tracing controls and stats -------------------------
   // UNCONDITIONAL by design (issue #886 unified API): these fields exist in
   // EVERY build so Context — and with it every Put/Get task — has exactly
@@ -1468,6 +1526,7 @@ struct Context {
         transform_flags_(kBlobTransformNone),
         replica_(0),
         replica_flags_(0),
+        replica_min_score_(-1.0f),
         dynamic_compress_(0),
         compress_lib_(0),
         compress_preset_(2),
@@ -1492,7 +1551,8 @@ struct Context {
     // field-block comment above).
     ar.range(persistence_target_, min_persistence_level_, preallocate_,
              emulate_, emulated_time_ns_, transform_flags_, replica_,
-             replica_flags_, dynamic_compress_, compress_lib_,
+             replica_flags_, replica_min_score_, dynamic_compress_,
+             compress_lib_,
              compress_preset_, target_psnr_, psnr_chance_, max_performance_,
              consumer_node_, data_type_, trace_, trace_key_, trace_node_,
              actual_original_size_, actual_compressed_size_,

@@ -118,6 +118,8 @@ struct TxnExtendReplica {
   std::string replica_name_;
   float score_ = -1.0f;       // the replica's own placement score
   clio::run::u32 flags_ = 0;  // REPLICA_* bits
+  clio::run::u32 transform_flags_ = 0;  // THIS copy's transform state (#886)
+  float min_score_ = -1.0f;   // organizer rescore floor (-1 = none)
   std::vector<TxnExtendBlobBlock> new_blocks_;
 };
 
@@ -216,6 +218,8 @@ class TransactionLog {
     WriteString(buffer_, txn.replica_name_);
     WriteFloat(buffer_, txn.score_);
     WriteU32(buffer_, txn.flags_);
+    WriteU32(buffer_, txn.transform_flags_);
+    WriteFloat(buffer_, txn.min_score_);
     WriteU32(buffer_, static_cast<clio::run::u32>(txn.new_blocks_.size()));
     for (const auto &blk : txn.new_blocks_) {
       WriteU32(buffer_, blk.bdev_major_);
@@ -376,6 +380,8 @@ class TransactionLog {
     txn.replica_name_ = ReadString(data, off);
     txn.score_ = ReadFloat(data, off);
     txn.flags_ = ReadU32(data, off);
+    txn.transform_flags_ = ReadU32(data, off);
+    txn.min_score_ = ReadFloat(data, off);
     clio::run::u32 num_blocks = ReadU32(data, off);
     txn.new_blocks_.resize(num_blocks);
     for (clio::run::u32 i = 0; i < num_blocks; ++i) {
