@@ -38,6 +38,7 @@
 #include <clio_ctp/util/singleton.h>
 #include <clio_cte/api.h>
 #include <clio_cte/core/core_tasks.h>
+#include <clio_cte/core/blob_batch.h>
 #include <clio_cte/core/shm_metadata_cache.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <atomic>
@@ -1286,14 +1287,7 @@ class Client : public clio::run::ContainerClient {
       const std::vector<MultiPutDesc> &descs,
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
     auto *ipc_manager = CLIO_CPU_IPC;
-    std::string packed;
-    {
-      std::vector<char> buf;
-      ctp::ipc::GlobalSerialize<std::vector<char>> ar(buf);
-      ar(const_cast<std::vector<MultiPutDesc> &>(descs));
-      ar.Finalize();
-      packed.assign(buf.begin(), buf.end());
-    }
+    std::string packed = EncodeMultiPutDescs(descs);
     TagId rt = descs.empty() ? TagId::GetNull() : descs.front().tag_id_;
     const std::string rb = descs.empty() ? std::string() : descs.front().blob_name_;
     auto task = ipc_manager->NewTask<MultiPutBlobTask>(

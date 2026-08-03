@@ -73,13 +73,9 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archiv
       break;
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default: {
-      clio::run::ContainerHold core = CoreContainer();
-      if (core != nullptr) {
-        core->SaveTask(method, archive, task_ptr);
-      }
+    default:
+      ForwardSaveTask(method, archive, task_ptr);
       break;
-    }
   }
 }
 
@@ -92,13 +88,9 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archiv
       break;
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default: {
-      clio::run::ContainerHold core = CoreContainer();
-      if (core != nullptr) {
-        core->LoadTask(method, archive, task_ptr);
-      }
+    default:
+      ForwardLoadTask(method, archive, task_ptr);
       break;
-    }
   }
 }
 
@@ -120,13 +112,9 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       break;
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default: {
-      clio::run::ContainerHold core = CoreContainer();
-      if (core != nullptr) {
-        core->LocalLoadTask(method, archive, task_ptr);
-      }
+    default:
+      ForwardLocalLoadTask(method, archive, task_ptr);
       break;
-    }
   }
 }
 
@@ -148,13 +136,9 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
       break;
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default: {
-      clio::run::ContainerHold core = CoreContainer();
-      if (core != nullptr) {
-        core->LocalSaveTask(method, archive, task_ptr);
-      }
+    default:
+      ForwardLocalSaveTask(method, archive, task_ptr);
       break;
-    }
   }
 }
 
@@ -177,13 +161,8 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(
     }
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default: {
-      clio::run::ContainerHold core = CoreContainer();
-      if (core != nullptr) {
-        return core->NewCopyTask(method, orig_task_ptr, deep);
-      }
-      break;
-    }
+    default:
+      return ForwardNewCopyTask(method, orig_task_ptr, deep);
   }
   return clio::run::shared_ptr<clio::run::Task>();
 }
@@ -199,13 +178,8 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       return ipc_manager->NewTask<TASK>().template Cast<clio::run::Task>();
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default: {
-      clio::run::ContainerHold core = CoreContainer();
-      if (core != nullptr) {
-        return core->NewTask(method);
-      }
-      return clio::run::shared_ptr<clio::run::Task>();
-    }
+    default:
+      return ForwardNewTask(method);
   }
 }
 
@@ -219,26 +193,16 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
       break;
     CLIO_REPL_FOR_EACH_METHOD(X)
 #undef X
-    default: {
-      clio::run::ContainerHold core = CoreContainer();
-      if (core != nullptr) {
-        core->AggregateOut(method, orig_task, replica_task);
-      } else {
-        orig_task->AggregateOut(
-            ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
-      }
+    default:
+      ForwardAggregateOut(method, orig_task, replica_task);
       break;
-    }
   }
 }
 
 void Runtime::AggregateIn(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &agg_task,
                           const clio::run::shared_ptr<clio::run::Task> &member_task) {
   // No ManyToOne methods of our own; forwarded core methods delegate.
-  clio::run::ContainerHold core = CoreContainer();
-  if (core != nullptr) {
-    core->AggregateIn(method, agg_task, member_task);
-  }
+  ForwardAggregateIn(method, agg_task, member_task);
 }
 
 #undef CLIO_REPL_FOR_EACH_METHOD

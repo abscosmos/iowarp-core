@@ -14,6 +14,7 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
+#include <clio_cte/core/core_interposer.h>
 #include <clio_cte/replication/replication_client.h>
 #include <clio_cte/replication/replication_tasks.h>
 
@@ -32,7 +33,7 @@ namespace clio::cte::replication {
  * method is forwarded to the next pool untouched. ReplicateBlob/FlushTag
  * remain the explicit verbs, numbered above the core's method space.
  */
-class Runtime : public clio::run::Container {
+class Runtime : public clio::cte::core::CoreInterposer {
  public:
   using CreateParams = ReplicationConfig;  // required by CLIO_TASK_CC
 
@@ -149,20 +150,8 @@ class Runtime : public clio::run::Container {
   /** Lazily bind the core client (compose next_pool_id, default kCtePoolId) */
   clio::cte::core::Client *GetCoreClient();
 
-  /** The core pool this module interposes on. */
-  clio::run::PoolId CorePoolId() const;
-
-  /** The local core container for direct forwarding (null before the core
-   *  pool is composed — compose order requires core BEFORE this module). */
-  clio::run::ContainerHold CoreContainer();
-
-  /**
-   * Forward a task to the core container's Run verbatim — the generic
-   * interposition escape: any core method this module does not override
-   * executes exactly as if the task had been addressed to the core pool.
-   */
-  clio::run::TaskResume ForwardToCore(clio::run::u32 method,
-                                      clio::run::shared_ptr<clio::run::Task> task);
+  // CorePoolId/CoreContainer/ForwardToCore + the lib_exec dispatch
+  // defaults come from clio::cte::core::CoreInterposer (shared base).
 
   /** Mark a blob dirty for the async write-through (deduped by key). */
   void EnqueueReplication(const TagId &tag_id, const std::string &blob_name);

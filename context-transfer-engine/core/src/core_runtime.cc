@@ -3374,32 +3374,24 @@ clio::run::TaskResume Runtime::MultiPutBlob(
   // buffer — the per-put task machinery is amortized across the batch.
   task->num_ok_ = 0;
   task->first_rc_ = 0;
-  std::vector<MultiPutDesc> descs;
-  {
-    std::string raw = task->descs_.str();
-    std::vector<char> buf(raw.begin(), raw.end());
-    ctp::ipc::GlobalDeserialize<std::vector<char>> ar(buf);
-    ar(descs);
-  }
   auto *ipc_manager = CLIO_CPU_IPC;
-  char *base = task->data_.IsNull()
-                   ? nullptr
-                   : ipc_manager->ToFullPtr<char>(
-                         task->data_.template Cast<char>()).ptr_;
-  if (base == nullptr || descs.empty()) {
-    task->SetReturnCode(descs.empty() ? 0 : 1);
+  // Shared batch decode (blob_batch.h) — the one wire-format authority for
+  // MultiPutBlob, used identically by the interposing chimods.
+  MultiPutBatchView batch;
+  if (!MultiPutBatchView::Attach(*task, &batch)) {
+    task->SetReturnCode(batch.descs_.empty() ? 0 : 1);
     CLIO_CO_RETURN;
   }
-  for (const auto &d : descs) {
-    if (d.payload_off_ + d.size_ > task->data_len_) {
+  for (size_t bi = 0; bi < batch.size(); ++bi) {
+    const auto &d = batch.descs_[bi];
+    if (!batch.RecordValid(bi)) {
       if (task->first_rc_ == 0) task->first_rc_ = 2;  // malformed batch entry
       continue;
     }
     // Null-allocator ShmPtr = absolute in-process address of the slice; the
     // put's bdev write reads it directly (same contract as the private put's
     // co-located zero-copy path).
-    ctp::ipc::ShmPtr<> slice =
-        ctp::ipc::ShmPtr<>::FromRaw(base + d.payload_off_);
+    ctp::ipc::ShmPtr<> slice = batch.RecordSlice(bi);
     auto sub = ipc_manager->NewTask<PutBlobTask>(
         clio::run::CreateTaskId(), task->pool_id_,
         clio::run::PoolQuery::Local(), d.tag_id_, d.blob_name_, d.offset_,

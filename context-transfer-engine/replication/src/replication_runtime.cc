@@ -20,6 +20,7 @@ static constexpr clio::run::u64 kReplicateChunkBytes = 4ULL * 1024 * 1024;
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   config_ = task->GetParams();
+  interposer_next_pool_ = config_.next_pool_id_;  // base forwarding target
   if (!config_.next_pool_id_.IsNull()) {
     core_client_ =
         std::make_unique<clio::cte::core::Client>(config_.next_pool_id_);
@@ -62,35 +63,6 @@ clio::cte::core::Client *Runtime::GetCoreClient() {
     core_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
   }
   return core_client_.get();
-}
-
-clio::run::PoolId Runtime::CorePoolId() const {
-  return !config_.next_pool_id_.IsNull() ? config_.next_pool_id_
-                                         : clio::cte::core::kCtePoolId;
-}
-
-clio::run::ContainerHold Runtime::CoreContainer() {
-  return CLIO_POOL_MANAGER->GetRealOrStaticContainer(CorePoolId()).get();
-}
-
-clio::run::TaskResume Runtime::ForwardToCore(
-    clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task) {
-#ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
-#endif
-  CLIO_TASK_BODY_BEGIN
-  {
-    clio::run::ContainerHold core = CoreContainer();
-    if (core == nullptr) {
-      // Compose order guarantees the core exists before this module; a null
-      // here means a task raced pool teardown or a miscomposed deployment.
-      task->SetReturnCode(1);
-      CLIO_CO_RETURN;
-    }
-    CLIO_CO_AWAIT(core->Run(method, task));
-  }
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
 }
 
 void Runtime::EnqueueReplication(const TagId &tag_id,
@@ -344,21 +316,19 @@ clio::run::TaskResume Runtime::PutBlob(
       if (rep_ctx.min_persistence_level_ < 1) {
         rep_ctx.min_persistence_level_ = 1;
       }
-      if (!task->segments_.empty()) {
-        for (size_t s = 0; s < task->segments_.size(); ++s) {
-          const auto &seg = task->segments_[s];
-          auto put = cte->AsyncPutBlob(task->tag_id_, blob_name,
-                                       seg.blob_off_, seg.size_, seg.data_,
-                                       config_.replica_score_, rep_ctx);
-          CLIO_CO_AWAIT(put);
-          if (put->GetReturnCode() != 0) {
-            task->return_code_ = 30 + put->GetReturnCode();
-            CLIO_CO_RETURN;
-          }
-        }
-      } else {
-        auto put = cte->AsyncPutBlob(task->tag_id_, blob_name, task->offset_,
-                                     task->size_, task->blob_data_,
+      // Shared scalar-vs-vectored iteration (blob_batch.h): collect the
+      // regions once, then one replica-targeted put per region in list
+      // order (the core's last-writer-wins rule).
+      std::vector<clio::cte::core::BlobRegion> regions;
+      clio::cte::core::ForEachBlobRegion(*task,
+          [&regions](const clio::cte::core::BlobRegion &r) {
+            regions.push_back(r);
+            return true;
+          });
+      for (size_t ri = 0; ri < regions.size(); ++ri) {
+        auto put = cte->AsyncPutBlob(task->tag_id_, blob_name,
+                                     regions[ri].blob_off_, regions[ri].size_,
+                                     regions[ri].data_,
                                      config_.replica_score_, rep_ctx);
         CLIO_CO_AWAIT(put);
         if (put->GetReturnCode() != 0) {
@@ -436,14 +406,9 @@ clio::run::TaskResume Runtime::GetBlob(
     // The range a copy must COVER to serve this read: the scalar range, or
     // the union of a vectored read's segments (the same union the core's
     // torn-layout guard uses).
-    clio::run::u64 end = task->offset_ + task->size_;
-    if (!task->segments_.empty()) {
-      end = 0;
-      for (size_t s = 0; s < task->segments_.size(); ++s) {
-        const auto &seg = task->segments_[s];
-        if (seg.blob_off_ + seg.size_ > end) end = seg.blob_off_ + seg.size_;
-      }
-    }
+    clio::run::u64 req_lo = 0, end = 0;
+    clio::cte::core::BlobRequestRange(*task, &req_lo, &end);
+    (void)req_lo;
     clio::run::u64 served_total = 0;  // full size of whatever copy served
 
     // 1. Primary (the LOCAL core container — the task was routed here by
@@ -544,35 +509,24 @@ clio::run::TaskResume Runtime::MultiPutBlob(
   }
   {
     auto *cte = GetCoreClient();
-    // Same batch decode as the core's handler; the slices stay zero-copy —
-    // the batch buffer outlives this task, and each replica put completes
-    // before the next is issued.
-    std::vector<clio::cte::core::MultiPutDesc> descs;
-    {
-      std::string raw = task->descs_.str();
-      std::vector<char> buf(raw.begin(), raw.end());
-      ctp::ipc::GlobalDeserialize<std::vector<char>> ar(buf);
-      ar(descs);
-    }
-    auto *ipc_manager = CLIO_CPU_IPC;
-    char *base = task->data_.IsNull()
-                     ? nullptr
-                     : ipc_manager->ToFullPtr<char>(
-                           task->data_.template Cast<char>()).ptr_;
-    if (base != nullptr && config_.replicate_period_ms_ > 0) {
+    // Shared batch decode (blob_batch.h — the same view the core executes);
+    // the slices stay zero-copy: the batch buffer outlives this task, and
+    // each replica put completes before the next is issued.
+    clio::cte::core::MultiPutBatchView batch;
+    if (clio::cte::core::MultiPutBatchView::Attach(*task, &batch) &&
+        config_.replicate_period_ms_ > 0) {
       // ASYNC write-through: mark every record dirty for the periodic sweep
       // and ack the batch now (see PutBlob).
-      for (size_t d = 0; d < descs.size(); ++d) {
-        EnqueueReplication(descs[d].tag_id_, descs[d].blob_name_);
+      for (size_t d = 0; d < batch.size(); ++d) {
+        EnqueueReplication(batch.descs_[d].tag_id_, batch.descs_[d].blob_name_);
       }
-    } else if (base != nullptr) {
-      for (size_t d = 0; d < descs.size(); ++d) {
-        const auto &desc = descs[d];
-        if (desc.payload_off_ + desc.size_ > task->data_len_) {
+    } else if (batch.base_ != nullptr) {
+      for (size_t d = 0; d < batch.size(); ++d) {
+        const auto &desc = batch.descs_[d];
+        if (!batch.RecordValid(d)) {
           continue;  // malformed entry — already counted by the core batch
         }
-        ctp::ipc::ShmPtr<> slice =
-            ctp::ipc::ShmPtr<>::FromRaw(base + desc.payload_off_);
+        ctp::ipc::ShmPtr<> slice = batch.RecordSlice(d);
         for (int r = 1; r <= config_.num_replicas_; ++r) {
           Context rep_ctx;
           rep_ctx.replica_ = r;
