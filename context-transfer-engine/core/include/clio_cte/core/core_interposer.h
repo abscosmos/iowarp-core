@@ -60,6 +60,32 @@ class CoreInterposer : public clio::run::Container {
     return CLIO_POOL_MANAGER->GetRealOrStaticContainer(CorePoolId()).get();
   }
 
+ public:
+  /**
+   * Route interposed tasks EXACTLY as the core routes its own (issue #886
+   * multi-node): the core's ScheduleTask hash-routes blob verbs to their
+   * owner container (HashBlobToContainer) and tag creation by tag-name
+   * hash — the mechanism that makes the blob namespace CLUSTER-GLOBAL.
+   * Without this override an interposer pool keeps the base default (the
+   * task's own query), every chain-bound op resolves on the submitting
+   * node, and cross-node readers simply never see each other's blobs.
+   * Delegating (rather than copying the switch) keeps one routing
+   * authority; the container counts of the chain pools match the core's
+   * (all compose one-per-node), so the returned query is valid for this
+   * pool too. Methods the core does not know (module verbs, 100+) fall
+   * through its default and keep their query.
+   */
+  clio::run::PoolQuery ScheduleTask(
+      const clio::run::shared_ptr<clio::run::Task> &task) override {
+    clio::run::ContainerHold core = CoreContainer();
+    if (core != nullptr) {
+      return core->ScheduleTask(task);
+    }
+    return task->pool_query_;
+  }
+
+ protected:
+
   /**
    * Execute a task on the next pool's container verbatim — the generic
    * interposition escape: any core method this module does not override

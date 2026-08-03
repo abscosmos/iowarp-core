@@ -84,24 +84,39 @@ class Runtime : public clio::cte::core::CoreInterposer {
                                            bool deep) override;
   clio::run::shared_ptr<clio::run::Task> NewTask(clio::run::u32 method) override;
 
+  /**
+   * Reader-local read routing (issue #886 distributed coherence): Dynamic
+   * GetBlob/GetBlobSize resolve to THIS node's cache container, which
+   * serves from the node-local raw copy and, on a miss, fetches from the
+   * blob's owner chain, populates the local copy, and registers it for the
+   * owner's put-invalidation. Everything else (writes, explicit-replica
+   * ops, module verbs) routes exactly as the core does (owner by blob
+   * hash) via the CoreInterposer delegation.
+   */
+  clio::run::PoolQuery ScheduleTask(
+      const clio::run::shared_ptr<clio::run::Task> &task) override;
+
  private:
   /** Aim a put context at THE cache replica slot (raw bytes, score floor). */
   void AimAtCacheReplica(Context *ctx) const;
 
   /**
-   * Best-effort re-population of the cache replica from the authoritative
-   * chain (used on read misses): logical size down, chunked raw reads down
-   * (decompressed by the chain), chunked cache-replica puts. Sequential from
-   * 0, so an interruption leaves a valid prefix.
+   * Best-effort population of THIS node's raw local copy from the blob's
+   * authoritative owner chain, plus coherence registration (the owner's
+   * next primary write invalidates the copy). Sequential from 0, so an
+   * interruption leaves a valid prefix.
    */
-  clio::run::TaskResume Repopulate(const TagId &tag_id,
-                                   const std::string &blob_name);
+  clio::run::TaskResume PopulateLocal(const TagId &tag_id,
+                                      const std::string &blob_name);
 
   /** Lazily bind the next-pool client (compose next_pool_id). */
   clio::cte::core::Client *GetNextClient();
+  /** Lazily bind a direct core client for node-LOCAL copy access. */
+  clio::cte::core::Client *GetLocalClient();
 
   CacheConfig config_;
   std::unique_ptr<clio::cte::core::Client> next_client_;
+  std::unique_ptr<clio::cte::core::Client> local_client_;
 };
 
 }  // namespace clio::cte::cache

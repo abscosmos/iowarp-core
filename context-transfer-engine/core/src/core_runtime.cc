@@ -936,6 +936,12 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       auto typed = task.template Cast<GetBlobSizeTask>();
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
+    case Method::kRegisterReplicaContainer: {
+      // Coherence registration must land on the blob's OWNER container —
+      // that is whose next primary write performs the invalidation.
+      auto typed = task.template Cast<RegisterReplicaContainerTask>();
+      return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
+    }
     case Method::kMultiPutBlob: {
       // Route by the FIRST put's blob (single-node/local semantics — see the
       // task's doc comment; all puts in a batch must map to one container).
