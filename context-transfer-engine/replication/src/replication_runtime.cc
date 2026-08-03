@@ -172,11 +172,16 @@ clio::run::TaskResume Runtime::ReplicateOne(
       CLIO_CO_RETURN;
     }
 
-    // The one field this module owns on the way down: aim the put at the
-    // replica. Everything else in the caller's context (persistence level,
-    // target, preallocation) passes through to place the replica's blocks.
+    // Aim the put at the replica, and stamp it with the STORED form's
+    // transform flags (the get's OUT context reports them, replica-aware):
+    // the copy is byte-for-byte of whatever the primary stores, so a
+    // compressed primary yields a compressed — and therefore never
+    // fast-pathable — replica (issue #886 per-replica transform flags).
+    // Everything else in the caller's context (persistence level, target,
+    // preallocation) passes through to place the replica's blocks.
     Context put_ctx = context;
     put_ctx.replica_ = replica_idx;
+    put_ctx.transform_flags_ = get_task->context_.transform_flags_;
     auto put_task = cte->AsyncPutBlob(tag_id, blob_name, off, len, buf_ptr,
                                       put_score, put_ctx);
     CLIO_CO_AWAIT(put_task);

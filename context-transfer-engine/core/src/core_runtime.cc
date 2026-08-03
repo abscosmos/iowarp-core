@@ -1672,11 +1672,13 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // this blob. A first write to replica N creates it (and any lower
     // indices) lazily.
     int rep_target = task->context_.replica_;
-    if (rep_target == kCacheReplica) {
-      // Sentinel: THE cache replica — find-or-create the slot carrying
-      // REPLICA_CACHE (under the write token; the slot append is a
-      // replicas_ mutation).
-      rep_target = blob_info_ptr->CacheReplicaIndex(/*create=*/true);
+    if (rep_target == kCacheReplica || rep_target > 0) {
+      // Selector -> raw slot (under the write token; a slot append is a
+      // replicas_ mutation). kCacheReplica finds-or-creates the
+      // REPLICA_CACHE slot; N > 0 is the N-th NON-cache slot, so explicit
+      // replica numbering can never clobber the cache copy.
+      rep_target = blob_info_ptr->ResolveReplicaSel(rep_target,
+                                                    /*create=*/true);
     }
     if (rep_target > 0) {
       clio::run::u32 rep_result = 0;
@@ -2304,18 +2306,18 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // needs one concrete source, so kAllReplicas (a write-through selector)
     // and a replica that no write has created yet both fail cleanly here.
     int replica_sel = task->context_.replica_;
-    if (replica_sel == kCacheReplica) {
-      // Sentinel resolution for reads: an absent cache copy fails cleanly
-      // below, like any absent replica.
-      replica_sel = blob_info_ptr->CacheReplicaIndex(/*create=*/false);
+    if (replica_sel == kCacheReplica || replica_sel > 0) {
+      // Selector resolution for reads (kCacheReplica -> the REPLICA_CACHE
+      // slot, N > 0 -> the N-th non-cache slot): an absent selected copy
+      // fails cleanly here.
+      replica_sel = blob_info_ptr->ResolveReplicaSel(replica_sel,
+                                                     /*create=*/false);
       if (replica_sel == 0) {
         task->return_code_ = 1;
         CLIO_CO_RETURN;
       }
-    }
-    if (replica_sel < 0 ||
-        (replica_sel > 0 &&
-         blob_info_ptr->GetReplica(replica_sel, /*create=*/false) == nullptr)) {
+    } else if (replica_sel < 0) {
+      // kAllReplicas and friends: a read needs one concrete source.
       task->return_code_ = 1;
       CLIO_CO_RETURN;
     }
@@ -2898,6 +2900,14 @@ clio::run::TaskResume Runtime::ReorganizeReplicaInternal(
       CLIO_CO_RETURN;
     }
     BlobInfo &blob_info = *blob_info_ptr;
+
+    // Selector -> raw slot (N-th non-cache replica; the cache slot is only
+    // reachable via capacity eviction, never a caller's replica number).
+    replica_idx = blob_info.ResolveReplicaSel(replica_idx, /*create=*/false);
+    if (replica_idx == 0) {
+      rc = 3;  // Replica not found
+      CLIO_CO_RETURN;
+    }
 
     // Same serialization story as the primary flow: the whole move runs
     // under the blob's #680 write token, via the internal helpers — never
@@ -6898,10 +6908,10 @@ clio::run::TaskResume Runtime::GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask
     // REPLICA's size (issue #886) — the caching layer keys "is the DRAM copy
     // usable / how many bytes must a re-cache copy" off this.
     int size_sel = task->replica_;
-    if (size_sel == kCacheReplica) {
-      size_sel = blob_info_ptr->CacheReplicaIndex(/*create=*/false);
+    if (size_sel == kCacheReplica || size_sel > 0) {
+      size_sel = blob_info_ptr->ResolveReplicaSel(size_sel, /*create=*/false);
       if (size_sel == 0) {
-        task->return_code_ = 1;  // no cache replica
+        task->return_code_ = 1;  // selected replica absent
         CLIO_CO_RETURN;
       }
     }

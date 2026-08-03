@@ -77,6 +77,7 @@ class Client : public clio::run::ContainerClient {
    */
   bool AttachShmCache(clio::run::u64 root_off) {
     shm_root_ = nullptr;
+    shm_replica_serving_ = false;
     if (root_off == 0) {
       HLOG(kDebug, "[#783] AttachShmCache: root_off=0 (runtime not caching)");
       return false;  // runtime is not caching -- not an error
@@ -138,6 +139,15 @@ class Client : public clio::run::ContainerClient {
    * mirror is never stale) and a dropped primary is re-mirrored EMPTY, so
    * the fast path misses and falls back to the task path — which is the
    * interposer's replica-serving ladder.
+   *
+   * This binding ALSO enables serving-replica reads (the untransformed
+   * cache copy): for a stack-bound client the task path would run the
+   * whole interposer chain and hand back PRODUCER bytes, so raw replica
+   * bytes are the correct answer. A client bound directly to the mirrored
+   * pool keeps the core's stored-bytes contract (#818: GetBlob returns
+   * STORED bytes) and must never be short-cut onto a raw copy — the
+   * replication sweep reads through exactly such a client, and copying raw
+   * bytes as if they were the stored form corrupts every replica.
    */
   bool AttachShmCacheOf(const clio::run::PoolId &mirror_pool) {
     auto *ipc = CLIO_CPU_IPC;
@@ -148,7 +158,11 @@ class Client : public clio::run::ContainerClient {
     if (dir == nullptr) {
       return false;
     }
-    return AttachShmCache(dir->FindRoot(mirror_pool.ToU64()));
+    if (!AttachShmCache(dir->FindRoot(mirror_pool.ToU64()))) {
+      return false;
+    }
+    shm_replica_serving_ = (mirror_pool != pool_id_);
+    return true;
   }
 
   /** Convenience: attach from a completed CreateTask, falling back to the
@@ -223,7 +237,11 @@ class Client : public clio::run::ContainerClient {
     // read past them has no block to resolve against.
     const bool primary_ok =
         rec.IsDirectReadable() && offset + size <= rec.CoveredBytes();
-    const bool replica_ok = !primary_ok && rec.HasServableReplica() &&
+    // Serving-replica reads only for STACK-bound clients (AttachShmCacheOf):
+    // they alias the whole interposer chain, whose task path returns
+    // producer bytes. A direct core client keeps stored-bytes semantics.
+    const bool replica_ok = shm_replica_serving_ && !primary_ok &&
+                            rec.HasServableReplica() &&
                             offset + size <= rec.RepCoveredBytes();
     if (!primary_ok && !replica_ok) {
       return false;  // transformed/file/remote/GPU-tier and no serving replica
@@ -301,7 +319,9 @@ class Client : public clio::run::ContainerClient {
     const bool primary_view = rec.IsDirectReadable() && rec.num_blocks_ == 1 &&
                               (rec.flags_ & kShmBlobTruncated) == 0 &&
                               rec.total_size_ != 0;
-    const bool replica_view = !primary_view && rec.HasServableReplica() &&
+    // Stack-bound clients only, same rule as TryReadBlobShm above.
+    const bool replica_view = shm_replica_serving_ && !primary_view &&
+                              rec.HasServableReplica() &&
                               rec.rep_num_blocks_ == 1 &&
                               rec.rep_total_size_ != 0;
     if (!primary_view && !replica_view) {
@@ -2466,6 +2486,10 @@ class Client : public clio::run::ContainerClient {
   // owns the segment and may drop the cache at any time, which is why every
   // read is validated rather than trusted.
   ShmMetadataCacheRoot *shm_root_ = nullptr;
+  // True only when the mirror was attached via AttachShmCacheOf for a pool
+  // OTHER than this client's own (interposition binding): gates the
+  // serving-replica fast path (see AttachShmCacheOf).
+  bool shm_replica_serving_ = false;
 
   /** One attached RAM-bdev segment, cached so a hot read does not re-attach. */
   struct RamBdevMap {

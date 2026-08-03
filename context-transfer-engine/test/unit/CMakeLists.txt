@@ -1001,6 +1001,83 @@ set_tests_properties(
 )
 endif()  # full interposer stack
 
+# Cache chimod (issue #886 cache/replication split): cache(563) -> core(512)
+# under a plain core client — write-back semantics (ack before primary),
+# overwrite coalescing, SHM fast path served from the cache replica, and
+# miss + re-populate.
+if(TARGET clio_cte_cache_client)
+add_executable(test_cache_interpose test_cache_interpose.cc)
+target_include_directories(test_cache_interpose PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/cache/include
+)
+target_link_libraries(test_cache_interpose
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_cache_runtime
+    clio_cte_cache_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_cache_interpose
+    COMMAND test_cache_interpose)
+
+set_tests_properties(
+    cte_cache_interpose
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;cache;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # TARGET clio_cte_cache_client
+
+# Full 4-layer stack (issue #886 cache/replication split): cache(563) ->
+# compressor(562) -> replication(561) -> core(512). A compressed blob KEEPS
+# the SHM fast path via its raw cache replica; the persistent replica holds
+# the stored form marked transformed; evict + refill round-trips.
+if(TARGET clio_cte_cache_client AND TARGET clio_cte_compressor_client
+   AND TARGET clio_cte_replication_client)
+add_executable(test_cache_stack test_cache_stack.cc)
+target_include_directories(test_cache_stack PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/cache/include
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/replication/include
+)
+target_link_libraries(test_cache_stack
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_cache_runtime
+    clio_cte_cache_client
+    clio_cte_compressor_runtime
+    clio_cte_compressor_client
+    clio_cte_replication_runtime
+    clio_cte_replication_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_cache_stack
+    COMMAND test_cache_stack)
+
+set_tests_properties(
+    cte_cache_stack
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;cache;compressor;replicas;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # full 4-layer cache stack
+
 # Add score-driven eviction tests (Method::kEvict)
 add_test(NAME cte_evict
     COMMAND test_evict)

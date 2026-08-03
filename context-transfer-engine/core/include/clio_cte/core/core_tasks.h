@@ -1106,6 +1106,44 @@ struct BlobInfo {
     return static_cast<int>(replicas_.size());
   }
 
+  /**
+   * Resolve a Context::replica_ SELECTOR to a raw 1-based replicas_ index.
+   * kCacheReplica -> the REPLICA_CACHE slot (CacheReplicaIndex); N > 0 ->
+   * the N-th NON-cache slot. The cache copy is an internal slot addressed
+   * only via its sentinel, so explicit replica numbering (e.g. the
+   * replication chimod's fixed 1..N) must never land on it — whichever
+   * write created its slot first, "replica 1" and "the cache replica" are
+   * different copies (a raw index would silently clobber one with the
+   * other). Returns 0 when the selected slot is absent and !create. Raw
+   * indices already resolved (WAL records, snapshot entries, internal
+   * replicas_ walks) must NOT come back through here.
+   */
+  CTP_CROSS_FUN int ResolveReplicaSel(int sel, bool create) {
+    if (sel == kCacheReplica) {
+      return CacheReplicaIndex(create);
+    }
+    if (sel <= 0) {
+      return 0;
+    }
+    int seen = 0;
+    for (size_t i = 0; i < replicas_.size(); ++i) {
+      if (replicas_[i].flags_ & REPLICA_CACHE) {
+        continue;
+      }
+      if (++seen == sel) {
+        return static_cast<int>(i) + 1;
+      }
+    }
+    if (!create) {
+      return 0;
+    }
+    while (seen < sel) {
+      replicas_.push_back(Replica());
+      ++seen;
+    }
+    return static_cast<int>(replicas_.size());
+  }
+
   CTP_CROSS_FUN BlobInfo()
       : blob_name_(CLIO_PRIV_ALLOC),
         blocks_(CLIO_PRIV_ALLOC),
