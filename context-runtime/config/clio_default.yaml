@@ -174,12 +174,15 @@ compose:
   #   cache(563.0) -> [compressor(562.0) ->] replication(561.0) -> core(512.0)
   #
   # Point any clio::cte::core::Client (or the filesystem chimod below) at
-  # the TOP pool and the whole chain is transparent: a put lands raw in the
-  # node-local cache replica and is written back down (compressed, then
-  # replicated, then stored); a read serves from the raw cache copy — which
-  # also keeps the zero-IPC SHM fast path live even for compressed blobs —
-  # and falls through the chain on a miss. Order in this file matters: each
-  # entry must come AFTER the entry its next_pool_id names.
+  # the TOP pool and the whole chain is transparent: a put writes through
+  # the chain (compressed, then replicated, then stored — the AUTHORITATIVE
+  # copy lands before the ack) and updates the raw node-local cache copy
+  # with it; a read serves from the raw cache copy — which also keeps the
+  # zero-IPC SHM fast path live even for compressed blobs — and falls
+  # through the chain on a miss (fetching from the blob's owner node and
+  # re-populating the local copy, coherently: the owner's next write
+  # invalidates it). Order in this file matters: each entry must come AFTER
+  # the entry its next_pool_id names.
 
   # === Replication (persistent copies, issue #886) ===
   # Reliability layer: every default put writes through to a fixed set of
