@@ -1473,13 +1473,51 @@ clio::run::TaskResume Runtime::GetBlobSize(
 clio::run::TaskResume Runtime::MultiPutBlob(
     clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  // Forwarded verbatim: batch records carry no per-record Context, so
-  // compression is not requestable on this path — the batch executes on the
-  // next pool exactly as the core would (records stay raw). Interposing the
-  // method (rather than falling to the generic default) documents that
-  // choice and keeps a hook point for a future per-record descriptor rev.
-  CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
-                         task.template Cast<clio::run::Task>()));
+  // Batches carry a batch-wide Context (issue #886 follow-up) and get
+  // SCALAR-EQUIVALENT semantics. No codec requested (or replica-addressed /
+  // emulated): forward the batch intact — the chain below executes every
+  // record with this context, records stay raw, amortization preserved.
+  if (task->context_.replica_ != 0 || task->context_.compress_lib_ <= 0 ||
+      task->context_.emulate_) {
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
+                           task.template Cast<clio::run::Task>()));
+    CLIO_CO_RETURN;
+  }
+  // Codec requested: records transform INDIVIDUALLY (some compress, some
+  // stay raw — not-beneficial or offset writes), so one shared batch cannot
+  // describe the results. Decompose through OUR scalar handler, which
+  // applies the exact scalar rules per record.
+  task->num_ok_ = 0;
+  task->first_rc_ = 0;
+  {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    clio::cte::core::MultiPutBatchView batch;
+    if (!clio::cte::core::MultiPutBatchView::Attach(*task, &batch)) {
+      task->SetReturnCode(batch.descs_.empty() ? 0 : 1);
+      CLIO_CO_RETURN;
+    }
+    for (size_t bi = 0; bi < batch.size(); ++bi) {
+      const auto &d = batch.descs_[bi];
+      if (!batch.RecordValid(bi)) {
+        if (task->first_rc_ == 0) task->first_rc_ = 2;
+        continue;
+      }
+      auto sub = ipc_manager->NewTask<clio::cte::core::PutBlobTask>(
+          clio::run::CreateTaskId(), task->pool_id_,
+          clio::run::PoolQuery::Local(), d.tag_id_, d.blob_name_, d.offset_,
+          d.size_, batch.RecordSlice(bi), /*score=*/-1.0f, task->context_,
+          /*flags=*/0);
+      sub.get()->BeginRunContext();
+      CLIO_CO_AWAIT(PutBlob(sub));
+      int rc = sub->GetReturnCode();
+      if (rc == 0) {
+        task->num_ok_++;
+      } else if (task->first_rc_ == 0) {
+        task->first_rc_ = rc;
+      }
+    }
+  }
+  task->SetReturnCode(task->first_rc_ == 0 ? 0 : task->first_rc_);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

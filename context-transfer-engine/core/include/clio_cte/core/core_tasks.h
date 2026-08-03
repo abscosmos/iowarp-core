@@ -2437,6 +2437,13 @@ struct MultiPutBlobTask : public clio::run::Task {
   IN ctp::ipc::ShmPtr<> data_;               // all payloads, one staging
   IN clio::run::u64 data_len_;
   IN clio::run::priv::string descs_;         // serialized vector<MultiPutDesc>
+  /** Batch-wide put context, applied to EVERY record's nested put — a batch
+   *  must be able to express everything a scalar put can (replica
+   *  addressing, transform flags, persistence, score floors) or the
+   *  interposition chain cannot give batches scalar-equivalent semantics
+   *  (issue #886: batched puts silently bypassed the cache layer). Records
+   *  needing DIFFERENT contexts belong in different batches. */
+  IN Context context_;
   OUT clio::run::u32 num_ok_;
   OUT int first_rc_;                         // first nonzero put rc (0 = all ok)
 
@@ -2452,13 +2459,15 @@ struct MultiPutBlobTask : public clio::run::Task {
       const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
       const clio::run::PoolQuery &pool_query, const TagId &route_tag_id,
       const std::string &route_blob, ctp::ipc::ShmPtr<> data,
-      clio::run::u64 data_len, const std::string &descs)
+      clio::run::u64 data_len, const std::string &descs,
+      const Context &context = Context())
       : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiPutBlob),
         route_tag_id_(route_tag_id),
         route_blob_(CLIO_PRIV_ALLOC, route_blob),
         data_(data),
         data_len_(data_len),
         descs_(CLIO_PRIV_ALLOC, descs),
+        context_(context),
         num_ok_(0),
         first_rc_(0) {
     task_id_ = task_id;
@@ -2482,7 +2491,7 @@ struct MultiPutBlobTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(route_tag_id_, route_blob_, data_, data_len_, descs_);
+    ar(route_tag_id_, route_blob_, data_, data_len_, descs_, context_);
   }
 
   template <typename Archive>
@@ -2498,6 +2507,7 @@ struct MultiPutBlobTask : public clio::run::Task {
     data_ = other->data_;
     data_len_ = other->data_len_;
     descs_ = other->descs_;
+    context_ = other->context_;
     num_ok_ = other->num_ok_;
     first_rc_ = other->first_rc_;
   }

@@ -506,6 +506,14 @@ clio::run::TaskResume Runtime::GetBlob(
 clio::run::TaskResume Runtime::MultiPutBlob(
     clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  // Explicit replica addressing passes through untouched (same gate as the
+  // scalar PutBlob): e.g. the cache layer's kCacheReplica-aimed batches are
+  // internal replica writes, not primary puts to replicate.
+  if (task->context_.replica_ != 0) {
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
+                           task.template Cast<clio::run::Task>()));
+    CLIO_CO_RETURN;
+  }
   // Primary batch on the core, verbatim (zero-copy slices, one completion).
   CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
                          task.template Cast<clio::run::Task>()));
@@ -533,11 +541,17 @@ clio::run::TaskResume Runtime::MultiPutBlob(
         }
         ctp::ipc::ShmPtr<> slice = batch.RecordSlice(d);
         for (int r = 1; r <= config_.num_replicas_; ++r) {
-          Context rep_ctx;
+          // Same context derivation as the scalar sync path: the batch
+          // context passes through (persistence, preallocation, transform)
+          // with only the replica addressing overridden.
+          Context rep_ctx = task->context_;
           rep_ctx.replica_ = r;
-          rep_ctx.replica_flags_ = clio::cte::core::REPLICA_FIXED |
+          rep_ctx.replica_flags_ = task->context_.replica_flags_ |
+                                   clio::cte::core::REPLICA_FIXED |
                                    clio::cte::core::REPLICA_PERSISTENT;
-          rep_ctx.min_persistence_level_ = 1;
+          if (rep_ctx.min_persistence_level_ < 1) {
+            rep_ctx.min_persistence_level_ = 1;
+          }
           auto put = cte->AsyncPutBlob(desc.tag_id_, desc.blob_name_,
                                        desc.offset_, desc.size_, slice,
                                        config_.replica_score_, rep_ctx);

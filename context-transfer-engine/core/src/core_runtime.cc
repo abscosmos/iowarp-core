@@ -3646,10 +3646,13 @@ clio::run::TaskResume Runtime::MultiPutBlob(
     // put's bdev write reads it directly (same contract as the private put's
     // co-located zero-copy path).
     ctp::ipc::ShmPtr<> slice = batch.RecordSlice(bi);
+    // The batch context applies to every record's nested put (replica
+    // addressing, transform flags, persistence, score floors) — batches have
+    // scalar-equivalent semantics, they are not context-less writes.
     auto sub = ipc_manager->NewTask<PutBlobTask>(
         clio::run::CreateTaskId(), task->pool_id_,
         clio::run::PoolQuery::Local(), d.tag_id_, d.blob_name_, d.offset_,
-        d.size_, slice, /*score=*/-1.0f, Context(), /*flags=*/0);
+        d.size_, slice, /*score=*/-1.0f, task->context_, /*flags=*/0);
     sub.get()->BeginRunContext();
     CLIO_CO_AWAIT(PutBlob(sub));
     int rc = sub->GetReturnCode();

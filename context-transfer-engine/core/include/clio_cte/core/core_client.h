@@ -1319,14 +1319,15 @@ class Client : public clio::run::ContainerClient {
   clio::run::Future<MultiPutBlobTask> AsyncMultiPutVectored(
       ctp::ipc::ShmPtr<> data, clio::run::u64 data_len,
       const std::vector<MultiPutDesc> &descs,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local(),
+      const Context &context = Context()) {
     auto *ipc_manager = CLIO_CPU_IPC;
     std::string packed = EncodeMultiPutDescs(descs);
     TagId rt = descs.empty() ? TagId::GetNull() : descs.front().tag_id_;
     const std::string rb = descs.empty() ? std::string() : descs.front().blob_name_;
     auto task = ipc_manager->NewTask<MultiPutBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, rt, rb, data,
-        data_len, packed);
+        data_len, packed, context);
     if (CLIO_RUNTIME_MANAGER->IsRuntime()) {
       // One shared object; flag must be set before Send (see PutBlob staging).
       task.get()->SetFlags(TASK_DATA_OWNER);

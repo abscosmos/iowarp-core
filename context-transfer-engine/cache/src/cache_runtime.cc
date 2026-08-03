@@ -14,6 +14,29 @@ namespace clio::cte::cache {
 /** Chunk size for cache <-> chain copies (flush and re-populate). */
 static constexpr clio::run::u64 kCacheChunkBytes = 4ULL * 1024 * 1024;
 
+/** Write-back flush re-batching (issue #886 follow-up): small dirty blobs
+ *  ship down the chain as MultiPutBlob batches — one task per batch instead
+ *  of a get+put pair per blob — mirroring the client defer pipeline's
+ *  constants (64 records / 128KB chunk; anything bigger flushes scalar,
+ *  the same large-value rule the client applies). */
+static constexpr size_t kFlushBatchMax = 64;
+static constexpr clio::run::u64 kFlushBatchBytes = 128ULL * 1024;
+
+/** True when a remembered put context carries no semantics beyond what a
+ *  batch-wide context can express for a MERGED batch — i.e. every field
+ *  that steers the downstream chain is at its default. Entries with richer
+ *  contexts flush scalar; correctness first, amortization second. */
+static bool BatchableContext(const clio::cte::core::Context &ctx) {
+  const clio::cte::core::Context def;
+  return ctx.replica_ == 0 && ctx.replica_flags_ == 0 &&
+         ctx.replica_min_score_ < 0.0f && ctx.transform_flags_ == 0 &&
+         ctx.dynamic_compress_ == def.dynamic_compress_ &&
+         ctx.compress_lib_ == def.compress_lib_ &&
+         ctx.min_persistence_level_ == def.min_persistence_level_ &&
+         ctx.persistence_target_ == def.persistence_target_ &&
+         ctx.preallocate_ == def.preallocate_ && !ctx.emulate_;
+}
+
 static std::string DirtyKey(const clio::cte::core::TagId &tag_id,
                             const std::string &blob_name) {
   return std::to_string(tag_id.major_) + "." + std::to_string(tag_id.minor_) +
@@ -157,18 +180,118 @@ clio::run::TaskResume Runtime::FlushSweep(
       std::lock_guard<std::mutex> lk(dirty_mtx_);
       batch.swap(dirty_);
     }
+    auto *next = GetNextClient();
+
+    // Pass 1: size every entry (cache-replica raw size == bytes to flush)
+    // and split scalar-vs-batchable. Blobs whose cache copy vanished are
+    // done; rich contexts and large blobs flush scalar; the rest re-batch.
+    std::vector<DirtyEntry> scalars;
+    std::vector<std::pair<DirtyEntry, clio::run::u64>> small;
     for (auto it = batch.begin(); it != batch.end(); ++it) {
-      clio::run::u32 rc = 0;
-      CLIO_CO_AWAIT(FlushOne(it->second, rc));
-      if (rc == 0 || rc == 1) {
-        // Flushed, or the blob/cache copy is gone — either way, done.
-        if (rc == 0) {
-          task->blobs_flushed_++;
-        }
+      auto sz = next->AsyncGetBlobSize(it->second.tag_id_,
+                                       it->second.blob_name_,
+                                       clio::run::PoolQuery::Local(),
+                                       clio::cte::core::kCacheReplica);
+      CLIO_CO_AWAIT(sz);
+      if (sz->GetReturnCode() != 0 || sz->size_ == 0) {
+        continue;  // blob or cache copy gone — nothing to flush
+      }
+      if (!BatchableContext(it->second.context_) ||
+          sz->size_ > kFlushBatchBytes) {
+        scalars.push_back(it->second);
       } else {
-        // Keep dirty for the next period (best-effort, periodic).
+        small.emplace_back(it->second, sz->size_);
+      }
+    }
+
+    for (size_t i = 0; i < scalars.size(); ++i) {
+      clio::run::u32 rc = 0;
+      CLIO_CO_AWAIT(FlushOne(scalars[i], rc));
+      if (rc == 0) {
+        task->blobs_flushed_++;
+      } else if (rc != 1) {
+        // Keep dirty for the next period (best-effort, periodic). emplace
+        // never overwrites — a NEWER re-dirtied entry wins.
         std::lock_guard<std::mutex> lk(dirty_mtx_);
-        dirty_.emplace(it->first, it->second);
+        dirty_.emplace(DirtyKey(scalars[i].tag_id_, scalars[i].blob_name_),
+                       scalars[i]);
+      }
+    }
+
+    // Pass 2: pack small entries into MultiPutBlob batches — read each raw
+    // copy straight into the staging chunk, ship one task per chunk. The
+    // chunk's ownership transfers to the task (TASK_DATA_OWNER inside
+    // AsyncMultiPutVectored), so each shipped batch gets a fresh chunk.
+    size_t gi = 0;
+    while (gi < small.size()) {
+      auto chunk = CLIO_IPC->AllocateBuffer(kFlushBatchBytes);
+      if (chunk.IsNull()) {
+        // No staging memory: fall back to scalar for the remainder.
+        for (; gi < small.size(); ++gi) {
+          clio::run::u32 rc = 0;
+          CLIO_CO_AWAIT(FlushOne(small[gi].first, rc));
+          if (rc == 0) {
+            task->blobs_flushed_++;
+          } else if (rc != 1) {
+            std::lock_guard<std::mutex> lk(dirty_mtx_);
+            dirty_.emplace(DirtyKey(small[gi].first.tag_id_,
+                                    small[gi].first.blob_name_),
+                           small[gi].first);
+          }
+        }
+        break;
+      }
+      std::vector<clio::cte::core::MultiPutDesc> descs;
+      std::vector<size_t> members;  // indices into `small` in this batch
+      clio::run::u64 used = 0;
+      while (gi < small.size() && descs.size() < kFlushBatchMax &&
+             used + small[gi].second <= kFlushBatchBytes) {
+        const DirtyEntry &e = small[gi].first;
+        const clio::run::u64 len = small[gi].second;
+        Context get_ctx;
+        get_ctx.replica_ = clio::cte::core::kCacheReplica;
+        auto get = next->AsyncGetBlob(
+            e.tag_id_, e.blob_name_, 0, len, /*flags=*/0,
+            ctp::ipc::ShmPtr<>::FromRaw(chunk.ptr_ + used),
+            clio::run::PoolQuery::Local(), get_ctx);
+        CLIO_CO_AWAIT(get);
+        if (get->GetReturnCode() != 0) {
+          // Raced away between sizing and reading — requeue, next period
+          // re-sizes it.
+          std::lock_guard<std::mutex> lk(dirty_mtx_);
+          dirty_.emplace(DirtyKey(e.tag_id_, e.blob_name_), e);
+          ++gi;
+          continue;
+        }
+        clio::cte::core::MultiPutDesc d;
+        d.tag_id_ = e.tag_id_;
+        d.blob_name_ = e.blob_name_;
+        d.offset_ = 0;
+        d.size_ = len;
+        d.payload_off_ = used;
+        descs.push_back(std::move(d));
+        members.push_back(gi);
+        used += len;
+        ++gi;
+      }
+      if (descs.empty()) {
+        CLIO_IPC->FreeBuffer(chunk);
+        continue;
+      }
+      Context put_ctx = small[members.front()].first.context_;
+      put_ctx.replica_ = 0;
+      auto ship = next->AsyncMultiPutVectored(
+          chunk.shm_.template Cast<void>(), used, descs,
+          clio::run::PoolQuery::Local(), put_ctx);
+      CLIO_CO_AWAIT(ship);
+      if (ship->GetReturnCode() == 0 && ship->first_rc_ == 0) {
+        task->blobs_flushed_ += descs.size();
+      } else {
+        for (size_t m = 0; m < members.size(); ++m) {
+          const DirtyEntry &e = small[members[m]].first;
+          std::lock_guard<std::mutex> lk(dirty_mtx_);
+          dirty_.emplace(DirtyKey(e.tag_id_, e.blob_name_), e);
+        }
       }
     }
   }
@@ -368,11 +491,56 @@ clio::run::TaskResume Runtime::GetBlobSize(
 clio::run::TaskResume Runtime::MultiPutBlob(
     clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  // Batches forward down verbatim (write-through): batch records carry no
-  // per-record Context to remember for a write-back flush, and the chain
-  // below already executes them with the core's exact semantics.
-  CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
-                         task.template Cast<clio::run::Task>()));
+  // Batches get SCALAR-EQUIVALENT semantics (issue #886 follow-up): the
+  // batch context applies to every record, so the whole batch is first
+  // re-aimed at the cache replica slots — one forwarded task writes every
+  // record's raw copy — then acked and marked dirty for the write-back
+  // sweep (which re-batches on the way down). Batching is never "passed
+  // on": a batched put and a scalar put leave identical state behind.
+  if (task->context_.replica_ != 0) {
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
+                           task.template Cast<clio::run::Task>()));
+    CLIO_CO_RETURN;
+  }
+  {
+    const Context orig_ctx = task->context_;
+    task->context_.replica_ = clio::cte::core::kCacheReplica;
+    task->context_.replica_flags_ =
+        orig_ctx.replica_flags_ | clio::cte::core::REPLICA_CACHE;
+    task->context_.replica_min_score_ = config_.min_score_;
+    task->context_.transform_flags_ = 0;
+    task->context_.min_persistence_level_ = 0;
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
+                           task.template Cast<clio::run::Task>()));
+    const clio::run::u32 cache_rc = task->GetReturnCode();
+    task->context_ = orig_ctx;
+    if (cache_rc != 0) {
+      HLOG(kWarning, "cache: batch cache-replica write failed rc={}, "
+           "pass-through", cache_rc);
+      task->num_ok_ = 0;
+      task->first_rc_ = 0;
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
+                             task.template Cast<clio::run::Task>()));
+      CLIO_CO_RETURN;
+    }
+    if (config_.flush_period_ms_ > 0) {
+      // Write-back: every record dirty under the batch's context; overwrites
+      // coalesce per blob (latest wins), exactly like the scalar path.
+      const std::vector<clio::cte::core::MultiPutDesc> descs =
+          clio::cte::core::DecodeMultiPutDescs(task->descs_);
+      for (size_t i = 0; i < descs.size(); ++i) {
+        EnqueueFlush(descs[i].tag_id_, descs[i].blob_name_, orig_ctx,
+                     /*score=*/-1.0f);
+      }
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+    // Write-through: push the original batch down before acking.
+    task->num_ok_ = 0;
+    task->first_rc_ = 0;
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
+                           task.template Cast<clio::run::Task>()));
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

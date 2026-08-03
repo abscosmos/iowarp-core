@@ -299,6 +299,65 @@ TEST_CASE("CacheInterpose - write-back cache over core",
     // The miss re-populated the REPLICA_CACHE slot.
     REQUIRE(WaitCacheReplicaSize(core, tag_id, "miss_blob", kValSize));
   }
+
+  // ======================================================================
+  // 4. BATCHED puts get SCALAR-EQUIVALENT semantics (issue #886 follow-up):
+  //    one MultiPutBlob through the cache writes EVERY record's raw cache
+  //    replica before the ack, the SHM fast path serves each record in the
+  //    pre-flush window, and the batched write-back flush materializes
+  //    every primary with the right bytes.
+  // ======================================================================
+  {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    constexpr size_t kRecords = 8;
+    constexpr clio::run::u64 kRecSize = 4096;
+    std::vector<std::string> vals;
+    ctp::ipc::FullPtr<char> staging =
+        ipc_manager->AllocateBuffer(kRecords * kRecSize);
+    REQUIRE(!staging.IsNull());
+    std::vector<clio::cte::core::MultiPutDesc> descs(kRecords);
+    for (size_t i = 0; i < kRecords; ++i) {
+      vals.push_back(Payload(kRecSize, static_cast<char>('e' + i)));
+      std::memcpy(staging.ptr_ + i * kRecSize, vals[i].data(), kRecSize);
+      descs[i].tag_id_ = tag_id;
+      descs[i].blob_name_ = "batch_blob_" + std::to_string(i);
+      descs[i].size_ = kRecSize;
+      descs[i].payload_off_ = i * kRecSize;
+    }
+    auto fut = cache_io.AsyncMultiPutVectored(
+        ctp::ipc::ShmPtr<>(staging.shm_), kRecords * kRecSize, descs);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+
+    for (size_t i = 0; i < kRecords; ++i) {
+      const std::string name = "batch_blob_" + std::to_string(i);
+      // Raw cache replica exists NOW, before any flush.
+      auto rsz = core->AsyncGetBlobSize(tag_id, name,
+                                        clio::run::PoolQuery::Dynamic(),
+                                        clio::cte::core::kCacheReplica);
+      rsz.Wait();
+      REQUIRE(rsz->GetReturnCode() == 0);
+      REQUIRE(rsz->size_ == kRecSize);
+      // Zero-IPC fast path serves the record from its cache replica.
+      const char *view = nullptr;
+      clio::run::u64 view_size = 0, gen = 0;
+      REQUIRE(shm_io.TryGetBlobViewShm(tag_id, name, &view, &view_size,
+                                       &gen));
+      REQUIRE(view_size == kRecSize);
+      REQUIRE(std::memcmp(view, vals[i].data(), kRecSize) == 0);
+    }
+    // The (re-batched) flush lands every primary with the right bytes.
+    for (size_t i = 0; i < kRecords; ++i) {
+      const std::string name = "batch_blob_" + std::to_string(i);
+      REQUIRE(WaitPrimarySize(core, tag_id, name, kRecSize));
+      std::vector<char> got(kRecSize, 0);
+      auto g = core->AsyncGetBlob(tag_id, name, 0, kRecSize, /*flags=*/0,
+                                  got.data());
+      g.Wait();
+      REQUIRE(g->GetReturnCode() == 0);
+      REQUIRE(std::memcmp(got.data(), vals[i].data(), kRecSize) == 0);
+    }
+  }
 }
 
 SIMPLE_TEST_MAIN()
