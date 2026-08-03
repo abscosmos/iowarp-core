@@ -1850,12 +1850,11 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
     }
 
-#if CTP_ENABLE_COMPRESS
     // Update compression metadata (provenance/telemetry; see BlobInfo).
+    // Unconditional like the fields themselves (unified Context layout).
     blob_info_ptr->compress_lib_ = context.compress_lib_;
     blob_info_ptr->compress_preset_ = context.compress_preset_;
     blob_info_ptr->trace_key_ = context.trace_key_;
-#endif
 
     // Update tag size
     clio::run::u64 new_blob_size = blob_info_ptr->GetTotalSize();

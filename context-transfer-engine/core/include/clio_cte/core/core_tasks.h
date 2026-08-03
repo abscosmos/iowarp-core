@@ -1425,7 +1425,16 @@ struct Context {
   // OUTSIDE the #if below, same reason as above.
   clio::run::u32 replica_flags_;
 
-#if CTP_ENABLE_COMPRESS
+  // ---- Compression / tracing controls and stats -------------------------
+  // UNCONDITIONAL by design (issue #886 unified API): these fields exist in
+  // EVERY build so Context — and with it every Put/Get task — has exactly
+  // ONE layout and ONE wire format across core, replication, compressor,
+  // clients and tools, regardless of CTP_ENABLE_COMPRESS. That flag gates
+  // codec CODE (the compression factory, the compressor module), never
+  // structure: a layout that depends on a compile flag is a standing
+  // ABI-skew hazard (two of these bit this tree already — see the
+  // transform_flags_ note above and blob_transform.h). A build without
+  // codecs simply carries zeroed fields.
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
   int compress_lib_;      // The compression library to apply (0-10)
   int compress_preset_;   // Compression preset: 1=FAST, 2=BALANCED, 3=BEST
@@ -1449,7 +1458,6 @@ struct Context {
                                      // (original/compressed)
   double actual_compress_time_ms_;   // Actual compression time in milliseconds
   double actual_psnr_db_;  // Actual PSNR for lossy compression (0 if lossless)
-#endif
 
   CTP_CROSS_FUN Context()
       : persistence_target_(-1),
@@ -1459,9 +1467,7 @@ struct Context {
         emulated_time_ns_(0),
         transform_flags_(kBlobTransformNone),
         replica_(0),
-        replica_flags_(0)
-#if CTP_ENABLE_COMPRESS
-        ,
+        replica_flags_(0),
         dynamic_compress_(0),
         compress_lib_(0),
         compress_preset_(2),
@@ -1477,23 +1483,21 @@ struct Context {
         actual_compressed_size_(0),
         actual_compression_ratio_(1.0),
         actual_compress_time_ms_(0.0),
-        actual_psnr_db_(0.0)
-#endif
-  {
+        actual_psnr_db_(0.0) {
   }
 
   template <class Archive>
   CTP_CROSS_FUN void serialize(Archive &ar) {
+    // ONE unconditional range = ONE wire format in every build (see the
+    // field-block comment above).
     ar.range(persistence_target_, min_persistence_level_, preallocate_,
              emulate_, emulated_time_ns_, transform_flags_, replica_,
-             replica_flags_);
-#if CTP_ENABLE_COMPRESS
-    ar.range(dynamic_compress_, compress_lib_, compress_preset_, target_psnr_,
-             psnr_chance_, max_performance_, consumer_node_, data_type_,
-             trace_, trace_key_, trace_node_, actual_original_size_,
-             actual_compressed_size_, actual_compression_ratio_,
-             actual_compress_time_ms_, actual_psnr_db_);
-#endif
+             replica_flags_, dynamic_compress_, compress_lib_,
+             compress_preset_, target_psnr_, psnr_chance_, max_performance_,
+             consumer_node_, data_type_, trace_, trace_key_, trace_node_,
+             actual_original_size_, actual_compressed_size_,
+             actual_compression_ratio_, actual_compress_time_ms_,
+             actual_psnr_db_);
   }
 
   CTP_CROSS_FUN static Context Preallocate(clio::run::u64 size) {
