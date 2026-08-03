@@ -1175,6 +1175,10 @@ else()
     # file ("nvcc fatal : A single input file is required ...").
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/FS>)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/FS>)
+    # Template/coroutine-heavy TUs (core_runtime.cc) exceed the COFF 65k
+    # section limit at default settings (C1128); raise it everywhere.
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/bigobj>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     # CUDA 13.x CCCL headers (cuda/std/*) require MSVC's conformant
     # preprocessor and #error out on the traditional one. Enable it for the
     # CUDA host compile only, so the existing CXX build is unaffected.
