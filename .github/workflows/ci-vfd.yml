@@ -56,16 +56,32 @@ jobs:
               # Locate the native HDF5 CLI tools (h5dump/h5ls/h5repack/h5diff)
               # used by the in-test native-compat matrix. Their location varies
               # across deps-cpu image revisions, so discover rather than assume:
-              # add wherever h5dump lives to PATH. If they are genuinely absent
-              # the matrix skips (the in-process sec2 differential still proves
-              # native readability) -- this must NOT fail the job.
+              # add wherever h5dump lives to PATH.
+              #
+              # Absence is a HARD FAILURE here, deliberately. This used to warn
+              # and continue, on the reasoning that the in-process sec2
+              # differential still proves native readability. It does not prove
+              # the same thing: the tool matrix is the only check that an
+              # EXTERNAL reader -- one that never loads the driver -- can read
+              # the file, which is the whole native-compatibility claim
+              # (§1.1(c)). deps-cpu ships these tools, so "not found" means the
+              # image regressed, and the correct response is a red job, not a
+              # green one with the load-bearing evidence quietly skipped.
+              # A developer running locally still gets the skip: the switch
+              # below is what makes the tests strict, and only CI sets it.
               h5bin="$(command -v h5dump 2>/dev/null || find /usr/local /opt /usr -name h5dump -type f 2>/dev/null | head -1)"
-              if [ -n "$h5bin" ]; then
-                export PATH="$(dirname "$h5bin"):$PATH"
-                echo "== native HDF5 tools: $(command -v h5dump) =="
-              else
-                echo "::warning::native HDF5 CLI tools not found in the image; the in-test tool matrix will skip (native readability is still covered in-process by the sec2 differential)"
+              if [ -z "$h5bin" ]; then
+                echo "::error::native HDF5 CLI tools not found in the image; the native-compat tool matrix cannot run. deps-cpu is expected to ship h5dump/h5ls/h5repack/h5diff."
+                exit 1
               fi
+              export PATH="$(dirname "$h5bin"):$PATH"
+              echo "== native HDF5 tools: $(command -v h5dump) =="
+              for t in h5dump h5ls h5repack h5diff; do
+                command -v "$t" >/dev/null 2>&1 || {
+                  echo "::error::required HDF5 tool missing: $t"; exit 1; }
+              done
+              # Turn every "tool absent -> skip" in the VFD suite into a failure.
+              export CLIO_REQUIRE_HDF5_TOOLS=1
               # Flags mirror the `vfd` CMake preset (ELF + POSIX/STDIO/VFD),
               # VFD-only (no VOL/fuse/adios). LOG_LEVEL=1 to keep CI logs sane.
               cmake -B build-vfd \

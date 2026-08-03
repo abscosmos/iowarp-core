@@ -133,30 +133,57 @@ install(
 )
 
 # ---------------------------------------------------------------------------
-# Differential VOL compatibility suite (Python). Native VOL is the oracle;
-# each feature case is written/read through the clio VOL and compared to
-# native, plus h5diff/h5dump. Unlike the C++ unit tests above, this exercises
-# real data round-trips end to end and REQUIRES a running clio_run — the suite
-# starts/stops its own (pkill + start), so it must run alone (RUN_SERIAL).
+# Differential HDF5 compatibility suite (Python). The NATIVE stack is the
+# oracle; each feature case is written/read through a clio connector and
+# compared to native, plus the §1.1 native-compatibility gates (h5diff,
+# h5clear+reopen structural validity, and h5dump/h5ls/h5stat output parity).
+# Unlike the C++ unit tests above, this exercises real data round-trips end to
+# end and REQUIRES a running clio_run — the suite starts/stops its own
+# (pkill + start), so it must run alone (RUN_SERIAL).
 #
-# Runs in HONEST mode (no --expect-fail allowlist): it reports the VOL's real
-# compatibility state rather than masking gaps, so any future regression fails the
-# test. Run it for the authoritative, always-current status; do not rely on numbers
-# copied into comments/prose.
+# ONE harness, TWO connectors, but TWO test registrations rather than one run
+# with --modes vol,vfd. The connectors fail for unrelated reasons and are owned
+# as separate deliverables; a single test would attribute a VFD regression to
+# the VOL on the dashboard and would make one connector's failure hide the
+# other's result. Each registration also gets its own results JSON.
+#
+# Both report the real compatibility state rather than masking gaps, so any
+# future regression fails the test. Run them for the authoritative,
+# always-current status; do not rely on numbers copied into comments/prose.
+#
+# The VFD arm carries NO --expect-fail at all. The VOL arm carries exactly ONE
+# entry, named individually and justified below -- not a blanket allowlist. The
+# suite reports an expected-gap entry that starts PASSING, so the allowlist
+# cannot quietly outlive the gap it excuses.
 #
 # Finding Python3 is necessary but NOT sufficient: the suite is a differential
 # test against a native HDF5 stack and also needs the h5py module plus the HDF5
-# CLI tools (h5diff/h5dump/h5ls/h5cc). Those are absent on some CDash builders
-# (e.g. macmini-m1). Rather than gate registration on every dependency here, the
-# suite self-detects a missing toolchain and exits SKIP_RETURN_CODE, so CDash
-# shows it as "Not Run" instead of a wall of false failures.
+# CLI tools (h5diff/h5dump/h5ls/h5stat/h5clear/h5cc). Those are absent on some
+# CDash builders (e.g. macmini-m1). Rather than gate registration on every
+# dependency here, the suite self-detects a missing toolchain and exits
+# SKIP_RETURN_CODE, so CDash shows it as "Not Run" instead of a wall of false
+# failures. CI, where the toolchain IS guaranteed, additionally asserts that the
+# suite did not take the skip path — see ci-adapters.yml.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_FOUND)
+    # Name kept as-is: CDash history and ci-adapters.yml both key on it.
     add_test(NAME cte_hdf5_vol_compat_suite
         COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_SOURCE_DIR}/benchmarks/hdf5-ingest/vol_compat_suite.py
+            ${CMAKE_SOURCE_DIR}/benchmarks/hdf5-ingest/hdf5_compat_suite.py
+            --modes vol
             --bin $<TARGET_FILE_DIR:clio_hdf5_vol>
             --out ${CMAKE_CURRENT_BINARY_DIR}/vol_compat_results.json
+            # KNOWN-OPEN GAP, not a regression. With the cache ON, a file
+            # damaged on disk after being read once is served from the staged
+            # copy, so the read SUCCEEDS where native fails its fletcher32
+            # check -- the cache masking the file's own error. This is
+            # external-modification staleness, documented in
+            # adapter/hdf5_vol/README.md; the connector has no invalidation
+            # signal for a change made behind HDF5's back. The same case with
+            # the cache OFF passes, and the VFD passes it in both settings
+            # (its cache is populate-only, so it has nothing to answer from).
+            # Remove this line if/when staleness detection lands.
+            --expect-fail vol/eparity_cacheon/corrupt_checksum_read
     )
     set_tests_properties(cte_hdf5_vol_compat_suite PROPERTIES
         TIMEOUT 900
@@ -166,6 +193,28 @@ if(Python3_FOUND)
         LABELS "integration;adapter;hdf5_vol;compat;cte"
         ENVIRONMENT "CLIO_HOME_DIR=$ENV{HOME};LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
     )
+
+    # The VFD arm over the same corpus. The clio_vfd target lives in the vfd
+    # adapter directory; guard on it so this only registers where it is built.
+    if(TARGET clio_vfd)
+        add_test(NAME cte_hdf5_vfd_compat_suite
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_SOURCE_DIR}/benchmarks/hdf5-ingest/hdf5_compat_suite.py
+                --modes vfd
+                --bin $<TARGET_FILE_DIR:clio_vfd>
+                --out ${CMAKE_CURRENT_BINARY_DIR}/vfd_compat_results.json
+        )
+        set_tests_properties(cte_hdf5_vfd_compat_suite PROPERTIES
+            TIMEOUT 900
+            RUN_SERIAL TRUE
+            RESOURCE_LOCK "clio_runtime"
+            SKIP_RETURN_CODE 125
+            LABELS "integration;adapter;hdf5_vfd;compat;cte"
+            ENVIRONMENT "CLIO_HOME_DIR=$ENV{HOME};LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+        )
+    else()
+        message(STATUS "hdf5_vol: clio_vfd target absent — skipping VFD compat suite test")
+    endif()
 else()
-    message(STATUS "hdf5_vol: Python3 not found — skipping VOL compat suite test")
+    message(STATUS "hdf5_vol: Python3 not found — skipping HDF5 compat suite tests")
 endif()
