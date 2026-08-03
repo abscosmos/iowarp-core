@@ -212,22 +212,31 @@ class Client : public clio::run::ContainerClient {
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
       return false;
     }
-    if (!rec.IsDirectReadable()) {
-      return false;  // file/remote/GPU-tier blob
-    }
+    // Source selection (issue #886 cache/replication split): the primary when
+    // it is direct-readable and covers the range; otherwise the published
+    // serving replica — the UNTRANSFORMED node-local copy the cache chimod
+    // maintains while the authoritative bytes live transformed below. Both
+    // are guarded by the same placement generation.
+    //
     // Bound by the CACHED PREFIX, not by the blob's total size: a truncated
-    // record describes only its first kMaxInlineBlocks blocks, and a read past
-    // them has no block to resolve against. For an untruncated record the two
-    // are equal, so this is strictly the safer of the two bounds.
-    if (offset + size > rec.CoveredBytes()) {
-      return false;
+    // primary record describes only its first kMaxInlineBlocks blocks, and a
+    // read past them has no block to resolve against.
+    const bool primary_ok =
+        rec.IsDirectReadable() && offset + size <= rec.CoveredBytes();
+    const bool replica_ok = !primary_ok && rec.HasServableReplica() &&
+                            offset + size <= rec.RepCoveredBytes();
+    if (!primary_ok && !replica_ok) {
+      return false;  // transformed/file/remote/GPU-tier and no serving replica
     }
+    const ShmBlockDesc *src_blocks = primary_ok ? rec.blocks_ : rec.rep_blocks_;
+    const clio::run::u32 src_nblocks =
+        primary_ok ? rec.num_blocks_ : rec.rep_num_blocks_;
     const clio::run::u64 gen_before = rec.placement_gen_;
 
     size_t copied = 0;
     clio::run::u64 want_from = offset;
-    for (clio::run::u32 i = 0; i < rec.num_blocks_ && copied < size; ++i) {
-      const ShmBlockDesc &b = rec.blocks_[i];
+    for (clio::run::u32 i = 0; i < src_nblocks && copied < size; ++i) {
+      const ShmBlockDesc &b = src_blocks[i];
       if (b.size_ <= want_from) {
         want_from -= b.size_;  // this block is entirely before `offset`
         continue;
@@ -286,24 +295,29 @@ class Client : public clio::run::ContainerClient {
     if (!TryGetBlobRecordShm(tag_id, blob_name, &rec)) {
       return false;
     }
-    if (!rec.IsDirectReadable() || rec.num_blocks_ != 1 ||
-        (rec.flags_ & kShmBlobTruncated) != 0) {
+    // Source selection (issue #886): the primary when viewable, else the
+    // published serving replica (the untransformed cache copy) when it is a
+    // single extent. Same zero-size distrust and generation contract.
+    const bool primary_view = rec.IsDirectReadable() && rec.num_blocks_ == 1 &&
+                              (rec.flags_ & kShmBlobTruncated) == 0 &&
+                              rec.total_size_ != 0;
+    const bool replica_view = !primary_view && rec.HasServableReplica() &&
+                              rec.rep_num_blocks_ == 1 &&
+                              rec.rep_total_size_ != 0;
+    if (!primary_view && !replica_view) {
+      // A zero-size record is untrustworthy, not "empty" (issue #862): a
+      // fresh blob's record can be mirrored before its completing put
+      // republishes the size. Refuse so the caller falls back to RPC.
       return false;
     }
-    // A zero-size record is untrustworthy, not "empty" (issue #862): a fresh
-    // blob's record can be mirrored before its completing put republishes the
-    // size, and a size-0 view reads as an absent/empty value to callers.
-    // Refuse the view so the caller falls back to the authoritative RPC path
-    // (same rule as Tag::GetBlobSize).
-    if (rec.total_size_ == 0) {
-      return false;
-    }
-    char *base = MapRamBdev(rec.blocks_[0].target_pool_);
+    const ShmBlockDesc &src =
+        primary_view ? rec.blocks_[0] : rec.rep_blocks_[0];
+    char *base = MapRamBdev(src.target_pool_);
     if (base == nullptr) {
       return false;
     }
-    *ptr = base + rec.blocks_[0].target_offset_;
-    *size = rec.total_size_;
+    *ptr = base + src.target_offset_;
+    *size = primary_view ? rec.total_size_ : rec.rep_total_size_;
     *gen = rec.placement_gen_;
     return true;
   }

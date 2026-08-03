@@ -433,6 +433,51 @@ bool Runtime::BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out) {
   if (all_direct) {
     out->flags_ |= kShmBlobDirectReadable;
   }
+
+  // Serving-replica extension (issue #886 cache/replication split): publish
+  // the first UNTRANSFORMED replica whose entire layout fits inline and
+  // qualifies for direct reads (node-local RAM blocks only) — in practice
+  // the REPLICA_CACHE copy. Default-refuse discipline: any disqualifying
+  // block, unknown target, or oversized layout publishes nothing.
+  for (size_t ri = 0; ri < info.replicas_.size(); ++ri) {
+    const Replica &rep = info.replicas_[ri];
+    if (rep.IsTransformed() || rep.blocks_.empty() ||
+        rep.blocks_.size() > kMaxInlineBlocks) {
+      continue;
+    }
+    bool rep_ok = true;
+    for (size_t i = 0; i < rep.blocks_.size(); ++i) {
+      const BlobBlock &b = rep.blocks_[i];
+      ShmBlockDesc &d = out->rep_blocks_[i];
+      d.target_pool_ = b.bdev_client_.pool_id_;
+      d.target_offset_ = b.target_offset_;
+      d.size_ = b.size_;
+      d.bdev_type_ = 0;
+      d.node_id_ = 0;
+      TargetInfo *tinfo = registered_targets_.find(d.target_pool_);
+      if (tinfo == nullptr) {
+        rep_ok = false;
+        break;
+      }
+      d.bdev_type_ = static_cast<clio::run::u32>(tinfo->bdev_type_);
+      const bool is_ram =
+          (tinfo->bdev_type_ == clio::run::bdev::BdevType::kRam);
+      const bool is_local =
+          TargetIsNodeLocal(tinfo->target_query_, d.target_pool_);
+      d.node_id_ = is_local ? CLIO_IPC->GetNodeId() : 0xFFFFFFFFu;
+      if (!is_ram || !is_local) {
+        rep_ok = false;
+        break;
+      }
+    }
+    if (rep_ok) {
+      out->rep_num_blocks_ = static_cast<clio::run::u32>(rep.blocks_.size());
+      out->rep_total_size_ = rep.total_size_cache_;
+      out->rep_direct_ = 1;
+      break;
+    }
+    out->rep_num_blocks_ = 0;  // partial fill above must not leak
+  }
   return true;
 }
 
@@ -2119,6 +2164,18 @@ clio::run::TaskResume Runtime::WriteReplicaData(
                                                        txn);
     }
   }
+
+  // Replica layouts are now part of the client-visible mirror (issue #886
+  // serving-replica fast path): bump the placement generation so an
+  // in-flight zero-IPC read of the OLD replica layout invalidates, then
+  // republish. Runs under the blob's write token like the primary's
+  // publish.
+  blob_info.BumpPlacementGen();
+  {
+    std::string shm_key = std::to_string(tag_id.major_) + "." +
+                          std::to_string(tag_id.minor_) + "." + blob_name;
+    MirrorBlobToShm(shm_key, blob_info);
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -3363,6 +3420,7 @@ clio::run::TaskResume Runtime::ReclaimCacheReplica(const TagId &tag_id,
       blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendReplica,
                                                        txn);
     }
+    blob_info_ptr->BumpPlacementGen();  // invalidate in-flight replica views
     {
       std::string shm_key = std::to_string(tag_id.major_) + "." +
                             std::to_string(tag_id.minor_) + "." + blob_name;

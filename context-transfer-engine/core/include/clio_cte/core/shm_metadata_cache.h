@@ -139,6 +139,24 @@ struct ShmBlobRecord {
   clio::run::u32 transform_flags_;
   ShmBlockDesc blocks_[kMaxInlineBlocks];
 
+  /**
+   * Serving-replica extension (issue #886 cache/replication split). When the
+   * PRIMARY is refused (transformed, absent, or not direct-readable), a
+   * client may serve the read from an UNTRANSFORMED node-local RAM-backed
+   * replica instead — in practice the REPLICA_CACHE copy the cache chimod
+   * maintains while the authoritative bytes live compressed further down
+   * the chain. rep_direct_ follows the same default-refuse discipline as
+   * kShmBlobDirectReadable: it is set only when EVERY published replica
+   * block qualifies, and replicas whose layouts exceed the inline array are
+   * not published at all (no truncated-prefix mode for replicas).
+   * placement_gen_ covers replica layout changes too — replica writers and
+   * the cache-reclaim path bump it before republishing.
+   */
+  clio::run::u32 rep_direct_;      // 1 = replica descriptor serves reads
+  clio::run::u32 rep_num_blocks_;
+  clio::run::u64 rep_total_size_;  // the replica copy's logical size
+  ShmBlockDesc rep_blocks_[kMaxInlineBlocks];
+
   ShmBlobRecord()
       : total_size_(0),
         last_modified_(0),
@@ -147,7 +165,25 @@ struct ShmBlobRecord {
         score_(0.0f),
         flags_(0),
         num_blocks_(0),
-        transform_flags_(0) {}
+        transform_flags_(0),
+        rep_direct_(0),
+        rep_num_blocks_(0),
+        rep_total_size_(0) {}
+
+  /** Bytes readable from the published replica descriptor. */
+  clio::run::u64 RepCoveredBytes() const {
+    clio::run::u64 n = 0;
+    for (clio::run::u32 i = 0; i < rep_num_blocks_ && i < kMaxInlineBlocks;
+         ++i) {
+      n += rep_blocks_[i].size_;
+    }
+    return n;
+  }
+
+  /** True when the replica descriptor may serve direct reads. */
+  bool HasServableReplica() const {
+    return rep_direct_ != 0 && rep_num_blocks_ > 0;
+  }
 
   /** True if this blob's stored bytes have been rewritten by some transform. */
   bool IsTransformed() const {
@@ -232,7 +268,7 @@ struct ShmMetadataCacheRoot {
   // v2 (issue #817): kMaxInlineBlocks 8 -> 16, and a truncated record is now
   // readable up to CoveredBytes(). Both change the record layout/semantics, so
   // a v1 client must refuse rather than misread it.
-  static constexpr clio::run::u32 kLayoutVersion = 2;
+  static constexpr clio::run::u32 kLayoutVersion = 3;
 
   clio::run::u32 version_;
   clio::run::u32 ready_;  /**< 0 until fully constructed; clients must check */
