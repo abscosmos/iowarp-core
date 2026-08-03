@@ -18,5 +18,3 @@ kGetBlob: 16
 kGetBlobSize: 23
 kMultiPutBlob: 48
 
-# Cache operations (above the core's method-id space)
-kFlushSweep: 100

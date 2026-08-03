@@ -14,11 +14,10 @@
  * clio::cte::core::Client at the top. Verifies the properties only this
  * stack has:
  *   - a compressed blob KEEPS the zero-IPC SHM fast path: the cache layer's
- *     raw REPLICA_CACHE copy serves it, both before the write-back flush
- *     (primary still empty) and after (primary stored compressed);
- *   - the write-back flush lands the blob COMPRESSED on the core and the
- *     replication layer's persistent replica holds the STORED form, marked
- *     transformed (the #886 per-replica transform stamping);
+ *     raw REPLICA_CACHE copy serves it while the primary (stored
+ *     compressed, landed with the ack — async write-through) refuses;
+ *   - the replication layer's persistent replica holds the STORED form,
+ *     marked transformed (the #886 per-replica transform stamping);
  *   - evicting the cache replica (capacity pass-0) drops the fast path to
  *     refusal without losing data — the task path still decompresses — and
  *     the next read re-populates the cache replica, reviving the fast path.
@@ -50,7 +49,6 @@ static std::string chi_test_data_dir() {
 
 static const clio::run::PoolId kStackCompPoolId(562, 0);
 static constexpr clio::run::u64 kValSize = 64 * 1024;
-static constexpr int kFlushPeriodMs = 100;
 
 class CacheStackFixture {
  public:
@@ -206,7 +204,6 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
                                    clio::cte::core::kCtePoolId);
     clio::cte::cache::CacheConfig params;
     params.next_pool_id_ = kStackCompPoolId;
-    params.flush_period_ms_ = kFlushPeriodMs;
     auto create = cache.AsyncCreateCache(
         clio::run::PoolQuery::Local(), clio::cte::cache::kCachePoolName,
         clio::cte::cache::kCachePoolId, params);
@@ -224,9 +221,10 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
   const std::string val = CompressiblePayload(kValSize);
 
   // ======================================================================
-  // 1. A COMPRESSED put through the stack: the raw cache replica lands
-  //    before the ack, and the SHM fast path serves ORIGINAL bytes while
-  //    the primary is still empty (pre-flush window).
+  // 1. A COMPRESSED put through the stack (async write-through): the
+  //    compressed primary AND the raw cache replica both land before the
+  //    ack, and the SHM fast path serves ORIGINAL bytes via the raw copy
+  //    while the transformed primary refuses.
   // ======================================================================
   {
     clio::cte::core::Context ctx;
@@ -258,10 +256,10 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
   }
 
   // ======================================================================
-  // 2. The write-back flush lands the blob COMPRESSED on the core; the
+  // 2. The primary is COMPRESSED on the core (it landed with the ack); the
   //    persistent replica holds the STORED form and is marked TRANSFORMED
   //    (the replication sweep stamps the get's OUT flags). The fast path
-  //    KEEPS serving raw bytes after the flush.
+  //    keeps serving raw bytes.
   // ======================================================================
   clio::run::u64 stored_size = 0;
   {

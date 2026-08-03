@@ -28,7 +28,9 @@ static constexpr const char *kCachePoolName = "clio_cte_cache";
 
 /**
  * Container creation params. next_pool_id_ is the pool this cache pushes
- * authoritative bytes to (usually the compressor).
+ * authoritative bytes to (usually the compressor). Semantics are
+ * ASYNCHRONOUS WRITE-THROUGH: puts land below before the ack; there is no
+ * dirty state and no flush period at this layer.
  */
 struct CacheConfig {
   static constexpr const char* chimod_lib_name = "clio_cte_cache";
@@ -40,17 +42,11 @@ struct CacheConfig {
   /// reclaims one. Modest default keeps hot raw bytes resident without
   /// starving primaries of the fast tier.
   float min_score_ = 0.5f;
-  /// Write-back flush period: a put acks after the cache-replica write; the
-  /// periodic sweep pushes each dirty blob's raw bytes down `next` (where
-  /// compression/replication/storage happen). 0 = write-through (the put
-  /// blocks until the whole chain acks).
-  int flush_period_ms_ = 50;
 
   CacheConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   CacheConfig(const clio::run::PoolId &pool_id, const CacheConfig &other)
       : next_pool_id_(other.next_pool_id_),
-        min_score_(other.min_score_),
-        flush_period_ms_(other.flush_period_ms_) {
+        min_score_(other.min_score_) {
     (void)pool_id;
   }
 
@@ -59,7 +55,7 @@ struct CacheConfig {
     // EVERY field round-trips — the audit rule three silently-dropped-field
     // bugs on this branch bought us (replication copy-ctor, ReplicationConfig
     // period, CompressorConfig next_pool_id_).
-    ar(next_pool_id_, min_score_, flush_period_ms_);
+    ar(next_pool_id_, min_score_);
   }
 
   /** Load configuration from compose YAML. */
@@ -78,9 +74,6 @@ struct CacheConfig {
         }
         if (node["min_score"]) {
           min_score_ = node["min_score"].as<float>();
-        }
-        if (node["flush_period_ms"]) {
-          flush_period_ms_ = node["flush_period_ms"].as<int>();
         }
       } catch (...) {
         // Config parsing is best-effort
@@ -112,46 +105,6 @@ struct DestroyTask : public clio::run::Task {
 
   template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
-};
-
-/**
- * FlushSweepTask (Method::kFlushSweep) — the periodic write-back driver:
- * drains the dirty set by copying each blob's raw bytes out of its cache
- * replica and putting them down `next` with the put's remembered Context
- * (compression settings and all). Spawned by Create with
- * SetPeriod(flush_period_ms_); runtime-internal.
- */
-struct FlushSweepTask : public clio::run::Task {
-  OUT clio::run::u64 blobs_flushed_;
-
-  FlushSweepTask() : clio::run::Task(), blobs_flushed_(0) {}
-
-  explicit FlushSweepTask(const clio::run::TaskId &task_id,
-                          const clio::run::PoolId &pool_id,
-                          const clio::run::PoolQuery &pool_query)
-      : clio::run::Task(task_id, pool_id, pool_query, Method::kFlushSweep),
-        blobs_flushed_(0) {}
-
-  template <typename Ar>
-  void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar);
-  }
-
-  template <typename Ar>
-  void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar);
-    ar(blobs_flushed_);
-  }
-
-  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
-    Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<FlushSweepTask>());
-  }
-
-  void Copy(const ctp::ipc::FullPtr<FlushSweepTask> &other) {
-    Task::Copy(other.template Cast<clio::run::Task>());
-    blobs_flushed_ = other->blobs_flushed_;
-  }
 };
 
 using MonitorTask = clio::run::admin::MonitorTask;

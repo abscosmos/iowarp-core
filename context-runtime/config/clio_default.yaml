@@ -210,20 +210,20 @@ compose:
   #   next_pool_id: "561.0"             # replication pool — see entry above
 
   # === Cache (node-local raw copies, issue #886) ===
-  # Locality layer and the TOP of the chain. Keeps an UNCOMPRESSED local
-  # copy of each blob in the core's REPLICA_CACHE slot: puts ack once the
-  # raw bytes land there (write-back; the periodic sweep pushes them down
-  # next_pool_id), reads serve the raw copy — including via the zero-IPC
-  # SHM fast path, which a compressed primary alone would refuse — and
-  # min_score is the floor below which the organizer will not rescore a
-  # cache copy (only genuine tier pressure evicts one).
+  # Locality layer and the TOP of the chain, with ASYNCHRONOUS WRITE-THROUGH
+  # semantics: a put lands below (authoritative) before the ack — the layers
+  # underneath keep their own async machinery — and the raw local copy in
+  # the core's REPLICA_CACHE slot is updated with it. Reads serve the raw
+  # copy — including via the zero-IPC SHM fast path, which a compressed
+  # primary alone would refuse — and min_score is the floor below which the
+  # organizer will not rescore a cache copy (only genuine tier pressure
+  # evicts one).
   - mod_name: clio_cte_cache
     pool_name: clio_cte_cache
     pool_query: local
     pool_id: "563.0"
     next_pool_id: "561.0"               # replication (562.0 with compressor)
     min_score: 0.5                      # cache copies' score floor
-    flush_period_ms: 50                 # write-back sweep period (0 = write-through)
 
   # === Context Filesystem (CFS) ===
   # POSIX-style filesystem chimod that the libfuse / POSIX adapters drive. It

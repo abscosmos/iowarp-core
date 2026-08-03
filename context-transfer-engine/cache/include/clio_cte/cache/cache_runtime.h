@@ -6,11 +6,7 @@
 #define CLIO_CTE_CACHE_CACHE_RUNTIME_H_
 
 #include <memory>
-#include <mutex>
 #include <string>
-#include <unordered_map>
-#include <utility>
-#include <vector>
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
@@ -22,27 +18,24 @@ namespace clio::cte::cache {
 
 /**
  * Cache chimod runtime (issue #886 cache/replication split) — the TOP of
- * the interposition chain (cache -> compressor -> replication -> core).
+ * the interposition chain (cache -> [compressor] -> replication -> core).
  * Keeps a node-local UNTRANSFORMED copy of each blob in the core's
  * REPLICA_CACHE slot, which the SHM zero-IPC fast path and raw task reads
- * serve directly, while the authoritative bytes flow down `next` (where
- * compression, persistent replication and storage happen) via a WRITE-BACK
- * sweep:
+ * serve directly, with ASYNCHRONOUS WRITE-THROUGH semantics (the same
+ * discipline as the replication chimod):
  *
- *  - PutBlob writes the caller's raw bytes into the cache replica (through
- *    the chain with Context::replica_ = kCacheReplica — the interposers
- *    below forward explicit replica addressing verbatim), acks, and marks
- *    the blob dirty; the periodic FlushSweep pushes each dirty blob down
- *    `next` with the put's remembered Context. flush_period_ms = 0 makes
- *    puts write-through instead.
+ *  - PutBlob/MultiPutBlob forward the AUTHORITATIVE write down `next`
+ *    FIRST — it must succeed before the ack, so the source of truth is
+ *    current after every ack and a crash loses nothing acked — then write
+ *    the raw cache copy (best-effort; a cache failure degrades reads,
+ *    never the put). The layers below keep their own async machinery
+ *    (replication's durable copies are sweep-driven); this layer defers
+ *    nothing and tracks no dirty state.
  *  - GetBlob serves from the cache replica when it covers the request
- *    (fresh by construction: the cache is written before the ack), else
- *    forwards down (decompressed below) and best-effort re-populates.
+ *    (never stale: write-through updates it before the ack), else forwards
+ *    down (decompressed below) and best-effort re-populates.
  *  - GetBlobSize answers from the cache replica (raw size == logical size)
- *    before consulting the chain — a dirty blob's downstream size is stale
- *    or absent.
- *  - MultiPutBlob batches forward down verbatim (write-through; batch
- *    records carry no per-record Context to remember).
+ *    before consulting the chain.
  */
 class Runtime : public clio::cte::core::CoreInterposer {
  public:
@@ -55,7 +48,6 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
   clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
-  clio::run::TaskResume FlushSweep(clio::run::shared_ptr<FlushSweepTask> &task);
   clio::run::TaskResume PutBlob(
       clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task);
   clio::run::TaskResume GetBlob(
@@ -93,26 +85,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::shared_ptr<clio::run::Task> NewTask(clio::run::u32 method) override;
 
  private:
-  /** One dirty blob awaiting write-back: the put's Context (compression
-   *  settings and all) and score travel down with the flush. */
-  struct DirtyEntry {
-    TagId tag_id_;
-    std::string blob_name_;
-    Context context_;
-    float score_;
-  };
-
-  /** Mark a blob dirty (deduped by key; the LATEST context/score wins —
-   *  overwrites coalesce into one flush of the final bytes). */
-  void EnqueueFlush(const TagId &tag_id, const std::string &blob_name,
-                    const Context &context, float score);
-
-  /**
-   * Push one dirty blob's raw bytes from its cache replica down `next` in
-   * bounded chunks with the remembered context. rc: 0 ok, 1 = blob/cache
-   * copy gone (drop the entry), else keep dirty.
-   */
-  clio::run::TaskResume FlushOne(const DirtyEntry &entry, clio::run::u32 &rc);
+  /** Aim a put context at THE cache replica slot (raw bytes, score floor). */
+  void AimAtCacheReplica(Context *ctx) const;
 
   /**
    * Best-effort re-population of the cache replica from the authoritative
@@ -126,14 +100,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /** Lazily bind the next-pool client (compose next_pool_id). */
   clio::cte::core::Client *GetNextClient();
 
-  /** True if the blob is dirty (cache newer than downstream). */
-  bool IsDirty(const TagId &tag_id, const std::string &blob_name);
-
   CacheConfig config_;
   std::unique_ptr<clio::cte::core::Client> next_client_;
-
-  std::mutex dirty_mtx_;
-  std::unordered_map<std::string, DirtyEntry> dirty_;
 };
 
 }  // namespace clio::cte::cache

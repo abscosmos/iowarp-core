@@ -31,9 +31,9 @@ GLOBAL_CROSS_CONST clio::run::u32 kGetBlobSize =
 GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob =
     clio::cte::core::Method::kMultiPutBlob;
 
-// cache-specific methods (above the core's id space)
-GLOBAL_CROSS_CONST clio::run::u32 kFlushSweep = 100;
-
+// No cache-specific methods beyond Create/Destroy/Monitor: the data verbs
+// are the core's, and asynchronous write-through needs no sweep. The id
+// space above the core's stays reserved for future module verbs.
 GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 101;
 
 inline const std::vector<std::string>& GetMethodNames() {
@@ -46,7 +46,6 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kGetBlob] = "GetBlob";
     v[kGetBlobSize] = "GetBlobSize";
     v[kMultiPutBlob] = "MultiPutBlob";
-    v[100] = "FlushSweep";
     return v;
   }();
   return names;

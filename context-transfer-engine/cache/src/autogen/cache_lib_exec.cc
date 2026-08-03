@@ -25,7 +25,6 @@ namespace clio::cte::cache {
   X(kCreate, CreateTask, Create)                   \
   X(kDestroy, DestroyTask, Destroy)                \
   X(kMonitor, MonitorTask, Monitor)                \
-  X(kFlushSweep, FlushSweepTask, FlushSweep)       \
   X(kPutBlob, clio::cte::core::PutBlobTask, PutBlob) \
   X(kGetBlob, clio::cte::core::GetBlobTask, GetBlob) \
   X(kGetBlobSize, clio::cte::core::GetBlobSizeTask, GetBlobSize) \

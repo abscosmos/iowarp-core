@@ -11,16 +11,16 @@
  *
  * cache(563) -> core(512) driven by ONE plain clio::cte::core::Client at the
  * top. Verifies the cache module's contract:
- *   - WRITE-BACK: a put acks after the raw bytes land in the core's
- *     REPLICA_CACHE slot; the primary fills in later via the periodic flush
- *     sweep, and reads/sizes through the cache are correct in the window
- *     where the primary is still empty;
- *   - overwrites in one flush window COALESCE (the primary ends at the
- *     final bytes);
+ *   - ASYNC WRITE-THROUGH: a put lands the AUTHORITATIVE primary below
+ *     before its ack (consistency: nothing acked lives only in the cache)
+ *     and updates the raw REPLICA_CACHE copy with it;
+ *   - overwrites replace both copies before their ack — reads through any
+ *     path observe the final bytes immediately;
  *   - the zero-IPC SHM fast path serves the blob from its (untransformed,
- *     RAM-local) cache replica BEFORE the flush has materialized a primary;
+ *     RAM-local) copies;
  *   - a read MISS (blob written behind the cache's back) forwards down and
- *     best-effort re-populates the cache replica.
+ *     best-effort re-populates the cache replica;
+ *   - batched puts get scalar-equivalent semantics for all of the above.
  */
 
 #include <clio_runtime/clio_runtime.h>
@@ -46,8 +46,6 @@ static std::string chi_test_data_dir() {
 }
 
 static constexpr clio::run::u64 kValSize = 64 * 1024;
-/** Long enough to assert the pre-flush window, short enough to wait out. */
-static constexpr int kFlushPeriodMs = 300;
 
 class CacheInterposeFixture {
  public:
@@ -153,20 +151,18 @@ static bool WaitCacheReplicaSize(clio::cte::core::Client *core,
   return false;
 }
 
-TEST_CASE("CacheInterpose - write-back cache over core",
+TEST_CASE("CacheInterpose - async write-through cache over core",
           "[cte][cache][886]") {
   CacheInterposeFixture fixture;
   auto *core = CLIO_CTE_CLIENT;
   REQUIRE(core != nullptr);
 
-  // cache(563) -> core(512), write-back with a wide-enough flush window to
-  // observe the pre-flush state.
+  // cache(563) -> core(512), asynchronous write-through.
   {
     clio::cte::cache::Client cache(clio::cte::cache::kCachePoolId,
                                    clio::cte::core::kCtePoolId);
     clio::cte::cache::CacheConfig params;
     params.next_pool_id_ = clio::cte::core::kCtePoolId;
-    params.flush_period_ms_ = kFlushPeriodMs;
     auto create = cache.AsyncCreateCache(
         clio::run::PoolQuery::Local(), clio::cte::cache::kCachePoolName,
         clio::cte::cache::kCachePoolId, params);
@@ -185,9 +181,9 @@ TEST_CASE("CacheInterpose - write-back cache over core",
   const std::string val = Payload(kValSize, 'a');
 
   // ======================================================================
-  // 1. WRITE-BACK: the ack precedes the primary. In the pre-flush window
-  //    the cache replica holds the bytes, sizes/reads through the cache are
-  //    already correct, and the SHM fast path serves from the replica.
+  // 1. ASYNC WRITE-THROUGH: after the ack, BOTH copies are current — the
+  //    authoritative primary below (consistency: nothing acked lives only
+  //    in the cache) AND the raw cache replica the fast path serves from.
   // ======================================================================
   {
     auto put = cache_io.AsyncPutBlob(tag_id, "wb_blob", 0, kValSize,
@@ -195,7 +191,16 @@ TEST_CASE("CacheInterpose - write-back cache over core",
     put.Wait();
     REQUIRE(put->GetReturnCode() == 0);
 
-    // The cache replica has the bytes NOW (written before the ack).
+    // The authoritative primary landed BEFORE the ack — no window where
+    // the only copy of acked data is the cache.
+    {
+      auto psz = core->AsyncGetBlobSize(tag_id, "wb_blob");
+      psz.Wait();
+      REQUIRE(psz->GetReturnCode() == 0);
+      REQUIRE(psz->size_ == kValSize);
+    }
+
+    // The cache replica has the bytes NOW too (written before the ack).
     {
       auto rsz = core->AsyncGetBlobSize(tag_id, "wb_blob",
                                         clio::run::PoolQuery::Dynamic(),
@@ -205,8 +210,7 @@ TEST_CASE("CacheInterpose - write-back cache over core",
       REQUIRE(rsz->size_ == kValSize);
     }
 
-    // Size through the cache answers the logical size even though the
-    // primary hasn't been flushed yet.
+    // Size through the cache answers the logical size from the raw copy.
     {
       auto sz = cache_io.AsyncGetBlobSize(tag_id, "wb_blob");
       sz.Wait();
@@ -224,9 +228,8 @@ TEST_CASE("CacheInterpose - write-back cache over core",
       REQUIRE(std::memcmp(got.data(), val.data(), kValSize) == 0);
     }
 
-    // Zero-IPC fast path from the SERVING REPLICA: the cache copy is
-    // untransformed, inline-sized, RAM and local, so the mirror serves it
-    // even while the primary is still empty (issue #886 task 8).
+    // Zero-IPC fast path serves the blob (primary or serving replica —
+    // both are current and untransformed here).
     {
       const char *view = nullptr;
       clio::run::u64 view_size = 0, gen = 0;
@@ -237,8 +240,7 @@ TEST_CASE("CacheInterpose - write-back cache over core",
       REQUIRE(shm_io.CheckBlobGenShm(tag_id, "wb_blob", gen));
     }
 
-    // The sweep materializes the primary with the same bytes.
-    REQUIRE(WaitPrimarySize(core, tag_id, "wb_blob", kValSize));
+    // And the primary holds the same bytes.
     {
       std::vector<char> got(kValSize, 0);
       auto get = core->AsyncGetBlob(tag_id, "wb_blob", 0, kValSize,
@@ -250,8 +252,8 @@ TEST_CASE("CacheInterpose - write-back cache over core",
   }
 
   // ======================================================================
-  // 2. COALESCING: two overwrites inside one flush window end with the
-  //    LAST bytes downstream — the dirty set dedupes by blob.
+  // 2. OVERWRITE: the second put replaces BOTH copies before its ack —
+  //    reads through any path observe the final bytes immediately.
   // ======================================================================
   {
     const std::string v1 = Payload(kValSize, 'b');
@@ -265,16 +267,24 @@ TEST_CASE("CacheInterpose - write-back cache over core",
     p2.Wait();
     REQUIRE(p2->GetReturnCode() == 0);
 
-    REQUIRE(WaitPrimarySize(core, tag_id, "co_blob", kValSize));
-    // Give a possible in-flight first flush time to be superseded, then
-    // confirm the primary settles at the SECOND payload.
-    std::this_thread::sleep_for(std::chrono::milliseconds(2 * kFlushPeriodMs));
+    // Primary AND cache replica both hold the second payload, no waiting.
     std::vector<char> got(kValSize, 0);
     auto get = core->AsyncGetBlob(tag_id, "co_blob", 0, kValSize,
                                   /*flags=*/0, got.data());
     get.Wait();
     REQUIRE(get->GetReturnCode() == 0);
     REQUIRE(std::memcmp(got.data(), v2.data(), kValSize) == 0);
+    {
+      std::vector<char> raw(kValSize, 0);
+      clio::cte::core::Context cctx;
+      cctx.replica_ = clio::cte::core::kCacheReplica;
+      auto gc = core->AsyncGetBlob(tag_id, "co_blob", 0, kValSize,
+                                   /*flags=*/0, raw.data(),
+                                   clio::run::PoolQuery::Dynamic(), cctx);
+      gc.Wait();
+      REQUIRE(gc->GetReturnCode() == 0);
+      REQUIRE(std::memcmp(raw.data(), v2.data(), kValSize) == 0);
+    }
   }
 
   // ======================================================================
@@ -302,10 +312,9 @@ TEST_CASE("CacheInterpose - write-back cache over core",
 
   // ======================================================================
   // 4. BATCHED puts get SCALAR-EQUIVALENT semantics (issue #886 follow-up):
-  //    one MultiPutBlob through the cache writes EVERY record's raw cache
-  //    replica before the ack, the SHM fast path serves each record in the
-  //    pre-flush window, and the batched write-back flush materializes
-  //    every primary with the right bytes.
+  //    one MultiPutBlob through the cache lands EVERY record's primary
+  //    below AND its raw cache replica before the ack, and the SHM fast
+  //    path serves each record.
   // ======================================================================
   {
     auto *ipc_manager = CLIO_CPU_IPC;
@@ -331,25 +340,28 @@ TEST_CASE("CacheInterpose - write-back cache over core",
 
     for (size_t i = 0; i < kRecords; ++i) {
       const std::string name = "batch_blob_" + std::to_string(i);
-      // Raw cache replica exists NOW, before any flush.
+      // Authoritative primary landed with the ack.
+      {
+        auto psz = core->AsyncGetBlobSize(tag_id, name);
+        psz.Wait();
+        REQUIRE(psz->GetReturnCode() == 0);
+        REQUIRE(psz->size_ == kRecSize);
+      }
+      // Raw cache replica exists NOW too.
       auto rsz = core->AsyncGetBlobSize(tag_id, name,
                                         clio::run::PoolQuery::Dynamic(),
                                         clio::cte::core::kCacheReplica);
       rsz.Wait();
       REQUIRE(rsz->GetReturnCode() == 0);
       REQUIRE(rsz->size_ == kRecSize);
-      // Zero-IPC fast path serves the record from its cache replica.
+      // Zero-IPC fast path serves the record.
       const char *view = nullptr;
       clio::run::u64 view_size = 0, gen = 0;
       REQUIRE(shm_io.TryGetBlobViewShm(tag_id, name, &view, &view_size,
                                        &gen));
       REQUIRE(view_size == kRecSize);
       REQUIRE(std::memcmp(view, vals[i].data(), kRecSize) == 0);
-    }
-    // The (re-batched) flush lands every primary with the right bytes.
-    for (size_t i = 0; i < kRecords; ++i) {
-      const std::string name = "batch_blob_" + std::to_string(i);
-      REQUIRE(WaitPrimarySize(core, tag_id, name, kRecSize));
+      // And the primary's bytes match.
       std::vector<char> got(kRecSize, 0);
       auto g = core->AsyncGetBlob(tag_id, name, 0, kRecSize, /*flags=*/0,
                                   got.data());
