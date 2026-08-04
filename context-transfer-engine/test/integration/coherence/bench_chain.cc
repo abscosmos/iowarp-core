@@ -33,8 +33,17 @@
 namespace {
 
 constexpr int kNumNodes = 4;
-constexpr int kBlobsPerRank = 64;
-constexpr clio::run::u64 kBlobSize = 1ULL * 1024 * 1024;  // 1 MiB pages
+
+int EnvInt(const char *name, int def) {
+  const char *v = std::getenv(name);
+  return (v && *v) ? std::atoi(v) : def;
+}
+
+// Knobs: BENCH_BLOBS (count/rank), BENCH_KB (blob size), BENCH_DEPTH
+// (outstanding gets; writes pipeline through the defer registry itself).
+const int kBlobsPerRank = EnvInt("BENCH_BLOBS", 64);
+const clio::run::u64 kBlobSize = 1024ULL * EnvInt("BENCH_KB", 1024);
+const int kDepth = EnvInt("BENCH_DEPTH", 8);
 
 int Rank() {
   const char *env = std::getenv("NODE_ID");
@@ -101,78 +110,96 @@ int main(int, char **) {
 
   if (!Barrier(bar_id)) return 3;
 
-  // ---- WRITE own file ----
+  // ---- WRITE own file via the DEFER pipeline ----
+  // AsyncPutBlobDefer is THE intended write path (clio-fs, YCSB, lmcache
+  // all write through it): it owns a copy of the bytes at submit, batches
+  // and pipelines internally, and flow-controls on SHM staging. The timed
+  // region includes the full drain — these are DURABLE-acked bytes/sec.
   {
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kBlobsPerRank; ++i) {
       std::memset(buf.data(), 'a' + ((rank + i) % 26), kBlobSize);
-      auto put = Cte()->AsyncPutBlob(my_id, "page_" + std::to_string(i), 0,
-                                     kBlobSize, buf.data());
-      put.Wait();
-      if (put->GetReturnCode() != 0) {
-        fprintf(stderr, "BENCH write FAILED rank=%d blob=%d rc=%u\n", rank, i,
-                put->GetReturnCode());
+      int rc = Cte()->AsyncPutBlobDefer(my_id, "page_" + std::to_string(i), 0,
+                                        kBlobSize, buf.data());
+      if (rc != 0) {
+        fprintf(stderr, "BENCH write submit FAILED rank=%d blob=%d rc=%d\n",
+                rank, i, rc);
         return 4;
       }
     }
-    double s = std::chrono::duration<double>(
-                   std::chrono::steady_clock::now() - t0).count();
-    fprintf(stderr, "BENCH write rank=%d mb=%llu secs=%.3f mbps=%.1f\n", rank,
-            (unsigned long long)(total >> 20), s, Mbps(total, s));
-  }
-  if (!Barrier(bar_id)) return 3;
-
-  // ---- READ own file (IOR read-verify) ----
-  {
-    auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < kBlobsPerRank; ++i) {
-      auto get = Cte()->AsyncGetBlob(my_id, "page_" + std::to_string(i), 0,
-                                     kBlobSize, /*flags=*/0, buf.data());
-      get.Wait();
-      if (get->GetReturnCode() != 0 ||
-          buf[0] != static_cast<char>('a' + ((rank + i) % 26))) {
-        fprintf(stderr, "BENCH read_own FAILED rank=%d blob=%d rc=%u\n", rank,
-                i, get->GetReturnCode());
-        return 5;
-      }
+    clio::cte::core::Client::AwaitPutsUntilSpace(0);
+    if (clio::cte::core::Client::DeferErrorCount() != 0) {
+      fprintf(stderr, "BENCH write FAILED rank=%d defer_errors=%llu\n", rank,
+              (unsigned long long)clio::cte::core::Client::DeferErrorCount());
+      return 4;
     }
     double s = std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - t0).count();
-    fprintf(stderr, "BENCH read_own rank=%d mb=%llu secs=%.3f mbps=%.1f\n",
-            rank, (unsigned long long)(total >> 20), s, Mbps(total, s));
+    fprintf(stderr,
+            "BENCH write rank=%d mb=%llu secs=%.3f mbps=%.1f kb=%llu\n",
+            rank, (unsigned long long)(total >> 20), s, Mbps(total, s),
+            (unsigned long long)(kBlobSize >> 10));
   }
+  if (!Barrier(bar_id)) return 3;
+
+  // Windowed DEFER reads (read-your-writes-consistent AsyncGetBlobDefer —
+  // the intended read path): kDepth outstanding gets, each with its own
+  // destination buffer, verified on completion.
+  auto read_phase = [&](const char *label, const clio::cte::core::TagId &tid,
+                        int seed_rank, bool verify) -> bool {
+    std::vector<std::vector<char>> bufs(kDepth,
+                                        std::vector<char>(kBlobSize));
+    std::vector<std::pair<clio::run::Future<clio::cte::core::GetBlobTask>,
+                          int>> win;
+    win.reserve(kDepth);
+    auto complete_front = [&]() -> bool {
+      auto &f = win.front().first;
+      const int idx = win.front().second;
+      f.Wait();
+      if (f->GetReturnCode() != 0) {
+        fprintf(stderr, "BENCH %s FAILED rank=%d blob=%d rc=%u\n", label,
+                rank, idx, f->GetReturnCode());
+        return false;
+      }
+      if (verify && bufs[idx % kDepth][0] !=
+                        static_cast<char>('a' + ((seed_rank + idx) % 26))) {
+        fprintf(stderr, "BENCH %s VERIFY FAILED rank=%d blob=%d\n", label,
+                rank, idx);
+        return false;
+      }
+      win.erase(win.begin());
+      return true;
+    };
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kBlobsPerRank; ++i) {
+      if ((int)win.size() == kDepth && !complete_front()) return false;
+      win.emplace_back(
+          Cte()->AsyncGetBlobDefer(tid, "page_" + std::to_string(i), 0,
+                                   kBlobSize, bufs[i % kDepth].data()),
+          i);
+    }
+    while (!win.empty()) {
+      if (!complete_front()) return false;
+    }
+    double s = std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - t0).count();
+    fprintf(stderr,
+            "BENCH %s rank=%d mb=%llu secs=%.3f mbps=%.1f depth=%d\n", label,
+            rank, (unsigned long long)(total >> 20), s, Mbps(total, s),
+            kDepth);
+    return true;
+  };
+
+  // ---- READ own file (IOR read-verify) ----
+  if (!read_phase("read_own", my_id, rank, /*verify=*/true)) return 5;
   if (!Barrier(bar_id)) return 3;
 
   // ---- READ own file AGAIN (steady-state cached reads) ----
-  {
-    auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < kBlobsPerRank; ++i) {
-      auto get = Cte()->AsyncGetBlob(my_id, "page_" + std::to_string(i), 0,
-                                     kBlobSize, /*flags=*/0, buf.data());
-      get.Wait();
-      if (get->GetReturnCode() != 0) return 5;
-    }
-    double s = std::chrono::duration<double>(
-                   std::chrono::steady_clock::now() - t0).count();
-    fprintf(stderr, "BENCH read_own2 rank=%d mb=%llu secs=%.3f mbps=%.1f\n",
-            rank, (unsigned long long)(total >> 20), s, Mbps(total, s));
-  }
+  if (!read_phase("read_own2", my_id, rank, /*verify=*/false)) return 5;
   if (!Barrier(bar_id)) return 3;
 
   // ---- READ peer's file (cross-node) ----
-  {
-    auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < kBlobsPerRank; ++i) {
-      auto get = Cte()->AsyncGetBlob(peer_id, "page_" + std::to_string(i), 0,
-                                     kBlobSize, /*flags=*/0, buf.data());
-      get.Wait();
-      if (get->GetReturnCode() != 0) return 6;
-    }
-    double s = std::chrono::duration<double>(
-                   std::chrono::steady_clock::now() - t0).count();
-    fprintf(stderr, "BENCH read_peer rank=%d mb=%llu secs=%.3f mbps=%.1f\n",
-            rank, (unsigned long long)(total >> 20), s, Mbps(total, s));
-  }
+  if (!read_phase("read_peer", peer_id, peer, /*verify=*/true)) return 6;
   if (!Barrier(bar_id)) return 3;
 
   fprintf(stderr, "BENCH done rank=%d\n", rank);

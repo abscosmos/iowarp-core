@@ -826,6 +826,21 @@ static constexpr clio::run::u32 REPLICA_PERSISTENT = 0x2;
  *  eviction may free its blocks under tier pressure, and the organizer may
  *  rescore it only down to its min_score_ floor. */
 static constexpr clio::run::u32 REPLICA_CACHE = 0x4;
+/** REQUEST-only flag (never persisted): the replica write applies ONLY if
+ *  the slot already exists — an absent slot returns rc kReplicaAbsentRc
+ *  without writing. Fuses the cache layer's exists-probe + update into one
+ *  task (issue #886 locality). */
+static constexpr clio::run::u32 REPLICA_UPDATE_ONLY = 0x8;
+/** REQUEST-only flag (never persisted), rides the PRIMARY put next to
+ *  Context::origin_node_: the writer created its local copy SPECULATIVELY
+ *  from this put alone, so the owner must verify the put covers the whole
+ *  pre-existing blob (scalar, offset 0, size >= prior size) before
+ *  registering — and CLEAR origin_node_ in the OUT context to tell the
+ *  writer to drop the copy otherwise. Without the flag, registration is
+ *  unconditional (the writer mirrors an existing complete copy in place). */
+static constexpr clio::run::u32 REPLICA_VERIFY_COMPLETE = 0x10;
+/** Return code of an UPDATE_ONLY replica write against an absent slot. */
+static constexpr clio::run::u32 kReplicaAbsentRc = 12;
 
 /**
  * One replica of a blob's data (issue #886): an independent block list,

@@ -132,42 +132,41 @@ clio::run::TaskResume Runtime::PutBlob(
     const std::string blob_name = task->blob_name_.str();
     const Context orig_ctx = task->context_;
 
-    bool have_local = false;
-    {
-      auto sz = local->AsyncGetBlobSize(task->tag_id_, blob_name,
-                                        clio::run::PoolQuery::Local(),
-                                        clio::cte::core::kCacheReplica);
-      CLIO_CO_AWAIT(sz);
-      have_local = (sz->GetReturnCode() == 0 && sz->size_ > 0);
-    }
-    bool create_local = false;
-    if (!have_local && task->segments_.empty() && task->offset_ == 0) {
-      // Whole-blob-covering iff the authoritative blob does not exist yet.
-      auto sz = next->AsyncGetBlobSize(task->tag_id_, blob_name);
-      CLIO_CO_AWAIT(sz);
-      create_local = !(sz->GetReturnCode() == 0 && sz->size_ > 0);
-    }
-
-    bool wrote_local = false;
-    if (have_local || create_local) {
+    // 1. ONE fused local task: apply the put to the local raw copy iff it
+    //    exists (UPDATE_ONLY; kReplicaAbsentRc = it doesn't). No probes.
+    task->context_ = orig_ctx;
+    AimAtCacheReplica(&task->context_);
+    task->context_.replica_flags_ |= clio::cte::core::REPLICA_UPDATE_ONLY;
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
+                           task.template Cast<clio::run::Task>()));
+    bool wrote_local = (task->GetReturnCode() == 0);
+    bool speculative = false;
+    if (!wrote_local &&
+        task->GetReturnCode() == clio::cte::core::kReplicaAbsentRc &&
+        task->segments_.empty() && task->offset_ == 0) {
+      // 1b. No copy yet and the put MIGHT cover the whole blob: create one
+      //     SPECULATIVELY. The owner verifies (VERIFY_COMPLETE rides the
+      //     authoritative put) and clears origin_node_ in the OUT context
+      //     if the blob pre-existed beyond this put — we then drop it.
       task->context_ = orig_ctx;
       AimAtCacheReplica(&task->context_);
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
                              task.template Cast<clio::run::Task>()));
       wrote_local = (task->GetReturnCode() == 0);
-      if (!wrote_local) {
-        HLOG(kWarning, "cache: local raw-copy write failed rc={}",
-             task->GetReturnCode());
-      }
+      speculative = true;
     }
 
-    // Authoritative put(s) to the owner chain (Dynamic hash-routes there).
-    // Vectored puts replay their regions in list order (the core's
-    // last-writer-wins rule, same as the replication sync path).
+    // 2. Authoritative put(s) to the owner chain (Dynamic hash-routes
+    //    there). Vectored puts replay their regions in list order (the
+    //    core's last-writer-wins rule, same as the replication sync path).
     {
       Context auth_ctx = orig_ctx;
       if (wrote_local) {
         auth_ctx.origin_node_ = CLIO_IPC->GetNodeId();
+        if (speculative) {
+          auth_ctx.replica_flags_ |=
+              clio::cte::core::REPLICA_VERIFY_COMPLETE;
+        }
       }
       std::vector<clio::cte::core::BlobRegion> regions;
       clio::cte::core::ForEachBlobRegion(*task,
@@ -186,13 +185,18 @@ clio::run::TaskResume Runtime::PutBlob(
         rc = put->GetReturnCode();
         out_ctx = put->context_;
       }
-      if (rc != 0 && wrote_local) {
-        // The unacked bytes must not survive locally.
+      if (wrote_local &&
+          (rc != 0 ||
+           out_ctx.origin_node_ == Context::kNoOriginNode)) {
+        // Failed put, or the owner REFUSED the speculative registration
+        // (the blob pre-existed beyond this put, so our copy is a prefix):
+        // the local copy must not survive.
         auto del = local->AsyncDelBlob(task->tag_id_, blob_name,
                                        clio::run::PoolQuery::Local());
         CLIO_CO_AWAIT(del);
       }
       out_ctx.replica_ = orig_ctx.replica_;
+      out_ctx.replica_flags_ = orig_ctx.replica_flags_;
       out_ctx.origin_node_ = Context::kNoOriginNode;
       task->context_ = out_ctx;
       task->SetReturnCode(rc);

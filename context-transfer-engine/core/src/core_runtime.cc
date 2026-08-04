@@ -1683,8 +1683,22 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       // replicas_ mutation). kCacheReplica finds-or-creates the
       // REPLICA_CACHE slot; N > 0 is the N-th NON-cache slot, so explicit
       // replica numbering can never clobber the cache copy.
+      // UPDATE_ONLY (issue #886 locality): apply only to an EXISTING slot —
+      // absent reports kReplicaAbsentRc without writing, fusing the cache
+      // layer's exists-probe + update into this one task.
+      const bool update_only =
+          (task->context_.replica_flags_ & REPLICA_UPDATE_ONLY) != 0;
       rep_target = blob_info_ptr->ResolveReplicaSel(rep_target,
-                                                    /*create=*/true);
+                                                    /*create=*/!update_only);
+      if (update_only &&
+          (rep_target == 0 ||
+           blob_info_ptr->GetReplica(rep_target, /*create=*/false)
+                   ->total_size_cache_ == 0)) {
+        // Absent OR reclaimed-empty: a partial update against no bytes
+        // would mint a prefix pretending to be complete.
+        task->return_code_ = kReplicaAbsentRc;
+        CLIO_CO_RETURN;
+      }
     }
     if (rep_target > 0) {
       clio::run::u32 rep_result = 0;
@@ -2020,18 +2034,38 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // under the blob's write token, after invalidating every other copy —
     // makes the registration atomic with the write: any LATER put's
     // invalidation snapshot will see it, so the copy can never be missed.
+    //
+    // VERIFY_COMPLETE: the writer built its copy SPECULATIVELY from this
+    // put alone (it had no copy before), so it is only a faithful mirror if
+    // this put covers the ENTIRE pre-existing blob. Otherwise refuse:
+    // clear origin_node_ in the OUT context — the writer drops its copy on
+    // return. (Unflagged registrations mirror an existing complete copy in
+    // place; they register unconditionally, any put shape.)
     if (task->context_.origin_node_ != Context::kNoOriginNode &&
         task->context_.origin_node_ != CLIO_IPC->GetNodeId() &&
         !task->context_.emulate_) {
-      bool present = false;
-      for (size_t ni = 0; ni < blob_info_ptr->replica_nodes_.size(); ++ni) {
-        if (blob_info_ptr->replica_nodes_[ni] == task->context_.origin_node_) {
-          present = true;
-          break;
+      bool ok = true;
+      if ((task->context_.replica_flags_ & REPLICA_VERIFY_COMPLETE) != 0) {
+        ok = task->offset_ == 0 && task->size_ >= old_blob_size;
+        if constexpr (TaskT::kSupportsVectored) {
+          ok = ok && task->segments_.empty();
         }
       }
-      if (!present) {
-        blob_info_ptr->replica_nodes_.push_back(task->context_.origin_node_);
+      if (!ok) {
+        task->context_.origin_node_ = Context::kNoOriginNode;
+      } else {
+        bool present = false;
+        for (size_t ni = 0; ni < blob_info_ptr->replica_nodes_.size(); ++ni) {
+          if (blob_info_ptr->replica_nodes_[ni] ==
+              task->context_.origin_node_) {
+            present = true;
+            break;
+          }
+        }
+        if (!present) {
+          blob_info_ptr->replica_nodes_.push_back(
+              task->context_.origin_node_);
+        }
       }
     }
 
@@ -2067,7 +2101,10 @@ clio::run::TaskResume Runtime::WriteReplicaData(
     // Flags first (sticky-OR), THEN derive the placement constraints from
     // the merged bits — a put that both marks REPLICA_PERSISTENT and writes
     // bytes must already place those bytes off volatile tiers.
-    rep->flags_ |= task->context_.replica_flags_;
+    // REQUEST-only bits (UPDATE_ONLY / VERIFY_COMPLETE) steer this one call
+    // and must never persist on the slot.
+    rep->flags_ |= task->context_.replica_flags_ &
+                   ~(REPLICA_UPDATE_ONLY | REPLICA_VERIFY_COMPLETE);
     // THIS copy's transform state is whatever the writer declares (issue
     // #886 cache/replication split): assignment, not OR — a replica write
     // replaces the copy's content. The cache chimod writes raw bytes
