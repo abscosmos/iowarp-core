@@ -137,11 +137,18 @@ static struct fuse_file_info MakeFi() {
 
 // readdir collector: matches the platform's fill-dir callback type
 // (fuse_fill_dir_t on Linux, WinFsp's fuse_fill_dir_t on Windows — both
-// spelled via the adapter's cte_* aliases).
+// spelled via the adapter's cte_* aliases — and macFUSE's
+// fuse_darwin_fill_dir_t, whose attr parameter is fuse_darwin_attr).
 static std::vector<std::string> *g_fill_names = nullptr;
+#ifdef __APPLE__
+static int CollectFiller(void *buf, const char *name,
+                         const struct fuse_darwin_attr *stbuf, cte_off_t off,
+                         enum fuse_fill_dir_flags flags) {
+#else
 static int CollectFiller(void *buf, const char *name,
                          const cte_stat_t *stbuf, cte_off_t off,
                          enum fuse_fill_dir_flags flags) {
+#endif
   (void)buf;
   (void)stbuf;
   (void)off;
@@ -316,8 +323,9 @@ TEST_CASE("FUSE ops - chmod chown utimens", "[fuse][ops]") {
   REQUIRE(st.st_uid == 4242);
   REQUIRE(st.st_gid == 4343);
 
-  // utimens: explicit times.
-  struct timespec tv[2];
+  // utimens: explicit times (cte_timespec_t: plain timespec on POSIX,
+  // WinFsp's fuse_timespec on Windows).
+  cte_timespec_t tv[2];
   tv[0].tv_sec = 111111;
   tv[0].tv_nsec = 222;
   tv[1].tv_sec = 333333;
@@ -589,7 +597,10 @@ TEST_CASE("FUSE ops - statfs", "[fuse][ops]") {
   cte_statvfs_t sv;
   REQUIRE(cte_fuse_statfs("/", &sv) == 0);
   REQUIRE(sv.f_bsize == 4096);
+#ifndef __APPLE__
+  // Darwin's struct statfs (macFUSE's reporting type) has no f_namemax.
   REQUIRE(sv.f_namemax == 255);
+#endif
 }
 
 // gcov flush entry point, present only in coverage builds (the build wires
