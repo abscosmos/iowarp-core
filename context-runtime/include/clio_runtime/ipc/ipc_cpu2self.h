@@ -113,8 +113,23 @@ struct IpcCpu2Self {
     (void)future_full;
     TaskT *task_ptr = future.get();
     auto start = std::chrono::steady_clock::now();
+    size_t spins = 0;
     while (!task_ptr->IsComplete()) {
-      CTP_THREAD_MODEL->Yield();
+      // Adaptive backoff. Busy-yield for the first burst so the common case (the
+      // worker completes our task in microseconds) stays low-latency, then sleep
+      // so we CEDE the CPU to the runtime workers. Without the sleep, many
+      // in-process waiter threads (same-blob write stress, a FUSE thread pool,
+      // etc.) all spin in Yield() and starve the very workers that must run and
+      // complete their tasks -- a livelock. std::this_thread::yield() does not
+      // cede to the workers on Windows, so this shows up as a deterministic hang
+      // there (cte_concurrent_same_blob_all) while Linux only slows down;
+      // reproduced on Linux with 64 waiter threads pinned to 1 CPU. Same
+      // oversubscription class as the FUSE xfstests hangs.
+      if (++spins < 256) {
+        CTP_THREAD_MODEL->Yield();
+      } else {
+        CTP_THREAD_MODEL->SleepForUs(50);
+      }
       if (max_sec > 0) {
         float elapsed = std::chrono::duration<float>(
                             std::chrono::steady_clock::now() - start)

@@ -15,6 +15,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/filesystem/filesystem_client.h>
 #include <clio_cte/filesystem/filesystem_tasks.h>
+#include <clio_cte/filesystem/shm_fs_cache.h>
 
 namespace clio::cte::filesystem {
 
@@ -47,6 +48,14 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume Rmdir(clio::run::shared_ptr<RmdirTask> &task);
   clio::run::TaskResume Rename(clio::run::shared_ptr<RenameTask> &task);
   clio::run::TaskResume Link(clio::run::shared_ptr<LinkTask> &task);
+  clio::run::TaskResume Symlink(clio::run::shared_ptr<SymlinkTask> &task);
+  clio::run::TaskResume Readlink(clio::run::shared_ptr<ReadlinkTask> &task);
+  clio::run::TaskResume Setxattr(clio::run::shared_ptr<SetxattrTask> &task);
+  clio::run::TaskResume Getxattr(clio::run::shared_ptr<GetxattrTask> &task);
+  clio::run::TaskResume Listxattr(clio::run::shared_ptr<ListxattrTask> &task);
+  clio::run::TaskResume Removexattr(clio::run::shared_ptr<RemovexattrTask> &task);
+  clio::run::TaskResume Utimens(clio::run::shared_ptr<UtimensTask> &task);
+  clio::run::TaskResume Chown(clio::run::shared_ptr<ChownTask> &task);
   clio::run::TaskResume Readdir(clio::run::shared_ptr<ReaddirTask> &task);
   clio::run::TaskResume StatSize(clio::run::shared_ptr<StatSizeTask> &task);
   // ---- deferred-append pipeline ----
@@ -93,17 +102,69 @@ class Runtime : public clio::run::Container {
   // the file's tag) so GetTagSize(file_tag) reports the true file tail,
   // unpolluted by still-unmerged staged appends. Resolved once at Create.
   clio::cte::core::TagId staging_tag_id_ = clio::cte::core::TagId::GetNull();
+  // Global store for per-file extended attributes. Each file's xattrs live in
+  // ONE serialized blob under this tag, named by the file's packed tag id
+  // (decimal string). Kept OUT of the file's own tag so xattrs never inflate
+  // GetTagSize (i.e. the reported st_size). Resolved once at Create.
+  clio::cte::core::TagId xattr_tag_id_ = clio::cte::core::TagId::GetNull();
 
   // ---- per-file logical-size metadata + handle table ----
   struct FileInfo {
     clio::cte::core::TagId tag_id_;
     std::string path_;
     std::atomic<clio::run::u64> size_{0};  // logical size
+    // utimens overrides (ns; 0 = not set, defer to the core tag's timestamp).
+    // Guarded by meta_mu_. Cleared by a later write/truncate (content change
+    // re-establishes the natural mtime) so the override never goes stale.
+    clio::run::u64 set_atime_{0};
+    clio::run::u64 set_mtime_{0};
+    clio::run::u64 set_ctime_{0};
+    // chown overrides. 0xFFFFFFFF = never chown'd (getattr defers to the
+    // adapter's getuid()/getgid() default). Guarded by meta_mu_.
+    clio::run::u32 set_uid_{0xFFFFFFFFu};
+    clio::run::u32 set_gid_{0xFFFFFFFFu};
+    // chmod / create mode override (permission bits). 0xFFFFFFFF = no stored
+    // mode (getattr synthesizes 0644 for files, 0755 for dirs). Persists across
+    // writes (unlike timestamps). Guarded by meta_mu_.
+    clio::run::u32 set_mode_{0xFFFFFFFFu};
   };
   std::mutex meta_mu_;
   std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> handles_;  // handle -> file
   std::unordered_map<std::string, std::shared_ptr<FileInfo>> by_path_;
   std::atomic<clio::run::u64> next_handle_{1};
+
+  // ---- issue #817: shared-memory attribute mirror ----
+  // Lets a client resolve path -> {tag id, logical size} itself and then read
+  // the file's page blobs straight out of the RAM bdev segment, with no round
+  // trip at all. Pure cache: every mirror call is best-effort and happens
+  // AFTER the authoritative update, so the mirror can only ever lag.
+  ShmFsCache shm_fs_cache_;
+
+  /**
+   * Publish a path's current attributes.
+   *
+   * @param path absolute path (the map key, and the CTE tag name).
+   * @param fi the authoritative entry, already updated.
+   * @param extra_flags refusal flags to OR in (e.g. kShmFilePendingAppend).
+   *
+   * Caller may hold meta_mu_ or not: the mirror is independent of it, and the
+   * SHM map has its own per-slot seqlock.
+   */
+  void MirrorFile(const std::string &path, const FileInfo &fi,
+                  clio::run::u32 extra_flags = 0);
+
+  /** Drop a path from the mirror (unlink/rename/rmdir). */
+  void MirrorErase(const std::string &path) {
+    shm_fs_cache_.ErasePath(path);
+  }
+
+  /**
+   * Re-publish a path with refusal flags set, so in-flight clients stop
+   * fast-pathing it. Used where the authoritative state is about to change in
+   * a way that invalidates cached pages (truncate, rename) but the path lives
+   * on. Erasing would work too; this keeps the tag binding for the next op.
+   */
+  void MirrorRefuse(const std::string &path);
 
   // ---- deferred-append pipeline state ----
   // Per-node logical append counter (orders appends sharing a UTC tick).

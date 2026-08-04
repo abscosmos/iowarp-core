@@ -33,6 +33,7 @@
 
 #include "fuse_cte.h"
 
+#include <algorithm>
 #include <climits>
 #include <cstring>
 #include <string>
@@ -40,21 +41,17 @@
 #include <cerrno>                 // errno
 #include <cstdio>                 // snprintf, fprintf
 #include <fcntl.h>                // O_CREAT, O_RDWR
+#ifdef __linux__
+#include <linux/falloc.h>         // FALLOC_FL_* (fallocate mode flags)
+#endif
 
 #ifndef _WIN32
 #include <sys/statvfs.h>          // struct statvfs (statfs op)
 #include <unistd.h>               // read, getuid, getgid
-#ifndef __APPLE__
-// Linux-only apptainer --fusemount fd-injection path: macFUSE lacks
-// fuse_session_custom_io and needs none of the mount/uio/dlsym machinery.
-#include <fuse3/fuse_lowlevel.h>  // fuse_session_custom_io, struct fuse_custom_io
-#include <dlfcn.h>                // dlsym (resolve fuse_session_custom_io at runtime
-                                  // so we can link against system libfuse 3.10.5
-                                  // which lacks the symbol)
-#include <sys/mount.h>            // mount syscall
-#include <sys/uio.h>              // struct iovec, writev
-#endif  // __APPLE__
 #endif  // _WIN32
+// The mount / process-entry glue (fuse_main, the apptainer --fusemount custom-io
+// path, and the fuse_lowlevel/dlsym/mount/uio machinery it needs) now lives in
+// fuse_cte_main.cc. This file holds only the operation callbacks.
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_cte/core/content_transfer_engine.h"
@@ -158,6 +155,29 @@ static void cte_fuse_destroy(void *private_data) {
 // Metadata
 // ============================================================================
 
+// Decode a tag timestamp (stored as the two's-complement bits of an i64
+// nanoseconds-since-epoch value in a u64 field) into a POSIX timespec. Using
+// signed floor division makes pre-epoch (negative) times round-trip correctly
+// — an unsigned divide turns e.g. Jan 1 1960 into a huge positive year
+// (generic/258). For normal post-epoch times the value and result are
+// identical to the old unsigned path (remainder is non-negative). tv_nsec is
+// always normalized into [0, 1e9).
+// NsecT is templated so this binds to the platform's timespec tv_nsec type:
+// `long` on Linux/libfuse, `int64_t` on Windows/WinFsp (struct fuse_timespec).
+template <typename NsecT>
+static inline void NsBitsToTimespec(clio::run::u64 bits, time_t &sec,
+                                    NsecT &nsec) {
+  int64_t ns = static_cast<int64_t>(bits);
+  int64_t s = ns / 1000000000LL;
+  int64_t rem = ns % 1000000000LL;
+  if (rem < 0) {
+    s -= 1;
+    rem += 1000000000LL;
+  }
+  sec = static_cast<time_t>(s);
+  nsec = static_cast<NsecT>(rem);
+}
+
 static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
                                  struct fuse_file_info *fi) {
   (void)fi;
@@ -182,14 +202,26 @@ static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
   if (t->GetReturnCode() != 0 || t->exists_ == 0) {
     return -ENOENT;
   }
-  stbuf->st_uid = getuid();
-  stbuf->st_gid = getgid();
+  // Owner: a prior chown recorded an override (uid_/gid_ != 0xFFFFFFFF);
+  // otherwise report the mounting user's uid/gid (files carry no stored owner).
+  stbuf->st_uid =
+      (t->uid_ != 0xFFFFFFFFu) ? static_cast<uid_t>(t->uid_) : getuid();
+  stbuf->st_gid =
+      (t->gid_ != 0xFFFFFFFFu) ? static_cast<gid_t>(t->gid_) : getgid();
   stbuf->st_ino = static_cast<ino_t>(t->ino_);  // stable inode = packed TagId
+  // A chmod/create recorded permission bits (t->mode_ != 0xFFFFFFFF) win over
+  // the synthesized defaults; keep only the low 12 bits (perms + setuid/gid/sticky).
+  const bool have_mode = (t->mode_ != 0xFFFFFFFFu);
+  const unsigned int perm = t->mode_ & 07777u;
   if (t->is_dir_) {
-    stbuf->st_mode = S_IFDIR | 0755;
+    stbuf->st_mode = S_IFDIR | (have_mode ? perm : 0755u);
     stbuf->st_nlink = 2;
+  } else if (t->is_symlink_) {
+    stbuf->st_mode = S_IFLNK | 0777;
+    stbuf->st_nlink = 1;
+    stbuf->st_size = static_cast<cte_off_t>(t->size_);  // target length
   } else {
-    stbuf->st_mode = S_IFREG | 0644;
+    stbuf->st_mode = S_IFREG | (have_mode ? perm : 0644u);
     // POSIX link count = canonical name (1) + tag-level hard-link aliases.
     // Ask the CTE core how many extra names are bound to this tag.
     nlink_t nlink = 1;
@@ -205,11 +237,28 @@ static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
     // cte_off_t is off_t on Linux; the WinFsp shim maps it for Windows.
     stbuf->st_size = static_cast<cte_off_t>(t->size_);
   }
-  // Change time (ctime): the tag's last_changed_, in ns since the epoch. Tags
-  // only; 0 means the chimod had no value (leave st_ctim at the epoch).
+  // Report the 512-byte block count backing the file so stat(2) st_blocks is
+  // non-zero for files that hold data (generic/615 asserts a buffered/direct
+  // write shows allocated blocks). Derived from the logical size; directories
+  // report 0. st_blksize advertises a sensible I/O unit for tools.
+  stbuf->st_blksize = static_cast<decltype(stbuf->st_blksize)>(4096);
+  stbuf->st_blocks = static_cast<decltype(stbuf->st_blocks)>(
+      (static_cast<uint64_t>(stbuf->st_size) + 511) / 512);
+  // Timestamps come from the tag as ns since the epoch (0 means the chimod had
+  // no value, so leave that field at the epoch): ctime = last metadata change
+  // (last_changed_), mtime = last content change (last_modified_), atime = last
+  // access (last_read_). All three are surfaced from the same GetTagSize query.
   if (t->ctime_ != 0) {
-    stbuf->st_ctim.tv_sec = static_cast<time_t>(t->ctime_ / 1000000000ULL);
-    stbuf->st_ctim.tv_nsec = static_cast<long>(t->ctime_ % 1000000000ULL);
+    NsBitsToTimespec(t->ctime_, stbuf->st_ctim.tv_sec, stbuf->st_ctim.tv_nsec);
+  }
+  // Fall back to ctime when mtime is unknown, so a valid file never reports
+  // mtime at the epoch while it has a real ctime (merged from #680).
+  clio::run::u64 mtime_ns = (t->mtime_ != 0) ? t->mtime_ : t->ctime_;
+  if (mtime_ns != 0) {
+    NsBitsToTimespec(mtime_ns, stbuf->st_mtim.tv_sec, stbuf->st_mtim.tv_nsec);
+  }
+  if (t->atime_ != 0) {
+    NsBitsToTimespec(t->atime_, stbuf->st_atim.tv_sec, stbuf->st_atim.tv_nsec);
   }
   return 0;
 }
@@ -254,11 +303,82 @@ static int cte_fuse_getattr(const char *path, cte_stat_t *stbuf,
 
 static int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
                             struct fuse_file_info *fi) {
-  (void)path;
-  (void)tv;
   (void)fi;
-  // CTE timestamps are managed internally; accept silently
-  return 0;
+  // Translate the POSIX (atime, mtime) timespec pair into the chimod's flag
+  // encoding: bit0/bit1 = explicit atime/mtime, bit2/bit3 = UTIME_NOW (resolved
+  // server-side so it shares the tag clock). UTIME_OMIT leaves a field alone.
+  clio::run::u32 flags = 0;
+  clio::run::u64 atime_ns = 0, mtime_ns = 0;
+#if defined(UTIME_NOW) && defined(UTIME_OMIT)
+  if (tv != nullptr) {
+    if (tv[0].tv_nsec == UTIME_NOW) {
+      flags |= 0x4u;
+    } else if (tv[0].tv_nsec != UTIME_OMIT) {
+      flags |= 0x1u;
+      // Signed arithmetic so pre-epoch times don't wrap (generic/258); stored
+      // as the two's-complement bits, decoded symmetrically in NsBitsToTimespec.
+      atime_ns = static_cast<clio::run::u64>(
+          static_cast<int64_t>(tv[0].tv_sec) * 1000000000LL +
+          static_cast<int64_t>(tv[0].tv_nsec));
+    }
+    if (tv[1].tv_nsec == UTIME_NOW) {
+      flags |= 0x8u;
+    } else if (tv[1].tv_nsec != UTIME_OMIT) {
+      flags |= 0x2u;
+      mtime_ns = static_cast<clio::run::u64>(
+          static_cast<int64_t>(tv[1].tv_sec) * 1000000000LL +
+          static_cast<int64_t>(tv[1].tv_nsec));
+    }
+  } else {
+    // NULL tv means "set both to now".
+    flags |= 0x4u | 0x8u;
+  }
+#else
+  // Platform without UTIME_NOW/OMIT: treat as set-both-to-now.
+  (void)tv;
+  flags |= 0x4u | 0x8u;
+#endif
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncUtimens(std::string(path), atime_ns, mtime_ns, flags);
+  t.Wait();
+  int rc = static_cast<int>(t->GetReturnCode());
+  return rc == 0 ? 0 : -rc;
+}
+
+// chmod records the permission bits as a per-file override in the chimod
+// (surfaced by getattr), mirroring chown. Storing the mode lets +x stick, so a
+// binary copied onto the fs can be executed (generic/452) and chmod-then-proceed
+// callers (e.g. mount's mtab updater in generic/089) still succeed. AsyncChmod
+// resolves the path and returns ENOENT for a missing file, so no separate
+// existence probe is needed.
+static int cte_fuse_chmod(const char *path, cte_mode_t mode,
+                          struct fuse_file_info *fi) {
+  (void)fi;
+  auto *cfs = CLIO_CFS_CLIENT;
+  std::string p(path);
+  // Probe existence first: the chmod path resolves via GetOrCreateTag, so a
+  // missing target would otherwise be silently created. chmod(2) must ENOENT.
+  auto g = cfs->AsyncGetattr(p);
+  g.Wait();
+  if (g->GetReturnCode() != 0 || g->exists_ == 0) return -ENOENT;
+  auto t = cfs->AsyncChmod(p, static_cast<clio::run::u32>(mode) & 07777u);
+  t.Wait();
+  return t->GetReturnCode() == 0 ? 0 : -EIO;
+}
+
+// chown records a per-file owner uid/gid override in the chimod, surfaced by
+// getattr (files carry no stored POSIX owner otherwise). A uid/gid of
+// (uid_t)-1 == 0xFFFFFFFF means "leave that field unchanged" (POSIX), which is
+// exactly the chimod's "unchanged" sentinel, so no translation is needed.
+static int cte_fuse_chown(const char *path, uid_t uid, gid_t gid,
+                          struct fuse_file_info *fi) {
+  (void)fi;
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncChown(std::string(path),
+                           static_cast<clio::run::u32>(uid),
+                           static_cast<clio::run::u32>(gid));
+  t.Wait();
+  return t->GetReturnCode() == 0 ? 0 : -EIO;
 }
 
 // ============================================================================
@@ -335,6 +455,25 @@ static int cte_fuse_rmdir(const char *path) {
 // File lifecycle
 // ============================================================================
 
+// O_DIRECT needs no special handling: we deliberately do NOT set the per-file
+// direct_io flag. Our read/write handlers already work at arbitrary offsets and
+// sizes, so an O_DIRECT open flows through the exact same buffered page-cache
+// path as a regular open — it is never rejected. (Enabling per-file direct_io
+// would make the kernel return ENODEV for any mmap of an O_DIRECT fd, breaking
+// programs that both O_DIRECT and mmap the same file, e.g. fsx -Z; see #597.)
+
+// Honor O_TRUNC: the chimod open resolves the tag but does not truncate, so an
+// open/creat of an existing file with O_TRUNC would keep its old page-blobs
+// (leaving stale data an app expects to be gone — e.g. reads of a re-created
+// file's holes). Clear it to zero length here, which frees those blobs.
+static inline void MaybeTruncateOnOpen(clio::cte::filesystem::Client *cfs,
+                                       const std::string &p, int flags) {
+  if (flags & O_TRUNC) {
+    auto tr = cfs->AsyncTruncate(p, 0);
+    tr.Wait();
+  }
+}
+
 static int cte_fuse_create(const char *path, cte_mode_t mode,
                            struct fuse_file_info *fi) {
   std::string p(path);
@@ -347,6 +486,7 @@ static int cte_fuse_create(const char *path, cte_mode_t mode,
   handle->fh = t->handle_;
   handle->path = p;
   fi->fh = reinterpret_cast<uint64_t>(handle);
+  MaybeTruncateOnOpen(cfs, p, fi->flags);
   return 0;
 }
 
@@ -364,6 +504,7 @@ static int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   handle->fh = t->handle_;
   handle->path = p;
   fi->fh = reinterpret_cast<uint64_t>(handle);
+  MaybeTruncateOnOpen(cfs, p, fi->flags);
   return 0;
 }
 
@@ -481,6 +622,91 @@ static int cte_fuse_truncate(const char *path, cte_off_t size,
   return t->GetReturnCode() == 0 ? 0 : -EIO;
 }
 
+#ifdef __linux__
+// Write `len` zero bytes at `off` through an open handle, chunked so a large
+// range doesn't need one giant SHM buffer. Used by ZERO_RANGE. Returns 0 or a
+// negative errno.
+static int cte_fuse_write_zeros(CfsHandle *handle, cte_off_t off,
+                                cte_off_t len) {
+  auto *ipc = CLIO_IPC;
+  auto *cfs = CLIO_CFS_CLIENT;
+  constexpr cte_off_t kChunk = 1 << 20;  // 1 MiB
+  const cte_off_t buf_sz = (len < kChunk) ? len : kChunk;
+  ctp::ipc::FullPtr<char> zbuf = ipc->AllocateBuffer(buf_sz);
+  if (zbuf.IsNull()) return -ENOMEM;
+  memset(zbuf.ptr_, 0, static_cast<size_t>(buf_sz));
+  int result = 0;
+  for (cte_off_t done = 0; done < len;) {
+    const cte_off_t n = ((len - done) < buf_sz) ? (len - done) : buf_sz;
+    auto t = cfs->AsyncWrite(handle->fh, static_cast<clio::run::u64>(off + done),
+                             static_cast<clio::run::u64>(n),
+                             ctp::ipc::ShmPtr<>(zbuf.shm_));
+    t.Wait();
+    if (t->GetReturnCode() != 0) { result = -EIO; break; }
+    done += n;
+  }
+  ipc->FreeBuffer(zbuf);
+  return result;
+}
+
+// fallocate — page-blobs are created lazily on write and holes read back as
+// zeros, so we never reserve storage ahead of time. Supported modes:
+//   * mode==0            : grow EOF to offset+length (never shrinks).
+//   * FALLOC_FL_KEEP_SIZE: no-op success (nothing to reserve).
+//   * FALLOC_FL_ZERO_RANGE: make [offset,offset+length) read as zeros by
+//     writing zeros through the open handle (with KEEP_SIZE, restore EOF after
+//     if the write extended it). This is a correct ZERO_RANGE for our
+//     hole-reads-as-zero model and unblocks the fzero xfstests.
+// Layout-shifting modes (punch hole, collapse/insert range) would need a
+// chimod-level block-dealloc/shift op and still return EOPNOTSUPP.
+static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
+                              cte_off_t length, struct fuse_file_info *fi) {
+  const int kSupportedModes = FALLOC_FL_KEEP_SIZE | FALLOC_FL_ZERO_RANGE;
+  if (mode & ~kSupportedModes) {
+    return -EOPNOTSUPP;  // punch/collapse/insert: layout-changing
+  }
+  if (offset < 0 || length <= 0) {
+    return -EINVAL;
+  }
+
+  if (mode & FALLOC_FL_ZERO_RANGE) {
+    auto *handle = GetHandle(fi);
+    if (!handle) return -EBADF;
+    // Original size, so KEEP_SIZE can restore EOF if the zero-write grows it.
+    cte_stat_t st;
+    int rc = cte_fuse_getattr_stat(path, &st, fi);
+    if (rc != 0) return rc;
+    rc = cte_fuse_write_zeros(handle, offset, length);
+    if (rc != 0) return rc;
+    if ((mode & FALLOC_FL_KEEP_SIZE) && (offset + length) > st.st_size) {
+      auto *cfs = CLIO_CFS_CLIENT;
+      auto t = cfs->AsyncTruncate(std::string(path),
+                                  static_cast<clio::run::u64>(st.st_size));
+      t.Wait();
+      if (t->GetReturnCode() != 0) return -EIO;
+    }
+    return 0;
+  }
+
+  if (mode & FALLOC_FL_KEEP_SIZE) {
+    return 0;  // no size change requested, and there is nothing to reserve
+  }
+
+  // mode == 0: extend EOF to offset+length if the file is currently shorter.
+  cte_stat_t st;
+  int rc = cte_fuse_getattr_stat(path, &st, fi);
+  if (rc != 0) return rc;
+  cte_off_t need = offset + length;
+  if (need <= st.st_size) return 0;  // already large enough; never shrink
+
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncTruncate(std::string(path),
+                              static_cast<clio::run::u64>(need));
+  t.Wait();
+  return t->GetReturnCode() == 0 ? 0 : -EIO;
+}
+#endif  // __linux__
+
 static int cte_fuse_link(const char *from, const char *to) {
   // Hard link `to` -> existing file `from`. The chimod binds both names to the
   // same CTE tag (a tag-level alias), so they share all data.
@@ -491,13 +717,128 @@ static int cte_fuse_link(const char *from, const char *to) {
   return rc == 0 ? 0 : -rc;  // chimod returns errno-style codes
 }
 
-static int cte_fuse_rename(const char *from, const char *to,
-                           unsigned int flags) {
-  // RENAME_NOREPLACE / RENAME_EXCHANGE aren't supported; POSIX replace is.
-  if (flags != 0) {
+static int cte_fuse_symlink(const char *target, const char *path) {
+  // Create a symlink at `path` pointing at `target`. The chimod stores the
+  // target string in a reserved marker blob under `path`'s tag.
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncSymlink(std::string(target), std::string(path));
+  t.Wait();
+  int rc = static_cast<int>(t->GetReturnCode());  // 0/EEXIST/EIO
+  return rc == 0 ? 0 : -rc;  // chimod returns errno-style codes
+}
+
+static int cte_fuse_readlink(const char *path, char *buf, size_t size) {
+  // Read the symlink target into `buf` (NUL-terminated). FUSE readlink returns
+  // 0 on success (not the length).
+  if (size == 0) {
     return -EINVAL;
   }
   auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncReadlink(std::string(path));
+  t.Wait();
+  int rc = static_cast<int>(t->GetReturnCode());  // 0/ENOENT/EINVAL
+  if (rc != 0) {
+    return -rc;
+  }
+  std::string target = t->target_.str();
+  size_t n = std::min(target.size(), size - 1);
+  std::memcpy(buf, target.data(), n);
+  buf[n] = '\0';
+  return 0;
+}
+
+static int cte_fuse_setxattr(const char *path, const char *name,
+                             const char *value, size_t size, int flags) {
+  // Set xattr `name` on `path`. `value` is raw bytes (may contain NULs), so
+  // preserve its length rather than treating it as a C string. `flags` carries
+  // XATTR_CREATE(1) / XATTR_REPLACE(2), matching the runtime's bit checks.
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncSetxattr(std::string(path), std::string(name),
+                              std::string(value, size),
+                              static_cast<unsigned int>(flags));
+  t.Wait();
+  int rc = static_cast<int>(t->GetReturnCode());
+  return rc == 0 ? 0 : -rc;  // EEXIST/ENODATA/ENOENT/EIO -> negative errno
+}
+
+static int cte_fuse_getxattr(const char *path, const char *name, char *value,
+                             size_t size) {
+  // Read xattr `name` of `path`. Return the value length (POSIX getxattr);
+  // size==0 is a length query. Missing attribute -> -ENODATA.
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncGetxattr(std::string(path), std::string(name));
+  t.Wait();
+  int rc = static_cast<int>(t->GetReturnCode());
+  if (rc != 0) {
+    return -rc;  // ENOENT (file absent)
+  }
+  if (t->found_ == 0) {
+    return -ENODATA;  // attribute not present
+  }
+  std::string val = t->value_.str();
+  size_t len = val.size();
+  if (size == 0) {
+    return static_cast<int>(len);  // length query
+  }
+  if (size < len) {
+    return -ERANGE;
+  }
+  std::memcpy(value, val.data(), len);
+  return static_cast<int>(len);
+}
+
+static int cte_fuse_listxattr(const char *path, char *list, size_t size) {
+  // Return the NUL-separated, NUL-terminated list of xattr names. size==0 is a
+  // length query.
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncListxattr(std::string(path));
+  t.Wait();
+  int rc = static_cast<int>(t->GetReturnCode());
+  if (rc != 0) {
+    return -rc;  // ENOENT
+  }
+  std::string names = t->names_.str();
+  size_t len = names.size();
+  if (size == 0) {
+    return static_cast<int>(len);  // length query
+  }
+  if (size < len) {
+    return -ERANGE;
+  }
+  std::memcpy(list, names.data(), len);
+  return static_cast<int>(len);
+}
+
+static int cte_fuse_removexattr(const char *path, const char *name) {
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncRemovexattr(std::string(path), std::string(name));
+  t.Wait();
+  int rc = static_cast<int>(t->GetReturnCode());
+  return rc == 0 ? 0 : -rc;  // ENODATA/ENOENT/EIO -> negative errno
+}
+
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)  // from <linux/fs.h>; guarded to avoid header clash
+#endif
+
+static int cte_fuse_rename(const char *from, const char *to,
+                           unsigned int flags) {
+  auto *cfs = CLIO_CFS_CLIENT;
+  // RENAME_NOREPLACE: the rename must fail with EEXIST if `to` already exists.
+  // Probe for the destination then fall through to a plain rename. This is the
+  // standard high-level-FUSE approach (a tiny TOCTOU window vs a truly atomic
+  // check, acceptable for a single-namespace rename). RENAME_EXCHANGE and
+  // RENAME_WHITEOUT need chimod-level atomic swap / whiteout support and stay
+  // EINVAL so callers fall back cleanly.
+  if (flags & RENAME_NOREPLACE) {
+    auto g = cfs->AsyncGetattr(std::string(to));
+    g.Wait();
+    if (g->GetReturnCode() == 0 && g->exists_ != 0) return -EEXIST;
+    flags &= ~static_cast<unsigned int>(RENAME_NOREPLACE);
+  }
+  if (flags != 0) {
+    return -EINVAL;  // RENAME_EXCHANGE / RENAME_WHITEOUT unsupported
+  }
   auto t = cfs->AsyncRename(std::string(from), std::string(to));
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());
@@ -549,13 +890,20 @@ static int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf) {
   return 0;
 }
 
-static const struct fuse_operations cte_fuse_ops = {
+// External linkage (declared in fuse_cte.h): the mount/process-entry glue in
+// fuse_cte_main.cc points fuse_main()/fuse_new() at this table. The callbacks
+// it references keep internal linkage — their addresses are captured here.
+const struct fuse_operations cte_fuse_ops = {
     .getattr = cte_fuse_getattr,
+    .readlink = cte_fuse_readlink,
     .mkdir = cte_fuse_mkdir,
     .unlink = cte_fuse_unlink,
     .rmdir = cte_fuse_rmdir,
+    .symlink = cte_fuse_symlink,
     .rename = cte_fuse_rename,
     .link = cte_fuse_link,
+    .chmod = cte_fuse_chmod,
+    .chown = cte_fuse_chown,
     .truncate = cte_fuse_truncate,
     .open = cte_fuse_open,
     .read = cte_fuse_read,
@@ -564,167 +912,16 @@ static const struct fuse_operations cte_fuse_ops = {
     .flush = cte_fuse_flush,
     .release = cte_fuse_release,
     .fsync = cte_fuse_fsync,
+    .setxattr = cte_fuse_setxattr,
+    .getxattr = cte_fuse_getxattr,
+    .listxattr = cte_fuse_listxattr,
+    .removexattr = cte_fuse_removexattr,
     .readdir = cte_fuse_readdir,
     .init = cte_fuse_init,
     .destroy = cte_fuse_destroy,
     .create = cte_fuse_create,
     .utimens = cte_fuse_utimens,
+#ifdef __linux__
+    .fallocate = cte_fuse_fallocate,
+#endif
 };
-
-#ifndef _WIN32
-// custom_io callbacks: when apptainer hands us an already-mounted
-// /dev/fuse fd, we need to drive the FUSE protocol on that fd directly
-// instead of having libfuse mount its own. Plain read/writev syscalls
-// suffice; splice is optional.
-#ifndef __APPLE__
-static ssize_t cte_custom_writev(int fd, struct iovec *iov, int count,
-                                 void * /*userdata*/) {
-  return writev(fd, iov, count);
-}
-static ssize_t cte_custom_read(int fd, void *buf, size_t buf_len,
-                               void * /*userdata*/) {
-  return read(fd, buf, buf_len);
-}
-#endif  // __APPLE__
-#endif  // _WIN32
-
-int main(int argc, char *argv[]) {
-#if defined(_WIN32) || defined(__APPLE__)
-  // Native Windows (WinFsp) and macOS (macFUSE): no Apptainer-style
-  // /dev/fuse fd injection. fuse_main() parses argv (on Windows the
-  // mountpoint is a drive letter like "Z:" or a host directory) and drives
-  // the FUSE protocol. The callbacks and the entire CTE data path below them
-  // are identical to the Linux build.
-  return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
-#else
-  // Apptainer's --fusemount opens /dev/fuse on the host, performs the
-  // kernel mount, and passes the fd to the FUSE binary as the last
-  // argv ("/dev/fd/<N>"). libfuse 3's high-level argv parser doesn't
-  // recognize this token (it's a libfuse2-era convention) and aborts
-  // with "fuse: invalid argument '/dev/fd/N'". apptainer also strips
-  // the mountpoint from the argv since it has already mounted, so
-  // there's no fuse_main path that works.
-  //
-  // libfuse 3.14 added fuse_session_custom_io() which lets us drive
-  // the protocol on an existing fd. When we detect /dev/fd/<N> as the
-  // last argv, take the custom-io path; otherwise fall back to the
-  // normal fuse_main mount-and-serve flow (host bare-metal use).
-  int prefd = -1;
-  int new_argc = argc;
-  if (argc >= 2 && std::strncmp(argv[argc - 1], "/dev/fd/", 8) == 0) {
-    prefd = std::atoi(argv[argc - 1] + 8);
-    if (prefd < 0) {
-      prefd = -1;
-    } else {
-      new_argc = argc - 1;  // drop /dev/fd/N from argv
-    }
-  }
-
-  if (prefd == -1) {
-    return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
-  }
-
-  // Apptainer 1.2.5 (unprivileged, no starter-suid) doesn't actually
-  // call mount(2) when --fusemount kicks in for a user-supplied
-  // binary — it only opens /dev/fuse and hands us the fd. We have to
-  // bind that fd to a mountpoint ourselves (this requires CAP_SYS_ADMIN
-  // in the current user_ns, which we have via apptainer's userns
-  // mapping). The mountpoint isn't communicated to us through argv or
-  // env by apptainer, so the caller MUST set CLIO_CTE_FUSE_MOUNTPOINT
-  // before exec'ing the FUSE binary via --fusemount.
-  const char *mountpoint = std::getenv("CLIO_CTE_FUSE_MOUNTPOINT");
-  if (mountpoint == nullptr) {
-    std::fprintf(stderr,
-                 "clio_cte_fuse: got pre-opened fd %d but "
-                 "CLIO_CTE_FUSE_MOUNTPOINT env var is not set\n", prefd);
-    return 1;
-  }
-  char mount_opts[256];
-  std::snprintf(mount_opts, sizeof(mount_opts),
-                "fd=%d,rootmode=040000,user_id=%u,group_id=%u",
-                prefd, (unsigned)getuid(), (unsigned)getgid());
-  if (mount("nodev", mountpoint, "fuse", MS_NODEV | MS_NOSUID,
-            mount_opts) != 0) {
-    std::fprintf(stderr, "clio_cte_fuse: mount(\"%s\", fuse) failed: %s\n",
-                 mountpoint, std::strerror(errno));
-    return 1;
-  }
-  std::fprintf(stderr, "clio_cte_fuse: mounted FUSE at %s with fd=%d\n",
-               mountpoint, prefd);
-
-  struct fuse_args args = FUSE_ARGS_INIT(new_argc, argv);
-  struct fuse *fuse =
-      fuse_new(&args, &cte_fuse_ops, sizeof(cte_fuse_ops), nullptr);
-  if (!fuse) {
-    fuse_opt_free_args(&args);
-    return 1;
-  }
-
-  struct fuse_session *se = fuse_get_session(fuse);
-  static const struct fuse_custom_io custom_io = {
-      .writev = cte_custom_writev,
-      .read = cte_custom_read,
-      .splice_receive = nullptr,
-      .splice_send = nullptr,
-  };
-
-  // Resolve fuse_session_custom_io at runtime via dlsym so this binary
-  // links against system libfuse 3.10.5 (which has setuid
-  // /usr/bin/fusermount3) without needing the 3.14+ symbol present at
-  // link time. The symbol IS present at runtime when the caller uses
-  // a newer libfuse runtime (e.g. apptainer --fusemount).
-  using FuseSessionCustomIoFn = int (*)(struct fuse_session *,
-                                        const struct fuse_custom_io *, int);
-  auto fuse_session_custom_io_dyn = reinterpret_cast<FuseSessionCustomIoFn>(
-      dlsym(RTLD_DEFAULT, "fuse_session_custom_io"));
-  if (!fuse_session_custom_io_dyn) {
-    std::fprintf(stderr,
-                 "clio_cte_fuse: fuse_session_custom_io not available in "
-                 "the loaded libfuse (need 3.14+); --fusemount mode "
-                 "requires a newer libfuse runtime.\n");
-    fuse_destroy(fuse);
-    fuse_opt_free_args(&args);
-    return 1;
-  }
-  if (fuse_session_custom_io_dyn(se, &custom_io, prefd) != 0) {
-    fuse_destroy(fuse);
-    fuse_opt_free_args(&args);
-    return 1;
-  }
-
-  // Multi-threaded FUSE loop. Single-threaded `fuse_loop()` serializes
-  // every fs op through one handler -- each call blocks on
-  // AsyncPutBlob.Wait() before the next can run -- so 24 concurrent
-  // ranks per node effectively run sequentially and a workload that
-  // should finish in seconds hangs past the test timeout. fuse_loop_mt
-  // spawns worker threads that handle ops in parallel; AsyncPutBlobs
-  // from different ranks now overlap.
-  //
-  // The libfuse 3.16 headers we compile against rewrite `fuse_loop_mt`
-  // to `fuse_loop_mt_32` (via macro), but the runtime libfuse 3.10.5
-  // (system) only exports `fuse_loop_mt@@FUSE_3.2` (the unversioned
-  // default), not `fuse_loop_mt_32`. Resolve the unversioned symbol
-  // via dlsym -- same pattern this file already uses for
-  // fuse_session_custom_io -- so the binary works against any
-  // libfuse runtime >= 3.2.
-  using FuseLoopMtFn = int (*)(struct fuse *, struct fuse_loop_config *);
-  auto fuse_loop_mt_dyn = reinterpret_cast<FuseLoopMtFn>(
-      dlsym(RTLD_DEFAULT, "fuse_loop_mt"));
-
-  int ret;
-  if (fuse_loop_mt_dyn != nullptr) {
-    struct fuse_loop_config loop_cfg = {0};
-    loop_cfg.clone_fd = 0;            // share /dev/fuse fd across workers
-    loop_cfg.max_idle_threads = 32;   // headroom for 24 ranks/node
-    ret = fuse_loop_mt_dyn(fuse, &loop_cfg);
-  } else {
-    std::fprintf(stderr,
-                 "clio_cte_fuse: fuse_loop_mt not in runtime libfuse, "
-                 "falling back to single-threaded loop.\n");
-    ret = fuse_loop(fuse);
-  }
-  fuse_destroy(fuse);
-  fuse_opt_free_args(&args);
-  return ret;
-#endif  // _WIN32 || __APPLE__
-}

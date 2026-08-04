@@ -34,6 +34,7 @@
 #ifndef WRPCTE_CORE_RUNTIME_H_
 #define WRPCTE_CORE_RUNTIME_H_
 
+#include <memory>
 #include <atomic>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/comutex.h>
@@ -43,8 +44,10 @@
 #include <clio_ctp/memory/allocator/malloc_allocator.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_config.h>
-#include <clio_cte/core/core_dpe.h>
+#include <clio_cte/core/dpe/dpe.h>
 #include <clio_cte/core/core_tasks.h>
+#include <clio_cte/core/data_organizer/data_organizer.h>
+#include <clio_cte/core/shm_metadata_cache.h>
 #include <clio_cte/core/gpu_metadata_cache.h>
 #include <clio_cte/core/transaction_log.h>
 #include <clio_ctp/search/regex_search_engine.h>
@@ -56,6 +59,16 @@ class Config;
 
 namespace clio::cte::core {
 
+
+/**
+ * Determine whether a target is eligible for blob placement under TTL rules.
+ *
+ * @param target Target metadata, including persistence and predicted TTL.
+ * @param min_persistence_level Minimum persistence level required by the blob.
+ * @return True when the target may receive the blob.
+ */
+bool IsTargetEligibleForBlob(const TargetInfo &target,
+                             int min_persistence_level);
 
 /**
  * CTE Core Runtime Container
@@ -72,14 +85,6 @@ public:
   // WAL files and clearing the tag/blob/target maps — instead of leaking it
   // until process exit.
   ~Runtime() override;
-
-  /**
-   * Fix up POD task members (clio::run::priv::string SSO data_ pointers,
-   * etc.) after a GPU2CPU D2H POD memcpy. Dispatched by the GPU pop
-   * path on the worker before Run.
-   */
-  void FixupAfterCopy(clio::run::u32 method,
-                      clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Create the container (Method::kCreate)
@@ -145,12 +150,114 @@ public:
   template <typename TaskT>
   clio::run::TaskResume ReorganizeBlobImpl(clio::run::shared_ptr<TaskT> &task);
 
+  /**
+   * Write one replica's bytes for a Put task (issue #886). Called from
+   * PutBlobImpl UNDER the blob's write token, for Context::replica_ > 0
+   * (replica-targeted put) and for each replica of a kAllReplicas
+   * write-through. Lends the replica's block layout to the primary
+   * extend/write machinery via a staging BlobInfo (the ReorganizeBlob
+   * pattern), then publishes the layout back and logs a kExtendReplica WAL
+   * record. error_code uses PutBlob's return-code space (10+x alloc,
+   * 20+x write).
+   *
+   * Score resolution: requested_score >= 0 sets the REPLICA's score (the
+   * primary's is untouched); -1 keeps the replica's own score, falling back
+   * to fallback_score for a replica this write creates. The write-through
+   * loop always passes -1 — an explicit put score is for the primary, not a
+   * blanket rescore of every copy. Context::replica_flags_ is OR'd in first,
+   * and REPLICA_PERSISTENT tightens the placement's min persistence level.
+   */
+  template <typename TaskT>
+  clio::run::TaskResume WriteReplicaData(clio::run::shared_ptr<TaskT> &task,
+                                         BlobInfo &blob_info,
+                                         const std::string &blob_name,
+                                         TagId tag_id, int replica_idx,
+                                         clio::run::u64 offset,
+                                         clio::run::u64 size,
+                                         float requested_score,
+                                         float fallback_score,
+                                         clio::run::u32 &error_code);
+
+  /**
+   * Migrate one REPLICA's blocks to the tier its new score selects (issue
+   * #886) — the replica half of ReorganizeBlobInternal, sharing its
+   * read→free→re-place→publish shape and rc space. REPLICA_FIXED makes this
+   * a no-op (rc 0); REPLICA_PERSISTENT keeps the re-place off volatile
+   * tiers. The primary's blocks, score and mirror are untouched.
+   */
+  clio::run::TaskResume ReorganizeReplicaInternal(const TagId &tag_id,
+                                                  const std::string &blob_name,
+                                                  int replica_idx,
+                                                  float new_score,
+                                                  clio::run::u32 &rc);
+
+  /** True when any of the replica's blocks sit on a target the health
+   *  predictor marks failing (the REPLICA_FIXED evacuation override). */
+  bool ReplicaBlocksOnFailingTarget(const Replica &rep);
+
+  /**
+   * Free a REPLICA_CACHE replica's blocks under capacity pressure (issue
+   * #886 cache chimod): write token + reader drain, blocks freed via the
+   * staging/FreeAllBlobBlocks path, empty layout published + WAL'd. The
+   * slot's metadata (flags, min_score) survives so the next cache write
+   * refills it. freed_bytes reports the physical footprint returned.
+   */
+  clio::run::TaskResume ReclaimCacheReplica(const TagId &tag_id,
+                                            const std::string &blob_name,
+                                            clio::run::u64 &freed_bytes,
+                                            clio::run::u32 &rc);
+
   /** Put blob (Method::kPutBlob) - allocates and writes data to blob. */
   clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
   /** Get blob (Method::kGetBlob) - reads data from existing blob. */
   clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
   /** Reorganize single blob (Method::kReorganizeBlob) - update score. */
   clio::run::TaskResume ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task);
+  /** Evict lowest-score blobs off a tier until a byte budget is reclaimed
+   *  (Method::kEvict). Broadcast; each shard reports its share. */
+  clio::run::TaskResume Evict(clio::run::shared_ptr<EvictTask> &task);
+  clio::run::TaskResume MultiPutBlob(
+      clio::run::shared_ptr<MultiPutBlobTask> &task);
+  /** Record that a node holds a cached/replicated copy of a blob
+   *  (Method::kRegisterReplicaContainer, issue #886 coherence). */
+  clio::run::TaskResume RegisterReplicaContainer(
+      clio::run::shared_ptr<RegisterReplicaContainerTask> &task);
+
+  /**
+   * Rescore-and-move one blob without spawning a ReorganizeBlobTask (issue
+   * #738). This is the body shared by the ReorganizeBlob task handler and
+   * the internal data organizers, which call it directly from the periodic
+   * DynamicReorganize coroutine. Applies the configured
+   * score_difference_threshold (small deltas are a successful no-op).
+   * @param tag_id Owning tag
+   * @param blob_name Blob to rescore
+   * @param new_score Target score in [0, 1]
+   * @param rc Output: 0 on success/skip, non-zero error code otherwise
+   */
+  clio::run::TaskResume ReorganizeBlobInternal(const TagId &tag_id,
+                                               const std::string &blob_name,
+                                               float new_score,
+                                               clio::run::u32 &rc);
+
+  /**
+   * Periodic internal data-organizer driver (Method::kDynamicReorganize).
+   * One-liner delegation: all organization logic lives in the configured
+   * DataOrganizer (issue #738).
+   */
+  clio::run::TaskResume DynamicReorganize(
+      clio::run::shared_ptr<DynamicReorganizeTask> &task);
+
+  /**
+   * Snapshot organizer-relevant metadata for this replica's partition of the
+   * local blob map. Partitioning hashes each blob's composite key modulo the
+   * configured organizer_tasks, so the `organizer_tasks` periodic replicas
+   * cover the blob space disjointly. Empty blobs are skipped (nothing to
+   * move).
+   * @param replica_id 0-based replica index of the calling organizer task
+   * @param out Filled with one entry per blob owned by this replica
+   */
+  void CollectOrganizerBlobStats(clio::run::u32 replica_id,
+                                 std::vector<OrganizerBlobStat> &out);
 
   /** Fully-POD, GPU-compatible blob handlers (issue #556). Thin wrappers over
    *  the *Impl<TaskT> templates above. */
@@ -239,6 +346,22 @@ public:
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 
+  /**
+   * Worker-local batching policy (issue #820).
+   *
+   * PutBlob/GetBlob tasks aimed at the SAME blob are parked together and then
+   * collapsed into one vectored task per blob. This is the whole point of the
+   * feature: the filesystem stores each 1 MiB page as one blob, so a sequential
+   * 4 KiB workload sends 256 tasks at one page-blob and every one of them has to
+   * take that blob's #680 write token across its entire body. Merged, they cost
+   * one token acquire and one bdev pass.
+   */
+  bool BuildBatch(clio::run::u32 method,
+                  const clio::run::shared_ptr<clio::run::Task> &task,
+                  clio::run::BatchGroups &groups) override;
+  void SmashBatch(clio::run::BatchGroups &groups,
+                  clio::run::BatchSink &sink) override;
+
   // Container virtual method implementations (defined in autogen/core_lib_exec.cc)
   void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
                 clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
@@ -285,8 +408,8 @@ private:
   // concurrent access)
   ctp::priv::unordered_map_ll<std::string, TagId>
       tag_name_to_id_;                                   // tag_name -> tag_id
-  ctp::priv::unordered_map_ll<TagId, TagInfo> tag_id_to_info_; // tag_id -> TagInfo
-  ctp::priv::unordered_map_ll<std::string, BlobInfo>
+  ctp::priv::unordered_map_ll<TagId, std::shared_ptr<TagInfo>> tag_id_to_info_; // tag_id -> TagInfo
+  ctp::priv::unordered_map_ll<std::string, std::shared_ptr<BlobInfo>>
       tag_blob_name_to_info_; // "tag_id.blob_name" -> BlobInfo
 
   // Secondary search index: absolute resolved tag name -> tag id. Lets TagQuery
@@ -296,19 +419,42 @@ private:
   // RenameTag, rebuilt after WAL/metadata restore).
   ctp::search::RegexSearchEngine<TagId> tag_search_;
 
+  // issue #783: shared-memory mirror of the tag/blob metadata, for zero-IPC
+  // client reads. DERIVED STATE ONLY -- the maps above stay authoritative.
+  // Every mirror call is best-effort and silently no-ops when the metadata
+  // segment is unavailable, so a metadata write is never rejected because the
+  // cache could not be updated.
+  ShmMetadataCache shm_cache_;
+
+  /** Project a BlobInfo into its cacheable form. Returns false when the blob
+   *  cannot be represented (too many blocks), in which case it is not
+   *  cached and clients keep using the RPC path for it. */
+  bool BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out);
+
+  /** Mirror one blob into the SHM cache. No-op when caching is off. */
+  void MirrorBlobToShm(const std::string &composite_key, const BlobInfo &info);
+
   // Atomic counters for thread-safe ID generation
   std::atomic<clio::run::u32>
       next_tag_id_minor_; // Minor counter for TagId UniqueId generation
 
   // Map sizes for data structures (must be large enough for expected entries)
-  static const size_t kBlobMapSize = 1000000;  // 1M blobs
-  static const size_t kTagMapSize = 100000;    // 100K tags
+  // Initial bucket count only; the maps grow (rehash) as entries are added.
+  // Kept small so for_each() (which scans every bucket) stays O(entries) rather
+  // than O(1M): the old 1M/100K pre-size made every full-map scan visit a
+  // million empty buckets, which is what made metadata-heavy workloads (e.g.
+  // generic/089) crawl to a timeout (issue #680).
+  static const size_t kBlobMapSize = 100;
+  static const size_t kTagMapSize = 100;
 
   // Synchronization primitives for thread-safe access to data structures
   // Single lock per data structure ensures all operations synchronize correctly
   clio::run::CoRwLock target_lock_;  // For registered_targets_ + target_name_to_id_
-  clio::run::CoRwLock tag_map_lock_;  // For tag_name_to_id_ + tag_id_to_info_
-  clio::run::CoRwLock blob_map_lock_;  // For tag_blob_name_to_info_
+  // tag_map_lock_ and blob_map_lock_ removed: the tag/blob maps are self-locking
+  // unordered_map_ll and tag_search_ is now internally synchronized, so the outer
+  // coroutine locks were redundant and deadlock-prone (issue #680). Values are
+  // std::shared_ptr, so a concurrent erase just drops the map's reference while
+  // any in-flight handle keeps the object alive -- no use-after-free.
   // Use a set of locks based on maximum number of lanes for better concurrency
   static const size_t kMaxLocks =
       64; // Maximum number of locks (matches max lanes)
@@ -326,6 +472,11 @@ private:
   // Cached Data Placement Engine — built once from config_ in Create() so
   // ExtendBlob does not allocate a fresh DPE on every PutBlob.
   std::unique_ptr<DataPlacementEngine> dpe_;
+
+  // Internal data organizer — built once from config_ in Create() (issue
+  // #738). nullptr when config_.organizer_.name_ is "none"/unknown; the
+  // periodic DynamicReorganize task then degrades to a no-op.
+  std::unique_ptr<DataOrganizer> organizer_;
 
   // Restart flag: set by Restart() before calling Init()/Create()
   bool is_restart_ = false;
@@ -491,8 +642,9 @@ private:
    * @param success Output parameter: true if allocation succeeded, false otherwise
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume AllocateFromTarget(TargetInfo &target_info, clio::run::u64 size,
-                                     clio::run::u64 &allocated_offset, bool &success);
+  clio::run::TaskResume AllocateFromTarget(
+      TargetInfo &target_info, clio::run::u64 size,
+      std::vector<clio::run::bdev::Block> &out_blocks, bool &success);
 
   /**
    * Free all blocks from a blob back to their respective targets
@@ -508,7 +660,7 @@ private:
    * @param tag_id Tag ID to search within
    * @return Pointer to BlobInfo if found, nullptr if not found
    */
-  BlobInfo *CheckBlobExists(const std::string &blob_name, const TagId &tag_id);
+  std::shared_ptr<BlobInfo> CheckBlobExists(const std::string &blob_name, const TagId &tag_id);
 
   /**
    * Create new blob with given parameters
@@ -517,7 +669,7 @@ private:
    * @param blob_score Score/priority for the blob
    * @return Pointer to created BlobInfo, nullptr on failure
    */
-  BlobInfo *CreateNewBlob(const std::string &blob_name, const TagId &tag_id,
+  std::shared_ptr<BlobInfo> CreateNewBlob(const std::string &blob_name, const TagId &tag_id,
                           float blob_score);
 
   /**
@@ -545,7 +697,8 @@ private:
    */
   clio::run::TaskResume ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset, clio::run::u64 size,
                              float blob_score, clio::run::u32 &error_code,
-                             int min_persistence_level = 0);
+                             int min_persistence_level = 0,
+                             clio::run::u64 preallocate = 0);
 
   /**
    * Resize a blob to exactly new_size: grow (allocate appended blocks via
@@ -571,9 +724,20 @@ private:
    * @param error_code Output: 0 for success, 1 for failure
    * Returns TaskResume for coroutine-based async operations
    */
+  // start_block_idx / start_block_offset_in_blob: an optional fast-path hint for
+  // writes known to target the blob tail (e.g. an append). The scan then begins
+  // at block `start_block_idx`, whose first byte sits at `start_block_offset_in_blob`
+  // in the blob, instead of re-walking from block 0. Callers MUST pass a
+  // consistent pair (start_block_offset_in_blob == sum of blocks[0..start_block_idx)
+  // sizes) and only for writes whose region lies entirely at/after that offset;
+  // the default (0,0) reproduces the exact full-scan behavior. This turns an
+  // O(blocks) rescan per append into O(1), fixing the O(N^2) blowup on files
+  // built by millions of tiny O_APPEND writes (generic/069).
   clio::run::TaskResume ModifyExistingData(const clio::run::priv::vector<BlobBlock> &blocks,
                                      ctp::ipc::ShmPtr<> data, size_t data_size,
-                                     size_t data_offset_in_blob, clio::run::u32 &error_code);
+                                     size_t data_offset_in_blob, clio::run::u32 &error_code,
+                                     size_t start_block_idx = 0,
+                                     size_t start_block_offset_in_blob = 0);
 
   /**
    * Read existing blob data from blocks
@@ -586,6 +750,25 @@ private:
    */
   clio::run::TaskResume ReadData(const clio::run::priv::vector<BlobBlock> &blocks, ctp::ipc::ShmPtr<> data,
                            size_t data_size, size_t data_offset_in_blob, clio::run::u32 &error_code);
+
+  /**
+   * Model the wall time of a data transfer over the blocks overlapping
+   * [offset, offset+size) WITHOUT performing it (I/O emulation, issue #747).
+   * Bytes are aggregated per target; each target contributes
+   * latency + bytes/bandwidth from its measured PerfMetrics (fallback
+   * constants when a target is unknown or reports zero), and the result is
+   * the max across targets — blocks on different targets transfer
+   * concurrently, blocks on the same target serialize on the device.
+   * @param blocks Block layout of the blob (snapshot or live under the
+   *        write token)
+   * @param offset Transfer start offset within the blob
+   * @param size Transfer size in bytes
+   * @param is_write true = use write latency/bandwidth, false = read
+   * @return Modeled duration in nanoseconds (0 if no blocks overlap)
+   */
+  clio::run::u64 EstimateIoTimeNs(const clio::run::priv::vector<BlobBlock> &blocks,
+                                  clio::run::u64 offset, clio::run::u64 size,
+                                  bool is_write);
 
   /**
    * Log telemetry data for CTE operations

@@ -460,6 +460,12 @@ target_link_libraries(host_deps INTERFACE
     ${REAL_TIME_FLAGS}
 )
 
+# NOTE: Poco::Net (the drive-failure prediction HTTP client) is intentionally
+# NOT linked into this INTERFACE aggregate. The client is compiled into
+# clio_ctp_host and links Poco PRIVATE there; propagating Poco::Foundation's
+# _FILE_OFFSET_BITS=64 / _LARGEFILE64_SOURCE through host_deps would collide with
+# the POSIX/stdio interception adapters (open64/creat64 "already defined").
+
 # Install interface libraries (compiled libraries are installed in src/CMakeLists.txt)
 install(TARGETS
     configure

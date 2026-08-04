@@ -66,17 +66,6 @@ class Scheduler {
   virtual void DivideWorkers(WorkOrchestrator *work_orch) = 0;
 
   /**
-   * Determines which worker to initially map a task to from clients.
-   * First few workers are always the scheduling workers.
-   * Analogous to the old MapTaskToLane function.
-   *
-   * @param ipc_manager Pointer to the IPC manager
-   * @param task The task to be scheduled
-   * @return Worker lane ID to assign the task to
-   */
-  virtual u32 ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task) = 0;
-
-  /**
    * Determines which worker to initially map a task to from runtime.
    * Called in RouteTask via IpcManager::EnqueueRuntime.
    *
@@ -91,12 +80,42 @@ class Scheduler {
                              ContainerHold container) = 0;
 
   /**
-   * Either steal or delegate tasks on a worker to balance load.
-   * Should be called after every ProcessNewTasks loop before SuspendMe.
-   *
-   * @param worker Pointer to the worker to rebalance
+   * Periodic load-balancing hook (issue #781). Called by the WorkOrchestrator
+   * monitor thread every ~500ms (NOT on the worker hot path). Implementations
+   * detect stalled workers (a worker stuck >1s inside one ExecTask on a
+   * non-yielding task), spawn a replacement thread and steal the stalled
+   * worker's backlog so one pathological/mislabeled task can never wedge the
+   * runtime, rebalance imbalanced load, retire idle elastic workers, and update
+   * the telemetry perf-bin PDF. This is the runtime's liveness guarantee: it
+   * does NOT depend on tasks being honestly labeled.
    */
-  virtual void RebalanceWorker(Worker *worker) = 0;
+  virtual void LoadBalance() = 0;
+
+  /**
+   * Telemetry hook (issue #781): called from Worker::EndTask with a completed
+   * task's ACTUAL measured cpu/wall time (us). Implementations fold it into the
+   * perf-bin PDF so the runtime can characterize its live workload (how many
+   * quick vs 1-second tasks it actually ran). Observation, not prediction —
+   * default no-op.
+   * @param method   the task's method id
+   * @param cpu_us   measured CPU time (us)
+   * @param wall_us  measured wall-clock time (us)
+   */
+  virtual void RecordCompletion(u32 method, double cpu_us, double wall_us) {
+    (void)method; (void)cpu_us; (void)wall_us;
+  }
+
+  /**
+   * Work-stealing hook (issue #781). Invoked when \a thief has drained its own
+   * lane. Implementations move a bounded number of tasks from neighbouring /
+   * overloaded workers' lanes onto the thief's lane so the pool stays
+   * work-conserving (which is what lets the runtime hit throughput with the
+   * MINIMUM number of threads). Must use a steal-safe lane pop.
+   *
+   * @param thief The idle worker looking for work.
+   * @return true if any task was stolen.
+   */
+  virtual bool StealWork(Worker *thief) = 0;
 
   /**
    * Adjust polling interval for periodic tasks based on work done.
@@ -136,6 +155,22 @@ class Scheduler {
    * @return Pointer to net recv worker, or nullptr if none assigned
    */
   virtual Worker *GetNetRecvWorker() const { return GetNetWorker(); }
+
+  /**
+   * Pick an alternate worker to drain a force-enqueued task that would
+   * otherwise route back to worker \a avoid_id (its own producer). Used by
+   * RouteLocal to break the self-send deadlock: a worker that force-enqueues a
+   * subtask onto its OWN lane busy-spins in the WAIT_FOR_SPACE ring Push when
+   * that lane is full and can never drain it (it is the consumer, blocked in
+   * Push). Redirecting to a different worker hands the task to a thread that
+   * actively drains, turning the deadlock into transient backpressure. Prefer
+   * a leaf-task drainer (I/O worker) that does not itself self-send.
+   * @return an alternate worker with id != avoid_id, or nullptr if none.
+   */
+  virtual Worker *PickAltWorker(u32 avoid_id) const {
+    (void)avoid_id;
+    return nullptr;
+  }
 };
 
 }  // namespace clio::run

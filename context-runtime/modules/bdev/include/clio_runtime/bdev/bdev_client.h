@@ -35,6 +35,7 @@
 #define BDEV_CLIENT_H_
 
 #include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/run_inline.h>
 
 #include "bdev_tasks.h"
 
@@ -64,7 +65,9 @@ class Client : public clio::run::ContainerClient {
       const std::string& pool_name, const clio::run::PoolId& custom_pool_id,
       BdevType bdev_type, clio::run::u64 total_size = 0,
       clio::run::u32 io_depth = 32, clio::run::u32 alignment = 4096,
-      const PerfMetrics* perf_metrics = nullptr) {
+      const PerfMetrics* perf_metrics = nullptr,
+      const std::string& alloc_log_path = "",
+      clio::run::u64 growth_unit = clio::run::u64(1) << 30) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     // CreateTask should always use admin pool, never the client's pool_id_
@@ -84,7 +87,8 @@ class Client : public clio::run::ContainerClient {
         custom_pool_id,   // target pool ID to create (explicit from user)
         this,             // Client pointer for PostWait
         // CreateParams arguments (perf_metrics is optional, defaults used if nullptr):
-        bdev_type, total_size, io_depth, safe_alignment, perf_metrics);
+        bdev_type, total_size, io_depth, safe_alignment, perf_metrics,
+        alloc_log_path, growth_unit);
 
     // Submit to runtime
     return ipc_manager->Send(task);
@@ -104,7 +108,8 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<AllocateBlocksTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, size);
 
-    return ipc_manager->Send(task);
+    // issue #862: see AsyncWrite.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -118,7 +123,8 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<clio::run::bdev::FreeBlocksTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, blocks);
 
-    return ipc_manager->Send(task);
+    // issue #862: see AsyncWrite.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -132,7 +138,8 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<clio::run::bdev::FreeBlocksTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, blocks);
 
-    return ipc_manager->Send(task);
+    // issue #862: see AsyncWrite.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -151,7 +158,9 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<clio::run::bdev::WriteTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, blocks, data, length);
 
-    return ipc_manager->Send(task);
+    // issue #862: a local (co-located, single-node) bdev write is a memcpy;
+    // run the handler inline instead of paying a task round trip for it.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -171,7 +180,8 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<clio::run::bdev::ReadTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, blocks, data, buffer_size);
 
-    return ipc_manager->Send(task);
+    // issue #862: see AsyncWrite.
+    return CLIO_RUN_INLINE(task);
   }
 
   /**
@@ -202,6 +212,28 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Flush (and periodically compact) the allocator-state log - asynchronous.
+   * When period_us > 0 the task is registered as TASK_PERIODIC so the
+   * runtime re-runs it on the given interval.
+   * @param pool_query Pool query for routing
+   * @param period_us Period in microseconds (0 = one-shot)
+   */
+  clio::run::Future<FlushAllocLogTask> AsyncFlushAllocLog(
+      const clio::run::PoolQuery& pool_query, double period_us = 0) {
+    auto* ipc_manager = CLIO_CPU_IPC;
+
+    auto task = ipc_manager->NewTask<FlushAllocLogTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query);
+
+    if (period_us > 0) {
+      task->SetPeriod(period_us, clio::run::kMicro);
+      task->SetFlags(TASK_PERIODIC);
+    }
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Get performance statistics - asynchronous
    */
   clio::run::Future<clio::run::bdev::GetStatsTask> AsyncGetStats(
@@ -210,6 +242,23 @@ class Client : public clio::run::ContainerClient {
 
     auto task = ipc_manager->NewTask<clio::run::bdev::GetStatsTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query);
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Set the predicted lifespan reported by bdev.
+   *
+   * @param pool_query Pool query used to route the override to the target.
+   * @param lifespan_days Remaining lifespan in days. Large values mean healthy
+   *     storage; small values let tests simulate a degrading device.
+   */
+  clio::run::Future<clio::run::bdev::SetLifespanTask> AsyncSetLifespan(
+      const clio::run::PoolQuery& pool_query, clio::run::u32 lifespan_days) {
+    auto* ipc_manager = CLIO_CPU_IPC;
+
+    auto task = ipc_manager->NewTask<clio::run::bdev::SetLifespanTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, lifespan_days);
 
     return ipc_manager->Send(task);
   }

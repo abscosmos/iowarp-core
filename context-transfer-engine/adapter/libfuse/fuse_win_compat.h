@@ -73,6 +73,13 @@ using nlink_t = fuse_nlink_t;
 using fsblkcnt_t = fuse_fsblkcnt_t;
 using fsfilcnt_t = fuse_fsfilcnt_t;
 
+// Owner id types the getattr/chown callbacks spell the POSIX way; WinFsp only
+// declares them fuse_-prefixed. The .chown slot in struct fuse_operations is
+// typed int(const char*, fuse_uid_t, fuse_gid_t, fuse_file_info*), so aliasing
+// to the fuse_ types keeps cte_fuse_chown's signature matching the slot.
+using uid_t = fuse_uid_t;
+using gid_t = fuse_gid_t;
+
 // --- File mode bits --------------------------------------------------------
 // POSIX octal values; fuse_stat::st_mode uses the same encoding. Guarded in
 // case a future WinFsp header begins providing them.
@@ -84,6 +91,9 @@ using fsfilcnt_t = fuse_fsfilcnt_t;
 #endif
 #ifndef S_IFREG
 #define S_IFREG 0100000
+#endif
+#ifndef S_IFLNK
+#define S_IFLNK 0120000
 #endif
 
 // --- Owner identity --------------------------------------------------------

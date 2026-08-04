@@ -37,8 +37,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <mutex>
 #include <regex>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -68,9 +70,16 @@ namespace ctp::search {
  * Match semantics: a key matches when std::regex_match(key, pattern) is true
  * (the whole key must match), using the ECMAScript grammar (std::regex default).
  *
- * Thread-safety: NOT internally synchronized. Callers that mutate and query
- * concurrently must provide external synchronization. References returned by a
- * SearchResult are valid only while the engine is unmodified.
+ * Thread-safety: internally synchronized with a shared_mutex — mutators
+ * (Insert/Delete/Rename/Clear) take it exclusively, queries (Search/Contains/
+ * Find/Size/Empty) take it shared. Search returns a SNAPSHOT of the matching
+ * (key, value) pairs, so a SearchResult — keys() and the value-yielding
+ * iterator alike — is stable under concurrent mutation. A key deleted between
+ * the candidate scan and the value snapshot is simply absent from the result
+ * (the documented "live subset" semantics). The previous design fetched
+ * values lazily via Find() at iteration time; a concurrent Delete then made
+ * the iterator dereference Find()'s nullptr — a NULL TagId read that crashed
+ * the runtime under the #807 CFS stress (readdir's TagQuery racing unlink).
  */
 template <typename ValueT>
 class RegexSearchEngine {
@@ -82,6 +91,19 @@ class RegexSearchEngine {
    * @return true if a new key was added, false if an existing one was updated.
    */
   bool Insert(const std::string &key, const ValueT &value) {
+    std::unique_lock<std::shared_mutex> lk(mtx_);
+    return InsertLocked(key, value);
+  }
+
+  /** Remove `key`. @return true if it existed. */
+  bool Delete(const std::string &key) {
+    std::unique_lock<std::shared_mutex> lk(mtx_);
+    return DeleteLocked(key);
+  }
+
+ private:
+  /** Insert body; caller must hold mtx_ exclusively. */
+  bool InsertLocked(const std::string &key, const ValueT &value) {
     auto res = entries_.insert_or_assign(key, value);
     const bool is_new = res.second;
     if (is_new) {
@@ -99,8 +121,8 @@ class RegexSearchEngine {
     return is_new;
   }
 
-  /** Remove `key`. @return true if it existed. */
-  bool Delete(const std::string &key) {
+  /** Delete body; caller must hold mtx_ exclusively. */
+  bool DeleteLocked(const std::string &key) {
     auto it = entries_.find(key);
     if (it == entries_.end()) {
       return false;
@@ -128,7 +150,9 @@ class RegexSearchEngine {
    * `new_key` already exists its value is overwritten by the moved one.
    * @return false if `old_key` does not exist.
    */
+ public:
   bool Rename(const std::string &old_key, const std::string &new_key) {
+    std::unique_lock<std::shared_mutex> lk(mtx_);
     auto it = entries_.find(old_key);
     if (it == entries_.end()) {
       return false;
@@ -137,25 +161,35 @@ class RegexSearchEngine {
       return true;
     }
     ValueT moved = std::move(it->second);
-    Delete(old_key);
-    Insert(new_key, moved);
+    DeleteLocked(old_key);
+    InsertLocked(new_key, moved);
     return true;
   }
 
   bool Contains(const std::string &key) const {
+    std::shared_lock<std::shared_mutex> lk(mtx_);
     return entries_.find(key) != entries_.end();
   }
 
-  /** @return pointer to the value bound to `key`, or nullptr if absent. */
+  /** @return pointer to the value bound to `key`, or nullptr if absent. NOTE:
+   *  the pointer is only stable while no concurrent mutation occurs. */
   const ValueT *Find(const std::string &key) const {
+    std::shared_lock<std::shared_mutex> lk(mtx_);
     auto it = entries_.find(key);
     return it == entries_.end() ? nullptr : &it->second;
   }
 
-  size_t Size() const { return entries_.size(); }
-  bool Empty() const { return entries_.empty(); }
+  size_t Size() const {
+    std::shared_lock<std::shared_mutex> lk(mtx_);
+    return entries_.size();
+  }
+  bool Empty() const {
+    std::shared_lock<std::shared_mutex> lk(mtx_);
+    return entries_.empty();
+  }
 
   void Clear() {
+    std::unique_lock<std::shared_mutex> lk(mtx_);
     entries_.clear();
     index_.clear();
   }
@@ -180,8 +214,9 @@ class RegexSearchEngine {
         return *this;
       }
       reference operator*() const {
-        const std::string &k = r_->keys_[i_];
-        return reference(k, *r_->eng_->Find(k));
+        // Both halves come from the result's own snapshot — no live engine
+        // access, so iteration is safe against concurrent mutation.
+        return reference(r_->keys_[i_], r_->values_[i_]);
       }
 
      private:
@@ -198,10 +233,10 @@ class RegexSearchEngine {
 
    private:
     friend class RegexSearchEngine;
-    SearchResult(std::vector<std::string> keys, const RegexSearchEngine *eng)
-        : keys_(std::move(keys)), eng_(eng) {}
-    std::vector<std::string> keys_;
-    const RegexSearchEngine *eng_;
+    SearchResult(std::vector<std::string> keys, std::vector<ValueT> values)
+        : keys_(std::move(keys)), values_(std::move(values)) {}
+    std::vector<std::string> keys_;   // sorted; aligned with values_
+    std::vector<ValueT> values_;      // snapshot taken under the shared lock
   };
 
   /**
@@ -209,51 +244,83 @@ class RegexSearchEngine {
    * @throws std::regex_error if `pattern` is not a valid ECMAScript regex.
    */
   SearchResult Search(const std::string &pattern) const {
-    std::regex re(pattern);  // compiled once per query; throws on bad pattern
+    // Compile the regex OUTSIDE the lock -- it touches no shared state and is
+    // ~50-100us, which would otherwise be held under the shared lock on every
+    // query and starve writers (#680: 3 tight-loop searchers vs 8 writers hung
+    // the parallel test intermittently under load).
+    std::regex re(pattern);  // throws on bad pattern
 
     std::vector<std::string> required;
     const bool prefilterable = ExtractRequiredTrigrams(pattern, required);
 
-    std::vector<std::string> matches;
-    if (!prefilterable || required.empty()) {
-      // No usable prefilter: verify the regex against every key.
-      for (const auto &kv : entries_) {
-        if (std::regex_match(kv.first, re)) {
-          matches.push_back(kv.first);
-        }
-      }
-    } else {
-      // Candidates = keys present in the posting lists of ALL required
-      // trigrams. Walk the smallest posting list and test membership in the
-      // others; this is a superset of the true matches.
-      const std::unordered_set<const std::string *> *smallest = nullptr;
-      for (const auto &t : required) {
-        auto it = index_.find(t);
-        if (it == index_.end()) {
-          // Some required trigram indexes no key at all => no match possible.
-          return SearchResult(std::vector<std::string>(), this);
-        }
-        if (smallest == nullptr || it->second.size() < smallest->size()) {
-          smallest = &it->second;
-        }
-      }
-      for (const std::string *kp : *smallest) {
-        bool in_all = true;
+    // Snapshot candidate key strings under the shared lock, then RELEASE it and
+    // run the expensive std::regex_match over the copies. Copying is far cheaper
+    // than matching, so the lock is held briefly -- writers no longer starve.
+    // A snapshot (copied strings) also makes SearchResult stable under
+    // concurrent mutation, matching the documented "live subset" semantics.
+    std::vector<std::string> candidates;
+    {
+      std::shared_lock<std::shared_mutex> lk(mtx_);
+      if (!prefilterable || required.empty()) {
+        // No usable prefilter: every key is a candidate.
+        candidates.reserve(entries_.size());
+        for (const auto &kv : entries_) candidates.push_back(kv.first);
+      } else {
+        // Candidates = keys present in the posting lists of ALL required
+        // trigrams. Walk the smallest posting list and test membership in the
+        // others; this is a superset of the true matches.
+        const std::unordered_set<const std::string *> *smallest = nullptr;
         for (const auto &t : required) {
-          const auto &posting = index_.find(t)->second;
-          if (posting.find(kp) == posting.end()) {
-            in_all = false;
-            break;
+          auto it = index_.find(t);
+          if (it == index_.end()) {
+            // Some required trigram indexes no key => no match possible.
+            return SearchResult(std::vector<std::string>(),
+                                std::vector<ValueT>());
+          }
+          if (smallest == nullptr || it->second.size() < smallest->size()) {
+            smallest = &it->second;
           }
         }
-        if (in_all && std::regex_match(*kp, re)) {
-          matches.push_back(*kp);
+        for (const std::string *kp : *smallest) {
+          bool in_all = true;
+          for (const auto &t : required) {
+            const auto &posting = index_.find(t)->second;
+            if (posting.find(kp) == posting.end()) {
+              in_all = false;
+              break;
+            }
+          }
+          if (in_all) candidates.push_back(*kp);  // copy under the lock
         }
       }
+    }  // shared lock released before matching
+
+    std::vector<std::string> matches;
+    for (auto &c : candidates) {
+      if (std::regex_match(c, re)) matches.push_back(std::move(c));
     }
 
     std::sort(matches.begin(), matches.end());
-    return SearchResult(std::move(matches), this);
+
+    // Snapshot the values under a brief re-acquired shared lock, AFTER the
+    // (deliberately unlocked, see above) regex pass and the sort, so keys_
+    // and values_ stay aligned. A key deleted since the candidate scan is
+    // dropped from the result here — the "live subset" semantics — instead
+    // of surfacing as a null value at iteration time.
+    std::vector<std::string> keys;
+    std::vector<ValueT> values;
+    keys.reserve(matches.size());
+    values.reserve(matches.size());
+    {
+      std::shared_lock<std::shared_mutex> lk(mtx_);
+      for (auto &k : matches) {
+        auto it = entries_.find(k);
+        if (it == entries_.end()) continue;  // concurrently deleted
+        values.push_back(it->second);
+        keys.push_back(std::move(k));
+      }
+    }
+    return SearchResult(std::move(keys), std::move(values));
   }
 
  private:
@@ -408,6 +475,8 @@ class RegexSearchEngine {
   // copies, to keep the index small for long keys.
   std::unordered_map<std::string, std::unordered_set<const std::string *>>
       index_;
+  // Guards entries_ + index_: exclusive for mutators, shared for queries.
+  mutable std::shared_mutex mtx_;
 };
 
 }  // namespace ctp::search

@@ -370,6 +370,10 @@ class Task {
   RunContext* RunCtxPtr();
   bool IsNotified() const;
   void SetNotified(bool v);
+  /** Identity of the future this task is suspended on (nullptr when not
+   *  awaiting a future). See RunContext::awaited_fshm_ / issue #705. */
+  const void* AwaitedFshm() const;
+  void SetAwaitedFshm(const void* fshm);
   /** Whether this task's coroutine/fiber has run to completion, without
    *  dereferencing the (possibly cross-thread-freed) coroutine frame. */
   bool IsCoroCompleted() const;
@@ -384,6 +388,8 @@ class Task {
   ctp::CpuTimer& RunCpuTimer();
   float PredictedLoad() const;
   void SetPredictedLoad(float v);
+  float SchedReservedUs() const;       // issue #781 queued-load reservation
+  void SetSchedReservedUs(float v);    // issue #781
   ctp::HighResMonotonicTimer& RunWallTimer();
   float PredictedWallUs() const;
   void SetPredictedWallUs(float v);
@@ -697,14 +703,6 @@ class Task {
   void AggregateIn(const ctp::ipc::FullPtr<Task>& member_task) {
     (void)member_task;
   }
-
-  /**
-   * Fix up internal pointers after a cudaMemcpy/memcpy (POD copy path).
-   * Override in tasks that contain priv::vector or other pointer-bearing
-   * fields to re-seat inline (SVO) pointers to the new host address.
-   * Default is a no-op for pure POD tasks.
-   */
-  CTP_CROSS_FUN void FixupAfterCopy() {}
 };
 
 }  // namespace clio::run
@@ -756,19 +754,22 @@ struct TaskQueueHeader {
 };
 
 // Type alias for individual lanes with per-lane headers (moved outside
-// TaskQueue class) Worker queues store Future<Task> objects directly
+// TaskQueue class) Worker queues store Future<Task> objects directly.
+// issue #822: lanes are ext_spsc_queue (mutex-serialized, growable) instead
+// of WAIT_FOR_SPACE MPSC rings — a push onto a full lane grows the lane
+// rather than busy-spinning, so a worker enqueuing onto the lane it drains
+// (producer==consumer) can no longer deadlock when queue_depth is small.
 using TaskLane =
-    ctp::ipc::multi_mpsc_ring_buffer<Future<Task>,
-                                 CLIO_QUEUE_ALLOC_T>::ring_buffer_type;
+    ctp::ipc::multi_ext_spsc_queue<Future<Task>,
+                                   CLIO_QUEUE_ALLOC_T>::ring_buffer_type;
 
 /**
- * Simple wrapper around ctp::ipc::multi_mpsc_ring_buffer
- *
- * This wrapper adds custom enqueue and dequeue functions while maintaining
- * compatibility with existing code that expects the multi_mpsc_ring_buffer
- * interface.
+ * Multi-lane worker task queue (one growable mutex-guarded ring per
+ * lane/priority); see the TaskLane comment above for the issue #822
+ * rationale.
  */
-typedef ctp::ipc::multi_mpsc_ring_buffer<Future<Task>, CLIO_QUEUE_ALLOC_T> TaskQueue;
+typedef ctp::ipc::multi_ext_spsc_queue<Future<Task>, CLIO_QUEUE_ALLOC_T>
+    TaskQueue;
 
 }  // namespace clio::run
 
@@ -852,6 +853,14 @@ class RunContext {
   char response_identity_[64];     /**< ZMQ echo-back identity (fallback path) */
   u32 response_identity_len_;
   int response_fd_;                /**< Socket fd for routing response (IPC) */
+  /** #722 bounded-drop of an undeliverable client response. When SendOut's
+   *  network Send keeps failing (a client that submitted over TCP/IPC then
+   *  disconnected), these bound the re-queue: after kMaxClientResponseRetries
+   *  attempts OR kClientResponseRetryDropSec seconds the response is dropped
+   *  (task freed via RAII) instead of re-queued forever. Non-serialized;
+   *  meaningful only on the server's outbound response future. */
+  u32 send_fail_count_;            /**< Consecutive response-Send failures */
+  ctp::Timepoint first_send_fail_; /**< Time of the first failure (for timeout) */
   ctp::abitfield32_t gpu_flags_;   /**< GPU device-completion bit (gpu2gpu) */
   uintptr_t gpu_task_device_ptr_;  /**< Device addr of the task POD (kDeviceMem) */
   u32 gpu_task_size_;              /**< sizeof(TaskT) for the H2D writeback */
@@ -865,6 +874,16 @@ class RunContext {
  private:
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
                                      queue additions */
+  /** Identity (FutureShm pointer) of the future this task is currently
+   *  suspended on, or nullptr when not awaiting a future. Set by the await
+   *  paths before suspending; ProcessEventQueue resumes the parent ONLY when
+   *  the completed subtask future matches. Without this, a parent awaiting
+   *  its subtask futures in order was resumed by ANY subtask's completion
+   *  event, returning from the await before the awaited subtask finished —
+   *  observed as short reads/writes on slow (yielding) bdev backends
+   *  (issue #705). Atomic: written on the fiber's executing worker, read on
+   *  the parent's event-queue worker. */
+  std::atomic<const void*> awaited_fshm_;
   // Set true by the top-level coroutine's final_suspend when the task
   // completes. The worker reads THIS instead of coro_handle_.done() to detect
   // completion, so it never dereferences a coroutine frame that a cross-thread
@@ -877,6 +896,9 @@ class RunContext {
   ctp::bitfield32_t flags_;
   ctp::CpuTimer cpu_timer_; /**< Accumulates thread CPU time across yields */
   float predicted_load_ = 0; /**< Predicted CPU time from InferModel (us) */
+  float sched_reserved_us_ = 0; /**< #781 queued-load reservation on a worker
+                                  * (predicted cost added to worker.queued_load_
+                                  * at map, released when the task starts) */
   ctp::HighResMonotonicTimer wall_timer_; /**< Wall clock time across yields */
   float predicted_wall_us_ =
       0; /**< Predicted wall time from InferWallClockTime */
@@ -900,10 +922,12 @@ class RunContext {
         response_transport_(nullptr),
         response_identity_len_(0),
         response_fd_(-1),
+        send_fail_count_(0),
         gpu_task_device_ptr_(0),
         gpu_task_size_(0),
         probe_rec_(0),
         is_notified_(false),
+        awaited_fshm_(nullptr),
         coro_completed_(false),
         flags_() {
     gpu_flags_.Clear();
@@ -937,6 +961,7 @@ class RunContext {
         yield_count_(other.yield_count_),
         future_(std::move(other.future_)),
         is_notified_(other.is_notified_.load()),
+        awaited_fshm_(other.awaited_fshm_.load()),
         coro_completed_(other.coro_completed_.load()),
         flags_(other.flags_),
         cpu_timer_(other.cpu_timer_),
@@ -970,6 +995,7 @@ class RunContext {
       yield_count_ = other.yield_count_;
       future_ = std::move(other.future_);
       is_notified_.store(other.is_notified_.load());
+      awaited_fshm_.store(other.awaited_fshm_.load());
       coro_completed_.store(other.coro_completed_.load());
       flags_ = other.flags_;
       cpu_timer_ = other.cpu_timer_;
@@ -1048,10 +1074,12 @@ class RunContext {
     block_start_ = ctp::Timepoint();
     yield_count_ = 0;
     is_notified_.store(false);
+    awaited_fshm_.store(nullptr);
     coro_completed_.store(false);
     flags_.UnsetBits(RCTX_DID_WORK);
     cpu_timer_.time_ns_ = 0;
     predicted_load_ = 0;
+    sched_reserved_us_ = 0;
     wall_timer_.time_ns_ = 0;
     predicted_wall_us_ = 0;
     predicted_stat_ = TaskStat();
@@ -1137,6 +1165,8 @@ CLIO_RCTX_FLAG(IsStarted, SetStarted)
 CLIO_RCTX_REF(ctp::CpuTimer, RunCpuTimer, cpu_timer_)
 CLIO_RCTX_GET(float, PredictedLoad, predicted_load_)
 CLIO_RCTX_SET(float, SetPredictedLoad, predicted_load_)
+CLIO_RCTX_GET(float, SchedReservedUs, sched_reserved_us_)
+CLIO_RCTX_SET(float, SetSchedReservedUs, sched_reserved_us_)
 CLIO_RCTX_REF(ctp::HighResMonotonicTimer, RunWallTimer, wall_timer_)
 CLIO_RCTX_GET(float, PredictedWallUs, predicted_wall_us_)
 CLIO_RCTX_SET(float, SetPredictedWallUs, predicted_wall_us_)
@@ -1200,6 +1230,18 @@ inline void Task::SetNotified(bool v) {
   }
   run_ctx_->is_notified_.store(v);
 }
+inline const void* Task::AwaitedFshm() const {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(AwaitedFshm);
+  }
+  return run_ctx_->awaited_fshm_.load();
+}
+inline void Task::SetAwaitedFshm(const void* fshm) {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(SetAwaitedFshm);
+  }
+  run_ctx_->awaited_fshm_.store(fshm);
+}
 inline bool Task::IsCoroCompleted() const {
   if (!run_ctx_) {
     CLIO_RCTX_NULL(IsCoroCompleted);
@@ -1254,6 +1296,15 @@ bool Future<TaskT, AllocT>::await_suspend_impl(
   }
   // Store parent task for resumption tracking
   SetParentTask(task);
+  // Record WHICH future this task is suspending on, so ProcessEventQueue only
+  // resumes it when THIS subtask completes. Every subtask future carries the
+  // parent (set at SendIn), so with several in flight an unrelated
+  // completion's event would otherwise resume the parent mid-await
+  // (issue #705).
+  {
+    auto fshm = GetFutureShm();
+    task->SetAwaitedFshm(fshm.IsNull() ? nullptr : fshm.ptr_);
+  }
   // Store coroutine handle in the task's RunContext for worker to resume
   task->CoroHandle() = handle;
   task->SetYielded(true);
@@ -1821,9 +1872,19 @@ inline void boost_await(clio::run::Future<TaskT, AllocT>& future) {
   clio::run::shared_ptr<clio::run::Task> task = clio::run::GetCurrentTask();
   if (task.IsNull()) return;
   future.SetParentTask(task);
+  // Record WHICH future this fiber is suspending on, so ProcessEventQueue
+  // only resumes it when THIS subtask completes — an unrelated subtask's
+  // completion event would otherwise resume the fiber mid-await and the
+  // caller would read the awaited task's outputs while it is still running
+  // (issue #705: short reads/writes on yielding bdev backends).
+  {
+    auto fshm = future.GetFutureShm();
+    task->SetAwaitedFshm(fshm.IsNull() ? nullptr : fshm.ptr_);
+  }
   task->SetYielded(true);
   task->SetYieldTimeUs(0.0);
   fiber_suspend_to_caller(&task->FiberStateRef());
+  task->SetAwaitedFshm(nullptr);
   task->SetYielded(false);
 }
 

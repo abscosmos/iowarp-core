@@ -153,3 +153,7 @@ bench_results/
 # Windows firewall allow-rule marker (scripts/windows/allow_firewall.ps1)
 .clio_firewall_allowed
 context-runtime/test/integration/collective_restart/docker-compose.override.yml
+build-tsan/
+
+# Local-only compose overrides (per-box mounts/debug shims) must never be committed
+docker-compose.override.yml

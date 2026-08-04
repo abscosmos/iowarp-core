@@ -6,13 +6,13 @@
  */
 
 /**
- * End-to-end I/O tests for the IOWarp HDF5 VOL connector.
+ * End-to-end I/O tests for the Clio HDF5 VOL connector.
  *
  * Unlike test_hdf5_vol_adapter.cc (which only touches the plugin registration
  * and property-list surface), this suite drives *real* HDF5 file, dataset,
  * group, and attribute operations through the connector against an in-process
  * Chimaera/CTE runtime. That exercises the data-path callbacks the base suite
- * cannot reach: iowarp_file_create/open/close, iowarp_dataset_create/open/
+ * cannot reach: clio_file_create/open/close, clio_dataset_create/open/
  * write/read/close (the chunked AsyncPutBlob / read-through-cache paths),
  * group create/open/close, attr create/write/read/close, and the wrap/unwrap/
  * info callbacks invoked while HDF5 manages object handles.
@@ -24,7 +24,7 @@
 
 #include "simple_test.h"
 
-#include "iowarp_vol.h"
+#include "clio_vol.h"
 
 #include <hdf5.h>
 
@@ -56,9 +56,9 @@ hid_t setupVolEnvironment() {
   // Small chunk size so the multi-chunk AsyncPutBlob loop is exercised even by
   // a modest dataset (16 KiB / 4 KiB = 4 chunks). setenv is POSIX-only.
 #ifdef _WIN32
-  _putenv_s("IOWARP_VOL_CHUNK_SIZE", "4096");
+  _putenv_s("CLIO_VOL_CHUNK_SIZE", "4096");
 #else
-  setenv("IOWARP_VOL_CHUNK_SIZE", "4096", 1);
+  setenv("CLIO_VOL_CHUNK_SIZE", "4096", 1);
 #endif
 
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true));
@@ -76,16 +76,16 @@ hid_t setupVolEnvironment() {
   reg_task.Wait();
   REQUIRE(reg_task->GetReturnCode() == 0);
 
-  vol_id = H5VL_iowarp_register();
+  vol_id = H5VL_clio_register();
   REQUIRE(vol_id >= 0);
   return vol_id;
 }
 
-/** Build a file-access property list bound to the IOWarp VOL connector. */
+/** Build a file-access property list bound to the Clio VOL connector. */
 hid_t makeFapl(hid_t vol_id) {
   hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
   REQUIRE(fapl >= 0);
-  iowarp_vol_info_t info;
+  clio_vol_info_t info;
   info.under_vol_id = H5VL_NATIVE;
   info.under_vol_info = nullptr;
   info.chunk_size = 0;  // fall back to the env-var chunk size
@@ -254,7 +254,7 @@ TEST_CASE("HDF5 VOL IO - Passthrough callbacks", "[hdf5_vol][io]") {
   H5Tclose(dtype);
 
   // Partial (hyperslab) write + read: exercises the non-cacheable passthrough
-  // branch in iowarp_dataset_write / iowarp_dataset_read.
+  // branch in clio_dataset_write / clio_dataset_read.
   hsize_t mem_dims[1] = {8};
   hid_t mem_space = H5Screate_simple(1, mem_dims, nullptr);
   hid_t file_space = H5Dget_space(dset);

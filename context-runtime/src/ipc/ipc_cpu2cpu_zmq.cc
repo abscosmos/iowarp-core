@@ -17,6 +17,15 @@
 
 namespace clio::run {
 
+// #722: bound the re-queue of an undeliverable client response. A client that
+// submitted a task over TCP/IPC and then disconnected leaves the daemon holding
+// a response whose network Send fails persistently. Without a cap the owning
+// future is re-enqueued forever (the reporter saw 22.9M retries / an 8.9 GB
+// log). Drop the response — freeing the task via RAII — after whichever of these
+// bounds trips first. Mirrors the run2run retry-timeout in ipc_run2run.cc.
+static constexpr u32 kMaxClientResponseRetries = 32;
+static constexpr double kClientResponseRetryDropSec = 5.0;
+
 //==============================================================================
 // RecvIn: poll ZMQ transports for incoming client tasks
 //==============================================================================
@@ -187,14 +196,16 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       // is deserialized, so RouteTask / the worker have an active RunContext.
       future.GetTaskPtr()->BeginRunContext();
 
-      // Enqueue to worker lane
-      LaneId lane_id =
-          ipc->GetScheduler()->ClientMapTask(ipc, future);
+      // issue #781: ClientMapTask removed. Recv threads deposit on the shared
+      // ingress lane (0); the runtime maps to a worker via RuntimeMapTask.
+      LaneId lane_id = 0;
       auto *worker_queues = ipc->GetTaskQueue();
       auto &lane_ref = worker_queues->GetLane(lane_id, 0);
       lane_ref.Push(future);
       // Always signal — see ipc_cpu2cpu_impl.h for the race.
       ipc->AwakenWorker(&lane_ref);
+      HLOG(kDebug, "[TRACE768] t={} RecvIn ingested task mode={} lane_tid={}",
+           std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), (int)mode, lane_ref.GetTid());
 
       did_work = true;
       tasks_received++;
@@ -283,6 +294,8 @@ bool IpcCpu2CpuZmq::SendOut(
     const size_t client_send_bound = ipc->GetNetQueueSize(priority);
     for (size_t send_i = 0; send_i < client_send_bound; ++send_i) {
       if (!ipc->TryPopNetTask(priority, queued_future)) break;
+      HLOG(kDebug, "[TRACE768] t={} SendOut popped queued response prio={}",
+           std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), (int)priority);
       auto origin_task = queued_future.GetTaskPtr();
       if (origin_task.IsNull()) continue;
 
@@ -337,12 +350,36 @@ bool IpcCpu2CpuZmq::SendOut(
       ctp::lbm::LbmContext send_ctx(ctp::lbm::LBM_SYNC);
       int rc = response_transport->Send(archive, send_ctx);
       if (rc != 0) {
-        size_t fail_total =
-            send_fail_counter.fetch_add(1, std::memory_order_relaxed) + 1;
-        HLOG(kError,
-             "[CountSend] Send rc={} fail#{} — re-queueing client response "
-             "(priority={})",
-             rc, fail_total, static_cast<int>(priority));
+        send_fail_counter.fetch_add(1, std::memory_order_relaxed);
+        // #722: bound the re-queue. Track failures on the response future's
+        // RunContext (it rides along across re-queues). Stamp the first-failure
+        // time once, then drop after N attempts OR T seconds — whichever first.
+        if (future_shm->send_fail_count_ == 0) {
+          future_shm->first_send_fail_.Now();
+        }
+        future_shm->send_fail_count_++;
+        ctp::Timepoint now;
+        now.Now();
+        double elapsed_sec =
+            future_shm->first_send_fail_.GetUsecFromStart(now) / 1e6;
+        if (future_shm->send_fail_count_ > kMaxClientResponseRetries ||
+            elapsed_sec >= kClientResponseRetryDropSec) {
+          // Undeliverable: log ONCE at kWarning and DROP. Not re-enqueuing
+          // means the next TryPopNetTask overwrites queued_future, dropping the
+          // last owner of the task → freed by RAII (no leak, no infinite loop).
+          HLOG(kWarning,
+               "IpcCpu2CpuZmq::SendOut: dropping undeliverable client response "
+               "for pid {} after {} retries / {}s (last rc={}, priority={})",
+               future_shm->client_pid_, future_shm->send_fail_count_,
+               elapsed_sec, rc, static_cast<int>(priority));
+          continue;
+        }
+        // Bounded retry: re-enqueue, but at kDebug (rate-limited) so a transient
+        // EAGAIN no longer floods the log at kError the way #722 described.
+        HLOG(kDebug,
+             "IpcCpu2CpuZmq::SendOut: Send rc={} attempt {} — re-queueing "
+             "client response (priority={})",
+             rc, future_shm->send_fail_count_, static_cast<int>(priority));
         ipc->EnqueueNetTask(queued_future, priority);
         continue;
       }

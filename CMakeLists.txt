@@ -62,6 +62,7 @@ option(CLIO_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(CLIO_CORE_ENABLE_DEB_PACKAGE "Build Debian .deb package via CPack" OFF)
 option(CLIO_CORE_ENABLE_RPM_PACKAGE "Build RPM .rpm package via CPack" OFF)
 option(CLIO_CORE_ENABLE_APPIMAGE "Build portable AppImage via appimagetool" OFF)
+option(CLIO_CORE_ENABLE_WINDOWS_PACKAGE "Build Windows ZIP archive + NSIS installer .exe via CPack" OFF)
 option(CLIO_CORE_ENABLE_CONDA "Enable Conda environment configuration (adds Conda paths to include/link directories)" OFF)
 option(CLIO_CORE_ENABLE_DOCKER_CI "Enable Docker-based integration tests (requires Docker)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
@@ -233,6 +234,15 @@ set(CLIO_CTP_ENABLE_OPENMP ${CLIO_CORE_ENABLE_OPENMP} CACHE BOOL "Enable OpenMP 
 set(CLIO_CTP_ENABLE_CEREAL ${CLIO_CORE_ENABLE_CEREAL} CACHE BOOL "Enable Cereal (controlled by CLIO_CORE_ENABLE_CEREAL)" FORCE)
 set(CLIO_CTP_ENABLE_DOXYGEN ${CLIO_CORE_ENABLE_DOXYGEN} CACHE BOOL "Enable Doxygen (controlled by CLIO_CORE_ENABLE_DOXYGEN)" FORCE)
 set(CLIO_CTP_ENABLE_COMPRESS ${CLIO_CTE_ENABLE_COMPRESS} CACHE BOOL "Enable Compress (controlled by CLIO_CTE_ENABLE_COMPRESS)" FORCE)
+# CTP_ENABLE_COMPRESS changes clio::cte::core::Context's LAYOUT (and with it
+# every Put/Get task). It must therefore be a TREE-WIDE definition: when only
+# the targets linking ctp::compress saw it, the compressor module compiled a
+# 440-byte PutBlobTask against a core/client world using the 344-byte one —
+# tasks silently misparse and puts vanish (the ABI-skew hazard documented in
+# core_tasks.h; previously bit the llama.cpp weight work the same way).
+if(CLIO_CTE_ENABLE_COMPRESS)
+    add_compile_definitions(CTP_ENABLE_COMPRESS=1)
+endif()
 set(CLIO_CTP_ENABLE_ENCRYPT ${CLIO_CORE_ENABLE_ENCRYPT} CACHE BOOL "Enable Encrypt (controlled by CLIO_CORE_ENABLE_ENCRYPT)" FORCE)
 set(CLIO_CTP_ENABLE_ELF ${CLIO_CORE_ENABLE_ELF} CACHE BOOL "Enable ELF (controlled by CLIO_CORE_ENABLE_ELF)" FORCE)
 set(CLIO_CTP_ENABLE_CUDA ${CLIO_CORE_ENABLE_CUDA} CACHE BOOL "Enable CUDA (controlled by CLIO_CORE_ENABLE_CUDA)" FORCE)
@@ -1165,6 +1175,10 @@ if(NOT CLIO_CORE_MSVC_LIKE)
                             $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-fprofile-arcs>
                             $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-ftest-coverage>)
         add_link_options(--coverage)
+        # Lets tests that must exit via _exit() (skipping a crash-prone global
+        # teardown) still flush gcov counters explicitly via __gcov_dump(); the
+        # symbol only exists in coverage builds, so it is gated on this define.
+        add_compile_definitions(CLIO_COVERAGE_ENABLED)
     endif()
 else()
     # MSVC compiler flags
@@ -1174,6 +1188,10 @@ else()
     # file ("nvcc fatal : A single input file is required ...").
     add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/FS>)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/FS>)
+    # Template/coroutine-heavy TUs (core_runtime.cc) exceed the COFF 65k
+    # section limit at default settings (C1128); raise it everywhere.
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/bigobj>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     # CUDA 13.x CCCL headers (cuda/std/*) require MSVC's conformant
     # preprocessor and #error out on the traditional one. Enable it for the
     # CUDA host compile only, so the existing CXX build is unaffected.
@@ -1231,6 +1249,17 @@ endforeach()
 if(CLIO_CORE_ENABLE_TESTS)
     enable_testing()
     include(CTest)
+
+    # CTest coverage exclusions (honoured by ctest_coverage(), which drives the
+    # CDash coverage submission — unlike lcov it has no per-line exclusion, so
+    # untestable whole files are dropped here by filename regex). Keep this in
+    # sync with the lcov --remove list in CI/calculate_coverage.sh and the
+    # codecov.yml ignore list.
+    #   * fuse_cte_main.cc — FUSE process entry / mount glue (fuse_main + the
+    #     apptainer --fusemount fd-injection path); not unit-testable.
+    file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
+         "set(CTEST_CUSTOM_COVERAGE_EXCLUDE \${CTEST_CUSTOM_COVERAGE_EXCLUDE}\n"
+         "    \".*/fuse_cte_main\\\\.cc\")\n")
 
     # -----------------------------------------------------------------------
     # Test cleanup fixture (pre + post)
@@ -1763,6 +1792,21 @@ endif()
 if(CLIO_CORE_ENABLE_CTE AND TARGET clio_cte_core_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_core_client clio_cte_core_runtime)
 endif()
+# Cache + replication chimods (#886) build ON by default and ship in the
+# deb/rpm/AppImage via the module macros' default-component installs — but
+# the wheel filters to COMPONENT pip_package, so without these entries
+# `pip install iowarp-core` silently lacks both modules (#899).
+if(TARGET clio_cte_cache_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_cache_client clio_cte_cache_runtime)
+endif()
+if(TARGET clio_cte_replication_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_replication_client clio_cte_replication_runtime)
+endif()
+# Filesystem chimod: NEEDED by the clio_cte_fuse adapter binary that ships
+# in the wheel when CLIO_CTE_ENABLE_FUSE_ADAPTER is ON (#899).
+if(TARGET clio_cte_filesystem_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_filesystem_client clio_cte_filesystem_runtime)
+endif()
 if(CLIO_CORE_ENABLE_CAE AND TARGET clio_cae_core_client)
   list(APPEND PIP_LIB_TARGETS clio_cae_core_client clio_cae_core_runtime)
 endif()
@@ -1901,6 +1945,11 @@ if(WIN32 AND DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
     if(_vcpkg_dlls)
       install(FILES ${_vcpkg_dlls}
         COMPONENT pip_package
+        DESTINATION bin)
+      # Mirror into the default component so the native Windows package
+      # (CPack ZIP/NSIS filters to Unspecified, like DEB/RPM) also ships
+      # the third-party DLLs its exes need (#899).
+      install(FILES ${_vcpkg_dlls}
         DESTINATION bin)
     endif()
   endif()

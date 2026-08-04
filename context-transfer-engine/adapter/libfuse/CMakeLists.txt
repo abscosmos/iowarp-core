@@ -44,7 +44,8 @@ endif()
 message(STATUS "Found FUSE3: ${FUSE3_VERSION}")
 
 add_executable(clio_cte_fuse
-    fuse_cte.cc)
+    fuse_cte.cc       # FUSE operation callbacks (unit-tested, coverage-tracked)
+    fuse_cte_main.cc) # process entry / mount glue (coverage-excluded)
 
 target_compile_definitions(clio_cte_fuse PRIVATE
     FUSE_USE_VERSION=35
@@ -66,4 +67,10 @@ target_link_libraries(clio_cte_fuse
     ctp::cxx)
 
 install(TARGETS clio_cte_fuse
+    RUNTIME DESTINATION bin)
+# Also ship in the pip wheel: scikit-build-core installs only COMPONENT
+# pip_package, so without this second rule the wheel's clio_cte_fuse
+# console script points at a binary that is not there (#899).
+install(TARGETS clio_cte_fuse
+    COMPONENT pip_package
     RUNTIME DESTINATION bin)

@@ -90,9 +90,43 @@ int main(int /*argc*/, char* /*argv*/[]) {
   failures += Expect("unsupported protocol -> nullptr",
                      factory.Get("frobnicate://bucket/key") == nullptr);
 
+  // A bare string with no "://" and no "::" has an empty protocol, which is
+  // unsupported -> nullptr. Exercises GetUrlProtocol's final `return ""`.
+  failures += Expect("no-delimiter src -> nullptr",
+                     factory.Get("just-a-path") == nullptr);
+
   // Always-available local file backend -> non-null.
   failures += Expect("file:: -> backend",
                      factory.Get("file::/tmp/example.bin") != nullptr);
+
+  // In-memory string backend is always compiled in -> non-null.
+  failures += Expect("string:: -> backend",
+                     factory.Get("string::my_blob") != nullptr);
+
+  // HDF5 dispatch tracks CLIO_CAE_ENABLE_HDF5.
+#ifdef CLIO_CAE_ENABLE_HDF5
+  failures += Expect("hdf5:: -> backend (CLIO_CAE_ENABLE_HDF5 on)",
+                     factory.Get("hdf5::/tmp/example.h5") != nullptr);
+#else
+  failures += Expect("hdf5:: -> nullptr (CLIO_CAE_ENABLE_HDF5 off)",
+                     factory.Get("hdf5::/tmp/example.h5") == nullptr);
+#endif
+
+  // Globus dispatch tracks CAE_ENABLE_GLOBUS, for both the "globus::" custom
+  // scheme and the "https://app.globus.org" web-URL fast path.
+#ifdef CAE_ENABLE_GLOBUS
+  failures += Expect("globus:: -> backend (CAE_ENABLE_GLOBUS on)",
+                     factory.Get("globus::/ep/path") != nullptr);
+  failures += Expect("globus web URL -> backend (CAE_ENABLE_GLOBUS on)",
+                     factory.Get("https://app.globus.org/file-manager") !=
+                         nullptr);
+#else
+  failures += Expect("globus:: -> nullptr (CAE_ENABLE_GLOBUS off)",
+                     factory.Get("globus::/ep/path") == nullptr);
+  failures += Expect("globus web URL -> nullptr (CAE_ENABLE_GLOBUS off)",
+                     factory.Get("https://app.globus.org/file-manager") ==
+                         nullptr);
+#endif
 
   // S3 dispatch tracks CAE_ENABLE_S3.
 #ifdef CAE_ENABLE_S3

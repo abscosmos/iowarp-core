@@ -71,13 +71,15 @@ CLIO_TASK_CC(clio::cae::core::Runtime)
 
 namespace clio::cae::core {
 
-
+// LCOV_EXCL_START: admin Monitor RPC hook — a no-op status handler that the
+// unit-test suite never dispatches (there is no monitoring client here).
 clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
+// LCOV_EXCL_STOP
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -110,10 +112,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_END
 }
 
+// LCOV_EXCL_START: unreachable in practice. Create() always constructs
+// cte_client_ up front, so the `if (!cte_client_)` fallbacks in the forward
+// handlers never call ResolveNextPoolId(). Kept as defensive belt-and-braces.
 clio::run::PoolId Runtime::ResolveNextPoolId() const {
   if (!next_pool_id_.IsNull()) return next_pool_id_;
   return clio::cte::core::kCtePoolId;
 }
+// LCOV_EXCL_STOP
 
 clio::run::PoolQuery Runtime::ScheduleTask(
     const clio::run::shared_ptr<clio::run::Task> &task) {

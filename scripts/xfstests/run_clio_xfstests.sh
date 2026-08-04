@@ -26,6 +26,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BUILD_BIN="${CLIO_BUILD_DIR:-${REPO_ROOT}/build}/bin"
 FUSE_BIN="${BUILD_BIN}/clio_cte_fuse"
 
+# Give the embedded runtime a larger DRAM tier than its ~100 MB default so
+# large-write tests (fsx/fstest, generic/074, generic/091, ...) aren't starved
+# by ENOSPC. The config is compose-only (no networking), so CLIO_PORT and other
+# env still win. Override by exporting CLIO_SERVER_CONF before invoking.
+export CLIO_SERVER_CONF="${CLIO_SERVER_CONF:-${SCRIPT_DIR}/clio_xfstests_config.yaml}"
+
 # --- locate xfstests --------------------------------------------------------
 if [ -z "${XFSTESTS_DIR:-}" ]; then
   for cand in /opt/xfstests "${REPO_ROOT}/external/xfstests"; do
@@ -72,7 +78,8 @@ mount_fuse() {  # $1 = mountpoint, $2 = with_runtime(1/0), $3 = fsname (mount so
   # source "clio_cte_fuse".)
   CLIO_REPO_PATH="${BUILD_BIN}" LD_LIBRARY_PATH="${BUILD_BIN}:${HOME}/.local/lib:${LD_LIBRARY_PATH:-}" \
     CLIO_WITH_RUNTIME="${with_rt}" CLIO_BIND_ADDR=127.0.0.1 \
-    "${FUSE_BIN}" "${mnt}" -o "fsname=${fsname}" -f &
+    "${FUSE_BIN}" "${mnt}" -o "fsname=${fsname}" -f \
+    >>"${CLIO_FUSE_RT_LOG:-/tmp/clio_fuse_rt.log}" 2>&1 &
   FUSE_PIDS+=("$!")
   # wait for the mount to appear
   for _ in $(seq 1 50); do
@@ -135,12 +142,25 @@ echo "[xfstests] running ${#LIST[@]} test(s) (mount-per-test)"
 # --- run, one fresh mount per test ------------------------------------------
 pass=0; fail=0; notrun=0; hang=0; failed_list=""
 for t in "${LIST[@]}"; do
+  : > "${CLIO_FUSE_RT_LOG:-/tmp/clio_fuse_rt.log}"   # fresh runtime log per test (hang diagnosis)
   remount >/dev/null 2>&1 || { echo "${t}: MOUNTFAIL"; fail=$((fail+1)); failed_list="${failed_list} ${t}"; continue; }
   out=$(timeout "${CLIO_XFS_PERTEST_TIMEOUT:-90}" ./check "${t}" 2>/dev/null)
   rc=$?
+  # NOTE: check "Not run:" BEFORE "Passed all". ./check prints BOTH
+  # "Not run: <t>" AND "Passed all 0 tests" when the only test notruns, so
+  # matching "^Passed all" first miscounts a notrun test as a pass -- which
+  # would silently admit a scratch/hardware-requiring test into the CI gate
+  # where it tests nothing. "Not run:" is the authoritative signal.
   if [ "${rc}" -eq 124 ]; then echo "${t}: HANG"; hang=$((hang+1)); failed_list="${failed_list} ${t}(hang)"
-  elif echo "${out}" | grep -q "^Passed all"; then echo "${t}: pass"; pass=$((pass+1))
+    RTLOG="${CLIO_FUSE_RT_LOG:-/tmp/clio_fuse_rt.log}"
+    echo "--- [${t}] clio runtime hang diagnosis (rtlog_lines=$(wc -l < "${RTLOG}" 2>/dev/null || echo NA)) ---"
+    echo "  [HANGWATCH/#781/#785 markers]:"
+    grep -aE "HANGWATCH|#781|#785|DEADLOCK|STALLED" "${RTLOG}" 2>/dev/null | tail -n 60 || true
+    echo "  [raw rtlog tail 30]:"
+    tail -n 30 "${RTLOG}" 2>/dev/null | sed 's/^/    /' || true
+    echo "--- end [${t}] runtime diagnosis ---"
   elif echo "${out}" | grep -q "^Not run:"; then echo "${t}: notrun"; notrun=$((notrun+1))
+  elif echo "${out}" | grep -q "^Passed all"; then echo "${t}: pass"; pass=$((pass+1))
   else echo "${t}: FAIL"; fail=$((fail+1)); failed_list="${failed_list} ${t}"; fi
 done
 

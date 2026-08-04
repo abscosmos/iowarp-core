@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "clio_runtime/task.h"
@@ -80,6 +81,17 @@ class WorkOrchestrator {
    * Stop all worker threads
    */
   void StopWorkers();
+
+  /**
+   * Wake EVERY worker thread out of its epoll sleep by signalling each
+   * worker's assigned-lane tid. Used as a lost-wakeup safety net: a task can be
+   * parked on a lane whose GetTid() is 0 (only a worker's own assigned_lane_
+   * ever gets a tid, so any secondary lane reads 0), which makes a targeted
+   * AwakenWorker(lane) a no-op even though some worker owns that task's event
+   * queue. Waking all workers guarantees the owner re-checks its event queue
+   * and resumes the parked parent. Cheap: only hit on the rare tid==0 path.
+   */
+  void AwakenAllWorkers();
 
   /**
    * Get worker by ID
@@ -141,7 +153,49 @@ class WorkOrchestrator {
    */
   u32 GetTotalWorkerCount() const { return static_cast<u32>(all_workers_.size()); }
 
+  // --- issue #781: monitor thread + elastic (unbounded) worker pool ---
+
+  /**
+   * Start the dedicated monitor thread. Not a worker: every ~500ms it samples
+   * worker progress/load and calls scheduler_->LoadBalance(), which detects
+   * stalled workers and grows/rebalances the pool. Idempotent.
+   */
+  void StartMonitorThread();
+
+  /** Stop and join the monitor thread. */
+  void StopMonitorThread();
+
+  /**
+   * Elastically add ONE worker + lane at runtime and spawn its thread (issue
+   * #781). Called by LoadBalance when a worker stalls on a non-yielding task so
+   * the stalled worker's backlog can be stolen onto a fresh thread. Unbounded by
+   * design (see issue #781 Observability) — emits metrics/warnings instead of a
+   * hard cap. Today the pool is created once at Init; this is the dynamic path.
+   * @return the new worker, or nullptr on failure.
+   */
+  Worker *SpawnAdditionalWorker();
+
+  /**
+   * issue #785: find an already-spawned replacement that is idle (no lane, not
+   * executing) so a rescue can reuse it instead of spawning another thread.
+   * Prefer this over SpawnAdditionalWorker(). Monitor thread only.
+   */
+  Worker *FindIdleElasticWorker();
+
+  /**
+   * Retire an idle elastic worker spawned by SpawnAdditionalWorker (issue #781):
+   * park it, join its thread, and drop it from the pool — the hysteresis that
+   * returns the runtime to the minimum thread count after a burst clears.
+   */
+  void RetireWorker(Worker *worker);
+
+  /** Interval between monitor-thread LoadBalance() ticks. */
+  static constexpr u32 kMonitorPeriodMs = 500;
+
  private:
+  /** Monitor-thread body: LoadBalance() loop on a kMonitorPeriodMs cadence. */
+  void MonitorLoop();
+
   /**
    * Spawn worker threads using CTP thread model
    * @return true if spawning successful, false otherwise
@@ -170,11 +224,30 @@ class WorkOrchestrator {
   bool is_initialized_ = false;
   bool workers_running_ = false;
 
+  // issue #785: headroom reserved in workers_/all_workers_/worker_threads_ at
+  // Init() for elastic workers spawned later by SpawnAdditionalWorker(). The
+  // reserve is what makes append safe without a lock: push_back cannot
+  // reallocate while readers on other threads hold Worker* or index the vector,
+  // so growth is a pure append and existing entries never move. Reaching this
+  // cap is a hard stop rather than a reallocation.
+  static constexpr u32 kElasticHeadroom = 64;
+
   // Worker ownership container (owns all worker unique_ptrs)
   std::vector<std::unique_ptr<Worker>> workers_;
 
   // All workers for easy access (raw pointers to owned workers)
   std::vector<Worker*> all_workers_;
+
+  // issue #785: number of entries in all_workers_ that are fully constructed
+  // and safe for another thread to read. Published with release ordering AFTER
+  // the worker is in both vectors; readers (GetWorker/GetWorkerCount, and thus
+  // ClientConnect's worker-tid publication) acquire it. all_workers_.size() is
+  // NOT safe to read concurrently with a spawn.
+  std::atomic<size_t> num_workers_published_{0};
+
+  // issue #785: workers created at Init. Anything at or beyond this index is an
+  // elastic replacement and is eligible for reuse.
+  size_t baseline_worker_count_ = 0;
 
   // Active lanes pointer to IPC Manager worker queues
   void* active_lanes_;
@@ -185,6 +258,10 @@ class WorkOrchestrator {
   // CTP threads (will be filled during initialization)
   std::vector<ctp::thread::Thread> worker_threads_;
   ctp::thread::ThreadGroup thread_group_;
+
+  // issue #781: dedicated monitor thread (not a worker) that drives LoadBalance.
+  std::thread monitor_thread_;
+  std::atomic<bool> monitor_running_{false};
 
   // Scheduler pointer (owned by IpcManager, not WorkOrchestrator)
   Scheduler *scheduler_;

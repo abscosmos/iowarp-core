@@ -64,16 +64,17 @@ Future<Task> IpcCpu2Self::SendIn(IpcManager *ipc,
     // enqueueing, so RouteTask / the worker have an active RunContext.
     future.GetTaskPtr()->BeginRunContext();
 
-    // Use ClientMapTask to pick a lane and enqueue.
-    if (ipc->scheduler_ != nullptr) {
-      u32 lane_id = ipc->scheduler_->ClientMapTask(ipc, future);
-      if (!ipc->worker_queues_.IsNull()) {
-        auto &dest_lane = ipc->worker_queues_->GetLane(lane_id, 0);
-        dest_lane.Push(future);
-        // Always signal — see ipc_cpu2cpu_impl.h for the race.
-        ipc->AwakenWorker(&dest_lane);
-      }
-    }
+    // Route via the runtime router (RuntimeMapTask) rather than ClientMapTask.
+    // ClientMapTask funnels EVERY task to lane 0 (the scheduler worker); a
+    // worker executing a task that self-sends a subtask (e.g. GetBlob ->
+    // bdev::AsyncRead) then enqueues onto the SAME lane it must drain. When that
+    // lane fills, the WAIT_FOR_SPACE ring Push busy-spins forever — the worker
+    // never suspends, so it can never pop to make space (producer==consumer
+    // deadlock; the genuine FUSE hangs generic/208,323,438). RuntimeMapTask
+    // distributes large I/O to dedicated I/O workers, so the subtask lands on a
+    // different worker's lane that drains independently. force_enqueue matches
+    // the non-worker branch below (never ExecHere-inline from a self-send).
+    ipc->RouteTask(future, /*force_enqueue=*/true);
   } else {
     // Non-worker thread path (e.g. ServerInit's synchronous admin pool
     // creation, where CLIO_CUR_WORKER is null): allocate the RunContext +
@@ -111,11 +112,27 @@ void IpcCpu2Self::SendOut(const clio::run::shared_ptr<Task> &task_ptr,
     // Runtime subtask with parent: enqueue Future to parent worker's event
     // queue. FUTURE_COMPLETE is NOT set here — it will be set by
     // ProcessEventQueue on the parent's worker thread.
+    // issue #822: cast to the REAL queue type (Worker::EventQueue). The old
+    // hand-spelled mpsc_ring_buffer cast silently diverged when the event
+    // queue became a mutex-guarded growable ring — pushing through the stale
+    // type bypassed the lock (and kept the WAIT_FOR_SPACE full-queue spin).
     auto *parent_event_queue =
-        reinterpret_cast<ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>,
-                                                ctp::ipc::MallocAllocator> *>(
-            parent_task->EventQueue());
-    parent_event_queue->Emplace(task_ptr->RunFuture());
+        reinterpret_cast<Worker::EventQueue *>(parent_task->EventQueue());
+    // issue #856: the queued event must OWN the subtask. RunFuture's task
+    // handle is deliberately non-owning (cycle avoidance — see the
+    // RouteManyToOne bind), but the enqueue-to-consume window here races the
+    // subtask's other owners: for a cross-node origin, run2run's
+    // RecvOutCompleteOriginTask drops the send_map_ reference and returns
+    // (releasing its local) before the parent's worker runs
+    // ProcessEventQueue, whose Future::Complete then wrote into a freed task
+    // (ASan heap-use-after-free in Task::SetComplete; the leader-recovery
+    // free(): invalid pointer crash of the same run). Re-seating the copied
+    // Future's handle with an owning reference pins the task until the entry
+    // is consumed; ProcessEventQueue's pop-by-value releases it after
+    // completion, so no cycle survives.
+    Future<Task, CLIO_QUEUE_ALLOC_T> event_future = task_ptr->RunFuture();
+    event_future.GetTaskPtr() = task_ptr;
+    parent_event_queue->Emplace(std::move(event_future));
     if (parent_task->Lane()) {
       // Always signal — see ipc_cpu2cpu_impl.h for the race.
       CLIO_IPC->AwakenWorker(parent_task->Lane());

@@ -74,6 +74,27 @@ else()
     message(STATUS "CTE: filesystem chimod disabled (use -DCLIO_CTE_ENABLE_FILESYSTEM=ON)")
 endif()
 
+# Add the replication ChiMod (issue #886) — policy layer over the CTE core's
+# blob replicas (ReplicateBlob / FlushTag). Small and dependency-free, so it
+# builds by default; OFF only trims build time.
+option(CLIO_CTE_ENABLE_REPLICATION "Build the replication chimod (#886)" ON)
+if(CLIO_CTE_ENABLE_REPLICATION)
+    message(STATUS "CTE: building replication chimod")
+    add_subdirectory(replication)
+else()
+    message(STATUS "CTE: replication chimod disabled (use -DCLIO_CTE_ENABLE_REPLICATION=ON)")
+endif()
+
+# Add the cache ChiMod (issue #886) — write-back node-local uncompressed
+# copies at the top of the interposition chain. Small and dependency-free.
+option(CLIO_CTE_ENABLE_CACHE "Build the cache chimod (#886)" ON)
+if(CLIO_CTE_ENABLE_CACHE)
+    message(STATUS "CTE: building cache chimod")
+    add_subdirectory(cache)
+else()
+    message(STATUS "CTE: cache chimod disabled (use -DCLIO_CTE_ENABLE_CACHE=ON)")
+endif()
+
 # Add the bdev ChiMod (when it exists)
 # add_subdirectory(chimods/bdev)
 

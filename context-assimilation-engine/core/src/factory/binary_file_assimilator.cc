@@ -372,9 +372,13 @@ std::string BinaryFileAssimilator::GetUrlProtocol(const std::string& url) {
 
 std::string BinaryFileAssimilator::GetUrlPath(const std::string& url) {
   size_t pos = url.find("::");
+  // LCOV_EXCL_START: unreachable. The assimilator factory only selects the
+  // binary backend when ctx.src already carries a "<proto>::" prefix, so by
+  // the time Schedule() calls GetUrlPath(ctx.src) the "::" is always present.
   if (pos == std::string::npos) {
     return "";
   }
+  // LCOV_EXCL_STOP
   return url.substr(pos + 2);
 }
 

@@ -42,6 +42,17 @@ target_link_libraries(clio_ctp_host PUBLIC
     configure
     thread_all
 )
+# Poco::Net powers the optional drive-failure prediction HTTP client, compiled
+# into system_info.cc. Link it PRIVATE: Poco::Foundation's INTERFACE compile
+# definitions include _FILE_OFFSET_BITS=64 / _LARGEFILE64_SOURCE, which — if
+# propagated to consumers — make glibc alias open()->open64() and collide with
+# the POSIX/stdio interception adapters that define open64/creat64/... directly
+# ("symbol already defined"). CTP_HAS_POCO stays PUBLIC so test TUs that #if on
+# it still see it; the Poco symbols themselves live inside libclio_ctp_host.
+if(Poco_FOUND)
+    target_link_libraries(clio_ctp_host PRIVATE Poco::Net Poco::Foundation)
+    target_compile_definitions(clio_ctp_host PUBLIC CTP_HAS_POCO=1)
+endif()
 if(WIN32)
     target_link_libraries(clio_ctp_host PUBLIC ws2_32)
 endif()

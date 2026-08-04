@@ -9,8 +9,18 @@
 #define CLIO_RUNTIME_INCLUDE_IPC_CPU2CPU_IMPL_H_
 
 #include "clio_runtime/ipc/ipc_cpu2cpu.h"
+#include "clio_runtime/ipc/ipc_cpu2cpu_zmq.h"
+
+#include <unordered_map>
 
 namespace clio::run {
+
+// NOTE (SHM refactor): the thread-local ShmOutResponseStash that used to demux
+// sibling responses off a per-thread ring is gone. Responses now arrive on the
+// single per-process ring and are demuxed centrally by RecvShmClientThread,
+// which parks each archive in IpcManager::pending_response_archives_ keyed by
+// net_key and wakes the owning waiter — exactly like the ZMQ recv thread. Each
+// RecvOut simply blocks on its EventManager and claims its own archive.
 
 template <typename TaskT>
 Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
@@ -60,17 +70,18 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
     ipc->pending_zmq_futures_[net_key] = {task_ptr.get()};
   }
 
-  // Pick a worker and high-level Send the task to its server. The worker tid
-  // comes from ClientConnect; the runtime pid keys the segment name.
-  ctp::lbm::ShmMpscTransport *conn = nullptr;
-  if (!ipc->worker_tids_.empty()) {
-    u32 wtid = ipc->worker_tids_[net_key % ipc->worker_tids_.size()];
-    conn = ipc->GetOrCreateShmConn(
-        "clio-" + std::to_string(ipc->runtime_pid_) + "-" +
-        std::to_string(wtid));
-  }
+  // issue #807: shard across the runtime's S inbound rings. Key by this client
+  // thread's tid so a given thread always targets the same ring — preserves
+  // per-thread request order and keeps the ring's producer set stable (locality).
+  // Each shard ring has its own dedicated drain thread on the runtime, so this
+  // spreads both the MPSC-tail contention and the deserialize+route work.
+  u32 shards = ipc->shm_in_shards_ >= 1 ? ipc->shm_in_shards_ : 1;
+  u32 shard = static_cast<u32>(ctp::SystemInfo::GetTid()) % shards;
+  ctp::lbm::ShmMpscTransport *conn = ipc->GetOrCreateShmConn(
+      "clio-" + std::to_string(ipc->runtime_pid_) + "-shm-in-" +
+      std::to_string(shard));
   if (conn == nullptr) {
-    HLOG(kError, "IpcCpu2Cpu::SendIn: no MPSC worker server available");
+    HLOG(kError, "IpcCpu2Cpu::SendIn: inbound SHM ring unavailable");
     task_ptr->SetComplete();  // unblock the waiter on the error path
     return future;
   }
@@ -79,7 +90,16 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
   SaveTaskArchive archive(MsgType::kSerializeIn,
                            ipc->shm_send_transport_.get());
   archive << (*task_ptr);
-  conn->Send(archive);
+  int send_rc = conn->Send(archive);
+  if (send_rc != 0) {
+    // A submit that never reached the daemon must FAIL the future, not hang
+    // it (issue #774: every silent drop on this path turns into a client
+    // parked forever in Future::Wait).
+    HLOG(kError, "IpcCpu2Cpu::SendIn: MPSC send failed rc={} for task {}",
+         send_rc, task_ptr->task_id_);
+    task_ptr->SetReturnCode(static_cast<clio::run::u32>(-send_rc));
+    task_ptr->SetComplete();
+  }
   return future;
 #endif  // CTP_IS_HOST
 }
@@ -94,24 +114,44 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
   return false;
 #else
   TaskT *task_ptr = future.get();
-  auto *tls = ipc->GetTls();
+  const size_t want_key = task_ptr->task_id_.net_key_;
 
-  // This thread's MPSC server only receives results for tasks this thread sent
-  // (the worker routes responses to clio-<this_pid>-<this_tid>). For the common
-  // one-outstanding-per-thread case the next result IS ours; deserialize it.
-  // (Per-net_key demux for concurrent async sends is a later refinement.)
+  // Block on this thread's EventManager until RecvShmClientThread marks this
+  // task complete and signals us (SHM analogue of IpcCpu2CpuZmq::RecvOut). The
+  // dedicated recv thread — not this thread — drains the single response ring,
+  // so app threads no longer poll a per-thread ring or demux siblings here. The
+  // 100us bounded Wait is a missed-signal / timeout safety re-check; the named
+  // auto-reset event latches a Signal that races the Wait.
+  ctp::lbm::EventManager *em = &ipc->GetTls()->event_manager_;
   ctp::Timepoint start;
   start.Now();
-  while (true) {
-    LoadTaskArchive archive;
-    ctp::lbm::ClientInfo info =
-        tls->shm_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
-    if (info.rc == 0) {
-      archive.ResetBulkIndex();
-      archive.msg_type_ = MsgType::kSerializeOut;
-      archive >> (*task_ptr);
-      return true;
-    }
+
+  // issue #807/#784: spin-poll for the response before parking. On SHM the
+  // round-trip is microseconds; a brief spin catches the completion (set by
+  // RecvShmClientThread when it demuxes our archive) without the park/wake +
+  // signal syscall that otherwise dominates low-latency round-trips. Bounded by
+  // config so a slow/absent response still falls through to the parked Wait.
+  const double spin_us =
+      static_cast<double>(CLIO_CONFIG_MANAGER->GetShmClientSpinUs());
+  if (spin_us > 0.0 && !task_ptr->IsComplete()) {
+    ctp::Timepoint spin_now;
+    do {
+      // issue #807: DRAIN INLINE while spinning instead of waiting for the
+      // dedicated RecvShmClientThread to demux our response and signal us. The
+      // try-lock inside makes us the sole consumer when we win it (no concurrent
+      // Recv with the fallback thread); if another drainer holds it we just poll
+      // our own completion below. Draining here also demuxes other waiters'
+      // responses, so one active waiter serves the whole process — and it cuts
+      // the entire RecvShmClientThread wake+demux hop off the response path,
+      // which the split-timing showed dominates the round-trip.
+      ipc->DrainShmResponses();
+      if (task_ptr->IsComplete()) break;
+      spin_now.Now();
+    } while (start.GetUsecFromStart(spin_now) < spin_us);
+  }
+
+  while (!task_ptr->IsComplete()) {
+    em->Wait(100);
     if (max_sec > 0) {
       ctp::Timepoint now;
       now.Now();
@@ -119,8 +159,42 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
         return false;
       }
     }
-    CTP_THREAD_MODEL->Yield();
+    // Server-death escape (issue #851): unlike the ZMQ twin of this loop, the
+    // SHM wait used to have NO liveness check — a task in flight over SHM when
+    // the runtime died (reconnect test: AsyncStopRuntime, then submit) left
+    // the client parked here forever, since a dead server can never set
+    // FUTURE_COMPLETE. The 1s heartbeat flips server_alive_; hand the future
+    // to the ZMQ RecvOut, whose kClientShm-origin head implements the
+    // reconnect/failover + resend path.
+    if (!ipc->server_alive_.load(std::memory_order_acquire) &&
+        !ipc->reconnecting_.load()) {
+      HLOG(kWarning,
+           "Recv(SHM): server died mid-wait; handing off to reconnect path");
+      return IpcCpu2CpuZmq::RecvOut(ipc, future, max_sec);
+    }
   }
+
+  // Claim our parked response archive and deserialize into the task. Moving it
+  // out and letting it destruct here matches the old stack-archive freeing:
+  // output buffers are adopted into the task (TASK_DATA_OWNER) and the archive
+  // frees only the wire bytes. Erasing the entry means Future::~Future's
+  // CleanupResponseArchive is a no-op on this (consumed) path.
+  std::atomic_thread_fence(std::memory_order_acquire);
+  std::unique_ptr<LoadTaskArchive> archive;
+  {
+    std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
+    auto it = ipc->pending_response_archives_.find(want_key);
+    if (it != ipc->pending_response_archives_.end()) {
+      archive = std::move(it->second);
+      ipc->pending_response_archives_.erase(it);
+    }
+  }
+  if (archive) {
+    archive->ResetBulkIndex();
+    archive->msg_type_ = MsgType::kSerializeOut;
+    *archive >> (*task_ptr);
+  }
+  return true;
 #endif  // CTP_IS_HOST
 }
 

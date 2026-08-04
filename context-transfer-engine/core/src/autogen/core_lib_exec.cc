@@ -121,10 +121,30 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(PodReorganizeBlob(typed_task));
       break;
     }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = task_ptr.template Cast<DynamicReorganizeTask>();
+      CLIO_CO_AWAIT(DynamicReorganize(typed_task));
+      break;
+    }
     case Method::kDelBlob: {
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
       CLIO_CO_AWAIT(DelBlob(typed_task));
+      break;
+    }
+    case Method::kEvict: {
+      auto& typed_task = task_ptr.template Cast<EvictTask>();
+      CLIO_CO_AWAIT(Evict(typed_task));
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiPutBlobTask>();
+      CLIO_CO_AWAIT(MultiPutBlob(typed_task));
+      break;
+    }
+    case Method::kRegisterReplicaContainer: {
+      auto& typed_task = task_ptr.template Cast<RegisterReplicaContainerTask>();
+      CLIO_CO_AWAIT(RegisterReplicaContainer(typed_task));
       break;
     }
     case Method::kTruncateBlob: {
@@ -323,8 +343,28 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = task_ptr.template Cast<DynamicReorganizeTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kDelBlob: {
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kEvict: {
+      auto& typed_task = task_ptr.template Cast<EvictTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiPutBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kRegisterReplicaContainer: {
+      auto& typed_task = task_ptr.template Cast<RegisterReplicaContainerTask>();
       archive << *typed_task;
       break;
     }
@@ -508,8 +548,28 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
       archive >> *typed_task;
       break;
     }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = task_ptr.template Cast<DynamicReorganizeTask>();
+      archive >> *typed_task;
+      break;
+    }
     case Method::kDelBlob: {
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kEvict: {
+      auto& typed_task = task_ptr.template Cast<EvictTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiPutBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kRegisterReplicaContainer: {
+      auto& typed_task = task_ptr.template Cast<RegisterReplicaContainerTask>();
       archive >> *typed_task;
       break;
     }
@@ -712,8 +772,31 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task;
       break;
     }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = task_ptr.template Cast<DynamicReorganizeTask>();
+      archive >> *typed_task;
+      break;
+    }
     case Method::kDelBlob: {
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kEvict: {
+      auto& typed_task = task_ptr.template Cast<EvictTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiPutBlobTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kRegisterReplicaContainer: {
+      auto& typed_task = task_ptr.template Cast<RegisterReplicaContainerTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -933,8 +1016,31 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
       archive << *typed_task;
       break;
     }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = task_ptr.template Cast<DynamicReorganizeTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kDelBlob: {
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kEvict: {
+      auto& typed_task = task_ptr.template Cast<EvictTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiPutBlobTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kRegisterReplicaContainer: {
+      auto& typed_task = task_ptr.template Cast<RegisterReplicaContainerTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1217,6 +1323,15 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kDynamicReorganize: {
+      auto new_task_ptr = ipc_manager->NewTask<DynamicReorganizeTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<DynamicReorganizeTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<DynamicReorganizeTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kDelBlob: {
       // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<DelBlobTask>();
@@ -1224,6 +1339,33 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
         // Copy task fields (includes base Task fields)
         auto& task_typed = orig_task_ptr.template Cast<DelBlobTask>();
         new_task_ptr->Copy(ctp::ipc::FullPtr<DelBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kEvict: {
+      auto new_task_ptr = ipc_manager->NewTask<EvictTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<EvictTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<EvictTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<MultiPutBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<MultiPutBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<MultiPutBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kRegisterReplicaContainer: {
+      auto new_task_ptr = ipc_manager->NewTask<RegisterReplicaContainerTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<RegisterReplicaContainerTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<RegisterReplicaContainerTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1514,8 +1656,24 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<PodReorganizeBlobTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kDynamicReorganize: {
+      auto new_task_ptr = ipc_manager->NewTask<DynamicReorganizeTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kDelBlob: {
       auto new_task_ptr = ipc_manager->NewTask<DelBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kEvict: {
+      auto new_task_ptr = ipc_manager->NewTask<EvictTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kMultiPutBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<MultiPutBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kRegisterReplicaContainer: {
+      auto new_task_ptr = ipc_manager->NewTask<RegisterReplicaContainerTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
     case Method::kTruncateBlob: {
@@ -1678,8 +1836,28 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = orig_task.template Cast<DynamicReorganizeTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
     case Method::kDelBlob: {
       auto& typed_task = orig_task.template Cast<DelBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kEvict: {
+      auto& typed_task = orig_task.template Cast<EvictTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kMultiPutBlob: {
+      auto& typed_task = orig_task.template Cast<MultiPutBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kRegisterReplicaContainer: {
+      auto& typed_task = orig_task.template Cast<RegisterReplicaContainerTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
