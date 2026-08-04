@@ -1139,7 +1139,13 @@ class IpcManager {
    * @param port Port number to connect to
    * @return Pointer to the ZeroMQ client (owned by the pool)
    */
-  ctp::lbm::Transport *GetOrCreateClient(const std::string &addr, int port);
+  /** Get (or dial) a cached persistent DEALER to addr:port. `lane` splits
+   *  the cache so different traffic classes get their OWN connection —
+   *  issue #892: responses (small metadata) sharing one DEALER with 1 MiB
+   *  task payloads serialize behind them on the connection's sock_mtx_,
+   *  inflating every cross-node round trip. */
+  ctp::lbm::Transport *GetOrCreateClient(const std::string &addr, int port,
+                                         const char *lane = "");
 
   /**
    * Get or create a dial-back connection for returning a response to a client.

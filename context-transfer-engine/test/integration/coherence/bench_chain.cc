@@ -23,6 +23,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -110,6 +111,41 @@ int main(int, char **) {
 
   if (!Barrier(bar_id)) return 3;
 
+  // Client-side staging micro-probe: AllocateBuffer + 1MiB memcpy + Free —
+  // the fixed per-submit cost of the client-mode defer staging path.
+  {
+    auto *ipc = CLIO_IPC;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 32; ++i) {
+      auto b = ipc->AllocateBuffer(kBlobSize);
+      if (b.IsNull()) break;
+      std::memcpy(b.ptr_, buf.data(), kBlobSize);
+      ipc->FreeBuffer(b);
+    }
+    double s = std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - t0).count();
+    fprintf(stderr, "BENCH staging rank=%d us_per_op=%.0f\n", rank,
+            s * 1e6 / 32);
+  }
+
+  // Raw private-put submit probe: how long does ONE AsyncPutBlob submit
+  // (stage + task + ring send, no wait) take, with nothing else in flight?
+  {
+    std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> futs;
+    std::vector<double> us(16, 0);
+    for (int i = 0; i < 16; ++i) {
+      auto s0 = std::chrono::steady_clock::now();
+      futs.push_back(Cte()->AsyncPutBlob(my_id, "probe_" + std::to_string(i),
+                                         0, kBlobSize, buf.data()));
+      us[i] = std::chrono::duration<double, std::micro>(
+                  std::chrono::steady_clock::now() - s0).count();
+    }
+    for (auto &f : futs) f.Wait();
+    std::sort(us.begin(), us.end());
+    fprintf(stderr, "BENCH rawsubmit rank=%d min=%.0f p50=%.0f max=%.0f\n",
+            rank, us.front(), us[8], us.back());
+  }
+
   // ---- WRITE own file via the DEFER pipeline ----
   // AsyncPutBlobDefer is THE intended write path (clio-fs, YCSB, lmcache
   // all write through it): it owns a copy of the bytes at submit, batches
@@ -117,16 +153,30 @@ int main(int, char **) {
   // region includes the full drain — these are DURABLE-acked bytes/sec.
   {
     auto t0 = std::chrono::steady_clock::now();
+    std::vector<double> submit_us(kBlobsPerRank, 0);
     for (int i = 0; i < kBlobsPerRank; ++i) {
       std::memset(buf.data(), 'a' + ((rank + i) % 26), kBlobSize);
+      auto s0 = std::chrono::steady_clock::now();
       int rc = Cte()->AsyncPutBlobDefer(my_id, "page_" + std::to_string(i), 0,
                                         kBlobSize, buf.data());
+      submit_us[i] = std::chrono::duration<double, std::micro>(
+                         std::chrono::steady_clock::now() - s0).count();
       if (rc != 0) {
         fprintf(stderr, "BENCH write submit FAILED rank=%d blob=%d rc=%d\n",
                 rank, i, rc);
         return 4;
       }
     }
+    {
+      std::vector<double> s = submit_us;
+      std::sort(s.begin(), s.end());
+      fprintf(stderr,
+              "BENCH submit_us rank=%d min=%.0f p50=%.0f p90=%.0f max=%.0f\n",
+              rank, s.front(), s[s.size() / 2], s[s.size() * 9 / 10],
+              s.back());
+    }
+    double submit_s = std::chrono::duration<double>(
+                          std::chrono::steady_clock::now() - t0).count();
     clio::cte::core::Client::AwaitPutsUntilSpace(0);
     if (clio::cte::core::Client::DeferErrorCount() != 0) {
       fprintf(stderr, "BENCH write FAILED rank=%d defer_errors=%llu\n", rank,
@@ -136,9 +186,10 @@ int main(int, char **) {
     double s = std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - t0).count();
     fprintf(stderr,
-            "BENCH write rank=%d mb=%llu secs=%.3f mbps=%.1f kb=%llu\n",
+            "BENCH write rank=%d mb=%llu secs=%.3f mbps=%.1f kb=%llu "
+            "submit_secs=%.3f\n",
             rank, (unsigned long long)(total >> 20), s, Mbps(total, s),
-            (unsigned long long)(kBlobSize >> 10));
+            (unsigned long long)(kBlobSize >> 10), submit_s);
   }
   if (!Barrier(bar_id)) return 3;
 

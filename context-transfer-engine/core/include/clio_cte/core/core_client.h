@@ -853,6 +853,10 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 size_;
     };
     std::vector<Ent> ents_;
+    // Pool-managed staging buffer (issue #892): returned to the registry's
+    // staging pool at reap instead of freed. Null for non-pooled paths.
+    ctp::ipc::FullPtr<char> staging_;
+    clio::run::u64 staging_size_ = 0;
   };
   // Keys are 64-bit FNV-1a hashes (no per-op allocation) and the per-key
   // pending table is sharded 16 ways: a client-mode mixed workload keeps puts
@@ -905,6 +909,15 @@ class Client : public clio::run::ContainerClient {
     // put), so batches only ever aggregate values smaller than it.
     static constexpr clio::run::u64 kBatchMax = 64;
     static constexpr clio::run::u64 kBatchChunk = 128 * 1024;
+    // Staging buffer pool for LARGE deferred puts (issue #892): allocating a
+    // fresh SHM buffer per 1 MiB put costs first-touch page faults plus an
+    // allocator walk that degrades to milliseconds under churn — measured as
+    // THE client-side submit bottleneck (p50 2.7-4.4 ms/submit vs ~0.1 ms
+    // with a recycled buffer). Completed puts return their staging here;
+    // submits pop an exact-size match (pre-faulted, no allocator).
+    static constexpr size_t kPoolMaxBufs = 64;
+    std::mutex pool_mtx_;
+    std::vector<std::pair<ctp::ipc::FullPtr<char>, clio::run::u64>> pool_;
     std::mutex batch_mtx_;
     std::atomic<Client *> flush_client_{nullptr};  // for static await entries
     ctp::ipc::FullPtr<char> batch_chunk_{};
@@ -1013,6 +1026,43 @@ class Client : public clio::run::ContainerClient {
    *  while the reaping thread was still waiting on that key's put — the read
    *  then missed the not-yet-published blob (the residual YCSB-D NOT_FOUNDs
    *  that survived the first RAW implementation). */
+  /** Pop a recycled staging buffer of EXACTLY `size` bytes, or allocate a
+   *  fresh one. Pool hits skip both the allocator walk and first-touch
+   *  faults (issue #892). */
+  static ctp::ipc::FullPtr<char> PoolAllocStaging(clio::run::u64 size) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    {
+      std::lock_guard<std::mutex> lk(reg.pool_mtx_);
+      for (size_t i = 0; i < reg.pool_.size(); ++i) {
+        if (reg.pool_[i].second == size) {
+          ctp::ipc::FullPtr<char> buf = reg.pool_[i].first;
+          reg.pool_[i] = reg.pool_.back();
+          reg.pool_.pop_back();
+          return buf;
+        }
+      }
+    }
+    return CLIO_IPC->AllocateBuffer(size);
+  }
+
+  /** Return a staging buffer to the pool (or free it when the pool is
+   *  full). */
+  static void PoolFreeStaging(ctp::ipc::FullPtr<char> buf,
+                              clio::run::u64 size) {
+    if (buf.IsNull()) {
+      return;
+    }
+    DeferRegistry &reg = DeferRegistry::Get();
+    {
+      std::lock_guard<std::mutex> lk(reg.pool_mtx_);
+      if (reg.pool_.size() < DeferRegistry::kPoolMaxBufs) {
+        reg.pool_.emplace_back(buf, size);
+        return;
+      }
+    }
+    CLIO_IPC->FreeBuffer(buf);
+  }
+
   static bool DeferAwaitOldest() {
     DeferRegistry &reg = DeferRegistry::Get();
     DeferredPut entry;
@@ -1050,6 +1100,8 @@ class Client : public clio::run::ContainerClient {
     if (t == nullptr || t->GetReturnCode() != 0) {
       reg.errors_.fetch_add(1);
     }
+    // Recycle the pool-managed staging buffer (issue #892).
+    PoolFreeStaging(entry.staging_, entry.staging_size_);
     clio::run::u64 bytes = 0;
     for (const auto &e : entry.ents_) bytes += e.size_;
     {
@@ -1062,6 +1114,49 @@ class Client : public clio::run::ContainerClient {
       reg.KeyRelease(e.key_, e.seq_);
     }
     return true;
+  }
+
+  /**
+   * Non-blocking reap of ALREADY-COMPLETED oldest deferred puts (issue
+   * #892): pops FIFO fronts whose futures are complete, releasing their
+   * bookkeeping and returning pooled staging buffers. Called opportunistically
+   * at submit time so a long burst continuously recycles its staging instead
+   * of allocating fresh (fault-cold) buffers for every put.
+   */
+  static void DeferReapCompleted() {
+    DeferRegistry &reg = DeferRegistry::Get();
+    while (true) {
+      DeferredPut entry;
+      {
+        std::lock_guard<std::mutex> lk(reg.mtx_);
+        if (reg.fifo_.empty()) {
+          return;
+        }
+        auto *t = reg.fifo_.front().fut_.get();
+        if (t == nullptr || !t->IsComplete()) {
+          return;
+        }
+        entry = std::move(reg.fifo_.front());
+        reg.fifo_.pop_front();
+      }
+      entry.fut_.Wait();  // already complete — returns immediately
+      auto *t = entry.fut_.get();
+      if (t == nullptr || t->GetReturnCode() != 0) {
+        reg.errors_.fetch_add(1);
+      }
+      PoolFreeStaging(entry.staging_, entry.staging_size_);
+      clio::run::u64 bytes = 0;
+      for (const auto &e : entry.ents_) bytes += e.size_;
+      {
+        std::lock_guard<std::mutex> lk(reg.mtx_);
+        reg.pending_count_.fetch_sub(entry.ents_.size(),
+                                     std::memory_order_relaxed);
+        reg.inflight_bytes_ -= bytes;
+      }
+      for (const auto &e : entry.ents_) {
+        reg.KeyRelease(e.key_, e.seq_);
+      }
+    }
   }
 
   /**
@@ -1094,6 +1189,29 @@ class Client : public clio::run::ContainerClient {
       AwaitPutsUntilSpace(max_inflight_bytes);
     }
     if (size >= DeferRegistry::kBatchChunk) {
+      // Recycle completed puts' staging FIRST (non-blocking), so a burst
+      // feeds its own pool instead of allocating fault-cold buffers.
+      DeferReapCompleted();
+      // Stage through the RECYCLED pool (issue #892): an exact-size pool hit
+      // is a pre-faulted buffer and no allocator walk — the fresh-allocation
+      // path was the measured submit bottleneck. The SHM-pointer put overload
+      // leaves ownership with us; the buffer returns to the pool at reap.
+      ctp::ipc::FullPtr<char> staging = PoolAllocStaging(size);
+      if (!staging.IsNull()) {
+        std::memcpy(staging.ptr_, priv_data, size);
+        int rc = DeferPutLarge(
+            tag_id, blob_name, offset, size, staging.ptr_,
+            [&] {
+              return AsyncPutBlob(tag_id, blob_name, offset, size,
+                                  staging.shm_.template Cast<void>(), score,
+                                  context, flags, pool_query);
+            },
+            staging, size);
+        if (rc != 0) {
+          PoolFreeStaging(staging, size);
+        }
+        return rc;
+      }
       return DeferPutLarge(tag_id, blob_name, offset, size, priv_data, [&] {
         return AsyncPutBlob(tag_id, blob_name, offset, size, priv_data, score,
                             context, flags, pool_query);
@@ -1240,7 +1358,10 @@ class Client : public clio::run::ContainerClient {
   template <typename SubmitFn>
   int DeferPutLarge(const TagId &tag_id, const std::string &blob_name,
                     clio::run::u64 offset, clio::run::u64 size,
-                    const char *runtime_extent, SubmitFn &&submit) {
+                    const char *runtime_extent, SubmitFn &&submit,
+                    ctp::ipc::FullPtr<char> staging =
+                        ctp::ipc::FullPtr<char>::GetNull(),
+                    clio::run::u64 staging_size = 0) {
     DeferRegistry &reg = DeferRegistry::Get();
     reg.flush_client_.store(this, std::memory_order_release);
     auto fut = submit();
@@ -1258,6 +1379,8 @@ class Client : public clio::run::ContainerClient {
     DeferredPut rec;
     rec.fut_ = fut.template Cast<clio::run::Task>();
     rec.ents_.push_back(DeferredPut::Ent{key, seq, size});
+    rec.staging_ = staging;
+    rec.staging_size_ = staging_size;
     {
       std::lock_guard<std::mutex> lk(reg.mtx_);
       reg.fifo_.push_back(std::move(rec));
