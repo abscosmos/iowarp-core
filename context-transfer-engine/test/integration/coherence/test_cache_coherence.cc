@@ -77,6 +77,29 @@ bool MatchesPattern(const char *buf, clio::run::u64 size, int writer,
 
 clio::cte::core::Client *Chain() { return CLIO_CTE_CLIENT; }
 
+/** Decode which (writer, round) pattern buf holds, for failure forensics.
+ *  Returns "w<writer>r<round>", "torn(...)" for a recognizable prefix, or
+ *  "unknown". */
+std::string DecodePattern(const char *buf, clio::run::u64 size) {
+  for (int w = 0; w < kNumNodes; ++w) {
+    for (int r = 0; r < kRepeatRounds; ++r) {
+      if (MatchesPattern(buf, size, w, r)) {
+        return "w" + std::to_string(w) + "r" + std::to_string(r);
+      }
+    }
+  }
+  for (int w = 0; w < kNumNodes; ++w) {
+    for (int r = 0; r < kRepeatRounds; ++r) {
+      if (buf[0] == static_cast<char>((w * 31 + r * 7) & 0x7f) &&
+          buf[1] == static_cast<char>((w * 31 + r * 7 + 13) & 0x7f)) {
+        return "torn(w" + std::to_string(w) + "r" + std::to_string(r) +
+               " prefix)";
+      }
+    }
+  }
+  return "unknown";
+}
+
 /** Blob-based rendezvous: every rank puts its arrival blob and waits for
  *  the other ranks' — the store itself is the message board. Epochs make
  *  names unique so no cleanup is needed between barriers. */
@@ -163,6 +186,16 @@ TEST_CASE("Coherence - put once read many (reader-local DRAM)",
                                         clio::cte::core::kCacheReplica);
       sz.Wait();
       if (sz->GetReturnCode() == 0 && sz->size_ >= kPormSize) {
+        local = true;
+        break;
+      }
+      // The blob's OWNER node keeps no cache-slot copy by design (issue
+      // #894): there the authoritative primary IS the node-local DRAM
+      // copy. A Local primary probe answers only on the owner node.
+      auto psz = direct.AsyncGetBlobSize(tag_id, peer_name,
+                                         clio::run::PoolQuery::Local());
+      psz.Wait();
+      if (psz->GetReturnCode() == 0 && psz->size_ >= kPormSize) {
         local = true;
         break;
       }
@@ -276,6 +309,21 @@ static void FragmentedRound(const clio::cte::core::TagId &tag_id,
     std::string name =
         "winner_" + std::to_string(epoch) + "_" + std::to_string(r);
     REQUIRE(ReadFull(tag_id, name, &w, 1));
+    if (w != static_cast<char>('0' + winner)) {
+      // Forensics for the winner split: whose pattern is this node actually
+      // holding, and does a fresh read still return it?
+      std::vector<char> now(kSharedSize);
+      std::string now_dec = "readfail";
+      if (ReadFull(tag_id, blob, now.data(), kSharedSize)) {
+        now_dec = DecodePattern(now.data(), kSharedSize);
+      }
+      fprintf(stderr,
+              "[COH-DIAG] rank=%d round=%d winner=%d but rank %d published "
+              "'%c'; my stable read decodes as %s, fresh re-read decodes as "
+              "%s\n",
+              rank, round, winner, r, w, DecodePattern(got.data(),
+              kSharedSize).c_str(), now_dec.c_str());
+    }
     REQUIRE(w == static_cast<char>('0' + winner));
   }
   REQUIRE(Barrier(tag_id));

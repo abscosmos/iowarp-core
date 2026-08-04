@@ -133,24 +133,6 @@ static bool WaitPrimarySize(clio::cte::core::Client *core,
   return false;
 }
 
-/** Poll until the CACHE replica of tag/name reports `want` bytes. */
-static bool WaitCacheReplicaSize(clio::cte::core::Client *core,
-                                 const clio::cte::core::TagId &tag_id,
-                                 const std::string &name,
-                                 clio::run::u64 want) {
-  for (int attempt = 0; attempt < 300; ++attempt) {
-    auto sz = core->AsyncGetBlobSize(tag_id, name,
-                                     clio::run::PoolQuery::Dynamic(),
-                                     clio::cte::core::kCacheReplica);
-    sz.Wait();
-    if (sz->GetReturnCode() == 0 && sz->size_ == want) {
-      return true;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  return false;
-}
-
 TEST_CASE("CacheInterpose - async write-through cache over core",
           "[cte][cache][886]") {
   CacheInterposeFixture fixture;
@@ -200,14 +182,15 @@ TEST_CASE("CacheInterpose - async write-through cache over core",
       REQUIRE(psz->size_ == kValSize);
     }
 
-    // The cache replica has the bytes NOW too (written before the ack).
+    // Single node ⇒ this node OWNS every blob, and the owner keeps NO
+    // cache-slot copy (issue #894): the primary IS the node-local copy,
+    // and an owner-side copy would sit outside the invalidation protocol.
     {
       auto rsz = core->AsyncGetBlobSize(tag_id, "wb_blob",
                                         clio::run::PoolQuery::Dynamic(),
                                         clio::cte::core::kCacheReplica);
       rsz.Wait();
-      REQUIRE(rsz->GetReturnCode() == 0);
-      REQUIRE(rsz->size_ == kValSize);
+      REQUIRE((rsz->GetReturnCode() != 0 || rsz->size_ == 0));
     }
 
     // Size through the cache answers the logical size from the raw copy.
@@ -267,23 +250,22 @@ TEST_CASE("CacheInterpose - async write-through cache over core",
     p2.Wait();
     REQUIRE(p2->GetReturnCode() == 0);
 
-    // Primary AND cache replica both hold the second payload, no waiting.
+    // The primary holds the second payload, no waiting. (No cache-slot
+    // copy to check — the owner node keeps none, issue #894.)
     std::vector<char> got(kValSize, 0);
     auto get = core->AsyncGetBlob(tag_id, "co_blob", 0, kValSize,
                                   /*flags=*/0, got.data());
     get.Wait();
     REQUIRE(get->GetReturnCode() == 0);
     REQUIRE(std::memcmp(got.data(), v2.data(), kValSize) == 0);
+    // Reads through the cache observe the final bytes too.
     {
-      std::vector<char> raw(kValSize, 0);
-      clio::cte::core::Context cctx;
-      cctx.replica_ = clio::cte::core::kCacheReplica;
-      auto gc = core->AsyncGetBlob(tag_id, "co_blob", 0, kValSize,
-                                   /*flags=*/0, raw.data(),
-                                   clio::run::PoolQuery::Dynamic(), cctx);
+      std::vector<char> via(kValSize, 0);
+      auto gc = cache_io.AsyncGetBlob(tag_id, "co_blob", 0, kValSize,
+                                      /*flags=*/0, via.data());
       gc.Wait();
       REQUIRE(gc->GetReturnCode() == 0);
-      REQUIRE(std::memcmp(raw.data(), v2.data(), kValSize) == 0);
+      REQUIRE(std::memcmp(via.data(), v2.data(), kValSize) == 0);
     }
   }
 
@@ -306,8 +288,15 @@ TEST_CASE("CacheInterpose - async write-through cache over core",
     REQUIRE(get->GetReturnCode() == 0);
     REQUIRE(std::memcmp(got.data(), vm.data(), kValSize) == 0);
 
-    // The miss re-populated the REPLICA_CACHE slot.
-    REQUIRE(WaitCacheReplicaSize(core, tag_id, "miss_blob", kValSize));
+    // The owner node never populates a cache-slot copy (issue #894): the
+    // read was served straight from the node-local primary.
+    {
+      auto rsz = core->AsyncGetBlobSize(tag_id, "miss_blob",
+                                        clio::run::PoolQuery::Dynamic(),
+                                        clio::cte::core::kCacheReplica);
+      rsz.Wait();
+      REQUIRE((rsz->GetReturnCode() != 0 || rsz->size_ == 0));
+    }
   }
 
   // ======================================================================
