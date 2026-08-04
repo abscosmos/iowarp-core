@@ -159,8 +159,11 @@ if(TARGET clio_cte_fuse)
             ${CMAKE_CURRENT_BINARY_DIR}/cte_config.yaml)
 
     add_test(NAME fuse_ops COMMAND test_fuse_ops)
+    # 900s: the suite runs 15 cases against one embedded runtime in a single
+    # process; the MSVC Debug build on the Windows adapters runner blew the
+    # old 300s ceiling (#903) — distinguish slow from hung before excluding.
     set_tests_properties(fuse_ops PROPERTIES
-        TIMEOUT 300
+        TIMEOUT 900
         LABELS "unit;adapter;fuse"
         ENVIRONMENT "CLIO_WITH_RUNTIME=1;CTP_LOG_LEVEL=error;CLIO_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/cte_config.yaml;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
         RESOURCE_LOCK "clio_runtime")

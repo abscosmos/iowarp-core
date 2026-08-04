@@ -73,6 +73,14 @@
 // the mount smoke test, not this unit test.
 #include "adapter/libfuse/fuse_cte.cc"  // NOLINT(build/include)
 
+#ifdef __APPLE__
+// macFUSE's public getattr callback fills a fuse_darwin_attr; these tests
+// assert struct-stat fields, so point them at the shared struct-stat
+// implementation both wrappers delegate to (the Darwin translation itself
+// is covered by the readdir filler path and the mount smoke).
+#define cte_fuse_getattr cte_fuse_getattr_stat
+#endif
+
 #include "simple_test.h"
 
 using namespace clio::cae::fuse;  // NOLINT(build/namespaces)
