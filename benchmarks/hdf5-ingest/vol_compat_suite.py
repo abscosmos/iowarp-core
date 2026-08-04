@@ -485,6 +485,7 @@ C_PROBES = {
     "c_cache_identity":    "vol_c_cache_identity_test.c",
     "c_error_propagation": "vol_c_error_propagation_test.c",
     "c_passthrough_ops":   "vol_c_passthrough_ops_test.c",
+    "c_isaccessible":      "vol_c_isaccessible_test.c",
 }
 
 
@@ -540,7 +541,10 @@ def _run_c_tests():
     selection-aware read caching + partial-write invalidation (c_selection), and
     the cache-identity regressions (c_cache_identity): mem/file datatype
     mismatch, a cache surviving H5F_ACC_TRUNC of its file, and H5Dflush as a
-    barrier. Each of those three returned wrong data with a success status."""
+    barrier. Each of those three returned wrong data with a success status.
+    c_isaccessible covers the filename-scoped file_specific ops HDF5 invokes
+    with a NULL object; h5py never calls H5Fis_accessible, so no h5py case
+    reaches that callback."""
     src_dir = os.path.dirname(os.path.abspath(__file__))
     out = {}
     for name, src in C_PROBES.items():
