@@ -32,6 +32,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <regex>
@@ -48,18 +49,85 @@ namespace clio::cte::indexer {
 
 namespace {
 
+/**
+ * Execute a freshly-built core-vocabulary task on the co-located core
+ * container as a NESTED call on the current fiber — the same mechanism
+ * ForwardToCore uses for interposed traffic, applied to the indexer's own
+ * sub-ops (size probe / read-back / tag-name resolve).
+ *
+ * This exists because the first cut issued these through the CLIENT API
+ * from inside the runtime: every re-index paid 2-3 full task
+ * dispatch/queue/schedule/complete round-trips whose payload was a local
+ * metadata lookup — the same cost profile CLIO_RUN_INLINE (#862) documents
+ * for puts, and the dominant term in the indexer's measured put overhead.
+ * Unlike CLIO_RUN_INLINE this is not env-gated: an interposer executing on
+ * its next pool's local container is the sanctioned chain mechanism, not an
+ * opt-in optimization.
+ *
+ * Same synthesized-completed-future shape as detail::RunInlineOrSend.
+ */
+template <typename TaskT>
+clio::run::TaskResume RunOnCore(clio::run::ContainerHold core,
+                                clio::run::u32 method,
+                                clio::run::shared_ptr<TaskT> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    if (core == nullptr) {
+      task->SetReturnCode(1);
+      CLIO_CO_RETURN;
+    }
+    task->BeginRunContext();
+    clio::run::Future<TaskT> fut(task->pool_id_, task->method_, task);
+    fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+    task->RunFuture() = fut.template Cast<clio::run::Task>();
+    clio::run::shared_ptr<clio::run::Task> base =
+        task.template Cast<clio::run::Task>();
+    CLIO_CO_AWAIT(core->Run(method, base));
+    task->SetComplete();
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+/** CLIO_INDEXER_PASSIVE=1: forward-only interposition — no index
+ *  maintenance at all. Kill switch for production triage and the measured
+ *  baseline separating interposition cost from indexing cost. */
+bool IndexerPassive() {
+  static const bool v = std::getenv("CLIO_INDEXER_PASSIVE") != nullptr;
+  return v;
+}
+
 // Tokenize raw bytes as lowercase alphanumeric runs of length >= 2.
-// MUST stay identical to the tokenization the core's old in-core scan used
-// (issue #905 moved it here verbatim): the python/CAE semantic-search tests
-// assert on its ranking behavior.
+// Classification semantics MUST stay identical to the core's old in-core
+// scan (C-locale isalnum/tolower over ASCII): the python/CAE semantic-search
+// tests assert on its ranking behavior. Unlike the old scan this runs on
+// EVERY put, so the per-byte cost is the put path's floor — the locale
+// isalnum()/tolower() calls it used were ~3-10ns/byte (measured ~350MB/s put
+// ceiling); the precomputed table below classifies+lowers in one L1 load.
+// 0 = not a token byte; else the lowercased byte.
+const unsigned char *SemSearchByteTable() {
+  // C-locale alnum only: '0'-'9', 'A'-'Z' (lowered), 'a'-'z'. High bytes
+  // stay 0 — matching C-locale isalnum on this runtime's daemons.
+  static const std::array<unsigned char, 256> table = [] {
+    std::array<unsigned char, 256> t{};
+    for (int c = '0'; c <= '9'; ++c) t[c] = static_cast<unsigned char>(c);
+    for (int c = 'a'; c <= 'z'; ++c) t[c] = static_cast<unsigned char>(c);
+    for (int c = 'A'; c <= 'Z'; ++c)
+      t[c] = static_cast<unsigned char>(c - 'A' + 'a');
+    return t;
+  }();
+  return table.data();
+}
+
 std::vector<std::string> SemSearchTokenize(const char *data, size_t size) {
+  const unsigned char *tbl = SemSearchByteTable();
   std::vector<std::string> tokens;
   std::string cur;
   cur.reserve(16);
   for (size_t i = 0; i < size; ++i) {
-    unsigned char c = static_cast<unsigned char>(data[i]);
-    if (std::isalnum(c)) {
-      cur.push_back(static_cast<char>(std::tolower(c)));
+    unsigned char mapped = tbl[static_cast<unsigned char>(data[i])];
+    if (mapped != 0) {
+      cur.push_back(static_cast<char>(mapped));
     } else {
       if (cur.size() >= 2) tokens.push_back(std::move(cur));
       cur.clear();
@@ -79,6 +147,21 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     next_client_ =
         std::make_unique<clio::cte::core::Client>(config_.next_pool_id_);
   }
+  // Background progress for the asynchronous index drain (same periodic
+  // pattern as replication's write-through sweep). Searches drain
+  // synchronously regardless — the sweep only bounds how stale the index
+  // can sit between searches.
+  if (config_.index_sweep_period_ms_ > 0) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto sweep = ipc->NewTask<IndexSweepTask>(
+        clio::run::CreateTaskId(), pool_id_, clio::run::PoolQuery::Local());
+    sweep->SetPeriod(static_cast<double>(config_.index_sweep_period_ms_),
+                     clio::run::kMilli);
+    sweep->SetFlags(TASK_PERIODIC);  // SetPeriod alone does not mark it
+    ipc->Send(sweep);
+    HLOG(kInfo, "Indexer: async index sweep every {} ms",
+         config_.index_sweep_period_ms_);
+  }
   if (is_restart_) {
     // Warm start: the storage below restored its own metadata/data before
     // this pool composed (compose order puts `next` first), so the index
@@ -97,6 +180,7 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
     std::lock_guard<std::mutex> lock(index_mutex_);
     index_.clear();
     tag_names_.clear();
+    pending_.clear();
   }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
@@ -133,10 +217,18 @@ clio::run::TaskResume Runtime::ResolveTagName(TagId tag_id,
     }
   }
   {
-    auto fut = GetNextClient()->AsyncGetTagName(tag_id);
-    CLIO_CO_AWAIT(fut);
-    if (fut->GetReturnCode() == 0 && fut->found_ != 0) {
-      *name_out = fut->tag_name_.str();
+    // Nested inline run on the co-located core: tag metadata is a local map
+    // lookup; a client round-trip here costs more than the lookup itself.
+    // Broadcast is unnecessary — every chain container is one-per-node and
+    // the tag either resolves locally or the name stays uncached until a
+    // path that can see it (rebuild seeds the cache from BlobQuery names).
+    auto task = CLIO_CPU_IPC->NewTask<clio::cte::core::GetTagNameTask>(
+        clio::run::CreateTaskId(), CorePoolId(), clio::run::PoolQuery::Local(),
+        tag_id);
+    CLIO_CO_AWAIT(RunOnCore(CoreContainer(),
+                            clio::cte::core::Method::kGetTagName, task));
+    if (task->GetReturnCode() == 0 && task->found_ != 0) {
+      *name_out = task->tag_name_.str();
       std::lock_guard<std::mutex> lock(index_mutex_);
       tag_names_[TagKey(tag_id)] = *name_out;
     } else {
@@ -147,32 +239,52 @@ clio::run::TaskResume Runtime::ResolveTagName(TagId tag_id,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::ProbeBlobSize(TagId tag_id,
+                                             const std::string &blob_name,
+                                             clio::run::u64 *total_out) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    auto task = CLIO_CPU_IPC->NewTask<clio::cte::core::GetBlobSizeTask>(
+        clio::run::CreateTaskId(), CorePoolId(), clio::run::PoolQuery::Local(),
+        tag_id, blob_name, 0);
+    CLIO_CO_AWAIT(RunOnCore(CoreContainer(),
+                            clio::cte::core::Method::kGetBlobSize, task));
+    *total_out = task->GetReturnCode() == 0 ? task->size_ : 0;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::IndexDocBytes(const TagId &tag_id, const std::string &tag_name,
+                            const std::string &blob_name, const char *data,
+                            clio::run::u64 len) {
+  auto tokens = SemSearchTokenize(data, len);
+  IndexedDoc doc;
+  doc.tag_id_ = tag_id;
+  doc.tag_name_ = tag_name;
+  doc.blob_name_ = blob_name;
+  doc.length_ = tokens.size();
+  for (auto &t : tokens) ++doc.tf_[t];
+  std::lock_guard<std::mutex> lock(index_mutex_);
+  index_[DocKey(tag_id, blob_name)] = std::move(doc);
+}
+
 clio::run::TaskResume Runtime::ReindexBlob(TagId tag_id,
                                            std::string blob_name) {
   CLIO_TASK_BODY_BEGIN
   {
     auto *ipc_manager = CLIO_CPU_IPC;
-    auto *next = GetNextClient();
 
     // Current logical size decides index membership: the old in-core scan
     // skipped zero-length blobs, so an empty (or vanished) blob leaves the
     // index rather than lingering as an empty doc.
     clio::run::u64 total = 0;
-    clio::run::u32 size_rc = 0;
-    {
-      auto size_fut = next->AsyncGetBlobSize(tag_id, blob_name,
-                                             clio::run::PoolQuery::Local());
-      CLIO_CO_AWAIT(size_fut);
-      size_rc = size_fut->GetReturnCode();
-      if (size_rc == 0) {
-        total = size_fut->size_;
-      }
-    }
+    CLIO_CO_AWAIT(ProbeBlobSize(tag_id, blob_name, &total));
     if (total == 0) {
       HLOG(kDebug,
-           "Indexer: blob '{}' (tag {}.{}) not indexable (size rc={}, "
-           "size 0) — dropping from index",
-           blob_name, tag_id.major_, tag_id.minor_, size_rc);
+           "Indexer: blob '{}' (tag {}.{}) not indexable (size 0 or stat "
+           "failed) — dropping from index",
+           blob_name, tag_id.major_, tag_id.minor_);
       std::lock_guard<std::mutex> lock(index_mutex_);
       index_.erase(DocKey(tag_id, blob_name));
       CLIO_CO_RETURN;
@@ -181,10 +293,11 @@ clio::run::TaskResume Runtime::ReindexBlob(TagId tag_id,
     std::string tag_name;
     CLIO_CO_AWAIT(ResolveTagName(tag_id, &tag_name));
 
-    // Re-read the blob's CURRENT bytes from the chain — always correct for
-    // partial/vectored writes and truncates, at the cost of one read-back
-    // per mutation. The layer below serves the logical (untransformed)
-    // bytes, which is what the tokenizer must see.
+    // Re-read the blob's CURRENT bytes from the chain — the always-correct
+    // fallback for partial/vectored writes and truncates (whole-blob puts
+    // never come here; they tokenize straight from the task payload). The
+    // read runs as a nested inline call on the core container: no client
+    // round-trip, no queue hop.
     ctp::ipc::FullPtr<char> buf = ipc_manager->AllocateBuffer(total);
     if (buf.IsNull()) {
       HLOG(kWarning,
@@ -195,11 +308,14 @@ clio::run::TaskResume Runtime::ReindexBlob(TagId tag_id,
     }
     clio::run::u32 read_rc = 0;
     {
-      auto get_fut = next->AsyncGetBlob(tag_id, blob_name, 0, total, 0,
-                                        ctp::ipc::ShmPtr<>(buf.shm_),
-                                        clio::run::PoolQuery::Local());
-      CLIO_CO_AWAIT(get_fut);
-      read_rc = get_fut->GetReturnCode();
+      auto get_task = ipc_manager->NewTask<clio::cte::core::GetBlobTask>(
+          clio::run::CreateTaskId(), CorePoolId(),
+          clio::run::PoolQuery::Local(), tag_id, blob_name.c_str(),
+          static_cast<clio::run::u64>(0), total, static_cast<clio::run::u32>(0),
+          ctp::ipc::ShmPtr<>(buf.shm_), clio::cte::core::Context());
+      CLIO_CO_AWAIT(RunOnCore(CoreContainer(),
+                              clio::cte::core::Method::kGetBlob, get_task));
+      read_rc = get_task->GetReturnCode();
     }
     if (read_rc != 0) {
       ipc_manager->FreeBuffer(buf);
@@ -212,26 +328,74 @@ clio::run::TaskResume Runtime::ReindexBlob(TagId tag_id,
       CLIO_CO_RETURN;
     }
 
-    auto tokens = SemSearchTokenize(buf.ptr_, total);
+    IndexDocBytes(tag_id, tag_name, blob_name, buf.ptr_, total);
     ipc_manager->FreeBuffer(buf);
-
-    IndexedDoc doc;
-    doc.tag_id_ = tag_id;
-    doc.tag_name_ = std::move(tag_name);
-    doc.blob_name_ = blob_name;
-    doc.length_ = tokens.size();
-    for (auto &t : tokens) ++doc.tf_[t];
-    {
-      std::lock_guard<std::mutex> lock(index_mutex_);
-      index_[DocKey(tag_id, blob_name)] = std::move(doc);
-    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
+void Runtime::EnqueuePending(const TagId &tag_id,
+                             const std::string &blob_name) {
+  std::lock_guard<std::mutex> lock(index_mutex_);
+  pending_[DocKey(tag_id, blob_name)] = PendingReindex{tag_id, blob_name};
+}
+
+clio::run::TaskResume Runtime::DrainPendingIndex() {
+  CLIO_TASK_BODY_BEGIN
+  for (;;) {
+    bool have = false;
+    bool wait = false;
+    TagId tag_id = TagId::GetNull();
+    std::string blob_name;
+    {
+      std::lock_guard<std::mutex> lock(index_mutex_);
+      if (!pending_.empty()) {
+        auto it = pending_.begin();
+        tag_id = it->second.tag_id_;
+        blob_name = std::move(it->second.blob_name_);
+        pending_.erase(it);
+        ++draining_;
+        have = true;
+      } else if (draining_ != 0) {
+        // Another drainer is mid-entry: the barrier must outlast it.
+        wait = true;
+      }
+    }
+    if (have) {
+      CLIO_CO_AWAIT(ReindexBlob(tag_id, blob_name));
+      std::lock_guard<std::mutex> lock(index_mutex_);
+      --draining_;
+      continue;
+    }
+    if (wait) {
+      CLIO_CO_AWAIT(clio::run::yield(50));
+      continue;
+    }
+    break;  // pending empty and nothing in flight
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::IndexSweep(
+    clio::run::shared_ptr<IndexSweepTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  CLIO_CO_AWAIT(DrainPendingIndex());
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 // ---------------------------------------------------------------------------
-// Intercepted mutating verbs: forward FIRST, then keep the index current.
+// Intercepted mutating verbs: forward FIRST, then mark the doc dirty.
+// Indexing is ASYNCHRONOUS (issue #905 perf): the ack path's only cost is
+// an O(1) coalesced enqueue — the measured synchronous alternatives were
+// put-throughput disasters (client-hop read-backs ~350MB/s; even a
+// payload-direct inline tokenize capped puts at the scanner's ~0.7GB/s).
+// The drain (sweep task or a search's barrier) re-reads CURRENT bytes per
+// dirty key, so N overwrites cost one scan and the index converges to the
+// latest content.
 // ---------------------------------------------------------------------------
 
 clio::run::TaskResume Runtime::PutBlob(
@@ -241,10 +405,11 @@ clio::run::TaskResume Runtime::PutBlob(
                               task.template Cast<clio::run::Task>()));
   // Replica-addressed writes duplicate primary content the index already
   // tracks (the primary put flowed through here too) — never re-index them.
-  if (task->GetReturnCode() == 0 && task->context_.replica_ == 0) {
+  if (task->GetReturnCode() == 0 && task->context_.replica_ == 0 &&
+      !IndexerPassive()) {
     // blob_name_ is INOUT (the gpu page suffix is composed handler-side),
     // so read it AFTER the forward.
-    CLIO_CO_AWAIT(ReindexBlob(task->tag_id_, task->blob_name_.str()));
+    EnqueuePending(task->tag_id_, task->blob_name_.str());
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -255,11 +420,12 @@ clio::run::TaskResume Runtime::MultiPutBlob(
   CLIO_TASK_BODY_BEGIN
   CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
                               task.template Cast<clio::run::Task>()));
-  if (task->GetReturnCode() == 0 && task->context_.replica_ == 0) {
+  if (task->GetReturnCode() == 0 && task->context_.replica_ == 0 &&
+      !IndexerPassive()) {
     std::vector<clio::cte::core::MultiPutDesc> descs =
         clio::cte::core::DecodeMultiPutDescs(task->descs_);
     for (size_t i = 0; i < descs.size(); ++i) {
-      CLIO_CO_AWAIT(ReindexBlob(descs[i].tag_id_, descs[i].blob_name_));
+      EnqueuePending(descs[i].tag_id_, descs[i].blob_name_);
     }
   }
   CLIO_CO_RETURN;
@@ -271,8 +437,8 @@ clio::run::TaskResume Runtime::TruncateBlob(
   CLIO_TASK_BODY_BEGIN
   CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kTruncateBlob,
                               task.template Cast<clio::run::Task>()));
-  if (task->GetReturnCode() == 0) {
-    CLIO_CO_AWAIT(ReindexBlob(task->tag_id_, task->blob_name_.str()));
+  if (task->GetReturnCode() == 0 && !IndexerPassive()) {
+    EnqueuePending(task->tag_id_, task->blob_name_.str());
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -285,7 +451,9 @@ clio::run::TaskResume Runtime::DelBlob(
                               task.template Cast<clio::run::Task>()));
   if (task->GetReturnCode() == 0) {
     std::lock_guard<std::mutex> lock(index_mutex_);
-    index_.erase(DocKey(task->tag_id_, task->blob_name_.str()));
+    std::string key = DocKey(task->tag_id_, task->blob_name_.str());
+    index_.erase(key);
+    pending_.erase(key);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -310,6 +478,14 @@ clio::run::TaskResume Runtime::DelTag(
       if (it->second.tag_id_.major_ == task->tag_id_.major_ &&
           it->second.tag_id_.minor_ == task->tag_id_.minor_) {
         it = index_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = pending_.begin(); it != pending_.end();) {
+      if (it->second.tag_id_.major_ == task->tag_id_.major_ &&
+          it->second.tag_id_.minor_ == task->tag_id_.minor_) {
+        it = pending_.erase(it);
       } else {
         ++it;
       }
@@ -349,6 +525,9 @@ clio::run::TaskResume Runtime::SemanticSearch(
   CLIO_TASK_BODY_BEGIN
   task->results_.clear();
   task->return_code_ = 0;
+  // Read-your-writes barrier: indexing is asynchronous, so bring the index
+  // current with every acked mutation BEFORE evaluating the query.
+  CLIO_CO_AWAIT(DrainPendingIndex());
   {
     std::string tag_regex_str = task->tag_regex_.str();
     std::string blob_regex_str = task->blob_regex_.str();

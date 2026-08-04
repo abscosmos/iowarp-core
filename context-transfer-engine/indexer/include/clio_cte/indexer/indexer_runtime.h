@@ -54,8 +54,12 @@ namespace clio::cte::indexer {
  * core (indexer -> core):
  *
  *  - PutBlob/MultiPutBlob/TruncateBlob forward down `next` FIRST; on
- *    success the affected doc is re-read from the chain and re-tokenized,
- *    so the index is updated before the ack (read-your-writes search).
+ *    success the affected doc is re-tokenized before the ack
+ *    (read-your-writes search). Whole-blob writes — the dominant shape —
+ *    tokenize the task's own payload directly; only partial writes re-read
+ *    the blob from the chain, via nested inline calls on the co-located
+ *    core container (never client round-trips: the dispatch/queue cycle
+ *    was the measured dominant cost, see CLIO_RUN_INLINE / #862).
  *  - DelBlob/DelTag drop the affected docs; RenameTag rewrites tag names.
  *  - SemanticSearch TERMINATES here: BM25 over the per-container index
  *    slice, identical semantics to the core's old scan (df/avgdl over the
@@ -98,6 +102,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
       clio::run::shared_ptr<clio::cte::core::RenameTagTask> &task);
   clio::run::TaskResume SemanticSearch(
       clio::run::shared_ptr<clio::cte::core::SemanticSearchTask> &task);
+  clio::run::TaskResume IndexSweep(
+      clio::run::shared_ptr<IndexSweepTask> &task);
 
   // ---- Container virtuals (defined in autogen/indexer_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
@@ -141,8 +147,32 @@ class Runtime : public clio::cte::core::CoreInterposer {
 
   /** Re-read one blob's current bytes from the chain and replace its index
    *  entry (erases it when the blob is empty or unreadable — matching the
-   *  old scan, which skipped zero-length and unreadable blobs). */
+   *  old scan, which skipped zero-length and unreadable blobs). Fallback
+   *  path only: whole-blob puts tokenize their own payload instead. The
+   *  read runs as a nested inline call on the core container. */
   clio::run::TaskResume ReindexBlob(TagId tag_id, std::string blob_name);
+
+  /** Post-op logical blob size via a nested inline GetBlobSize on the core
+   *  container (0 when absent/failed). */
+  clio::run::TaskResume ProbeBlobSize(TagId tag_id,
+                                      const std::string &blob_name,
+                                      clio::run::u64 *total_out);
+
+  /** Tokenize `data` and replace the blob's index entry (synchronous, no
+   *  awaits; locks index_mutex_ internally). */
+  void IndexDocBytes(const TagId &tag_id, const std::string &tag_name,
+                     const std::string &blob_name, const char *data,
+                     clio::run::u64 len);
+
+  /** Mark a blob dirty for the asynchronous drain (O(1), coalesced by doc
+   *  key — the put ack path's ONLY indexing cost). */
+  void EnqueuePending(const TagId &tag_id, const std::string &blob_name);
+
+  /** Drain the pending set to empty: pop-and-reindex until no entry remains
+   *  AND no other drainer is mid-entry. Multiple drainers cooperate (each
+   *  pops distinct keys); a search calls this as its read-your-writes
+   *  barrier, the periodic sweep calls it for background progress. */
+  clio::run::TaskResume DrainPendingIndex();
 
   /** Rebuild this container's index slice from the storage below (restart
    *  path): enumerate local (tag, blob) pairs via BlobQuery, re-read and
@@ -178,6 +208,19 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::unordered_map<std::string, IndexedDoc> index_;
   /** TagId -> resolved full tag name (rewritten by RenameTag). */
   std::unordered_map<clio::run::u64, std::string> tag_names_;
+
+  /** Dirty blobs awaiting re-tokenization, keyed like index_ so overwrites
+   *  COALESCE (N puts to a hot blob = one drain-time read+scan). Guarded by
+   *  index_mutex_. */
+  struct PendingReindex {
+    TagId tag_id_;
+    std::string blob_name_;
+  };
+  std::unordered_map<std::string, PendingReindex> pending_;
+  /** Entries popped by a drainer but not yet indexed — the search barrier
+   *  waits for BOTH pending_ empty and this zero. Guarded by index_mutex_. */
+  clio::run::u32 draining_ = 0;
+
   std::mutex index_mutex_;
 };
 

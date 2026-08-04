@@ -68,8 +68,9 @@ GLOBAL_CROSS_CONST clio::run::u32 kRenameTag =
 GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob =
     clio::cte::core::Method::kMultiPutBlob;
 
-// The id space above the core's stays reserved for future module verbs
-// (explicit BuildIndex/DropIndex/IndexStats), which must live >= 100.
+// Module verbs live ABOVE the core's id space (>= 100, interposer rule).
+// kIndexSweep drives the asynchronous index drain (periodic task).
+GLOBAL_CROSS_CONST clio::run::u32 kIndexSweep = 100;
 GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 101;
 
 inline const std::vector<std::string>& GetMethodNames() {
@@ -85,6 +86,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kTruncateBlob] = "TruncateBlob";
     v[kRenameTag] = "RenameTag";
     v[kMultiPutBlob] = "MultiPutBlob";
+    v[kIndexSweep] = "IndexSweep";
     return v;
   }();
   return names;

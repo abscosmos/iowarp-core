@@ -67,10 +67,18 @@ struct IndexerConfig {
   static constexpr const char* chimod_lib_name = "clio_cte_indexer";
 
   clio::run::PoolId next_pool_id_;  ///< Next pool in the chain (e.g. 512.0)
+  /// Period of the asynchronous index drain (kIndexSweep). Indexing is OFF
+  /// the put ack path: a put only enqueues its (tag, blob) key — coalesced,
+  /// so N overwrites of a hot blob cost ONE re-tokenize — and the sweep (or
+  /// a SemanticSearch, which drains first for read-your-writes) does the
+  /// work. 0 disables the sweep: the index is then updated only when a
+  /// search runs (lazy indexing).
+  clio::run::u32 index_sweep_period_ms_ = 100;
 
   IndexerConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   IndexerConfig(const clio::run::PoolId &pool_id, const IndexerConfig &other)
-      : next_pool_id_(other.next_pool_id_) {
+      : next_pool_id_(other.next_pool_id_),
+        index_sweep_period_ms_(other.index_sweep_period_ms_) {
     (void)pool_id;
   }
 
@@ -78,7 +86,7 @@ struct IndexerConfig {
   void serialize(Archive &ar) {
     // EVERY field round-trips (the cache/replication silently-dropped-field
     // audit rule).
-    ar(next_pool_id_);
+    ar(next_pool_id_, index_sweep_period_ms_);
   }
 
   /** Load configuration from compose YAML. */
@@ -94,6 +102,10 @@ struct IndexerConfig {
             clio::run::u32 minor = std::stoul(next_str.substr(dot + 1));
             next_pool_id_ = clio::run::PoolId(major, minor);
           }
+        }
+        if (node["index_sweep_period_ms"]) {
+          index_sweep_period_ms_ =
+              node["index_sweep_period_ms"].as<clio::run::u32>();
         }
       } catch (...) {
         // Config parsing is best-effort
@@ -128,6 +140,23 @@ struct DestroyTask : public clio::run::Task {
 };
 
 using MonitorTask = clio::run::admin::MonitorTask;
+
+/** Periodic driver of the asynchronous index drain (Method::kIndexSweep). */
+struct IndexSweepTask : public clio::run::Task {
+  IndexSweepTask() : clio::run::Task() {}
+
+  explicit IndexSweepTask(const clio::run::TaskId &task_id,
+                          const clio::run::PoolId &pool_id,
+                          const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kIndexSweep) {}
+
+  void Copy(const ctp::ipc::FullPtr<IndexSweepTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+  }
+
+  template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
 
 }  // namespace clio::cte::indexer
 
