@@ -23,6 +23,15 @@ runtime:
   local_sched: "default"
   heartbeat_interval: 1000
 
+# This suite validates COHERENCE, not failure detection (the leader-election
+# cluster test owns SWIM coverage). On CI-class CPU budgets (4 runtimes + 4
+# spinning clients on ~4 vCPUs) probe responses starve for >30s and SWIM
+# false-positives a healthy node dead — recovery then reshuffles containers
+# and every blob-barrier cascades to timeout (issue #894's second failure
+# shape). A genuinely dead node still fails the suite via barrier timeouts.
+swim:
+  enabled: false
+
 compose:
   - mod_name: clio_cte_core
     pool_name: cte_main

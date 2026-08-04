@@ -2005,6 +2005,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
       blob_info_ptr->replica_nodes_.clear();
       const clio::run::u64 self_node = CLIO_IPC->GetNodeId();
+      HLOG(kInfo, "[COH] put blob={} inval {} node(s) (origin={} ver={})",
+           blob_name, inval_nodes.size(), task->context_.origin_node_,
+           blob_info_ptr->last_modified_);
       for (size_t ni = 0; ni < inval_nodes.size(); ++ni) {
         if (inval_nodes[ni] == self_node) {
           continue;  // this container IS the owner; nothing cached here
@@ -2052,6 +2055,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         }
       }
       if (!ok) {
+        HLOG(kInfo, "[COH] put blob={} REFUSED origin {} (incomplete)",
+             blob_name, task->context_.origin_node_);
         task->context_.origin_node_ = Context::kNoOriginNode;
       } else {
         bool present = false;
@@ -2066,6 +2071,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           blob_info_ptr->replica_nodes_.push_back(
               task->context_.origin_node_);
         }
+        HLOG(kInfo, "[COH] put blob={} registered origin {} ver={}",
+             blob_name, task->context_.origin_node_,
+             blob_info_ptr->last_modified_);
       }
     }
 
@@ -2431,6 +2439,12 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         replica_sel > 0
             ? blob_info_ptr->GetReplica(replica_sel, false)->transform_flags_
             : blob_info_ptr->transform_flags_;
+    // OUT: content version at serve time (issue #894), read BEFORE the block
+    // snapshot — if a put completes between this read and the snapshot the
+    // caller holds NEW bytes stamped with the OLD version, and a
+    // version-checked registration then REJECTS (safe, refetch) rather than
+    // accepting stale bytes under a fresh version.
+    task->context_.version_ = blob_info_ptr->last_modified_;
 
     // Use the pre-provided data pointer from the task
     ctp::ipc::ShmPtr<> blob_data_ptr = task->blob_data_;
@@ -2545,7 +2559,24 @@ clio::run::TaskResume Runtime::RegisterReplicaContainer(
     // registered self would make the next put's invalidation delete the
     // authoritative blob (replicas included).
     if (task->node_id_ == CLIO_IPC->GetNodeId()) {
+      HLOG(kInfo, "[COH] register blob={} node {} SELF-refused",
+           task->blob_name_.str(), task->node_id_);
       task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+    // Version gate (issue #894): the registrant fetched its copy at
+    // expected_version_. If the content has moved on since, the copy is
+    // STALE and must not be registered — a put that completed between the
+    // fetch and this registration took its invalidation snapshot without
+    // the registrant, so accepting here would leave a permanently stale
+    // registered copy (the CI-reproduced fragmented-round winner split).
+    if (task->expected_version_ != 0 &&
+        blob_info_ptr->last_modified_ != task->expected_version_) {
+      HLOG(kInfo,
+           "[COH] register blob={} node {} VERSION-reject (want {} have {})",
+           task->blob_name_.str(), task->node_id_, task->expected_version_,
+           blob_info_ptr->last_modified_);
+      task->return_code_ = RegisterReplicaContainerTask::kVersionMismatchRc;
       CLIO_CO_RETURN;
     }
     // Dedup append. No co_await from the check to the push, so this is
@@ -2562,6 +2593,9 @@ clio::run::TaskResume Runtime::RegisterReplicaContainer(
     if (!present) {
       blob_info_ptr->replica_nodes_.push_back(task->node_id_);
     }
+    HLOG(kInfo, "[COH] register blob={} node {} ACCEPTED ver={}",
+         task->blob_name_.str(), task->node_id_,
+         blob_info_ptr->last_modified_);
     task->return_code_ = 0;
   } catch (const std::exception &e) {
     task->return_code_ = 1;

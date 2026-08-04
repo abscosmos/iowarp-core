@@ -101,6 +101,16 @@ class Runtime : public clio::cte::core::CoreInterposer {
   void AimAtCacheReplica(Context *ctx) const;
 
   /**
+   * True when THIS node hosts the blob's owner container (issue #894).
+   * The owner node keeps NO cache-slot copy: its primary is already
+   * node-local DRAM (and zero-IPC readable), and an owner-side copy sits
+   * outside the register/invalidate protocol — origin registration skips
+   * self, so nothing would ever invalidate it and it serves stale bytes
+   * after a foreign write (the CI-caught fragmented winner split).
+   */
+  bool IsBlobOwnerLocal(const TagId &tag_id, const std::string &blob_name);
+
+  /**
    * Best-effort population of THIS node's raw local copy from the blob's
    * authoritative owner chain, plus coherence registration (the owner's
    * next primary write invalidates the copy). Sequential from 0, so an

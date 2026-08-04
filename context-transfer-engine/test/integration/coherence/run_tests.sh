@@ -73,6 +73,15 @@ if [ "$overall" != "0" ]; then
         say "=== node $n log (tail) ==="
         docker logs "coh-node$n" 2>&1 | tail -60
     done
+    if [ -n "${COH_LOG_DIR:-}" ]; then
+        # Full per-node logs for post-mortem (the tails above routinely miss
+        # the interesting window; the EXIT trap destroys the containers).
+        mkdir -p "$COH_LOG_DIR"
+        for n in 1 2 3 4; do
+            docker logs "coh-node$n" > "$COH_LOG_DIR/coh-node$n.log" 2>&1 || true
+        done
+        say "full node logs saved to $COH_LOG_DIR"
+    fi
     err "cache coherence suite FAILED"
     exit 1
 fi

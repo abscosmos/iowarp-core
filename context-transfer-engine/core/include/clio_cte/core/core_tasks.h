@@ -922,19 +922,28 @@ struct RegisterReplicaContainerTask : public clio::run::Task {
   IN TagId tag_id_;
   IN clio::run::priv::string blob_name_;
   IN clio::run::u64 node_id_;  // the node holding the copy
+  /** Expected content version (issue #894): the Context::version_ the copy
+   *  was fetched at. Non-zero => the owner registers ONLY IF the blob's
+   *  content version still matches, and reports kVersionMismatchRc
+   *  otherwise — the copy is stale and the registrant must drop it. 0 =
+   *  unconditional (legacy). */
+  IN clio::run::u64 expected_version_;
+
+  static constexpr clio::run::u32 kVersionMismatchRc = 2;
 
   RegisterReplicaContainerTask()
       : clio::run::Task(), tag_id_(TagId::GetNull()),
-        blob_name_(CLIO_PRIV_ALLOC), node_id_(0) {}
+        blob_name_(CLIO_PRIV_ALLOC), node_id_(0), expected_version_(0) {}
 
   CTP_CROSS_FUN explicit RegisterReplicaContainerTask(
       const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
       const clio::run::PoolQuery &pool_query, const TagId &tag_id,
-      const std::string &blob_name, clio::run::u64 node_id)
+      const std::string &blob_name, clio::run::u64 node_id,
+      clio::run::u64 expected_version = 0)
       : clio::run::Task(task_id, pool_id, pool_query,
                         Method::kRegisterReplicaContainer),
         tag_id_(tag_id), blob_name_(CLIO_PRIV_ALLOC, blob_name),
-        node_id_(node_id) {
+        node_id_(node_id), expected_version_(expected_version) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kRegisterReplicaContainer;
@@ -945,7 +954,7 @@ struct RegisterReplicaContainerTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_, node_id_);
+    ar(tag_id_, blob_name_, node_id_, expected_version_);
   }
 
   template <typename Archive>
@@ -958,6 +967,7 @@ struct RegisterReplicaContainerTask : public clio::run::Task {
     tag_id_ = other->tag_id_;
     blob_name_ = other->blob_name_;
     node_id_ = other->node_id_;
+    expected_version_ = other->expected_version_;
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
@@ -1542,6 +1552,14 @@ struct Context {
   // put and dies on the next foreign put. kNoOriginNode = none.
   clio::run::u64 origin_node_;
   static constexpr clio::run::u64 kNoOriginNode = ~0ULL;
+  // OUT (issue #894 coherence): the blob's content version at the moment a
+  // GetBlob served it (the owner's last_modified_ tick). A reader that
+  // populates a node-local copy from the fetched bytes registers it with
+  // this as the EXPECTED version; the owner rejects the registration if the
+  // content moved on in between — closing the fetch->populate->register
+  // window that otherwise leaves a permanently stale registered copy when
+  // a racing put's invalidation snapshot ran before the registration.
+  clio::run::u64 version_;
 
   // ---- Compression / tracing controls and stats -------------------------
   // UNCONDITIONAL by design (issue #886 unified API): these fields exist in
@@ -1588,6 +1606,7 @@ struct Context {
         replica_flags_(0),
         replica_min_score_(-1.0f),
         origin_node_(kNoOriginNode),
+        version_(0),
         dynamic_compress_(0),
         compress_lib_(0),
         compress_preset_(2),
@@ -1612,7 +1631,7 @@ struct Context {
     // field-block comment above).
     ar.range(persistence_target_, min_persistence_level_, preallocate_,
              emulate_, emulated_time_ns_, transform_flags_, replica_,
-             replica_flags_, replica_min_score_, origin_node_,
+             replica_flags_, replica_min_score_, origin_node_, version_,
              dynamic_compress_,
              compress_lib_,
              compress_preset_, target_psnr_, psnr_chance_, max_performance_,
