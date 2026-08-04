@@ -61,10 +61,26 @@ public:
   // CreateParams type used by CLIO_TASK_CC macro for lib_name access
   using CreateParams = clio::run::MOD_NAME::CreateParams;
 
+  // issue #781: expose a real per-task cost signal to the scheduler's learned
+  // model. CustomTask carries spin_us_ (its busy-spin compute time); reporting it
+  // as TaskStat.compute_ lets Container::InferCpuTime (coef*(compute+1)) converge
+  // — after a few runs the model predicts ~spin_us, so RuntimeMapTask can route
+  // by predicted cost instead of treating every Custom task as identical.
+  clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override {
+    clio::run::TaskStat stat;
+    if (task != nullptr && task->method_ == Method::kCustom) {
+      stat.compute_ = static_cast<const CustomTask *>(task)->spin_us_;
+    }
+    return stat;
+  }
+
 private:
   // Container-specific state
   clio::run::u32 create_count_ = 0;
-  clio::run::u32 custom_count_ = 0;
+  // issue #785: atomic — several workers run Custom concurrently, so the plain
+  // counter was a data race (TSan). Only a test-module tally, but it drowned
+  // the report and made real races harder to spot.
+  std::atomic<clio::run::u32> custom_count_{0};
 
   // Client for making calls to this ChiMod
   Client client_;

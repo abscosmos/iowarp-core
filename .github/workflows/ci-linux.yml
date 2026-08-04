@@ -42,7 +42,10 @@ jobs:
             site: ubu-24.amd64.unit
             flag: unit
             apt: ""
-            cmake_args: ""
+            # ENABLE_LLAMA without LLAMA_SERVER = just the llm-hooks kvcache +
+            # lmcache libraries and the lmcache store tests (CTE-only, no
+            # llama.cpp external) — otherwise that code has zero CI coverage.
+            cmake_args: "-DCLIO_CORE_ENABLE_LLAMA=ON"
             labels: ""
             extract: ""
           - phase: unit
@@ -51,7 +54,7 @@ jobs:
             site: ubu-24.arm64.unit
             flag: unit
             apt: ""
-            cmake_args: ""
+            cmake_args: "-DCLIO_CORE_ENABLE_LLAMA=ON"
             labels: ""
             extract: ""
           # FUSE adapter: native libfuse3, run FUSE/adapter tests, scope coverage

@@ -388,6 +388,8 @@ class Task {
   ctp::CpuTimer& RunCpuTimer();
   float PredictedLoad() const;
   void SetPredictedLoad(float v);
+  float SchedReservedUs() const;       // issue #781 queued-load reservation
+  void SetSchedReservedUs(float v);    // issue #781
   ctp::HighResMonotonicTimer& RunWallTimer();
   float PredictedWallUs() const;
   void SetPredictedWallUs(float v);
@@ -701,14 +703,6 @@ class Task {
   void AggregateIn(const ctp::ipc::FullPtr<Task>& member_task) {
     (void)member_task;
   }
-
-  /**
-   * Fix up internal pointers after a cudaMemcpy/memcpy (POD copy path).
-   * Override in tasks that contain priv::vector or other pointer-bearing
-   * fields to re-seat inline (SVO) pointers to the new host address.
-   * Default is a no-op for pure POD tasks.
-   */
-  CTP_CROSS_FUN void FixupAfterCopy() {}
 };
 
 }  // namespace clio::run
@@ -760,19 +754,22 @@ struct TaskQueueHeader {
 };
 
 // Type alias for individual lanes with per-lane headers (moved outside
-// TaskQueue class) Worker queues store Future<Task> objects directly
+// TaskQueue class) Worker queues store Future<Task> objects directly.
+// issue #822: lanes are ext_spsc_queue (mutex-serialized, growable) instead
+// of WAIT_FOR_SPACE MPSC rings — a push onto a full lane grows the lane
+// rather than busy-spinning, so a worker enqueuing onto the lane it drains
+// (producer==consumer) can no longer deadlock when queue_depth is small.
 using TaskLane =
-    ctp::ipc::multi_mpsc_ring_buffer<Future<Task>,
-                                 CLIO_QUEUE_ALLOC_T>::ring_buffer_type;
+    ctp::ipc::multi_ext_spsc_queue<Future<Task>,
+                                   CLIO_QUEUE_ALLOC_T>::ring_buffer_type;
 
 /**
- * Simple wrapper around ctp::ipc::multi_mpsc_ring_buffer
- *
- * This wrapper adds custom enqueue and dequeue functions while maintaining
- * compatibility with existing code that expects the multi_mpsc_ring_buffer
- * interface.
+ * Multi-lane worker task queue (one growable mutex-guarded ring per
+ * lane/priority); see the TaskLane comment above for the issue #822
+ * rationale.
  */
-typedef ctp::ipc::multi_mpsc_ring_buffer<Future<Task>, CLIO_QUEUE_ALLOC_T> TaskQueue;
+typedef ctp::ipc::multi_ext_spsc_queue<Future<Task>, CLIO_QUEUE_ALLOC_T>
+    TaskQueue;
 
 }  // namespace clio::run
 
@@ -893,6 +890,9 @@ class RunContext {
   ctp::bitfield32_t flags_;
   ctp::CpuTimer cpu_timer_; /**< Accumulates thread CPU time across yields */
   float predicted_load_ = 0; /**< Predicted CPU time from InferModel (us) */
+  float sched_reserved_us_ = 0; /**< #781 queued-load reservation on a worker
+                                  * (predicted cost added to worker.queued_load_
+                                  * at map, released when the task starts) */
   ctp::HighResMonotonicTimer wall_timer_; /**< Wall clock time across yields */
   float predicted_wall_us_ =
       0; /**< Predicted wall time from InferWallClockTime */
@@ -1072,6 +1072,7 @@ class RunContext {
     flags_.UnsetBits(RCTX_DID_WORK);
     cpu_timer_.time_ns_ = 0;
     predicted_load_ = 0;
+    sched_reserved_us_ = 0;
     wall_timer_.time_ns_ = 0;
     predicted_wall_us_ = 0;
     predicted_stat_ = TaskStat();
@@ -1157,6 +1158,8 @@ CLIO_RCTX_FLAG(IsStarted, SetStarted)
 CLIO_RCTX_REF(ctp::CpuTimer, RunCpuTimer, cpu_timer_)
 CLIO_RCTX_GET(float, PredictedLoad, predicted_load_)
 CLIO_RCTX_SET(float, SetPredictedLoad, predicted_load_)
+CLIO_RCTX_GET(float, SchedReservedUs, sched_reserved_us_)
+CLIO_RCTX_SET(float, SetSchedReservedUs, sched_reserved_us_)
 CLIO_RCTX_REF(ctp::HighResMonotonicTimer, RunWallTimer, wall_timer_)
 CLIO_RCTX_GET(float, PredictedWallUs, predicted_wall_us_)
 CLIO_RCTX_SET(float, SetPredictedWallUs, predicted_wall_us_)

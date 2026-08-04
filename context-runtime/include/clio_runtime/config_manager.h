@@ -34,6 +34,7 @@
 #ifndef CLIO_RUNTIME_INCLUDE_MANAGERS_CONFIG_MANAGER_H_
 #define CLIO_RUNTIME_INCLUDE_MANAGERS_CONFIG_MANAGER_H_
 
+#include "clio_ctp/introspect/system_info.h"
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -156,6 +157,43 @@ class ConfigManager : public ctp::BaseConfig {
    */
   u32 GetNumThreads() const { return num_threads_; }
 
+  /** issue #807: number of parallel inbound SHM rings + drain threads. */
+  u32 GetShmInShards() const { return shm_in_shards_; }
+
+  /** issue #807: if true, SHM responses are handed to a background sender thread
+   *  (nonblocking, never stalls a worker on a full client ring). Default false:
+   *  measured ~3x latency regression on latency-bound workloads because the
+   *  thread handoff is pure overhead when the client ring is not full, which is
+   *  the common case. Enable for overload/back-pressure-heavy deployments. */
+  bool GetShmAsyncSend() const { return shm_async_send_; }
+
+  /** issue #807/#784: microseconds a SHM client waiter spins polling for its
+   *  response before parking on its EventManager. On SHM the round-trip is
+   *  microseconds, so a brief spin catches the completion without a park/wake +
+   *  signal syscall — the dominant cost at low latency. Larger values trade
+   *  throughput for latency (#784: 1ms spin = 2.2x latency, -45% throughput), so
+   *  keep it small. Default 50us. */
+  u32 GetShmClientSpinUs() const { return shm_client_spin_us_; }
+
+  /**
+   * issue #785: extra task lanes reserved for elastic replacement workers.
+   * Lanes are indexed by worker id, so replacements spawned by a stall rescue
+   * need lanes allocated up front or they can never be routed to. Matches the
+   * spawn budget in WorkOrchestrator (one replacement per core).
+   */
+  u32 GetElasticLaneHeadroom() const {
+    // Bounded deliberately. Each reserved lane costs queue_depth x priorities
+    // slots in the queue segment, so scaling this with core count would add
+    // ~128 lanes of segment on a large machine purely to hold replacements
+    // that may never be spawned. Rescues are rare and replacements are
+    // recycled, so a modest fixed ceiling is enough: the pool only ever needs
+    // as many replacements as there are workers wedged AT ONCE.
+    static constexpr u32 kMaxElasticLanes = 8;
+    int ncpu = ctp::SystemInfo::GetCpuCount();
+    u32 want = (ncpu > 0) ? static_cast<u32>(ncpu) : 8;
+    return want < kMaxElasticLanes ? want : kMaxElasticLanes;
+  }
+
   /**
    * Get task queue depth per worker
    * @return Queue depth (number of tasks per worker queue)
@@ -163,8 +201,12 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetQueueDepth() const { return queue_depth_; }
 
   /**
-   * Calculate main segment size based on queue_depth and num_threads
-   * @return Calculated size in bytes, or explicit size if main_segment_size_ > 0
+   * Size of the main task-data segment (issue #727).
+   * @return The explicit size when main_segment_size_ > 0 (yaml
+   *         `runtime: main_segment_size` or CLIO_MAIN_SEGMENT_SIZE), else the
+   *         auto default: the machine's RAM capacity (1 GiB if introspection
+   *         fails). The reservation is sparse; creation-time clamps in
+   *         ipc_manager.cc bound what the segment actually gets. Never 0.
    */
   size_t CalculateMainSegmentSize() const;
 
@@ -173,6 +215,17 @@ class ConfigManager : public ctp::BaseConfig {
    * @return Calculated size in bytes
    */
   size_t CalculateQueueSegmentSize() const;
+
+  /**
+   * Calculate the runtime-wide metadata segment size (issue #783).
+   *
+   * Backs the CTE shared-memory metadata cache. The reservation is large and
+   * sparse: it is never pre-faulted, so untouched pages cost nothing. Sizing is
+   * therefore about the address-space reservation, not RAM.
+   *
+   * @return Calculated size in bytes, or the explicit size if one is configured
+   */
+  size_t CalculateMetadataSegmentSize() const;
 
   /**
    * Get memory segment size
@@ -348,24 +401,57 @@ class ConfigManager : public ctp::BaseConfig {
    */
   void ParseYAML(YAML::Node& yaml_conf) override;
 
+ public:
   /**
    * Apply environment-variable overrides (CLIO_PORT, CLIO_SERVER_ADDR, etc.).
    * Must run after every (re)load: LoadFromFile resets to defaults via
    * LoadDefault, so a config reload (e.g. parsing a compose file into this
    * manager) would otherwise silently drop the env-configured port — which on
-   * the force-net path retargets every forward at the wrong port.
+   * the force-net path retargets every forward at the wrong port. Public so
+   * external reloaders (and tests) can restore env semantics after a bare
+   * LoadYaml.
    */
   void ApplyEnvOverrides();
 
+ private:
   bool is_initialized_ = false;
   std::string config_file_path_;
 
   // Configuration parameters
   u32 num_threads_ = 4;
+  // issue #807: parallel inbound SHM rings, ENABLED by default. 0 = auto (=
+  // worker count, so every worker drains its own shard). Since the drain is
+  // done by the EXISTING workers in their poll loop (not dedicated threads),
+  // more shards spreads ingest across the pool with no extra threads — measured
+  // worker-driven S=1 1.48x and S=4 1.68x over dev. Capped at the worker count
+  // in ServerInitShm (worker w owns shard w). CLIO_SHM_IN_SHARDS overrides;
+  // set 1 to restore a single ingest ring.
+  u32 shm_in_shards_ = 0;
+  bool shm_async_send_ = false;  // issue #807: deferred SHM response send (opt-in)
+  u32 shm_client_spin_us_ = 50;  // issue #807/#784: waiter spin before park
   u32 queue_depth_ = 1024;
 
-  size_t main_segment_size_ = ctp::Unit<size_t>::Gigabytes(1);
+  // issue #727: 0 = auto (the machine's RAM capacity — a sparse reservation;
+  // see CalculateMainSegmentSize() and the creation-time clamps in
+  // ipc_manager.cc). Settable via yaml `runtime: main_segment_size` or
+  // CLIO_MAIN_SEGMENT_SIZE; LoadDefault() also installs 0, this initializer
+  // just matches it.
+  size_t main_segment_size_ = 0;
   size_t client_data_segment_size_ = ctp::Unit<size_t>::Megabytes(256);
+  // issue #783: metadata segment. Deliberately huge and never pre-faulted --
+  // shm_open + ftruncate + mmap is lazily populated, so the reservation
+  // (default: the machine's RAM capacity, so metadata scales with the host)
+  // costs only the pages actually touched. Creation-time safety clamps live in
+  // ipc_manager.cc (half the cgroup-aware budget on Linux; 1 GB file cap
+  // elsewhere). NOTE: on a host whose /dev/shm is smaller than the live set,
+  // touching past the tmpfs limit raises SIGBUS, not ENOMEM. See
+  // CalculateMetadataSegmentSize().
+  // 0 means "auto-calculate" — CalculateMetadataSegmentSize() supplies the
+  // default. Initialising this to a non-zero size would make the explicit
+  // override branch there permanently true and the documented sentinel a lie;
+  // it only worked because LoadDefault() resets it to 0. Set via the
+  // `metadata_segment_size` key under `runtime` in the config file.
+  size_t metadata_segment_size_ = 0;
 
   u32 port_ = 9413;
   // If true (CLIO_EPHEMERAL / --ephemeral), skip the default compose at startup.
@@ -377,6 +463,7 @@ class ConfigManager : public ctp::BaseConfig {
   std::string main_segment_name_ = "chi_main_segment_${USER}";
   std::string client_data_segment_name_ = "chi_client_data_segment_${USER}";
   std::string queue_segment_name_ = "chi_queue_segment_${USER}";
+  std::string metadata_segment_name_ = "chi_metadata_segment_${USER}";
 
   // Networking configuration
   std::string hostfile_path_ = "";
@@ -390,7 +477,14 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Worker sleep configuration (in microseconds)
   u32 first_busy_wait_ = 10000;              // Default: 10000us (10ms) busy wait
-  u32 task_progress_interval_ms_ = 0;        // #628: 0 = periodic validity check disabled
+  // #628 task-progress probe (0 = disabled). ON by default (issue #774): this
+  // probe is the ONLY recovery for a cross-node task whose response was lost
+  // (e.g. the SendOut retry queue timing out under sustained back-pressure) —
+  // with it disabled, the origin task leaks in send_map_ and the client's
+  // Future::Wait() hangs forever. 5s keeps the scan cheap (throttled, probes
+  // only replicas outstanding beyond the interval) while bounding how long a
+  // lost response can park a client.
+  u32 task_progress_interval_ms_ = 5000;
   u32 max_sleep_ = 50000;                    // Default: 50000us (50ms) maximum sleep
 
   // Task load prediction model

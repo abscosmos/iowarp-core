@@ -12302,6 +12302,12 @@ TEST_CASE("Autogen - CTE Context struct GlobalSerialize", "[autogen][cte][contex
     ctx.persistence_target_ = 1;
     ctx.min_persistence_level_ = 2;
     ctx.preallocate_ = 4096;
+    // issue #818: the transform bit is serialized UNCONDITIONALLY, outside the
+    // compression guard below -- a safety flag that vanishes with a compile
+    // flag is worse than no flag, and a conditionally-present member changes
+    // Context's wire layout between TUs built with different flags.
+    ctx.transform_flags_ = clio::cte::core::kBlobTransformed |
+                           clio::cte::core::kBlobTransformCompressed;
 #ifdef CLIO_CTE_ENABLE_COMPRESSION
     ctx.dynamic_compress_ = 2;
     ctx.compress_lib_ = 3;
@@ -12330,6 +12336,9 @@ TEST_CASE("Autogen - CTE Context struct GlobalSerialize", "[autogen][cte][contex
     REQUIRE(loaded.persistence_target_ == 1);
     REQUIRE(loaded.min_persistence_level_ == 2);
     REQUIRE(loaded.preallocate_ == 4096);
+    REQUIRE(loaded.transform_flags_ ==
+            (clio::cte::core::kBlobTransformed |
+             clio::cte::core::kBlobTransformCompressed));
 #ifdef CLIO_CTE_ENABLE_COMPRESSION
     REQUIRE(loaded.dynamic_compress_ == 2);
     REQUIRE(loaded.compress_lib_ == 3);
@@ -13874,10 +13883,10 @@ TEST_CASE("Autogen - DefaultScheduler AdjustPolling", "[autogen][scheduler][adju
     INFO("AdjustPolling(nullptr) did not crash");
   }
 
-  SECTION("RebalanceWorker noop") {
+  SECTION("LoadBalance noop") {  // issue #781: replaced RebalanceWorker
     clio::run::DefaultScheduler sched;
-    sched.RebalanceWorker(nullptr);  // Should not crash
-    INFO("RebalanceWorker(nullptr) did not crash");
+    sched.LoadBalance();  // Should not crash (stub today)
+    INFO("LoadBalance() did not crash");
   }
 
   SECTION("RuntimeMapTask with null worker") {

@@ -124,9 +124,18 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
   // Start dedicated recv threads in IpcManagerRun2Run.
   CLIO_IPC->GetRun2Run()->StartRecvThreads();
+  // Start the dedicated inbound-SHM-ring recv thread (SHM mode only; a no-op
+  // otherwise). Same rationale and same lifetime as the threads above: by this
+  // point the pool manager, task queue and scheduler it pushes into all exist.
+  CLIO_IPC->StartShmServerRecvThread();
+  // issue #807: dedicated background thread that owns SHM response send, so no
+  // worker ever serializes or blocks on a full client ring. Same lifetime.
+  CLIO_IPC->StartShmServerSendThread();
   // Stop recv threads before the main transport is freed.
   CLIO_IPC->RegisterTransportShutdownHook([]() {
     CLIO_IPC->GetRun2Run()->StopRecvThreads();
+    CLIO_IPC->StopShmServerRecvThread();
+    CLIO_IPC->StopShmServerSendThread();
   });
 
   // Spawn periodic WreapDeadIpcs task with 1 second period
@@ -399,6 +408,28 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
   clio::run::Future<clio::run::Task> queued_future;
   bool did_send = false;
 
+  // TEMP NET TRACE (issue #892): measure the ACTUAL tick rate of this
+  // periodic — the drain's byte budget × tick rate caps cross-node BW.
+  {
+    static bool trace_on = std::getenv("CLIO_NET_TRACE") != nullptr;
+    if (trace_on) {
+      static std::atomic<uint64_t> ticks{0};
+      static std::atomic<int64_t> window_start_ns{0};
+      uint64_t t = ++ticks;
+      if (t % 512 == 1) {
+        int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+        int64_t prev = window_start_ns.exchange(now);
+        if (prev != 0) {
+          double secs = (now - prev) / 1e9;
+          HLOG(kInfo, "[NETTRACE sendpoll] 512 ticks in {}s = {}/s",
+               secs, 512.0 / secs);
+        }
+      }
+    }
+  }
+
   // Per-tick maintenance: retries and dead-node fanout.
   CLIO_IPC->GetRun2Run()->ProcessRetryQueues();
   CLIO_IPC->GetRun2Run()->ScanSendMapTimeouts();
@@ -582,10 +613,14 @@ clio::run::TaskResume Runtime::ClientConnect(clio::run::shared_ptr<ClientConnect
   task->server_generation_ = CLIO_IPC->GetServerGeneration();
   task->server_pid_ = static_cast<int32_t>(getpid());
   task->worker_queues_off_ = CLIO_IPC->GetWorkerQueuesOffset();
+  // issue #807: tell the client how many inbound SHM rings to shard across.
+  task->shm_in_shards_ = CLIO_CONFIG_MANAGER->GetShmInShards();
   // Report this runtime's pid-based allocator ids so the client attaches the
   // correct allocators (segments are no longer the hardcoded (1,0)/(2,0)).
   task->main_alloc_id_ = CLIO_IPC->GetMainAllocatorId();
   task->queue_alloc_id_ = CLIO_IPC->GetQueueAllocatorId();
+  // issue #783: tell the client where the metadata-segment directory lives.
+  task->metadata_dir_off_ = CLIO_IPC->GetMetadataDirOffset();
 
   // #642: publish worker OS thread ids so SHM clients can address each worker's
   // "clio-<server_pid>-<worker_tid>" MPSC receive server.
@@ -1991,6 +2026,22 @@ clio::run::TaskResume Runtime::RecoverContainers(
 
     // Only dest node creates the container
     if (static_cast<clio::run::u64>(ra.dest_node_id_) != self_node_id) continue;
+
+    // Idempotence guard (issue #856): a Broadcast task executes once per
+    // LOCAL container of the pool, and after a prior recovery a survivor
+    // hosts more than one admin container — so this handler runs multiple
+    // times with the same assignment list. Re-creating and re-registering an
+    // already-recovered container constructs a second module instance and
+    // drops the first mid-use (the free(): invalid pointer aborts that kill
+    // the new leader during leader-election). Skip assignments that are
+    // already satisfied locally.
+    if (pool_manager->GetContainer(ra.pool_id_, ra.container_id_)) {
+      HLOG(kInfo,
+           "Recovery: container {} for pool {} already present locally; "
+           "skipping duplicate recovery",
+           ra.container_id_, ra.pool_name_);
+      continue;
+    }
 
     HLOG(kInfo, "Recovery: Creating container {} for pool {} ({})",
          ra.container_id_, ra.pool_name_, ra.chimod_name_);
