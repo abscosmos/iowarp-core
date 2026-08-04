@@ -184,6 +184,17 @@ TEST_CASE("Indexer - scope, drain, and index maintenance verbs",
     return t->tag_id_;
   };
 
+  // --- A SemanticSearch reaching the BARE core (no indexer above it) must
+  // fail loudly (rc=2), not silently return empty — the miscomposed-
+  // deployment guard in core_lib_exec.
+  {
+    auto task = direct.AsyncSemanticSearch(".*", ".*", "anything", 0,
+                                           clio::run::PoolQuery::Local());
+    task.Wait();
+    REQUIRE(task->GetReturnCode() == 2);
+    REQUIRE(task->results_.empty());
+  }
+
   // --- Scope: only tags matching "idx_.*" are tokenized -------------------
   auto tag1 = tag_of(via_idx, "idx_tag1");
   auto tag_out = tag_of(via_idx, "other_tag");
