@@ -1995,6 +1995,12 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         if (inval_nodes[ni] == self_node) {
           continue;  // this container IS the owner; nothing cached here
         }
+        if (inval_nodes[ni] == task->context_.origin_node_) {
+          // The WRITER's own local copy holds these very bytes — it is the
+          // one registered copy that must SURVIVE this put (issue #886
+          // locality: register-with-put). It is re-registered below.
+          continue;
+        }
         auto inval = client_.AsyncDelBlob(
             tag_id, blob_name,
             clio::run::PoolQuery::Physical(
@@ -2007,6 +2013,25 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                "PutBlob: cache invalidation on node {} returned rc={}",
                inval_nodes[ni], inval->GetReturnCode());
         }
+      }
+    }
+    // Register-with-put (issue #886 locality): the writer declared it holds
+    // a raw node-local copy of exactly these bytes. Recording it HERE —
+    // under the blob's write token, after invalidating every other copy —
+    // makes the registration atomic with the write: any LATER put's
+    // invalidation snapshot will see it, so the copy can never be missed.
+    if (task->context_.origin_node_ != Context::kNoOriginNode &&
+        task->context_.origin_node_ != CLIO_IPC->GetNodeId() &&
+        !task->context_.emulate_) {
+      bool present = false;
+      for (size_t ni = 0; ni < blob_info_ptr->replica_nodes_.size(); ++ni) {
+        if (blob_info_ptr->replica_nodes_[ni] == task->context_.origin_node_) {
+          present = true;
+          break;
+        }
+      }
+      if (!present) {
+        blob_info_ptr->replica_nodes_.push_back(task->context_.origin_node_);
       }
     }
 
@@ -2347,6 +2372,18 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                 : blob_info_ptr->GetTotalSize()) < offset + size &&
            blob_info_ptr->IsWriteLocked()) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+    }
+
+    // A replica slot with NO bytes (post-eviction reclaim, or never written)
+    // holds nothing to read: report ABSENT, exactly like GetBlobSize does
+    // for the same state. Without this a replica-targeted read of a
+    // reclaimed copy "succeeds" as a zero-byte short read and hands the
+    // caller its own uninitialized buffer.
+    if (replica_sel > 0 &&
+        blob_info_ptr->GetReplica(replica_sel, false)->total_size_cache_ ==
+            0) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
     }
 
     // OUT: report the blob's transform state so every Get caller -- scalar,

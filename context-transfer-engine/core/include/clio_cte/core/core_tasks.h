@@ -1520,6 +1520,13 @@ struct Context {
   // below it. -1 = leave the replica's floor untouched. Unconditional, same
   // ABI rule as every Context field.
   float replica_min_score_;
+  // IN (issue #886 locality): the node id holding a raw node-local copy of
+  // this blob, registered ATOMICALLY with the put under the blob's write
+  // token — the owner invalidates every OTHER registered copy and then
+  // records this one, so a writer's own fresh local copy survives its own
+  // put and dies on the next foreign put. kNoOriginNode = none.
+  clio::run::u64 origin_node_;
+  static constexpr clio::run::u64 kNoOriginNode = ~0ULL;
 
   // ---- Compression / tracing controls and stats -------------------------
   // UNCONDITIONAL by design (issue #886 unified API): these fields exist in
@@ -1565,6 +1572,7 @@ struct Context {
         replica_(0),
         replica_flags_(0),
         replica_min_score_(-1.0f),
+        origin_node_(kNoOriginNode),
         dynamic_compress_(0),
         compress_lib_(0),
         compress_preset_(2),
@@ -1589,7 +1597,8 @@ struct Context {
     // field-block comment above).
     ar.range(persistence_target_, min_persistence_level_, preallocate_,
              emulate_, emulated_time_ns_, transform_flags_, replica_,
-             replica_flags_, replica_min_score_, dynamic_compress_,
+             replica_flags_, replica_min_score_, origin_node_,
+             dynamic_compress_,
              compress_lib_,
              compress_preset_, target_psnr_, psnr_chance_, max_performance_,
              consumer_node_, data_type_, trace_, trace_key_, trace_node_,
