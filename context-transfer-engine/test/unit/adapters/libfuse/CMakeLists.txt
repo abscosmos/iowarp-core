@@ -122,12 +122,11 @@ install(TARGETS test_fuse_adapter test_fuse_copy_workspace RUNTIME DESTINATION b
 # that having succeeded at configure time.
 # ------------------------------------------------------------------------------
 if(TARGET clio_cte_fuse)
-  find_package(PkgConfig QUIET)
-  if(PkgConfig_FOUND)
-    pkg_check_modules(FUSE3 QUIET fuse3)
-  endif()
-
-  if(FUSE3_FOUND)
+  # Reuse the adapter's FUSE3 discovery (CLIO_FUSE3_* cache-internal vars set
+  # in adapter/libfuse/CMakeLists.txt, which is processed first). The previous
+  # pkg-config re-probe here silently skipped this suite on Windows — WinFsp
+  # has no .pc file — so the callback coverage never ran there (#903).
+  if(CLIO_FUSE3_FOUND)
     add_executable(test_fuse_ops test_fuse_ops.cc)
 
     target_compile_definitions(test_fuse_ops PRIVATE
@@ -138,9 +137,10 @@ if(TARGET clio_cte_fuse)
         ${CLIO_CTE_ROOT}
         ${CLIO_CTE_ROOT}/adapter/libfuse
         ${CMAKE_SOURCE_DIR}/context-transfer-engine/filesystem/include
-        ${FUSE3_INCLUDE_DIRS})
+        ${CLIO_FUSE3_INCLUDE_DIRS}
+        ${CLIO_FUSE3_INCLUDEDIR})
 
-    target_link_directories(test_fuse_ops PRIVATE ${FUSE3_LIBRARY_DIRS})
+    target_link_directories(test_fuse_ops PRIVATE ${CLIO_FUSE3_LIBRARY_DIRS})
     target_link_libraries(test_fuse_ops
         clio_cte_filesystem_client
         clio_cte_core_runtime
@@ -150,7 +150,7 @@ if(TARGET clio_cte_fuse)
         clio::run::bdev_runtime
         clio::run::bdev_client
         ctp::cxx
-        ${FUSE3_LIBRARIES}
+        ${CLIO_FUSE3_LIBRARIES}
         ${CMAKE_THREAD_LIBS_INIT})
 
     add_custom_command(TARGET test_fuse_ops POST_BUILD
