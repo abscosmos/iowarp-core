@@ -62,6 +62,7 @@ option(CLIO_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(CLIO_CORE_ENABLE_DEB_PACKAGE "Build Debian .deb package via CPack" OFF)
 option(CLIO_CORE_ENABLE_RPM_PACKAGE "Build RPM .rpm package via CPack" OFF)
 option(CLIO_CORE_ENABLE_APPIMAGE "Build portable AppImage via appimagetool" OFF)
+option(CLIO_CORE_ENABLE_WINDOWS_PACKAGE "Build Windows ZIP archive + NSIS installer .exe via CPack" OFF)
 option(CLIO_CORE_ENABLE_CONDA "Enable Conda environment configuration (adds Conda paths to include/link directories)" OFF)
 option(CLIO_CORE_ENABLE_DOCKER_CI "Enable Docker-based integration tests (requires Docker)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
@@ -1779,6 +1780,21 @@ endif()
 if(CLIO_CORE_ENABLE_CTE AND TARGET clio_cte_core_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_core_client clio_cte_core_runtime)
 endif()
+# Cache + replication chimods (#886) build ON by default and ship in the
+# deb/rpm/AppImage via the module macros' default-component installs — but
+# the wheel filters to COMPONENT pip_package, so without these entries
+# `pip install iowarp-core` silently lacks both modules (#899).
+if(TARGET clio_cte_cache_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_cache_client clio_cte_cache_runtime)
+endif()
+if(TARGET clio_cte_replication_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_replication_client clio_cte_replication_runtime)
+endif()
+# Filesystem chimod: NEEDED by the clio_cte_fuse adapter binary that ships
+# in the wheel when CLIO_CTE_ENABLE_FUSE_ADAPTER is ON (#899).
+if(TARGET clio_cte_filesystem_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_filesystem_client clio_cte_filesystem_runtime)
+endif()
 if(CLIO_CORE_ENABLE_CAE AND TARGET clio_cae_core_client)
   list(APPEND PIP_LIB_TARGETS clio_cae_core_client clio_cae_core_runtime)
 endif()
@@ -1917,6 +1933,11 @@ if(WIN32 AND DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
     if(_vcpkg_dlls)
       install(FILES ${_vcpkg_dlls}
         COMPONENT pip_package
+        DESTINATION bin)
+      # Mirror into the default component so the native Windows package
+      # (CPack ZIP/NSIS filters to Unspecified, like DEB/RPM) also ships
+      # the third-party DLLs its exes need (#899).
+      install(FILES ${_vcpkg_dlls}
         DESTINATION bin)
     endif()
   endif()
