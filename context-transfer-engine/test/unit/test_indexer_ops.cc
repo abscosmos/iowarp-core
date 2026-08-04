@@ -74,6 +74,10 @@ class IndexerOpsFixture {
     if (g_initialized) return;
     config_path_ = chi_test_data_dir() + "/indexer_ops_config.yaml";
     restart_log_path_ = chi_test_data_dir() + "/indexer_ops_restart.bin";
+    // Stale persisted index state from an earlier run would RESTORE into
+    // this boot and pollute the assertions — start clean.
+    fs::remove(IndexLogPath());
+    fs::remove(IndexLogPath() + ".wal");
     CreateConfigFile();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
     // Hermetic pool set (same discipline as the cache interpose test).
@@ -86,9 +90,16 @@ class IndexerOpsFixture {
     g_initialized = true;
   }
 
+  static std::string IndexLogPath() {
+    return chi_test_data_dir() + "/indexer_ops_index.log";
+  }
+
   void CreateConfigFile() {
     std::ofstream f(config_path_);
     REQUIRE(f.is_open());
+    // index_log_path exercises the WAL appends on every mutation; the tiny
+    // compact threshold makes the periodic sweep fold the WAL into a
+    // snapshot mid-test (SnapshotIndex coverage).
     f << R"(
 runtime:
   num_threads: 4
@@ -114,6 +125,8 @@ compose:
     next_pool_id: "512.0"
     tag_re: "idx_.*"
     index_sweep_period_ms: 50
+    index_log_path: ")" << IndexLogPath() << R"("
+    index_wal_compact_bytes: "2KB"
 )";
   }
 };
@@ -275,6 +288,32 @@ TEST_CASE("Indexer - scope, drain, and index maintenance verbs",
     hits = Search(via_idx, "ancient manuscripts newspaper");
     REQUIRE(!Contains(hits, "bf_old"));
     REQUIRE(!Contains(hits, "bf_new"));
+  }
+
+  // --- Persistence restore: a SECOND indexer pool over the same log files
+  // must serve searches it never saw written — its Create() runs
+  // RestoreIndex over 564's snapshot + WAL. (In-process stand-in for a
+  // daemon reboot; the restart integration test covers the real thing.)
+  {
+    clio::cte::indexer::IndexerConfig params;
+    params.next_pool_id_ = clio::run::PoolId(512, 0);
+    params.tag_re_ = "idx_.*";
+    params.index_log_path_ = IndexerOpsFixture::IndexLogPath();
+    auto create = idx.AsyncCreateIndexer(clio::run::PoolQuery::Local(),
+                                         "indexer_restore",
+                                         clio::run::PoolId(565, 0), params);
+    create.Wait();
+    REQUIRE(create->GetReturnCode() == 0);
+
+    clio::cte::core::Client via_restored(clio::run::PoolId(565, 0));
+    auto task = via_restored.AsyncSemanticSearch(
+        ".*", "^scan_1$", "volcanic basalt columns", 0,
+        clio::run::PoolQuery::Local());
+    task.Wait();
+    REQUIRE(task->GetReturnCode() == 0);
+    REQUIRE(!task->results_.empty());
+    REQUIRE(task->results_[0].blob_name_ == "scan_1");
+    REQUIRE(task->results_[0].score_ > 0.0);
   }
 }
 
