@@ -1127,7 +1127,9 @@ set_tests_properties(
 # pure-stress binaries are intentionally excluded.
 # ---------------------------------------------------------------------------
 set(_cte_fn_env_basic "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
-set(_cte_fn_env_data "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+# CLIO_NET_TRACE exercises the env-gated per-stage net telemetry (issue
+# #892) on the wire path these force_net tests already traverse.
+set(_cte_fn_env_data "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;CLIO_NET_TRACE=1")
 clio_add_force_net_test(NAME cte_core_unit_force_net
     COMMAND cte_core_unit_tests ENVIRONMENT "${_cte_fn_env_basic}")
 clio_add_force_net_test(NAME cte_core_simple_force_net

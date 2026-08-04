@@ -177,6 +177,59 @@ TEST_CASE("MultiPutDefer - batched deferred puts with read-your-writes",
   REQUIRE(clio::cte::core::Client::DeferErrorCount() == 0);
 }
 
+TEST_CASE("MultiPutDefer - large values via the recycled staging pool",
+          "[cte][multiput][defer][892]") {
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("multiput_defer_large_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  // Values >= the 128 KiB batch threshold take the LARGE defer path: staged
+  // through the recycled pool (issue #892 — pool hits skip the allocator and
+  // first-touch faults) and shipped as individual puts. Three rounds over
+  // the same size class so later rounds RE-USE pooled buffers, with the
+  // non-blocking completed-put reap feeding the pool mid-burst.
+  constexpr clio::run::u64 kBig = 256 * 1024;
+  constexpr int kRounds = 3;
+  constexpr int kPerRound = 6;
+  std::string big(kBig, 'L');
+  for (int r = 0; r < kRounds; ++r) {
+    for (int i = 0; i < kPerRound; ++i) {
+      big[0] = static_cast<char>('a' + r);
+      big[kBig - 1] = static_cast<char>('a' + i);
+      int rc = client->AsyncPutBlobDefer(
+          tag_id, "big_" + std::to_string(r) + "_" + std::to_string(i), 0,
+          kBig, big.data());
+      REQUIRE(rc == 0);
+    }
+    // Read-your-writes on a possibly-pending large put.
+    {
+      std::vector<char> got(kBig, 0);
+      auto fut = client->AsyncGetBlobDefer(
+          tag_id, "big_" + std::to_string(r) + "_0", 0, kBig, got.data());
+      fut.Wait();
+      REQUIRE(got[0] == static_cast<char>('a' + r));
+    }
+  }
+  clio::cte::core::Client::AwaitPutsUntilSpace(0);
+  REQUIRE(clio::cte::core::Client::DeferErrorCount() == 0);
+
+  // Every value durably readable, byte-exact at both ends.
+  for (int r = 0; r < kRounds; ++r) {
+    for (int i = 0; i < kPerRound; ++i) {
+      std::vector<char> got(kBig, 0);
+      auto fut = client->AsyncGetBlob(
+          tag_id, "big_" + std::to_string(r) + "_" + std::to_string(i), 0,
+          kBig, /*flags=*/0, got.data());
+      fut.Wait();
+      REQUIRE(fut->GetReturnCode() == 0);
+      REQUIRE(got[0] == static_cast<char>('a' + r));
+      REQUIRE(got[kBig - 1] == static_cast<char>('a' + i));
+    }
+  }
+}
+
 TEST_CASE("MultiPutDefer - AsyncMultiPutVectored direct contract",
           "[cte][multiput][862]") {
   auto *client = CLIO_CTE_CLIENT;

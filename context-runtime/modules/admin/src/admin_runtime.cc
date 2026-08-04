@@ -408,6 +408,28 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
   clio::run::Future<clio::run::Task> queued_future;
   bool did_send = false;
 
+  // TEMP NET TRACE (issue #892): measure the ACTUAL tick rate of this
+  // periodic — the drain's byte budget × tick rate caps cross-node BW.
+  {
+    static bool trace_on = std::getenv("CLIO_NET_TRACE") != nullptr;
+    if (trace_on) {
+      static std::atomic<uint64_t> ticks{0};
+      static std::atomic<int64_t> window_start_ns{0};
+      uint64_t t = ++ticks;
+      if (t % 512 == 1) {
+        int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+        int64_t prev = window_start_ns.exchange(now);
+        if (prev != 0) {
+          double secs = (now - prev) / 1e9;
+          HLOG(kInfo, "[NETTRACE sendpoll] 512 ticks in {}s = {}/s",
+               secs, 512.0 / secs);
+        }
+      }
+    }
+  }
+
   // Per-tick maintenance: retries and dead-node fanout.
   CLIO_IPC->GetRun2Run()->ProcessRetryQueues();
   CLIO_IPC->GetRun2Run()->ScanSendMapTimeouts();

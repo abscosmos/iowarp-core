@@ -2266,9 +2266,16 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
 }
 
 ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
-                                                    int port) {
-  // Create key for the pool map
+                                                    int port,
+                                                    const char *lane) {
+  // Create key for the pool map. The lane suffix gives distinct traffic
+  // classes (bulk task payloads vs small responses) their own connection
+  // and thus their own socket mutex + ZMQ pipe (issue #892).
   std::string key = addr + ":" + std::to_string(port);
+  if (lane != nullptr && *lane != '\0') {
+    key += "#";
+    key += lane;
+  }
 
   // Lock the pool for thread-safe access
   std::lock_guard<std::mutex> lock(client_pool_mutex_);

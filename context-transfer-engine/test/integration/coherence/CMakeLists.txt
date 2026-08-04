@@ -22,6 +22,21 @@ add_dependencies(test_cache_coherence
     clio_run clio_cte_core_runtime
     clio_cte_replication_runtime clio_cte_cache_runtime)
 
+# IOR-like chain benchmark (not a ctest; driven manually / by bench scripts).
+add_executable(bench_chain bench_chain.cc)
+set_target_properties(bench_chain PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+target_link_libraries(bench_chain
+    clio_cte_core_client
+    clio_admin_client
+    clio_run_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_dependencies(bench_chain
+    clio_run clio_cte_core_runtime
+    clio_cte_replication_runtime clio_cte_cache_runtime)
+
 set(COHERENCE_TEST_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_test(

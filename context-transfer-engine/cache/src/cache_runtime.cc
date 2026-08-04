@@ -58,10 +58,12 @@ clio::cte::core::Client *Runtime::GetLocalClient() {
 
 clio::run::PoolQuery Runtime::ScheduleTask(
     const clio::run::shared_ptr<clio::run::Task> &task) {
-  // Reads route READER-LOCAL (coherence: serve the node-local raw copy;
-  // a miss fetches from the owner and populates it). Explicit-replica
-  // reads keep owner routing — they address a concrete copy that lives
-  // with the blob.
+  // Reads AND writes route SUBMITTER-LOCAL (issue #886 locality): the
+  // local handler serves/updates the node-local raw copy and reaches the
+  // blob's owner through the chain client — so the hot path (a rank
+  // touching its own data) is all PoolQuery::Local, and only the
+  // authoritative hop crosses nodes. Explicit-replica ops keep owner
+  // routing — they address a concrete copy that lives with the blob.
   switch (task->method_) {
     case clio::cte::core::Method::kGetBlob: {
       auto typed = task.template Cast<clio::cte::core::GetBlobTask>();
@@ -73,6 +75,13 @@ clio::run::PoolQuery Runtime::ScheduleTask(
     case clio::cte::core::Method::kGetBlobSize: {
       auto typed = task.template Cast<clio::cte::core::GetBlobSizeTask>();
       if (typed->replica_ == 0) {
+        return clio::run::PoolQuery::Local();
+      }
+      break;
+    }
+    case clio::cte::core::Method::kPutBlob: {
+      auto typed = task.template Cast<clio::cte::core::PutBlobTask>();
+      if (typed->context_.replica_ == 0) {
         return clio::run::PoolQuery::Local();
       }
       break;
@@ -96,44 +105,102 @@ void Runtime::AimAtCacheReplica(Context *ctx) const {
 clio::run::TaskResume Runtime::PutBlob(
     clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  // Explicit replica addressing passes through untouched.
+  // Explicit replica addressing passes through untouched (owner-routed).
   if (task->context_.replica_ != 0) {
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
                            task.template Cast<clio::run::Task>()));
     CLIO_CO_RETURN;
   }
   {
-    // ASYNCHRONOUS WRITE-THROUGH (same discipline as the replication
-    // chimod): the AUTHORITATIVE write goes down the chain FIRST and must
-    // succeed before the ack — after every ack the source of truth is
-    // current, and a crash loses nothing that was acked. The layers below
-    // keep their own async machinery (replication's durable copies are
-    // sweep-driven); this layer defers nothing.
+    // WRITER-LOCAL asynchronous write-through (issue #886 locality). This
+    // handler runs on the SUBMITTER's node. The node-local raw copy is
+    // written FIRST, then the authoritative put goes to the blob's owner
+    // chain carrying origin_node_ — the owner invalidates every OTHER
+    // registered copy and registers ours atomically under the write token,
+    // so the fresh local copy is coherent by construction. Ordering is the
+    // safety: the local write strictly precedes the registration, so any
+    // LATER foreign put's invalidation always catches it.
+    //
+    // The local copy is CREATED only when this put demonstrably covers the
+    // whole blob (single region at offset 0 AND the authoritative blob does
+    // not exist yet) — a partial write must never mint a prefix that
+    // pretends to be complete. An EXISTING local copy mirrors every put
+    // in place, staying byte- and size-identical to the authoritative blob
+    // for all writes issued through this node.
+    auto *local = GetLocalClient();
+    auto *next = GetNextClient();
+    const std::string blob_name = task->blob_name_.str();
     const Context orig_ctx = task->context_;
-    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
-                           task.template Cast<clio::run::Task>()));
-    if (task->GetReturnCode() != 0) {
-      CLIO_CO_RETURN;  // authoritative write failed — nothing was cached
-    }
-    const Context out_ctx = task->context_;  // chain's OUT fields (compress
-                                             // telemetry etc.) survive below
 
-    // Then the raw node-local copy: the SAME task re-aimed at the cache
-    // replica slot (the interposers below forward explicit replica
-    // addressing verbatim), which also publishes the serving-replica mirror
-    // record for the zero-IPC fast path. Best-effort: the authoritative
-    // write already landed, so a cache failure (e.g. fast tier full)
-    // degrades reads, never the put.
+    // 1. ONE fused local task: apply the put to the local raw copy iff it
+    //    exists (UPDATE_ONLY; kReplicaAbsentRc = it doesn't). No probes.
     task->context_ = orig_ctx;
     AimAtCacheReplica(&task->context_);
+    task->context_.replica_flags_ |= clio::cte::core::REPLICA_UPDATE_ONLY;
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
                            task.template Cast<clio::run::Task>()));
-    if (task->GetReturnCode() != 0) {
-      HLOG(kWarning, "cache: cache-replica write failed rc={} (put ok)",
-           task->GetReturnCode());
+    bool wrote_local = (task->GetReturnCode() == 0);
+    bool speculative = false;
+    if (!wrote_local &&
+        task->GetReturnCode() == clio::cte::core::kReplicaAbsentRc &&
+        task->segments_.empty() && task->offset_ == 0) {
+      // 1b. No copy yet and the put MIGHT cover the whole blob: create one
+      //     SPECULATIVELY. The owner verifies (VERIFY_COMPLETE rides the
+      //     authoritative put) and clears origin_node_ in the OUT context
+      //     if the blob pre-existed beyond this put — we then drop it.
+      task->context_ = orig_ctx;
+      AimAtCacheReplica(&task->context_);
+      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
+                             task.template Cast<clio::run::Task>()));
+      wrote_local = (task->GetReturnCode() == 0);
+      speculative = true;
     }
-    task->context_ = out_ctx;
-    task->return_code_ = 0;
+
+    // 2. Authoritative put(s) to the owner chain (Dynamic hash-routes
+    //    there). Vectored puts replay their regions in list order (the
+    //    core's last-writer-wins rule, same as the replication sync path).
+    {
+      Context auth_ctx = orig_ctx;
+      if (wrote_local) {
+        auth_ctx.origin_node_ = CLIO_IPC->GetNodeId();
+        if (speculative) {
+          auth_ctx.replica_flags_ |=
+              clio::cte::core::REPLICA_VERIFY_COMPLETE;
+        }
+      }
+      std::vector<clio::cte::core::BlobRegion> regions;
+      clio::cte::core::ForEachBlobRegion(*task,
+          [&regions](const clio::cte::core::BlobRegion &r) {
+            regions.push_back(r);
+            return true;
+          });
+      clio::run::u32 rc = 0;
+      Context out_ctx = auth_ctx;
+      for (size_t i = 0; i < regions.size() && rc == 0; ++i) {
+        auto put = next->AsyncPutBlob(task->tag_id_, blob_name,
+                                      regions[i].blob_off_, regions[i].size_,
+                                      regions[i].data_, task->score_,
+                                      auth_ctx, task->flags_);
+        CLIO_CO_AWAIT(put);
+        rc = put->GetReturnCode();
+        out_ctx = put->context_;
+      }
+      if (wrote_local &&
+          (rc != 0 ||
+           out_ctx.origin_node_ == Context::kNoOriginNode)) {
+        // Failed put, or the owner REFUSED the speculative registration
+        // (the blob pre-existed beyond this put, so our copy is a prefix):
+        // the local copy must not survive.
+        auto del = local->AsyncDelBlob(task->tag_id_, blob_name,
+                                       clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(del);
+      }
+      out_ctx.replica_ = orig_ctx.replica_;
+      out_ctx.replica_flags_ = orig_ctx.replica_flags_;
+      out_ctx.origin_node_ = Context::kNoOriginNode;
+      task->context_ = out_ctx;
+      task->SetReturnCode(rc);
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -194,48 +261,32 @@ clio::run::TaskResume Runtime::GetBlob(
   {
     // This handler runs READER-LOCAL (ScheduleTask). The node-local raw
     // copy lives in the LOCAL core container's cache-replica slot — the
-    // same slot the write path fills on the owner — so owner and remote
-    // reader serve through one code path, and the node's SHM mirror record
-    // makes the copy zero-IPC readable.
-    auto *local = GetLocalClient();
+    // same slot the write path fills — so writer and remote reader serve
+    // through one code path, and the node's SHM mirror record makes the
+    // copy zero-IPC readable. INVARIANT: a present local copy is COMPLETE
+    // and CURRENT (creation covers the whole blob; every put through this
+    // node mirrors into it; invalidation and populate-failure delete it
+    // whole), so the read is OPPORTUNISTIC — no size probe, just try it.
     const std::string blob_name = task->blob_name_.str();
-    clio::run::u64 req_lo = 0, req_hi = 0;
-    clio::cte::core::BlobRequestRange(*task, &req_lo, &req_hi);
-
-    // 1. Node-local raw copy first — the owner's write-through keeps it
-    //    current on the owner, and the owner's put INVALIDATES reader
-    //    copies before acking, so a covering local copy is never stale.
-    clio::run::u64 cache_size = 0;
-    {
-      auto sz = local->AsyncGetBlobSize(task->tag_id_, blob_name,
-                                        clio::run::PoolQuery::Local(),
-                                        clio::cte::core::kCacheReplica);
-      CLIO_CO_AWAIT(sz);
-      if (sz->GetReturnCode() == 0) {
-        cache_size = sz->size_;
-      }
-    }
-    if (cache_size >= req_hi && req_hi > 0) {
-      task->context_.replica_ = clio::cte::core::kCacheReplica;
-      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
-                             task.template Cast<clio::run::Task>()));
-      task->context_.replica_ = 0;
-      if (task->GetReturnCode() == 0) {
-        CLIO_CO_RETURN;
-      }
+    task->context_.replica_ = clio::cte::core::kCacheReplica;
+    CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
+                           task.template Cast<clio::run::Task>()));
+    task->context_.replica_ = 0;
+    if (task->GetReturnCode() == 0) {
+      CLIO_CO_RETURN;
     }
 
-    // 2. Miss: fetch from the blob's authoritative owner chain (Dynamic
-    //    hash-routes to the owner; the layers there decompress/heal). Each
-    //    region reads straight into the caller's buffer.
+    // Miss: fetch from the blob's authoritative owner chain (Dynamic
+    // hash-routes to the owner; the layers there decompress/heal). Each
+    // region reads straight into the caller's buffer.
+    auto *next = GetNextClient();
+    std::vector<clio::cte::core::BlobRegion> regions;
+    clio::cte::core::ForEachBlobRegion(*task,
+        [&regions](const clio::cte::core::BlobRegion &r) {
+          regions.push_back(r);
+          return true;
+        });
     {
-      auto *next = GetNextClient();
-      std::vector<clio::cte::core::BlobRegion> regions;
-      clio::cte::core::ForEachBlobRegion(*task,
-          [&regions](const clio::cte::core::BlobRegion &r) {
-            regions.push_back(r);
-            return true;
-          });
       clio::run::u32 rc = 0;
       clio::run::u32 out_tflags = 0;
       for (size_t i = 0; i < regions.size() && rc == 0; ++i) {
@@ -254,9 +305,40 @@ clio::run::TaskResume Runtime::GetBlob(
       }
     }
 
-    // 3. Best-effort local population + coherence registration, so the
-    //    next read (and the zero-IPC fast path) is node-local.
-    CLIO_CO_AWAIT(PopulateLocal(task->tag_id_, blob_name));
+    // Best-effort local population + coherence registration, so the next
+    // read (and the zero-IPC fast path) is node-local. When this read
+    // fetched the WHOLE blob (the file-per-process page pattern), the
+    // caller's buffer seeds the copy directly — no re-fetch.
+    {
+      clio::run::u64 total = 0;
+      {
+        auto sz = next->AsyncGetBlobSize(task->tag_id_, blob_name);
+        CLIO_CO_AWAIT(sz);
+        if (sz->GetReturnCode() != 0 || sz->size_ == 0) {
+          CLIO_CO_RETURN;  // raced away — nothing to populate
+        }
+        total = sz->size_;
+      }
+      if (regions.size() == 1 && regions[0].blob_off_ == 0 &&
+          regions[0].size_ >= total &&
+          task->context_.transform_flags_ == 0) {
+        auto *local = GetLocalClient();
+        Context put_ctx;
+        AimAtCacheReplica(&put_ctx);
+        auto put = local->AsyncPutBlob(task->tag_id_, blob_name, 0, total,
+                                       regions[0].data_, /*score=*/-1.0f,
+                                       put_ctx, /*flags=*/0,
+                                       clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(put);
+        if (put->GetReturnCode() == 0) {
+          auto reg = next->AsyncRegisterReplicaContainer(
+              task->tag_id_, blob_name, CLIO_IPC->GetNodeId());
+          CLIO_CO_AWAIT(reg);
+        }
+      } else {
+        CLIO_CO_AWAIT(PopulateLocal(task->tag_id_, blob_name));
+      }
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -281,32 +363,47 @@ clio::run::TaskResume Runtime::PopulateLocal(const TagId &tag_id,
     }
     total = sz->size_;
   }
-  for (clio::run::u64 off = 0; off < total; off += kCacheChunkBytes) {
-    clio::run::u64 len = std::min(kCacheChunkBytes, total - off);
-    auto buf = CLIO_IPC->AllocateBuffer(len);
-    if (buf.IsNull()) {
-      CLIO_CO_RETURN;  // best-effort: keep the valid prefix
-    }
-    ctp::ipc::ShmPtr<> buf_ptr = buf.shm_.template Cast<void>();
-    auto get = next->AsyncGetBlob(tag_id, blob_name, off, len, /*flags=*/0,
-                                  buf_ptr);
-    CLIO_CO_AWAIT(get);
-    if (get->GetReturnCode() != 0) {
+  {
+    bool failed = false;
+    for (clio::run::u64 off = 0; off < total && !failed;
+         off += kCacheChunkBytes) {
+      clio::run::u64 len = std::min(kCacheChunkBytes, total - off);
+      auto buf = CLIO_IPC->AllocateBuffer(len);
+      if (buf.IsNull()) {
+        failed = true;
+        break;
+      }
+      ctp::ipc::ShmPtr<> buf_ptr = buf.shm_.template Cast<void>();
+      auto get = next->AsyncGetBlob(tag_id, blob_name, off, len, /*flags=*/0,
+                                    buf_ptr);
+      CLIO_CO_AWAIT(get);
+      if (get->GetReturnCode() != 0) {
+        CLIO_IPC->FreeBuffer(buf);
+        failed = true;
+        break;
+      }
+      // Into THIS node's core container cache-replica slot (Local query
+      // bypasses owner routing): raw bytes, mirror record published for the
+      // node's zero-IPC fast path.
+      Context put_ctx;
+      AimAtCacheReplica(&put_ctx);
+      auto put = local->AsyncPutBlob(tag_id, blob_name, off, len, buf_ptr,
+                                     /*score=*/-1.0f, put_ctx, /*flags=*/0,
+                                     clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(put);
       CLIO_IPC->FreeBuffer(buf);
-      CLIO_CO_RETURN;
+      if (put->GetReturnCode() != 0) {
+        failed = true;
+      }
     }
-    // Into THIS node's core container cache-replica slot (Local query
-    // bypasses owner routing): raw bytes, mirror record published for the
-    // node's zero-IPC fast path.
-    Context put_ctx;
-    AimAtCacheReplica(&put_ctx);
-    auto put = local->AsyncPutBlob(tag_id, blob_name, off, len, buf_ptr,
-                                   /*score=*/-1.0f, put_ctx, /*flags=*/0,
-                                   clio::run::PoolQuery::Local());
-    CLIO_CO_AWAIT(put);
-    CLIO_IPC->FreeBuffer(buf);
-    if (put->GetReturnCode() != 0) {
-      CLIO_CO_RETURN;  // abandon; prefix stays valid
+    if (failed) {
+      // The present ⇒ COMPLETE invariant (the opportunistic read and the
+      // local size answer both rely on it) forbids keeping a prefix: a
+      // partial population is deleted whole.
+      auto del = local->AsyncDelBlob(tag_id, blob_name,
+                                     clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(del);
+      CLIO_CO_RETURN;
     }
   }
   {
