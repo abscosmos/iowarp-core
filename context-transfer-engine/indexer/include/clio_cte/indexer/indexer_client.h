@@ -60,6 +60,25 @@ class Client : public clio::cte::core::Client {
   }
 
 #if CTP_IS_HOST
+  /**
+   * On-demand backfill: enumerate existing blobs matching the given regexes
+   * (intersected with the module's configured scope) and enqueue them for
+   * asynchronous indexing. The ONLY way to index pre-existing data besides
+   * a tag's first-insertion backfill — restarts restore persisted state and
+   * never rescan.
+   */
+  clio::run::Future<ReindexScanTask> AsyncReindexScan(
+      const std::string &tag_regex = ".*",
+      const std::string &blob_regex = ".*",
+      const clio::run::PoolQuery &pool_query =
+          clio::run::PoolQuery::Broadcast()) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<ReindexScanTask>(
+        clio::run::CreateTaskId(), indexer_pool_id_, pool_query, tag_regex,
+        blob_regex);
+    return ipc->Send(task);
+  }
+
   /** Create the indexer container. Set params.next_pool_id_ to the pool it
    *  forwards to (usually the CTE core). */
   clio::run::Future<CreateTask> AsyncCreateIndexer(

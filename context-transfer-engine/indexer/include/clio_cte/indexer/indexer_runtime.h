@@ -34,10 +34,13 @@
 #ifndef CLIO_CTE_INDEXER_INDEXER_RUNTIME_H_
 #define CLIO_CTE_INDEXER_INDEXER_RUNTIME_H_
 
+#include <fstream>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
@@ -64,12 +67,18 @@ namespace clio::cte::indexer {
  *  - SemanticSearch TERMINATES here: BM25 over the per-container index
  *    slice, identical semantics to the core's old scan (df/avgdl over the
  *    regex-matched working set; Broadcast + AggregateOut merges shards).
- *  - The index is DERIVED, rebuildable state: never persisted. On restart
- *    each container rebuilds its slice from the storage below (BlobQuery +
- *    GetBlob against `next`) before Create() acks. Blobs whose bytes lived
- *    only on volatile (RAM) tiers cannot be re-read after a reboot and drop
- *    out of the index — the same content is also unreadable by GetBlob, so
- *    the index stays consistent with what storage can actually serve.
+ *  - SCOPE: only blobs matching the configured tag_re AND blob_re are ever
+ *    tokenized (default .*): out-of-scope content costs no scan, no index
+ *    memory, no WAL.
+ *  - PERSISTENCE (index_log_path): the module owns a snapshot + append WAL
+ *    of its own state. A restart RESTORES and never rescans storage; the
+ *    WAL folds into the snapshot at a size threshold and on clean
+ *    shutdown (which also persists still-dirty keys). Pre-existing data
+ *    enters the index only via a tag's one-time first-insertion backfill
+ *    or the explicit kReindexScan verb — both ENQUEUE for the async drain.
+ *    Crash window: dirty keys acked after the last WAL record may stay
+ *    stale until rewritten or rescanned (the index is derived state;
+ *    kReindexScan repairs).
  *
  * The index is a FORWARD index (per-doc term frequencies + lengths), not a
  * term->postings inverted index: the search semantics compute BM25 corpus
@@ -104,6 +113,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
       clio::run::shared_ptr<clio::cte::core::SemanticSearchTask> &task);
   clio::run::TaskResume IndexSweep(
       clio::run::shared_ptr<IndexSweepTask> &task);
+  clio::run::TaskResume ReindexScan(
+      clio::run::shared_ptr<ReindexScanTask> &task);
 
   // ---- Container virtuals (defined in autogen/indexer_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
@@ -165,8 +176,27 @@ class Runtime : public clio::cte::core::CoreInterposer {
                      clio::run::u64 len);
 
   /** Mark a blob dirty for the asynchronous drain (O(1), coalesced by doc
-   *  key — the put ack path's ONLY indexing cost). */
+   *  key — the put ack path's ONLY indexing cost). Pre-filters on the
+   *  module's blob_re scope; the tag_re half is enforced at drain time
+   *  (the tag name is only resolved there). Also triggers the one-time
+   *  first-insertion backfill for tags the index has never seen. */
   void EnqueuePending(const TagId &tag_id, const std::string &blob_name);
+
+  // ---- Persistence (issue #905: snapshot + WAL, never rescan) ----
+  /** Append one WAL record; no-op when persistence is off. */
+  void WalAppendDoc(const IndexedDoc &doc);
+  void WalAppendDelDoc(const TagId &tag_id, const std::string &blob_name);
+  void WalAppendDelTag(const TagId &tag_id);
+  void WalAppendRenameTag(const TagId &tag_id, const std::string &new_name);
+  void WalAppendTagSeen(const TagId &tag_id);
+  /** Truncate-and-rewrite the snapshot (docs + tag names + seen tags +
+   *  dirty keys), then truncate the WAL. Called on clean shutdown, after a
+   *  restore (compaction), and when the WAL crosses the size threshold. */
+  void SnapshotIndex();
+  /** Load snapshot + replay WAL into memory (last-wins), dropping docs
+   *  outside the CURRENT scope config. Returns true when state was
+   *  restored. */
+  bool RestoreIndex();
 
   /** Drain the pending set to empty: pop-and-reindex until no entry remains
    *  AND no other drainer is mid-entry. Multiple drainers cooperate (each
@@ -174,10 +204,14 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  barrier, the periodic sweep calls it for background progress. */
   clio::run::TaskResume DrainPendingIndex();
 
-  /** Rebuild this container's index slice from the storage below (restart
-   *  path): enumerate local (tag, blob) pairs via BlobQuery, re-read and
-   *  tokenize each. */
-  clio::run::TaskResume RebuildIndex();
+  /** Enumerate existing local (tag, blob) pairs matching the given regexes
+   *  (each intersected with the module scope) via BlobQuery on the chain
+   *  below and ENQUEUE them for the asynchronous drain. Used by the
+   *  kReindexScan verb and the per-tag first-insertion backfill; restarts
+   *  restore persisted state and never call this. */
+  clio::run::TaskResume ScanAndEnqueue(std::string tag_regex,
+                                       std::string blob_regex,
+                                       clio::run::u64 *enqueued_out);
 
   /** Resolve (and cache) a tag's full name for result rows / tag_regex. */
   clio::run::TaskResume ResolveTagName(TagId tag_id, std::string *name_out);
@@ -217,9 +251,29 @@ class Runtime : public clio::cte::core::CoreInterposer {
     std::string blob_name_;
   };
   std::unordered_map<std::string, PendingReindex> pending_;
+  /** Tags whose FIRST insertion has been observed and whose pre-existing
+   *  blobs must be backfilled (drained before pending_; each pops into a
+   *  scoped ScanAndEnqueue). Guarded by index_mutex_. */
+  std::unordered_map<clio::run::u64, TagId> pending_tag_backfills_;
+  /** Tags the index has already seen (backfill fired or restored) — the
+   *  first-insertion trigger. Persisted, so restarts never re-backfill.
+   *  Guarded by index_mutex_. */
+  std::unordered_set<clio::run::u64> tags_seen_;
   /** Entries popped by a drainer but not yet indexed — the search barrier
-   *  waits for BOTH pending_ empty and this zero. Guarded by index_mutex_. */
+   *  waits for BOTH pending sets empty and this zero. Guarded by
+   *  index_mutex_. */
   clio::run::u32 draining_ = 0;
+
+  /** Compiled module scope (config tag_re_/blob_re_). */
+  std::regex scope_tag_re_;
+  std::regex scope_blob_re_;
+  bool scope_match_all_ = true;  ///< both regexes are ".*" (skip the checks)
+
+  /** Persistence streams (open iff config index_log_path_ non-empty). WAL
+   *  appends run under index_mutex_ (they follow the state mutation they
+   *  record). */
+  std::ofstream wal_;
+  clio::run::u64 wal_bytes_ = 0;
 
   std::mutex index_mutex_;
 };

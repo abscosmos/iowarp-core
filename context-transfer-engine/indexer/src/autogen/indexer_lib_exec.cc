@@ -65,7 +65,8 @@ namespace clio::cte::indexer {
   X(kTruncateBlob, clio::cte::core::TruncateBlobTask, TruncateBlob)       \
   X(kRenameTag, clio::cte::core::RenameTagTask, RenameTag)                \
   X(kMultiPutBlob, clio::cte::core::MultiPutBlobTask, MultiPutBlob)       \
-  X(kIndexSweep, IndexSweepTask, IndexSweep)
+  X(kIndexSweep, IndexSweepTask, IndexSweep)                              \
+  X(kReindexScan, ReindexScanTask, ReindexScan)
 
 void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
                    clio::run::u32 container_id) {

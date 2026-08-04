@@ -69,9 +69,11 @@ GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob =
     clio::cte::core::Method::kMultiPutBlob;
 
 // Module verbs live ABOVE the core's id space (>= 100, interposer rule).
-// kIndexSweep drives the asynchronous index drain (periodic task).
+// kIndexSweep drives the asynchronous index drain (periodic task);
+// kReindexScan is the explicit on-demand backfill of existing data.
 GLOBAL_CROSS_CONST clio::run::u32 kIndexSweep = 100;
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 101;
+GLOBAL_CROSS_CONST clio::run::u32 kReindexScan = 101;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 102;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -87,6 +89,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[kRenameTag] = "RenameTag";
     v[kMultiPutBlob] = "MultiPutBlob";
     v[kIndexSweep] = "IndexSweep";
+    v[kReindexScan] = "ReindexScan";
     return v;
   }();
   return names;

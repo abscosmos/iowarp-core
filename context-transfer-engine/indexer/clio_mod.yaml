@@ -23,4 +23,5 @@ kRenameTag: 38
 kMultiPutBlob: 48
 
 # Module verbs (>= 100, above the core id space)
-kIndexSweep: 100  # periodic asynchronous index drain
+kIndexSweep: 100   # periodic asynchronous index drain
+kReindexScan: 101  # explicit on-demand backfill of existing data

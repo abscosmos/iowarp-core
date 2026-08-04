@@ -37,6 +37,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/task.h>
 #include <clio_runtime/admin/admin_tasks.h>
+#include <clio_ctp/util/config_parse.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/indexer/autogen/indexer_methods.h>
 
@@ -74,11 +75,32 @@ struct IndexerConfig {
   /// work. 0 disables the sweep: the index is then updated only when a
   /// search runs (lazy indexing).
   clio::run::u32 index_sweep_period_ms_ = 100;
+  /// Index SCOPE: only blobs whose full tag name matches tag_re_ AND whose
+  /// blob name matches blob_re_ are tokenized (std::regex_match, same
+  /// full-string semantics as the search filters). Out-of-scope content
+  /// costs nothing — no scan, no index memory, no WAL. Defaults index
+  /// everything.
+  std::string tag_re_ = ".*";
+  std::string blob_re_ = ".*";
+  /// Index persistence (issue #905): when non-empty, the module keeps its
+  /// state in <path> (snapshot) + <path>.wal (append-only deltas) and a
+  /// restart RESTORES instead of rescanning storage. Empty = in-memory
+  /// only: a restart comes up EMPTY and re-indexes incrementally (first
+  /// insertion per tag backfills that tag; kReindexScan backfills on
+  /// demand).
+  std::string index_log_path_;
+  /// WAL size that triggers snapshot+truncate compaction (checked by the
+  /// periodic sweep).
+  clio::run::u64 index_wal_compact_bytes_ = 8ULL * 1024 * 1024;
 
   IndexerConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   IndexerConfig(const clio::run::PoolId &pool_id, const IndexerConfig &other)
       : next_pool_id_(other.next_pool_id_),
-        index_sweep_period_ms_(other.index_sweep_period_ms_) {
+        index_sweep_period_ms_(other.index_sweep_period_ms_),
+        tag_re_(other.tag_re_),
+        blob_re_(other.blob_re_),
+        index_log_path_(other.index_log_path_),
+        index_wal_compact_bytes_(other.index_wal_compact_bytes_) {
     (void)pool_id;
   }
 
@@ -86,7 +108,8 @@ struct IndexerConfig {
   void serialize(Archive &ar) {
     // EVERY field round-trips (the cache/replication silently-dropped-field
     // audit rule).
-    ar(next_pool_id_, index_sweep_period_ms_);
+    ar(next_pool_id_, index_sweep_period_ms_, tag_re_, blob_re_,
+       index_log_path_, index_wal_compact_bytes_);
   }
 
   /** Load configuration from compose YAML. */
@@ -106,6 +129,20 @@ struct IndexerConfig {
         if (node["index_sweep_period_ms"]) {
           index_sweep_period_ms_ =
               node["index_sweep_period_ms"].as<clio::run::u32>();
+        }
+        if (node["tag_re"]) {
+          tag_re_ = node["tag_re"].as<std::string>();
+        }
+        if (node["blob_re"]) {
+          blob_re_ = node["blob_re"].as<std::string>();
+        }
+        if (node["index_log_path"]) {
+          index_log_path_ = ctp::ConfigParse::ExpandPath(
+              node["index_log_path"].as<std::string>());
+        }
+        if (node["index_wal_compact_bytes"]) {
+          index_wal_compact_bytes_ = ctp::ConfigParse::ParseSize(
+              node["index_wal_compact_bytes"].as<std::string>());
         }
       } catch (...) {
         // Config parsing is best-effort
@@ -140,6 +177,61 @@ struct DestroyTask : public clio::run::Task {
 };
 
 using MonitorTask = clio::run::admin::MonitorTask;
+
+/**
+ * Explicit on-demand index scan (Method::kReindexScan): enumerate existing
+ * blobs matching tag_re_ AND blob_re_ (intersected with the module's
+ * configured scope) via BlobQuery on the chain below, and ENQUEUE them for
+ * the asynchronous drain. The only way pre-existing cold data enters the
+ * index besides a tag's first-insertion backfill — restarts restore
+ * persisted state and never rescan.
+ */
+struct ReindexScanTask : public clio::run::Task {
+  IN clio::run::priv::string tag_regex_;
+  IN clio::run::priv::string blob_regex_;
+  OUT clio::run::u64 blobs_enqueued_;
+
+  ReindexScanTask()
+      : clio::run::Task(),
+        tag_regex_(CLIO_PRIV_ALLOC),
+        blob_regex_(CLIO_PRIV_ALLOC),
+        blobs_enqueued_(0) {}
+
+  explicit ReindexScanTask(const clio::run::TaskId &task_id,
+                           const clio::run::PoolId &pool_id,
+                           const clio::run::PoolQuery &pool_query,
+                           const std::string &tag_regex,
+                           const std::string &blob_regex)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kReindexScan),
+        tag_regex_(CLIO_PRIV_ALLOC, tag_regex),
+        blob_regex_(CLIO_PRIV_ALLOC, blob_regex),
+        blobs_enqueued_(0) {}
+
+  template <typename Ar>
+  void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_regex_, blob_regex_);
+  }
+
+  template <typename Ar>
+  void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar);
+    ar(blobs_enqueued_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<ReindexScanTask> &other) {
+    Task::Copy(other.template Cast<clio::run::Task>());
+    tag_regex_ = other->tag_regex_;
+    blob_regex_ = other->blob_regex_;
+    blobs_enqueued_ = other->blobs_enqueued_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<ReindexScanTask>();
+    blobs_enqueued_ += other->blobs_enqueued_;
+  }
+};
 
 /** Periodic driver of the asynchronous index drain (Method::kIndexSweep). */
 struct IndexSweepTask : public clio::run::Task {

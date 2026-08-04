@@ -35,3 +35,6 @@ compose:
     pool_id: "564.0"
     restart: true
     next_pool_id: "512.0"
+    # Module WAL (issue #905): phase 2 verifies searches served from the
+    # RESTORED index — no rescan of storage happens on restart.
+    index_log_path: /tmp/clio_indexer_restart_test/indexer_index.log
