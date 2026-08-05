@@ -76,12 +76,21 @@ struct RetryEntry {
 struct ReplicaProgress {
   clio::run::u64 target_node_id = kInvalidNodeId;
   bool accounted = false;  // response received, or the replica was declared lost
+  // issue #856/#896: a replica transmitted to a node that was later confirmed
+  // dead is re-dispatched ONCE through send_in_retry_ (which re-routes to the
+  // post-recovery container mapping, or fails the replica after its bounded
+  // timeout). This flag stops the dead-node scan from enqueuing duplicates.
+  bool redispatched = false;
 };
 
 /** Per-origin progress state, keyed by net_key in progress_map_ (issue #628). */
 struct OriginProgress {
   std::chrono::steady_clock::time_point enqueue_time;
   std::vector<ReplicaProgress> replicas;  // indexed by replica_id
+  // Admin-pool origins are tracked for the dead-node scan but must never be
+  // PROBED: QueryTaskProgress is itself an admin cross-node task, so probing
+  // admin origins would recurse (issue #896).
+  bool probe_eligible = true;
 };
 
 /** A replica the origin is still waiting on, to be probed via QueryTaskProgress. */
@@ -359,9 +368,15 @@ class IpcManagerRun2Run {
   // Throttle: last time CollectStuckReplicas actually ran a scan pass.
   std::chrono::steady_clock::time_point last_progress_scan_{};
 
-  /** Register an origin's replicas for progress tracking (called from SendIn). */
+  /**
+   * Register an origin's replicas for progress tracking (called from SendIn).
+   * probe_eligible=false registers the origin for dead-node completion but
+   * excludes it from QueryTaskProgress probing (admin-pool origins: the probe
+   * is itself an admin cross-node task and would recurse).
+   */
   void RegisterOriginProgress(size_t net_key,
-                              const std::vector<clio::run::u64> &replica_targets);
+                              const std::vector<clio::run::u64> &replica_targets,
+                              bool probe_eligible = true);
   /**
    * Mark a replica as accounted for (a response arrived, or it was declared
    * lost). Returns whether the caller should count it toward completion:

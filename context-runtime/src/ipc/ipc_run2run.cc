@@ -291,12 +291,14 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
                           target_node_id, origin_task);
   }
 
-  // Register this origin for the #628 task-progress scan. Admin-pool tasks are
-  // excluded: QueryTaskProgress is itself an admin cross-node task, so tracking
-  // it (and the other admin liveness/control probes) would recurse.
-  if (!(origin_task->pool_id_ == clio::run::kAdminPoolId)) {
-    RegisterOriginProgress(send_map_key, replica_targets);
-  }
+  // Register EVERY origin: progress_map_ is the authoritative record of which
+  // node each replica was dispatched to, and the dead-node sweep
+  // (ScanSendMapTimeouts) needs it for all routing modes. Admin-pool origins
+  // are registered but NOT probe-eligible: QueryTaskProgress is itself an
+  // admin cross-node task, so probing them would recurse (issue #896).
+  RegisterOriginProgress(send_map_key, replica_targets,
+                         /*probe_eligible=*/
+                         !(origin_task->pool_id_ == clio::run::kAdminPoolId));
 }
 
 // =============================================================================
@@ -725,9 +727,11 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
 // =============================================================================
 
 void IpcManagerRun2Run::RegisterOriginProgress(
-    size_t net_key, const std::vector<clio::run::u64> &replica_targets) {
+    size_t net_key, const std::vector<clio::run::u64> &replica_targets,
+    bool probe_eligible) {
   OriginProgress prog;
   prog.enqueue_time = std::chrono::steady_clock::now();
+  prog.probe_eligible = probe_eligible;
   prog.replicas.resize(replica_targets.size());
   for (size_t i = 0; i < replica_targets.size(); ++i) {
     prog.replicas[i].target_node_id = replica_targets[i];
@@ -776,6 +780,9 @@ std::vector<StuckReplica> IpcManagerRun2Run::CollectStuckReplicas(
 
   for (auto &kv : progress_map_) {
     OriginProgress &prog = kv.second;
+    if (!prog.probe_eligible) {
+      continue;  // admin origin: probing it would recurse (issue #896)
+    }
     if (now - prog.enqueue_time < interval) {
       continue;  // give the task at least one interval before probing
     }
@@ -1028,57 +1035,71 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
     dead_map[entry.node_id] = entry.detected_at;
   }
 
-  std::vector<std::pair<size_t, clio::run::shared_ptr<clio::run::Task>>> to_complete;
+  // Drive off progress_map_, NOT the origin's pool queries (issue #896). The
+  // queries record ROUTING INTENT, and only Physical mode names a node — a
+  // Dynamic or Broadcast task is resolved to DirectId/Range queries whose
+  // node is looked up from the container map at dispatch time. Scanning only
+  // Physical queries therefore missed every replica of the common routing
+  // modes: CollectStuckReplicas skips dead targets ("handled by the dead-node
+  // timeout path") and this scan skipped non-Physical replicas, so NOBODY
+  // completed the origin and its client parked forever (the 15-minute
+  // leader-election step timeout: a post-failover Dynamic CreatePool whose
+  // DirectId replica pointed at the killed leader). progress_map_ holds the
+  // node each replica was ACTUALLY dispatched to, for every mode.
+  struct DeadReplica {
+    size_t net_key;
+    clio::run::u32 replica_id;
+    clio::run::u64 node_id;
+  };
+  std::vector<DeadReplica> to_fail;
   {
     std::lock_guard<std::mutex> lk(send_map_mutex_);
-    send_map_.for_each(
-        [&](const size_t &key, clio::run::shared_ptr<clio::run::Task> &origin_task) {
-          if (origin_task.IsNull()) {
-            return;
-          }
+    for (auto &kv : progress_map_) {
+      auto sit = send_map_.find(kv.first);
+      if (sit == nullptr || (*sit).IsNull()) {
+        continue;  // origin already completed/erased
+      }
+      clio::run::shared_ptr<clio::run::Task> &origin_task = *sit;
 
-          float task_timeout = kRun2RunRetryTimeoutSec;
-          float task_net_timeout = origin_task->pool_query_.GetNetTimeout();
-          if (task_net_timeout >= 0) {
-            task_timeout = task_net_timeout;
-          }
+      float task_timeout = kRun2RunRetryTimeoutSec;
+      float task_net_timeout = origin_task->pool_query_.GetNetTimeout();
+      if (task_net_timeout >= 0) {
+        task_timeout = task_net_timeout;
+      }
 
-          bool any_timed_out = false;
-          for (const auto &pq : origin_task->PoolQueries()) {
-            if (!pq.IsPhysicalMode()) {
-              continue;
-            }
-            auto dit = dead_map.find(pq.GetNodeId());
-            if (dit == dead_map.end()) {
-              continue;
-            }
-            float dead_elapsed =
-                std::chrono::duration<float>(now - dit->second).count();
-            if (dead_elapsed >= task_timeout) {
-              any_timed_out = true;
-              break;
-            }
-          }
-
-          if (any_timed_out) {
-            to_complete.emplace_back(key, origin_task);
-          }
-        });
+      OriginProgress &prog = kv.second;
+      for (clio::run::u32 rid = 0; rid < prog.replicas.size(); ++rid) {
+        ReplicaProgress &rp = prog.replicas[rid];
+        if (rp.accounted || rp.target_node_id == kInvalidNodeId) {
+          continue;
+        }
+        auto dit = dead_map.find(rp.target_node_id);
+        if (dit == dead_map.end()) {
+          continue;  // target still alive: the probe path owns it
+        }
+        float dead_elapsed =
+            std::chrono::duration<float>(now - dit->second).count();
+        if (dead_elapsed >= task_timeout) {
+          to_fail.push_back({kv.first, rid, rp.target_node_id});
+        }
+      }
+    }
   }
 
-  for (auto &entry : to_complete) {
-    auto &origin_task = entry.second;
+  for (const auto &dr : to_fail) {
     HLOG(kError,
-         "[ScanSendMapTimeouts] Task {} timed out waiting for dead node",
-         origin_task->task_id_);
-    origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
-    // Exactly-once (issue #856): funnel through RecvOutCompleteOriginTask,
-    // whose ClaimOrigin() erases the send_map_ entry BEFORE completing. The
-    // old order (EndTask first, erase in a second pass) left a window where a
-    // late replica response found the origin still in send_map_, aggregated
-    // into the completed task, and completed it a second time — the double
-    // EndTask heap corruption behind the leader-election crashes.
-    RecvOutCompleteOriginTask(entry.first, origin_task);
+         "[ScanSendMapTimeouts] replica {} of net_key {} timed out waiting "
+         "for dead node {}; completing with network-timeout RC",
+         dr.replica_id, dr.net_key, dr.node_id);
+    // Exactly-once (issue #856): HandleTaskProgressResult claims the
+    // accounting transition (MarkReplicaAccounted) before counting, and the
+    // final count funnels through RecvOutCompleteOriginTask, whose
+    // ClaimOrigin() erases the send_map_ entry BEFORE completing. A late
+    // replica response therefore cannot aggregate into an already-completed
+    // task and complete it a second time (the double-EndTask heap corruption
+    // behind the earlier leader-election crashes).
+    HandleTaskProgressResult(static_cast<clio::run::u64>(dr.net_key),
+                             dr.replica_id, /*gone=*/true);
   }
 }
 
