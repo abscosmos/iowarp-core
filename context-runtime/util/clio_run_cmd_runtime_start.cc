@@ -47,7 +47,22 @@ bool InitializeAdminChiMod() {
     HLOG(kDebug, "Admin pool creation handled by PoolManager::ServerInit()");
 
     if (!pool_manager->HasPool(clio::run::kAdminPoolId)) {
-      HLOG(kError, "Admin pool creation reported success but pool is not found");
+      // HasPool answers false for two very different states -- "the pool
+      // manager is not initialized" and "the pool genuinely is not there" --
+      // and the old message could not tell them apart. This check has fired
+      // intermittently right after ServerInit reported the pool created,
+      // killing the daemon at startup (issue #924, seen as a cr_detached_spawn
+      // failure on macos-14). Say which state it is, so the next occurrence
+      // answers the question instead of posing it.
+      HLOG(kError,
+           "Admin pool creation reported success but pool is not found "
+           "(pool_manager initialized={}, pools known={}). {}",
+           pool_manager->IsInitialized(), pool_manager->GetPoolCount(),
+           pool_manager->IsInitialized()
+               ? "The manager is up, so the admin pool's metadata is genuinely "
+                 "absent -- it was inserted and lost, or never durably inserted."
+               : "The manager reports NOT initialized, so this is an ordering "
+                 "problem in startup, not a missing pool.");
       return false;
     }
 
