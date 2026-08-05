@@ -69,14 +69,13 @@ TEST_CASE("DaemonDetachedSpawn - transport initializes without a console (#721)"
   test::RuntimeServer server;
   bool ready = false;
   unsigned port = kPort;
-  for (int attempt = 0; attempt < 3 && !ready; ++attempt, port += 7) {
+  for (int attempt = 0; attempt < 3 && !ready; ++attempt) {
     ::remove(log_path.c_str());
     test::SetEnvVar("CLIO_PORT", std::to_string(port));
-    if (!server.Start(port, "127.0.0.1", /*ephemeral=*/true,
-                      /*detached=*/true)) {
-      continue;
+    if (server.Start(port, "127.0.0.1", /*ephemeral=*/true,
+                     /*detached=*/true)) {
+      ready = server.WaitForReady();
     }
-    ready = server.WaitForReady();
     if (!ready) {
       std::printf(
           "[detached-spawn] attempt %d on port %u: daemon not ready "
@@ -84,6 +83,7 @@ TEST_CASE("DaemonDetachedSpawn - transport initializes without a console (#721)"
           attempt, port, static_cast<int>(server.IsRunning()),
           ReadWholeFile(log_path).c_str());
       server.Stop();
+      port += 7;  // fresh port => fresh port-keyed segment names
     }
   }
   REQUIRE(ready);
@@ -95,6 +95,16 @@ TEST_CASE("DaemonDetachedSpawn - transport initializes without a console (#721)"
   test::SetEnvVar("CLIO_IPC_MODE", "tcp");
   test::SetEnvVar("CLIO_WAIT_SERVER", "15");
   bool connected = CLIO_INIT(RuntimeMode::kClient, false);
+  if (!connected) {
+    // The daemon passed WaitForReady but its ROUTER did not answer. Dump its
+    // log: without this the CI failure is just "connect timed out" with no way
+    // to tell a dead daemon from a slow one (issue #919).
+    std::printf(
+        "[detached-spawn] client could not reach the daemon on port %u "
+        "(DEALER dials %u); IsRunning=%d; daemon log follows:\n----\n%s\n----\n",
+        port, port + 3, static_cast<int>(server.IsRunning()),
+        ReadWholeFile(log_path).c_str());
+  }
   REQUIRE(connected);  // #721: a dead ROUTER would make this time out / fail
 
   auto *ipc = CLIO_IPC;

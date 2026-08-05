@@ -1110,8 +1110,20 @@ TEST_CASE("ReorganizeBlob - Cleanup", "[reorganize][cleanup]") {
 }
 
 int main(int argc, char** argv) {
-  // Create fixture (initializes runtime)
-  g_fixture = new ReorganizeBlobTestFixture();
+  // Create fixture (initializes runtime).
+  //
+  // Guarded: the fixture REQUIREs the runtime to come up, and a REQUIRE throws.
+  // Thrown from here it escaped main, so a runtime that failed to start turned
+  // into std::terminate -> SIGABRT, which ctest reports as the bare
+  // "Subprocess aborted" seen on the leak-check runner (#919) with the reason
+  // buried thousands of log lines up. Report it as a failure instead.
+  try {
+    g_fixture = new ReorganizeBlobTestFixture();
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "FATAL: reorganize fixture setup failed: %s\n",
+                 e.what());
+    return 1;
+  }
 
   // Run tests with optional filter from command line
   std::string filter = (argc > 1) ? argv[1] : "";

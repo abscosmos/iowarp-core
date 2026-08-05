@@ -59,6 +59,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -144,11 +146,25 @@ class RuntimeServer {
   }
 
   /**
-   * Poll until the runtime's main shared-memory segment exists, signalling that
-   * the daemon has initialized far enough to serve clients. Portable: on POSIX
-   * the segment is a file under /tmp/clio_$USER, on Windows a named mapping
-   * — SystemInfo::OpenSharedMemory abstracts both. Returns false if the timeout
-   * elapses or the daemon exits early.
+   * Poll until the daemon is genuinely able to serve clients. Two stages:
+   *
+   *   1. the runtime's main shared-memory segment exists — portable: on POSIX a
+   *      file under /tmp/clio_$USER, on Windows a named mapping, both behind
+   *      SystemInfo::OpenSharedMemory;
+   *   2. its request ROUTER is BOUND, read from the daemon's captured log.
+   *
+   * Stage 2 exists because stage 1 fires early in daemon init, well before the
+   * transport comes up. This used to be papered over with a flat 1 s sleep,
+   * which is a guess, not a signal: on a loaded Windows Debug runner the ROUTER
+   * can still be unbound when it expires, and the daemon can also die inside it
+   * (issue #848) with the old code returning true for a dead process. Either
+   * way the caller was handed a daemon it could not reach, and callers that
+   * retry on a fresh port (see test_daemon_detached_spawn) never got the chance
+   * — they had already been told the daemon was ready. That is the
+   * cr_detached_spawn flake: the client's DEALER dials port+3 and times out.
+   *
+   * Returns false if the timeout elapses or the daemon exits early, which is
+   * what lets those callers retry instead of failing outright.
    */
   bool WaitForReady(int timeout_ms = 30000) {
     // Segment names are port-keyed (see ConfigManager::GetSharedMemorySegmentName)
@@ -157,18 +173,63 @@ class RuntimeServer {
         ctp::ConfigParse::ExpandPath("chi_main_segment_${USER}") + "_" +
         std::to_string(port_);
     const int attempts = timeout_ms / 200;
-    for (int i = 0; i < attempts; ++i) {
+    int i = 0;
+    bool segment_up = false;
+    for (; i < attempts && !segment_up; ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       if (!IsRunning()) return false;  // daemon died during startup
       ctp::File fd;
       if (ctp::SystemInfo::OpenSharedMemory(fd, seg)) {
         ctp::SystemInfo::CloseSharedMemory(fd);
-        // Let the daemon finish binding its transports / starting workers.
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        return true;
+        segment_up = true;
       }
     }
-    return false;
+    if (!segment_up) return false;
+
+    // Spend whatever budget is left waiting for the daemon to log that its
+    // admin pool exists. The daemon logs it at INFO, so a caller that wants
+    // this stage must leave CTP_LOG_LEVEL at info or lower; if the line never
+    // shows up we fall through to the settle sleep rather than failing a
+    // daemon that is fine.
+    //
+    // The marker is the ADMIN POOL, not the ROUTER bind. Ordering the daemon's
+    // own startup log, the ROUTER binds second of twenty-one markers -- before
+    // the chimods load, before the workers spawn, and before the admin pool is
+    // created. Treating it as "ready" would hand callers a daemon that cannot
+    // yet route a task, which is strictly worse than the sleep it replaced.
+    // Waiting for the admin pool means the runtime can actually serve work.
+    const std::string log_path = ServerLogPath();
+    bool marker_seen = false;
+    for (; i < attempts && !marker_seen; ++i) {
+      if (!IsRunning()) return false;
+      if (ServerLogHasAdminPool(log_path)) {
+        marker_seen = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    // Keep the historical settle in BOTH cases -- marker seen or budget spent.
+    // The marker is necessary but not provably sufficient: startup work that
+    // logs nothing (e.g. compose/WAL replay re-creating restartable pools) can
+    // still be in flight. Retaining the settle makes this readiness check
+    // strictly stronger than the sleep-only version it replaces, never weaker.
+    // Do not call a daemon that died inside the settle ready.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    return IsRunning();
+  }
+
+  /**
+   * @return true if the daemon's captured log shows the admin pool created --
+   * i.e. the runtime can route a task, not merely accept a connection.
+   */
+  static bool ServerLogHasAdminPool(const std::string &log_path) {
+    std::ifstream f(log_path, std::ios::binary);
+    if (!f) return false;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str().find("Admin chimod pool created successfully") !=
+           std::string::npos;
   }
 
   /** Stop the daemon (SIGTERM then SIGKILL on POSIX — so ServerFinalize's leak

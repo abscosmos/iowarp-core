@@ -126,6 +126,12 @@ add_executable(test_bdev_fragmentation
     test_bdev_fragmentation.cc
 )
 
+# Freed space must reach the DPE without waiting for a StatTargets tick (#919).
+# Drives the stale-mirror window that made cte_bdev_fragmentation flaky.
+add_executable(test_bdev_free_visibility
+    test_bdev_free_visibility.cc
+)
+
 # Batching benchmark (#820): many small writes at ONE blob, A/B'd on the same
 # binary via CLIO_TASK_BATCHING.
 add_executable(bench_same_blob_batching
@@ -445,6 +451,18 @@ target_link_libraries(test_vectored_blob_io
 
 # Link test_bdev_fragmentation (#820) - same deps.
 target_link_libraries(test_bdev_fragmentation
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# Link test_bdev_free_visibility (#919) - same deps.
+target_link_libraries(test_bdev_free_visibility
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime
@@ -849,6 +867,15 @@ add_test(NAME cte_bdev_fragmentation
 set_tests_properties(cte_bdev_fragmentation PROPERTIES
     TIMEOUT 300
     LABELS "regression;bdev;cte;820"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+
+# issue #919: placement must see space freed since the last StatTargets tick.
+# Four fill/stat/delete/put cycles; a stray periodic tick can rescue one, not all.
+add_test(NAME cte_bdev_free_visibility
+    COMMAND test_bdev_free_visibility)
+set_tests_properties(cte_bdev_free_visibility PROPERTIES
+    TIMEOUT 600
+    LABELS "regression;bdev;cte;919"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
 
 # Add reorganize blob tests
