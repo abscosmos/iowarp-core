@@ -495,37 +495,16 @@ void PoolManager::InitAddressMap(PoolId pool_id, u32 num_containers) {
   HLOG(kDebug, "=== Address Map for Pool {} ===", pool_id);
   HLOG(kDebug, "Creating address map with {} containers", num_containers);
 
-  // Place containers on LIVE nodes only (issue #856). The mapping used to be
-  // the identity ContainerId == NodeId, which places a container on every node
-  // in the hostfile INCLUDING ones already confirmed dead — and a container
-  // cannot be created on a dead node. Every such replica then fails the whole
-  // create: Task::AggregateOut propagates any non-zero replica RC to the
-  // origin, so `CreatePool` after a node death returned an error even though
-  // it succeeded everywhere it could. (Before dead-node tasks completed at all
-  // it did not error, it HUNG — the leader-election step timeout.)
-  std::vector<u32> target_nodes;
-  {
-    auto *ipc_manager = CLIO_IPC;
-    if (ipc_manager != nullptr) {
-      for (const auto &h : ipc_manager->GetAllHosts()) {
-        if (h.IsAlive()) {
-          target_nodes.push_back(static_cast<u32>(h.node_id));
-        }
-      }
-    }
-  }
-  if (target_nodes.empty()) {
-    // No liveness information (single-node / early boot): keep the identity
-    // mapping so behaviour is unchanged.
-    for (u32 i = 0; i < num_containers; ++i) {
-      target_nodes.push_back(i);
-    }
-  }
+  // ContainerId == NodeId. This mapping must be globally consistent — every
+  // node derives routing from it — so it deliberately does NOT consult
+  // liveness (issue #856): a view-dependent map lets two nodes disagree about
+  // where a container lives. A container whose node is dead is handled by
+  // recovery (which redistributes it) and by forgiving its undeliverable
+  // replica at completion, not by quietly moving it here.
   for (u32 container_idx = 0; container_idx < num_containers; ++container_idx) {
-    u32 node = target_nodes[container_idx % target_nodes.size()];
-    info.address_map_[container_idx] = node;
-    HLOG(kDebug, "  Container[{}] -> Node[{}] (pool: {})", container_idx, node,
-         pool_id);
+    info.address_map_[container_idx] = container_idx;
+    HLOG(kDebug, "  Container[{}] -> Node[{}] (pool: {})", container_idx,
+         container_idx, pool_id);
   }
 
   HLOG(kDebug, "=== Address Map Complete ===");
@@ -555,15 +534,15 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   // Set num_containers equal to number of nodes in the cluster
   auto* ipc_manager = CLIO_IPC;
   std::vector<Host> all_hosts = ipc_manager->GetAllHosts();
-  // Size the pool to the LIVE cluster (issue #856): a container cannot be
-  // created on a dead node, and counting one anyway makes every create fail
-  // (or, before dead-node tasks completed, hang) after a node death.
-  u32 num_alive = 0;
-  for (const auto &h : all_hosts) {
-    if (h.IsAlive()) ++num_alive;
-  }
-  const u32 num_containers =
-      num_alive > 0 ? num_alive : static_cast<u32>(all_hosts.size());
+  // Pool geometry MUST be identical on every node (issue #856). Sizing this to
+  // the live cluster instead was tried and reverted: CreatePool runs on every
+  // node handling the broadcast, so each computed its own count from its own
+  // transient liveness view — a restarted node built the pool with 4
+  // containers while the survivors built it with 3, i.e. a split-brain layout.
+  // The hostfile size is the same everywhere, so it stays the source of truth;
+  // an undeliverable replica for a dead node is forgiven at completion instead
+  // (BaseCreateTask::PostWait).
+  const u32 num_containers = static_cast<u32>(all_hosts.size());
 
   HLOG(kInfo,
        "PoolManager: Creating pool '{}' with {} containers (one per node)",
