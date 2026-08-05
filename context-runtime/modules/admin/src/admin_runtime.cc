@@ -38,6 +38,7 @@
  * Contains the server-side task processing logic with PoolManager integration.
  */
 
+#include <cstdlib>
 #include "clio_runtime/admin/admin_runtime.h"
 
 #include <clio_runtime/manager.h>
@@ -2026,8 +2027,21 @@ clio::run::TaskResume Runtime::TriggerRecovery(clio::run::u64 dead_node_id) {
 
   HLOG(kInfo, "Recovery: {} containers to redistribute from node {}",
        assignments.size(), dead_node_id);
-  CLIO_CO_AWAIT(client_.AsyncRecoverContainers(clio::run::PoolQuery::Broadcast(0),
-                                          assignments, dead_node_id));
+  {
+    // Do NOT keep the plan alive across the suspend (issue #856). The crash
+    // backtrace lands in ~vector<RecoveryAssignment>() at this scope's exit:
+    // the vector owns heap strings and lived on the FIBER STACK across the
+    // await, and by the time the fiber resumed those blocks were freed twice
+    // (`free(): invalid pointer` / `double free detected in tcache 2`).
+    // AsyncRecoverContainers serializes the plan into the task before it
+    // returns the future, so nothing needs the vector afterwards — hand off,
+    // release the heap ownership, and only then suspend.
+    auto fut = client_.AsyncRecoverContainers(
+        clio::run::PoolQuery::Broadcast(0), assignments, dead_node_id);
+    assignments.clear();
+    assignments.shrink_to_fit();
+    CLIO_CO_AWAIT(fut);
+  }
   CLIO_TASK_BODY_END
 }
 
@@ -2048,6 +2062,26 @@ clio::run::TaskResume Runtime::RecoverContainers(
     std::vector<char> buf(data.begin(), data.end());
     ctp::ipc::GlobalDeserialize<std::vector<char>> ar(buf);
     ar(assignments);
+  }
+
+  // TRACE856 bisect knob 2 (diagnostic; default OFF). With
+  // CLIO_856_NOOP_RECOVER=1 the handler deserializes the plan and returns
+  // without touching the address map or the WAL, isolating the BROADCAST/TASK
+  // machinery from the work the handler does. Knob 1
+  // (CLIO_856_SKIP_RECOVER_CREATE) already showed the corruption survives with
+  // zero container creation.
+  {
+    static const bool noop_recover = [] {
+      const char *e = std::getenv("CLIO_856_NOOP_RECOVER");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (noop_recover) {
+      HLOG(kWarning, "[TRACE856] RecoverContainers no-op ({} assignments)",
+           assignments.size());
+      task->SetReturnCode(0);
+      cur_task->SetDidWork(true);
+      CLIO_CO_RETURN;
+    }
   }
 
   for (const auto &ra : assignments) {
@@ -2076,6 +2110,24 @@ clio::run::TaskResume Runtime::RecoverContainers(
       continue;
     }
 
+    // TRACE856 bisect knob (diagnostic; default OFF = normal behaviour).
+    // CLIO_856_SKIP_RECOVER_CREATE=1 performs the address-map updates but
+    // skips container construction/registration, to isolate whether the
+    // recovery-path memory corruption comes from creating+registering a
+    // container underneath live fibers, or from the broadcast/task machinery.
+    {
+      static const bool skip_create = [] {
+        const char *e = std::getenv("CLIO_856_SKIP_RECOVER_CREATE");
+        return e != nullptr && e[0] == '1';
+      }();
+      if (skip_create) {
+        HLOG(kWarning,
+             "[TRACE856] skipping container {} creation for pool {} "
+             "(CLIO_856_SKIP_RECOVER_CREATE=1)",
+             ra.container_id_, ra.pool_name_);
+        continue;
+      }
+    }
     HLOG(kInfo, "Recovery: Creating container {} for pool {} ({})",
          ra.container_id_, ra.pool_name_, ra.chimod_name_);
     clio::run::DynamicContainer container(ra.chimod_name_, ra.pool_id_,
