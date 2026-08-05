@@ -91,7 +91,13 @@ endif()
 # its own symbols at System.loadLibrary time.
 find_path(CLIO_JNI_INCLUDE_DIR jni.h
   HINTS $ENV{JAVA_HOME}/include /usr/lib/jvm/default-java/include)
-if(CLIO_JNI_INCLUDE_DIR)
+# NOT WIN32: InitOnce() installs a no-op SIGUSR1 sigaction to survive the
+# Linux SHM transport's tgkill wakeups — POSIX-signal machinery with no
+# Windows counterpart (and no Windows SHM-wake path to survive). Windows
+# runners ship a JDK, so without this gate every Windows build that finds
+# jni.h dies compiling sigaction/SIGUSR1 (first seen when the packaging
+# workflows ran against dev content in #899).
+if(CLIO_JNI_INCLUDE_DIR AND NOT WIN32)
   message(STATUS "YCSB JNI binding enabled (jni.h at ${CLIO_JNI_INCLUDE_DIR})")
   add_library(clio_ycsb_jni SHARED
     ycsb/clio_ycsb_jni.cc

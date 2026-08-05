@@ -4,6 +4,13 @@ cmake_minimum_required(VERSION 3.10)
 # Restart integration test (no Docker required)
 add_subdirectory(restart)
 
+# Indexer restart test (#905, no Docker required): docs put through the
+# indexer, runtime reboot, SemanticSearch verified against the index the
+# indexer rebuilt from file-backed storage. Gated on the indexer chimod.
+if(TARGET clio_cte_indexer_client)
+    add_subdirectory(indexer_restart)
+endif()
+
 # Replication persistence test (#886, no Docker required): 50 CachedPuts
 # (DRAM primary + disk replica), runtime reboot, disk replicas verified.
 # Gated on the replication chimod (default ON).

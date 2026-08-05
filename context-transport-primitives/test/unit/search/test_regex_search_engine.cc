@@ -394,3 +394,69 @@ TEST_CASE("RegexSearch: parallel insert/delete/search", "[regex_search][parallel
   }
   REQUIRE(eng.Size() == final_res.keys().size());
 }
+
+TEST_CASE("RegexSearch: rename never drops an entry from a listing (#919)",
+          "[regex_search][parallel]") {
+  // A renamer flips a fixed set of keys between two names in the SAME
+  // directory, so the directory's population never changes: at every instant
+  // each key exists exactly once, under one name or the other, and both names
+  // match the listing pattern. A listing may therefore report a key under
+  // either name, but must always report exactly kFiles of them.
+  //
+  // Search used to break that. It snapshots candidate keys under the shared
+  // lock, releases it for the (expensive, deliberately unlocked) regex pass,
+  // then re-acquires to fetch values -- and a key renamed a->b in between was
+  // captured as `a`, is gone as `a` by the value lookup, and `b` was never a
+  // candidate. The entry vanished from a listing of its own directory, which is
+  // the cr_cli_cfs_rename D4 failure (`n == kFiles`) reproduced here at its
+  // source.
+  RegexSearchEngine<int> eng;
+  constexpr int kFiles = 12;
+  constexpr int kRounds = 400;
+  const std::string kPattern = "^/D4/[^/]+$";
+
+  auto name = [](const char *side, int i) {
+    return std::string("/D4/") + side + std::to_string(i) + ".bin";
+  };
+  for (int i = 0; i < kFiles; ++i) {
+    eng.Insert(name("a", i), i);
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> short_listings{0};
+  std::atomic<int> listings{0};
+  std::atomic<int> worst{kFiles};
+
+  std::thread renamer([&]() {
+    for (int round = 0; round < kRounds; ++round) {
+      const char *from = (round % 2 == 0) ? "a" : "b";
+      const char *to = (round % 2 == 0) ? "b" : "a";
+      for (int i = 0; i < kFiles; ++i) {
+        eng.Rename(name(from, i), name(to, i));
+      }
+    }
+    stop.store(true, std::memory_order_relaxed);
+  });
+
+  std::thread lister([&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      const int n = static_cast<int>(eng.Search(kPattern).keys().size());
+      listings.fetch_add(1, std::memory_order_relaxed);
+      if (n != kFiles) {
+        short_listings.fetch_add(1, std::memory_order_relaxed);
+        int cur = worst.load(std::memory_order_relaxed);
+        while (n < cur &&
+               !worst.compare_exchange_weak(cur, n, std::memory_order_relaxed)) {
+        }
+      }
+    }
+  });
+
+  renamer.join();
+  lister.join();
+
+  INFO("listings=" << listings.load() << " short=" << short_listings.load()
+                   << " worst=" << worst.load() << " expected=" << kFiles);
+  REQUIRE(listings.load() > 0);  // the lister really did run concurrently
+  REQUIRE(short_listings.load() == 0);
+}

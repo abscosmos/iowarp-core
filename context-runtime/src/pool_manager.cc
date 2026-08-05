@@ -74,6 +74,11 @@ bool PoolManager::ServerInit() {
   }
 
   is_initialized_ = true;
+  // Log the instance address so a later "container not found" miss can be told
+  // apart: same address as the miss => access-before-init ordering; different
+  // address => this manager is duplicated per module (issue #923).
+  HLOG(kInfo, "PoolManager::ServerInit: instance={}",
+       static_cast<const void *>(this));
 
   // Create the admin chimod pool (kAdminPoolId = 1)
   // This is required for flush operations and other admin tasks

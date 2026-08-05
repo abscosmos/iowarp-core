@@ -19,20 +19,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ---- Matrix tier selection (issue #921) -----------------------------------
+  # A pull request builds ONE representative macOS runner; the full arm64 +
+  # Intel, macOS 14 -> 26 sweep runs on push to main/dev. Breadth on every PR
+  # commit bought little: the five runners fail together on real breakage, so
+  # what the extra four mostly added was more chances to hit a flake, more
+  # queue time, and more reruns. The sweep still gates what lands, just at the
+  # merge point instead of on every push to a branch.
+  #
+  # macos-15 (arm64) is the PR runner: current-generation Apple silicon, the
+  # default arch for contributors, and where cr_cli_cfs_rename surfaced.
+  matrix-tier:
+    runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.pick.outputs.os }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo 'os=["macos-15"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["macos-14","macos-15","macos-15-intel","macos-26","macos-26-intel"]' >> "$GITHUB_OUTPUT"
+          fi
+
   # ---- Standard build + ctest (arm64 + Intel, macOS 14 -> 26) ---------------
   build-test:
     name: build-test (${{ matrix.os }})
+    needs: matrix-tier
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - macos-14         # arm64, macOS 14 (Sonoma)
-          - macos-15         # arm64, macOS 15 (Sequoia)
-          - macos-15-intel   # x86_64, macOS 15 (Sequoia)
-          - macos-26         # arm64, macOS 26 (Tahoe)
-          - macos-26-intel   # x86_64, macOS 26 (Tahoe)
+        os: ${{ fromJSON(needs.matrix-tier.outputs.os) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -135,9 +155,20 @@ jobs:
           else
             echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Report retried-but-passed tests
+        if: always()
+        shell: bash
+        # A green check must not mean "some test failed and we retried until it
+        # did not" (#921). Reports only -- never fails the job.
+        run: bash CI/report_flaky_tests.sh build/Testing/Temporary/LastTest.log "macos ${{ matrix.os }}"
 
       - name: Upload test logs
         if: always()
+        # Never let the artifact service sink an otherwise-green job (#921).
+        # These logs are diagnostics; the verdict already came from "Run tests".
+        # Seen on PR #920: build-test (windows-11-arm) passed every one of its
+        # tests, then failed the job on an upload-artifact BlobNotFound.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: mac-test-logs-${{ matrix.os }}
@@ -149,6 +180,9 @@ jobs:
   # ---- Boost.Context stackful coroutine backend (#620) ----------------------
   boost:
     name: boost (${{ matrix.os }})
+    # Push-only (#921): the Boost.Context coroutine backend is a build variant,
+    # not an arch. It gates main/dev rather than every PR commit.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
