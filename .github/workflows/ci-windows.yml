@@ -220,6 +220,12 @@ jobs:
           else
             echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Report retried-but-passed tests
+        if: always()
+        shell: bash
+        # A green check must not mean "some test failed and we retried until it
+        # did not" (#921). Reports only -- never fails the job.
+        run: bash CI/report_flaky_tests.sh build/Testing/Temporary/LastTest.log "windows ${{ matrix.os }}"
       - name: Upload test logs
         if: always()
         # Never let the artifact service sink an otherwise-green job (#921).
@@ -421,6 +427,12 @@ jobs:
           else
             echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Report retried-but-passed tests
+        if: always()
+        shell: bash
+        # A green check must not mean "some test failed and we retried until it
+        # did not" (#921). Reports only -- never fails the job.
+        run: bash CI/report_flaky_tests.sh build/Testing/Temporary/LastTest.log "windows ${{ matrix.os }}"
       - name: Upload test logs
         if: always()
         # Never let the artifact service sink an otherwise-green job (#921).
