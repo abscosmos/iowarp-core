@@ -452,6 +452,21 @@ private:
   // Recovery state
   std::vector<clio::run::RecoveryAssignment> ComputeRecoveryPlan(clio::run::u64 dead_node_id);
   clio::run::TaskResume TriggerRecovery(clio::run::u64 dead_node_id);
+  /**
+   * Dead nodes whose recovery this leader has already started.
+   *
+   * Guarded by recovery_mutex_ (issue #856): HeartbeatProbe is periodic and
+   * runs on DIFFERENT worker threads across periods (observed alternating
+   * between two workers in the leader-election harness), and each period
+   * gets its own fiber. When more than one node is confirmed dead — the
+   * normal case once a crashed leader is followed by a second failure — two
+   * HeartbeatProbe fibers call TriggerRecovery concurrently on separate
+   * threads and mutate this set at the same time. An unsynchronized
+   * std::unordered_set rehash then frees the old bucket array underneath the
+   * other thread: `free(): invalid pointer`, which killed the recovery
+   * leader and cascaded to the next one.
+   */
+  std::mutex recovery_mutex_;
   std::unordered_set<clio::run::u64> recovery_initiated_;
 };
 

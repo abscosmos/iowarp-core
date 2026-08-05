@@ -1975,8 +1975,25 @@ clio::run::TaskResume Runtime::TriggerRecovery(clio::run::u64 dead_node_id) {
   CLIO_TASK_BODY_BEGIN
   auto *ipc_manager = CLIO_IPC;
   if (!ipc_manager->IsLeader()) CLIO_CO_RETURN;
-  if (recovery_initiated_.count(dead_node_id)) CLIO_CO_RETURN;
-  recovery_initiated_.insert(dead_node_id);
+  // Claim this dead node's recovery exactly once, ATOMICALLY (issue #856).
+  // Two things were wrong with the old `count()` then `insert()` pair:
+  //   1. It ran unsynchronized while HeartbeatProbe fibers from different
+  //      periods execute on different worker THREADS. With two nodes down
+  //      (a crashed leader followed by a second failure) the two calls race,
+  //      and the insert that rehashes frees the old bucket array under the
+  //      other thread — the `free(): invalid pointer` abort that killed the
+  //      recovery leader and cascaded to its successor.
+  //   2. Even without corruption, check-then-act let two threads both decide
+  //      to recover the same node (duplicate redistribution).
+  // insert() returns .second=false when the key was already present, so one
+  // locked call both tests and claims. No await inside the lock: a fiber must
+  // never suspend holding a std::mutex.
+  {
+    std::lock_guard<std::mutex> lk(recovery_mutex_);
+    if (!recovery_initiated_.insert(dead_node_id).second) {
+      CLIO_CO_RETURN;
+    }
+  }
   if (ipc_manager->IsSelfFenced()) {
     HLOG(kWarning, "Recovery: Skipping for node {} - self-fenced",
          dead_node_id);
