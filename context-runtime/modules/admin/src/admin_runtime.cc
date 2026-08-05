@@ -1943,6 +1943,20 @@ std::vector<clio::run::RecoveryAssignment> Runtime::ComputeRecoveryPlan(
   size_t rr_idx = 0;
 
   for (const auto &pool_id : pool_manager->GetAllPoolIds()) {
+    // NEVER redistribute the admin pool (issue #856). Admin is per-node
+    // control-plane infrastructure: the pool is created with one container
+    // per node and every node builds its own at startup. A dead node's admin
+    // container has no work to take over — moving it to a survivor just
+    // constructs a SECOND admin Runtime there, duplicating the periodics that
+    // instance owns (HeartbeatProbe, SystemMonitor, ...) and racing them
+    // against the node's real admin container. It also means RecoverContainers
+    // registers a new admin container on a node whose HeartbeatProbe fibers
+    // are executing on the existing one — and ContainerHold is a bare
+    // Container* whose header states the container "is never swapped or
+    // migrated while handles are live".
+    if (pool_id == clio::run::kAdminPoolId) {
+      continue;
+    }
     const clio::run::PoolInfo *info = pool_manager->GetPoolInfo(pool_id);
     if (!info) continue;
     for (const auto &[container_id, node_id] : info->address_map_) {
