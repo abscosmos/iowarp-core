@@ -6100,10 +6100,29 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   // Snapshot available targets for the DPE. target_list_ is the contiguous
   // mirror of registered_targets_ — copying it under the read lock is O(N_live)
   // with no map iteration over empty slots.
+  //
+  // remaining_space_ is the one field the data path mutates: PutBlob debits and
+  // Free credits the CANONICAL map entry only, lock-free, while the mirror is
+  // refreshed lazily by the periodic StatTargets sweep
+  // (performance.stat_targets_period_ms, 5 s by default). Feeding the DPE the
+  // mirror's copy therefore places against free space that can be a full tick
+  // out of date — and the failure is not symmetric: a tick that lands while a
+  // tier is full pins the mirror at ~0, so every subsequent put is rejected for
+  // "no target has space" even after the blobs holding that space are deleted.
+  // Re-read the canonical value here so placement always sees real free space
+  // (same reason GetCapacity iterates registered_targets_ directly).
   std::vector<TargetInfo> available_targets;
   {
     clio::run::ScopedCoRwReadLock read_lock(target_lock_);
     available_targets = target_list_;
+    for (auto &t : available_targets) {
+      TargetInfo *canonical = registered_targets_.find(t.bdev_client_.pool_id_);
+      if (canonical != nullptr) {
+        t.remaining_space_ =
+            ctp::ipc::atomic_ref<clio::run::u64>(canonical->remaining_space_)
+                .load(std::memory_order_relaxed);
+      }
+    }
   }
   if (available_targets.empty()) {
     error_code = 1;
