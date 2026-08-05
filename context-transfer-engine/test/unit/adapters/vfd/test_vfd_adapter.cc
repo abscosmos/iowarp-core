@@ -242,6 +242,24 @@ int RunCmd(const std::string &cmd) {
   return std::system((cmd + " >/dev/null 2>&1").c_str());
 }
 
+// Is a missing HDF5 CLI tool an environment gap (skip) or a broken build (fail)?
+//
+// It depends entirely on WHERE we are running, which is why this is a switch and
+// not a policy baked into the test. On a developer's box the tools may genuinely
+// not be installed, and skipping is right -- the rest of the suite still runs.
+// In CI it is the opposite: the deps-cpu image ships h5dump/h5ls/h5repack/h5diff,
+// so "not found" means the environment regressed, and the tool matrix is the
+// ONLY evidence in this binary for native compatibility as external readers see
+// it (§1.1(c)). Letting that warn-and-pass meant the single most load-bearing
+// check in the suite was allowed to silently not run while the job stayed green.
+//
+// CI sets CLIO_REQUIRE_HDF5_TOOLS=1 (see .github/workflows/ci-vfd.yml) to turn
+// every such skip into a failure.
+bool ToolsAreRequired() {
+  const char *v = std::getenv("CLIO_REQUIRE_HDF5_TOOLS");
+  return v && *v && std::strcmp(v, "0") != 0;
+}
+
 // H5Ewalk callback: set *data if any error on the stack is the driver's own
 // push, identified by the message text the driver emits.
 herr_t FindClioErr(unsigned n, const H5E_error2_t *err, void *data) {
@@ -322,6 +340,36 @@ int main() {
     CHECK(VerifyRich(rs), "3: sec2 file content correct");
     CHECK(VerifyRich(rn), "3: VFD's native file content correct (read w/o VFD)");
     CHECK(H5Fclose(rs) >= 0 && H5Fclose(rn) >= 0, "3: close diff files");
+
+    // The two VerifyRich calls above are each a SELF-consistency check: they
+    // assert that a file contains what this test wrote. Two independent
+    // self-checks are not a differential test -- they would both still pass if
+    // the VFD and sec2 produced files that differed in any way VerifyRich does
+    // not happen to look at (anything outside the datasets and attribute it
+    // reads: layout, filter pipeline, object header contents, fill values,
+    // storage sizes). "Differential vs sec2" is what this section is called, so
+    // it should actually compare the two files.
+    //
+    // h5diff is the same oracle §1.1(a) of VFD_VOL_TECHNICAL_GOALS.md names, and
+    // the same one the Python compat suite uses, which keeps the two suites
+    // saying the same thing by the same means. Not byte-identity: HDF5 is
+    // permitted to vary allocation order and free-space layout, which is
+    // precisely why the criterion is h5diff and not cmp(1).
+    //
+    // Skipped, loudly, when h5diff is absent -- but CI requires it (ci-vfd.yml),
+    // so the skip only ever fires on a bare local box.
+    if (!HasTool("h5diff")) {
+      CHECK(!ToolsAreRequired(),
+            "3: h5diff required (CLIO_REQUIRE_HDF5_TOOLS=1) but not on PATH");
+      std::printf("[vfd-suite] WARN 3: h5diff not on PATH; SKIPPING the "
+                  "VFD-vs-sec2 file comparison (the differential half of this "
+                  "section is NOT verified here)\n");
+    } else {
+      CHECK(RunCmd(std::string("h5diff '") + kNativeDiff + "' '" + kSec2 +
+                   "'") == 0,
+            "3: h5diff(VFD-produced, sec2-produced) reports no differences");
+      std::printf("[vfd-suite] ok 3: h5diff VFD-produced == sec2-produced\n");
+    }
     std::printf("[vfd-suite] ok 3: differential vs sec2 (rich content)\n");
   }
 
@@ -1054,6 +1102,9 @@ int main() {
   {
     if (!HasTool("h5dump") || !HasTool("h5ls") || !HasTool("h5repack") ||
         !HasTool("h5diff")) {
+      CHECK(!ToolsAreRequired(),
+            "4: native HDF5 CLI tools required (CLIO_REQUIRE_HDF5_TOOLS=1) but "
+            "not on PATH");
       std::fprintf(stderr,
                    "[vfd-suite] WARN 4: native HDF5 CLI tools not on PATH; "
                    "SKIPPING the tool matrix (native-compat NOT verified here). "

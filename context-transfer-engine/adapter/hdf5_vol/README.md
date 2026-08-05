@@ -98,14 +98,24 @@ writes are valid native HDF5 files readable by standard tools.
   because with it on there is no error to observe.
 
   The architectural question this raises: **what establishes that a cached
-  image still corresponds to the file, and where does that check live?** A
-  per-connector stamp is enough for the between-sessions case, but the same
-  question recurs for byte-range residency in the VFD and for the filesystem
-  adapter's shared-memory read path, which already gives up whenever any page
-  might be missing because it cannot tell an absent page from a zero-filled
-  one. Three call sites, one missing primitive. See
-  `translation/VFD_VOL_ARCH_DECISIONS.md` §1, which argues the residency half
-  belongs at the chimod and the coherence half stays with the adapter.
+  image still corresponds to the file, and where does that check live?** These
+  are TWO questions, and running them together makes a cheap fix look gated
+  behind an expensive one:
+
+  - **Coherence** — does the cached copy still match the file? Only the
+    *adapter* can answer, since only it knows which POSIX file a tag stands
+    for. That is this gap, and a stamp captured at close and validated at open
+    closes the between-sessions case (not the during-a-session one, which is
+    the multi-process problem and is declared undefined).
+  - **Residency** — is a byte range actually present in the tier, or a hole the
+    tier will silently zero-fill? Only the *tier* can answer. This is a
+    different problem that this connector does not currently have; it is what
+    stalls the VFD read tier and what makes the filesystem adapter's
+    shared-memory read path give up whenever any page might be missing, because
+    it cannot tell an absent page from a zero-filled one.
+
+  See `translation/VFD_VOL_PLAN.md` "Architectural decisions" §1: the residency
+  half belongs at the chimod, the coherence half stays with the adapter.
 - **No `HDF5_VOL_CONNECTOR` config string** — `info_cls.from_str` is not
   implemented, so options come from the environment variables above (W14).
 
@@ -136,28 +146,44 @@ caching is helping, which selections repeat, small-read/per-object-cost patterns
 
 ## Testing and current status
 
-Compatibility is verified by a differential suite (native VOL as the oracle):
-each feature case is written/read through the connector and compared to native,
-plus `h5diff`/`h5dump`. It is registered as the CTest test
-`cte_hdf5_vol_compat_suite` (gated on `CLIO_CTE_ENABLE_HDF5_VOL`; `RUN_SERIAL`
-because it manages its own `clio_run`).
+Compatibility is verified by a differential suite (the native stack as the
+oracle): each feature case is written/read through the connector and compared to
+native across four arms, plus the §1.1 native-compatibility gates — `h5diff`,
+structural validity (`h5clear -s` + a clean reopen), `h5dump -pBH`/`h5ls
+-vlr`/`h5stat` **output** parity, and error-code parity against native on
+negative paths. It is registered as the CTest test `cte_hdf5_vol_compat_suite`
+(gated on `CLIO_CTE_ENABLE_HDF5_VOL`; `RUN_SERIAL` because it manages its own
+`clio_run`).
+
+The same harness drives the VFD via `--modes vfd`, registered separately as
+`cte_hdf5_vfd_compat_suite`. The corpus is shared; what it *means* is not — see
+the module docstring.
 
 ```bash
 ctest -R cte_hdf5_vol_compat_suite --output-on-failure
 # or directly:
-python3 benchmarks/hdf5-ingest/vol_compat_suite.py --bin <build>/bin
+python3 benchmarks/hdf5-ingest/hdf5_compat_suite.py --modes vol --bin <build>/bin
 ```
 
-The test runs in **honest mode** (no `--expect-fail` allowlist): it reports the
-connector's real compatibility state rather than masking gaps, so any future
-regression fails the test. For the authoritative, always-current status run the
-test; do not rely on numbers copied into prose. As of this writing it is **green
-(20/20)** — compatible for dataset I/O (signed/unsigned int, float, compound, enum,
-array-element, scalar, and variable-length string datatypes; contiguous and
-chunked; shuffle/fletcher32 filters; whole-dataset, hyperslab, and point
-selections; extendible datasets with reopen+append), attributes, group/link
+The test reports the connector's real compatibility state rather than masking
+gaps, so any future regression fails it. For the authoritative, always-current
+status run the test; do not rely on numbers copied into prose.
+
+It carries exactly **one** `--expect-fail` entry, not a blanket allowlist:
+`vol/eparity_cacheon/corrupt_checksum_read`. With the cache on, a file damaged on
+disk after being read once is served from the staged copy, so the read succeeds
+where native fails its fletcher32 check — the external-modification staleness
+limitation described above. The same case passes with the cache off. The suite
+reports an expected-gap entry that starts passing, so the allowlist cannot
+outlive the gap it excuses. As of this writing it is **40/41 — every entry
+passing except that one expected gap** — compatible for dataset I/O
+(signed/unsigned int, float, compound, enum, array-element, scalar, and
+variable-length string datatypes; contiguous, chunked, **compact, external and
+virtual/VDS** layouts; shuffle/fletcher32 filters; whole-dataset, hyperslab, and
+point selections; extendible datasets with reopen+append), attributes, group/link
 structure, modern-API iteration (C `H5Ovisit3`/`H5Literate2`), selection-aware read
-caching, Safe-mode `H5Fflush` durability, and access telemetry.
+caching, Safe-mode `H5Fflush` durability, access telemetry, and error-code parity
+with native on negative paths in both cache-on and cache-off configurations.
 
 Feature areas the h5py cases can't reach (h5py has poor non-native VOL support) run
 through the C API / a telemetry check, all automated by the suite: iteration
