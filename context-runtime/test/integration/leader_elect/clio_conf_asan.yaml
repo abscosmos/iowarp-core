@@ -1,0 +1,34 @@
+# Clio Configuration for Leader Election Integration Testing
+# 4-node cluster testing leader shutdown, failover, and restart
+
+# Network configuration
+networking:
+  port: 9413
+  neighborhood_size: 4
+  hostfile: "/workspace/context-runtime/test/integration/leader_elect/hostfile"
+
+# Logging configuration
+logging:
+  level: "info"
+  file: "/tmp/clio.log"
+
+# Runtime configuration
+runtime:
+  num_threads: 8
+  queue_depth: 1024
+  local_sched: "default"
+  first_busy_wait: 50
+
+# Fast SWIM failure detection for the test (production defaults are 30/15/60s,
+# which would take ~150s to confirm a dead node — longer than the scenario).
+swim:
+  enabled: true
+  direct_probe_timeout_sec: 20.0
+  indirect_probe_timeout_sec: 20.0
+  suspicion_timeout_sec: 30.0
+
+# ASan variant of clio_conf.yaml (issue #856): the base config uses very
+# aggressive SWIM timeouts (2s/2s/3s) so the suite runs fast. Under an
+# ASan-instrumented build everything is several times slower, so those
+# timeouts false-positive healthy nodes as dead and the cluster never
+# stabilises enough to create a pool. Scaled 10x here.
