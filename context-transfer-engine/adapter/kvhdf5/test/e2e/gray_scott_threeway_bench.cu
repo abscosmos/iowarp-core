@@ -3150,10 +3150,12 @@ double RunHdf5Arm(const Cfg& cfg_in, uint64_t* checksum) {
 // Structure mirrors the CLIO async arm exactly: fire every snapshot's create+write+close
 // onto the event set as it is produced, then drain once at the end inside the timed region.
 //
-// Buffers: one per snapshot, NOT a recycled pool. The connector reads the buffer later, so
-// reusing one would race the next D2H against an in-flight write. That costs snaps *
-// grid_bytes of pinned host memory (1875 MB at defaults) — the direct analogue of the CLIO
-// async arm, which likewise holds a device backend per chunk per snapshot.
+// Buffers: by default one per snapshot, NOT a recycled pool. The connector reads the buffer
+// later, so reusing one would race the next D2H against an in-flight write. That costs
+// snaps * grid_bytes of pinned host memory (1875 MB at defaults) — the direct analogue of the
+// CLIO async arm, which likewise holds a device backend per chunk per snapshot.
+// GSBENCH_HDF5_ASYNC_POOL=<M> opts into a bounded M-buffer pool instead; see the comment on
+// `pool` below for the reuse contract and why it needs a full drain.
 //
 // Durability: drain + flush + fdatasync ONCE at the end, rather than per snapshot. That
 // matches CLIO-async's drain-at-end semantics; per-snapshot fsync would serialise exactly
@@ -3187,12 +3189,50 @@ double RunHdf5AsyncArm(const Cfg& cfg_in, uint64_t* checksum) {
     }
     std::fprintf(stderr, "[hdf5_async] async VOL connector CONFIRMED loaded\n");
 
-    // One pinned buffer per snapshot (see the buffer contract above).
-    std::vector<uint8_t*> bufs(cfg.snaps, nullptr);
-    for (unsigned s = 0; s < cfg.snaps; ++s) bufs[s] = Hdf5AllocBuf(cfg, gbytes);
-    // Deterministic footprint: our snaps staging buffers (unbounded, like gpuh5_noreuse). The
-    // async VOL adds small internal copies on top -- see the sampled host RSS for the total.
-    g_io_buf_bytes = uint64_t(cfg.snaps) * gbytes;
+    // GSBENCH_HDF5_ASYNC_POOL=<M>: bound the staging footprint to M buffers, snapshot si
+    // writing into slot si % M — the async_VOL analogue of GPUH5's `k mod g` buffer groups, so
+    // the bounded-memory claim can be tested on the baseline instead of only asserted about it.
+    // 0 (the default, EnvU0 so 0 means 0) keeps the unbounded one-buffer-per-snapshot path
+    // BYTE-FOR-BYTE: with nbuf == cfg.snaps the round-robin index si % nbuf collapses to si and
+    // the reuse guard `si >= nbuf` is never true, so nothing below executes differently.
+    //
+    // REUSE CONTRACT (the whole reason this needs care). We link /opt/vol-async-nomemcpy
+    // (ENABLE_WRITE_MEMCPY=OFF, because the stock memcpy-on build livelocks in Argobots at
+    // scale), so the connector does ZERO internal copying: the pointer handed to H5Dwrite_async
+    // is the buffer the Argobots thread reads later. Overwriting slot si % M with snapshot si's
+    // D2H before snapshot si-M's write has finished is therefore a silent data race — no crash,
+    // no H5 error, just wrong bytes on disk, caught only by Hdf5ReadbackChecksum at the very
+    // end. So every reuse MUST be preceded by a drain that provably covers si-M's write.
+    //
+    // DESIGN CHOICE: one shared event set + a FULL drain before each reuse, NOT M per-slot
+    // event sets. Per-slot event sets would be the tighter analogue of GPUH5's per-group
+    // completion flag (reusing slot k would wait only on slot k, leaving the other M-1 writes
+    // overlapping), but they would buy nothing here: the drain path's fast route is
+    // Hdf5Sink::FileWait(), which is H5VLfile_optional_op(file_, "gov.lbl.async.file.wait") —
+    // a FILE-scoped wait. It takes the file, not an event set, so it blocks until every
+    // outstanding task on the file is done no matter which event set tracked it. With
+    // GSBENCH_HDF5_ASYNC_FWAIT on (the default, and worth 3.4x, see below) any per-slot wait
+    // would degenerate into a file-wide barrier anyway; splitting the event set would only
+    // manufacture the APPEARANCE of partial overlap. Honest full barrier instead.
+    //
+    // (GSBENCH_HDF5_ASYNC_FWAIT=0 IS event-set scoped — it drains with H5ESwait alone — so
+    // per-slot sets would be genuinely granular there. It is still not worth building: that
+    // path pays H5ESwait's whole-second-quantised ~2 s mutex backoff on every wait that finds
+    // work outstanding, so making the wait per-reuse costs ~2 s x (snaps - M) no matter how
+    // finely it is scoped. WARNING for whoever runs this: gsbench_driver's registry pins
+    // async_VOL to FWAIT=0, so a pooled campaign run inherits exactly that tax — set
+    // GSBENCH_HDF5_ASYNC_FWAIT=1 when pooling, on an otherwise idle box.)
+    const unsigned pool = EnvU0("GSBENCH_HDF5_ASYNC_POOL", 0);
+    // M >= snaps is pooling that never wraps, i.e. exactly the unpooled arm; clamp so we do not
+    // allocate (and report) buffers no snapshot will ever touch.
+    const unsigned nbuf = pool ? std::min(pool, cfg.snaps) : cfg.snaps;
+    // One pinned buffer per slot (see the buffer contract above).
+    std::vector<uint8_t*> bufs(nbuf, nullptr);
+    for (unsigned s = 0; s < nbuf; ++s) bufs[s] = Hdf5AllocBuf(cfg, gbytes);
+    // Deterministic footprint: our nbuf staging buffers -- unbounded (== snaps, like
+    // gpuh5_noreuse) unpooled, bounded at M when pooling. The async VOL adds small internal
+    // copies on top -- see the sampled host RSS for the total.
+    g_io_buf_bytes = uint64_t(nbuf) * gbytes;
 
     sink.PrecreateAll();                 // outside the timed region
     if (cfg.prefault) {                  // ditto — synchronous zero pass (Cfg::prefault)
@@ -3244,11 +3284,23 @@ double RunHdf5AsyncArm(const Cfg& cfg_in, uint64_t* checksum) {
     D2HTrace d2h(EnvU0("GSBENCH_D2H_TRACE", 0) != 0, cfg.snaps, gbytes);
     Grids g = MakeGrids(cfg.N);
     auto snap = [&](unsigned si, float* v_curr) {
-        // Same D2H as raw/hdf5/hostclio, into THIS snapshot's own buffer.
+        // MANDATORY pre-reuse drain (pooled only; never taken when nbuf == cfg.snaps, so the
+        // unpooled path does not even read the clock here). Slot si % nbuf currently holds
+        // snapshot si - nbuf's payload, which the connector may still be reading, and the D2H
+        // below overwrites it. Charged to t_wait: it is the same H5ESwait/H5Fwait work
+        // drain_every does, just made compulsory, so the printed breakdown stays additive and
+        // ms - t_d2h - t_fire - t_wait - t_sync still approximates compute.
+        if (si >= nbuf) {
+            auto w0 = Clk::now();
+            drain();
+            t_wait += secs(w0, Clk::now());
+        }
+        // Same D2H as raw/hdf5/hostclio, into THIS snapshot's slot.
+        uint8_t* buf = bufs[si % nbuf];
         auto a = Clk::now();
-        d2h.Copy(bufs[si], masker.Apply(v_curr));
+        d2h.Copy(buf, masker.Apply(v_curr));
         auto b = Clk::now();
-        sink.WriteSnapAsync(si, bufs[si], es);   // returns immediately; VOL drains it
+        sink.WriteSnapAsync(si, buf, es);        // returns immediately; VOL drains it
         auto c = Clk::now();
         if (drain_every && (si + 1) % drain_every == 0) drain();
         auto d = Clk::now();
@@ -3278,8 +3330,17 @@ double RunHdf5AsyncArm(const Cfg& cfg_in, uint64_t* checksum) {
     H5CHK(H5ESclose(es));
     sink.Close();
     for (auto* b : bufs) Hdf5FreeBuf(cfg, b);
-    std::fprintf(stderr, "[hdf5_async] total=%.1f ms  (event-set fire-all + drain-at-end)\n",
-                 ms);
+    // The GSBENCH_RESULT arm name stays "async_VOL" whether or not pooling is on. Renaming it
+    // (async_VOL_poolM) would break two things: PrintResult decides the durable= source with an
+    // EXACT strcmp(arm, "async_VOL"), so a suffixed name would be misclassified as a CLIO arm
+    // and report the wrong durability; and gsbench_driver aggregates on its registry name, so
+    // the parsed arm= would no longer agree with the row it lands in. Pooled and unpooled runs
+    // stay distinguishable without touching the line format: GSBENCH_RESULT already carries
+    // io_buf_mb, which is nbuf * grid_bytes (M vs snaps). This stderr note names M outright.
+    std::fprintf(stderr,
+                 "[hdf5_async] total=%.1f ms  (event-set fire-all + drain-at-end, "
+                 "bufs=%u%s)\n",
+                 ms, nbuf, pool ? " POOLED: full drain before every slot reuse" : "");
     if (cfg.read_pdf) {
         Pdf pdf;
         const double rms = Hdf5ReadPdf(path, cfg, gbytes, pdf);
