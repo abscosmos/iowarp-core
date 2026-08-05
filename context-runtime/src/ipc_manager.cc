@@ -4087,8 +4087,18 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
     // lines, and a green coverage run logs ~19k of these (issue #849). The
     // callers in RouteTask log the kError summary on first failure and on
     // retry exhaustion.
-    HLOG(kDebug, "RouteLocal: Container not found for pool={} container_id={} method={}",
-         task_ptr->pool_id_, container_id, task_ptr->method_);
+    // Include the pool manager's own state. GetContainer can only return an
+    // invalid handle three ways: the manager is not initialized, the pool has
+    // no metadata entry, or the entry exists but has no usable container --
+    // and those want opposite fixes (issue #923). Printing initialized/pool
+    // count here says which, without needing to reproduce.
+    auto *pm_diag = pool_manager;
+    HLOG(kDebug,
+         "RouteLocal: Container not found for pool={} container_id={} "
+         "method={} (pool_manager initialized={}, pools known={})",
+         task_ptr->pool_id_, container_id, task_ptr->method_,
+         pm_diag != nullptr && pm_diag->IsInitialized(),
+         pm_diag != nullptr ? pm_diag->GetPoolCount() : 0);
     return RouteResult::Dne;
   }
   if (exec_dc.IsPlugged()) {
