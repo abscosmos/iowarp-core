@@ -136,6 +136,10 @@ jobs:
   # /Volumes) and is NON-BLOCKING until proven on runner images.
   macos-adapters:
     name: adapters (macos, hdf5_vol + macfuse)
+    # Push-only (#921): the linux job above covers all five adapters on
+    # every PR; these two re-verify the platform-specific mount layers
+    # (macfuse / winfsp) at the merge point.
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     timeout-minutes: 120
     steps:
@@ -246,6 +250,10 @@ jobs:
   # old pkg-config gate never matched WinFsp) and the live mount smoke below.
   windows-adapters:
     name: adapters (windows, hdf5_vol + winfsp)
+    # Push-only (#921): the linux job above covers all five adapters on
+    # every PR; these two re-verify the platform-specific mount layers
+    # (macfuse / winfsp) at the merge point.
+    if: github.event_name != 'pull_request'
     runs-on: windows-2025
     timeout-minutes: 120
     env:

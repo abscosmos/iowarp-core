@@ -356,23 +356,39 @@ if [ "$ONLY_DEPS" = true ]; then
     # outlived all three of the shorter waits and failed the macOS legs
     # (#916), while sibling jobs on the same commit rendered fine minutes
     # later. The wider window costs nothing on the happy path.
+    # 4 attempts, 30/60/120/240s: on 2026-08-05 an episode outlived even the
+    # widened 30/60/120 window on PR #922 (both Linux legs, same six minutes),
+    # and a plain `gh run rerun --failed` a quarter-hour later went green with
+    # no code change. The extra step roughly doubles the window it can ride out
+    # and still costs nothing when the first render works.
+    #
+    # Keep the render output instead of discarding it to /dev/null. On the
+    # final failure it is the only thing that says WHY -- diagnosing the #922
+    # episode meant hunting a conda_build IndexError through several thousand
+    # lines of job log, because this loop threw the message away.
     _render_ok=0
-    for _attempt in 1 2 3; do
+    _render_log="${RENDERED}.render.log"
+    for _attempt in 1 2 3 4; do
         if "$CONDA_BIN" render "$RECIPE_DIR" \
                 -c conda-forge \
-                -f "$RENDERED" >/dev/null 2>&1; then
+                -f "$RENDERED" >"$_render_log" 2>&1; then
             _render_ok=1
             break
         fi
+        if [ "$_attempt" -eq 4 ]; then
+            break
+        fi
         _render_wait=$((30 * (1 << (_attempt - 1))))
-        echo -e "${YELLOW}conda render failed (attempt $_attempt/3), retrying in ${_render_wait}s...${NC}"
+        echo -e "${YELLOW}conda render failed (attempt $_attempt/4), retrying in ${_render_wait}s...${NC}"
         sleep "$_render_wait"
     done
     if [ "$_render_ok" -ne 1 ]; then
-        echo -e "${RED}conda render failed${NC}"
-        rm -f "$RENDERED"
+        echo -e "${RED}conda render failed after 4 attempts; last output:${NC}"
+        tail -n 40 "$_render_log" || true
+        rm -f "$RENDERED" "$_render_log"
         exit 1
     fi
+    rm -f "$_render_log"
 
     # Parse rendered meta.yaml with python+yaml (conda-build pulls in
     # pyyaml into base, so $CONDA_BIN's python has it).
