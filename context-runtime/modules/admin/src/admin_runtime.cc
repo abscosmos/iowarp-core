@@ -1971,28 +1971,30 @@ std::vector<clio::run::RecoveryAssignment> Runtime::ComputeRecoveryPlan(
   return assignments;
 }
 
+bool Runtime::ClaimRecovery(clio::run::u64 dead_node_id) {
+  // Function-local statics: process-wide lifetime, immune to admin containers
+  // being destroyed/re-registered by recovery itself, and constructed exactly
+  // once (thread-safe by the standard). insert().second both tests and claims
+  // in one locked call, so no check-then-act window. Never awaits while
+  // holding the lock — a fiber must not suspend holding a std::mutex.
+  static std::mutex mtx;
+  static std::unordered_set<clio::run::u64> initiated;
+  std::lock_guard<std::mutex> lk(mtx);
+  return initiated.insert(dead_node_id).second;
+}
+
 clio::run::TaskResume Runtime::TriggerRecovery(clio::run::u64 dead_node_id) {
   CLIO_TASK_BODY_BEGIN
   auto *ipc_manager = CLIO_IPC;
   if (!ipc_manager->IsLeader()) CLIO_CO_RETURN;
-  // Claim this dead node's recovery exactly once, ATOMICALLY (issue #856).
-  // Two things were wrong with the old `count()` then `insert()` pair:
-  //   1. It ran unsynchronized while HeartbeatProbe fibers from different
-  //      periods execute on different worker THREADS. With two nodes down
-  //      (a crashed leader followed by a second failure) the two calls race,
-  //      and the insert that rehashes frees the old bucket array under the
-  //      other thread — the `free(): invalid pointer` abort that killed the
-  //      recovery leader and cascaded to its successor.
-  //   2. Even without corruption, check-then-act let two threads both decide
-  //      to recover the same node (duplicate redistribution).
-  // insert() returns .second=false when the key was already present, so one
-  // locked call both tests and claims. No await inside the lock: a fiber must
-  // never suspend holding a std::mutex.
-  {
-    std::lock_guard<std::mutex> lk(recovery_mutex_);
-    if (!recovery_initiated_.insert(dead_node_id).second) {
-      CLIO_CO_RETURN;
-    }
+  // Claim this dead node's recovery exactly once for the whole PROCESS
+  // (issue #856). See ClaimRecovery's contract for why the state is not a
+  // member: recovery re-registers admin containers while HeartbeatProbe
+  // fibers are still running on them, so per-instance dedup state is exactly
+  // what gets pulled out from under the probe — and a node hosting two admin
+  // containers would otherwise dedup twice and recover the same node twice.
+  if (!ClaimRecovery(dead_node_id)) {
+    CLIO_CO_RETURN;
   }
   if (ipc_manager->IsSelfFenced()) {
     HLOG(kWarning, "Recovery: Skipping for node {} - self-fenced",
