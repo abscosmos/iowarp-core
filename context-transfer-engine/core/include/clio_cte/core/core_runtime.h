@@ -856,14 +856,9 @@ private:
    */
   clio::run::TaskResume BlobQuery(clio::run::shared_ptr<BlobQueryTask> &task);
 
-  /**
-   * BM25 keyword search over blob contents (Method::kSemanticSearch).
-   * Filters by tag+blob regex like BlobQuery, then tokenizes each
-   * candidate blob's bytes and scores them against query_text_ using
-   * Okapi BM25 with corpus stats computed over the matched working
-   * set. Returns top-k results sorted by descending score.
-   */
-  clio::run::TaskResume SemanticSearch(clio::run::shared_ptr<SemanticSearchTask> &task);
+  // SemanticSearch (Method::kSemanticSearch) moved to the indexer chimod
+  // (issue #905) — the task struct and client API stay here (interposers
+  // speak the core's vocabulary), but the core no longer executes it.
 
   /**
    * Timestamp-window search over blob metadata (Method::kTemporalSearch).

@@ -1036,6 +1036,41 @@ set_tests_properties(
 )
 endif()  # TARGET clio_cte_cache_client
 
+#------------------------------------------------------------------------------
+# Indexer chimod behavioral coverage (issue #905): scope, async drain +
+# search barrier, maintenance verbs, kReindexScan, first-insertion backfill.
+#------------------------------------------------------------------------------
+if(TARGET clio_cte_indexer_client)
+add_executable(test_indexer_ops test_indexer_ops.cc)
+target_include_directories(test_indexer_ops PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/indexer/include
+)
+target_link_libraries(test_indexer_ops
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_indexer_runtime
+    clio_cte_indexer_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_indexer_ops
+    COMMAND test_indexer_ops)
+
+set_tests_properties(
+    cte_indexer_ops
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;indexer;cte;semantic-search;coverage"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # TARGET clio_cte_indexer_client
+
 # Full 4-layer stack (issue #886 cache/replication split): cache(563) ->
 # compressor(562) -> replication(561) -> core(512). A compressed blob KEEPS
 # the SHM fast path via its raw cache replica; the persistent replica holds
