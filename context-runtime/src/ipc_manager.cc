@@ -4092,11 +4092,19 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
     // no metadata entry, or the entry exists but has no usable container --
     // and those want opposite fixes (issue #923). Printing initialized/pool
     // count here says which, without needing to reproduce.
+    // The instance ADDRESS is the discriminator. CLIO_POOL_MANAGER resolves
+    // through GetGlobalPtrVar, which lazily `new`s a blank PoolManager when the
+    // global pointer is null -- so "initialized=0, pools=0" can mean either a
+    // second, duplicated instance (one per module) or a genuine
+    // access-before-init window on the one instance. Those want different
+    // fixes. Compare this against the address ServerInit logs: two addresses
+    // is duplication, one address is ordering. (issue #923)
     auto *pm_diag = pool_manager;
     HLOG(kDebug,
          "RouteLocal: Container not found for pool={} container_id={} "
-         "method={} (pool_manager initialized={}, pools known={})",
+         "method={} (pool_manager={} initialized={}, pools known={})",
          task_ptr->pool_id_, container_id, task_ptr->method_,
+         static_cast<const void *>(pm_diag),
          pm_diag != nullptr && pm_diag->IsInitialized(),
          pm_diag != nullptr ? pm_diag->GetPoolCount() : 0);
     return RouteResult::Dne;
