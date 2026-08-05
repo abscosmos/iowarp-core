@@ -3899,9 +3899,10 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
         const auto inline_retry_budget = (task_ptr->pool_id_ == kAdminPoolId)
                                              ? std::chrono::seconds(30)
                                              : kInlineRetryBudget;
-        const auto deadline =
-            std::chrono::steady_clock::now() + inline_retry_budget;
-        while (!task_ptr->IsPeriodic() &&
+        const auto retry_start = std::chrono::steady_clock::now();
+        const auto deadline = retry_start + inline_retry_budget;
+        const bool is_periodic = task_ptr->IsPeriodic();
+        while (!is_periodic &&
                (result == RouteResult::Retry || result == RouteResult::Dne) &&
                std::chrono::steady_clock::now() < deadline) {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -3918,12 +3919,30 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
           // entry once the popping iteration's owning reference died: the icx
           // windows-2025 cte_tag_large SEGFAULT. Terminal failure is the
           // correct end state.)
-          HLOG(kError,
-               "RouteTask: inline retry exhausted ({} ms) on non-worker "
-               "thread; failing task pool={} method={}",
-               std::chrono::duration_cast<std::chrono::milliseconds>(
-                   inline_retry_budget).count(),
-               task_ptr->pool_id_, task_ptr->method_);
+          // Report what actually happened, not the budget. A PERIODIC task
+          // skips the loop entirely (see above) and is failed instantly and
+          // by design -- printing the budget for it made five harmless drops
+          // read as five 30-second stalls, and that misreading has cost real
+          // diagnosis time twice (issue #923). Log elapsed time and say which
+          // of the two cases this is.
+          const auto elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - retry_start).count();
+          if (is_periodic) {
+            HLOG(kError,
+                 "RouteTask: periodic task not routable at spawn time; failing "
+                 "it immediately by design (no retry attempted) -- pool={} "
+                 "method={}",
+                 task_ptr->pool_id_, task_ptr->method_);
+          } else {
+            HLOG(kError,
+                 "RouteTask: inline retry exhausted after {} ms (budget {} ms) "
+                 "on non-worker thread; failing task pool={} method={}",
+                 elapsed_ms,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     inline_retry_budget).count(),
+                 task_ptr->pool_id_, task_ptr->method_);
+          }
           task_ptr->SetReturnCode(static_cast<u32>(-1));
           task_ptr->SetComplete();
         }
