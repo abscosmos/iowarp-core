@@ -57,6 +57,7 @@
 #include <filesystem>
 #include <memory>
 #include <unordered_map>
+#include <set>
 #include <unordered_set>
 #include <vector>
 
@@ -2069,10 +2070,20 @@ bool Runtime::ClaimRecovery(clio::run::u64 dead_node_id) {
   // once (thread-safe by the standard). insert().second both tests and claims
   // in one locked call, so no check-then-act window. Never awaits while
   // holding the lock — a fiber must not suspend holding a std::mutex.
+  //
+  // The claim is keyed by (membership epoch, dead node), not by node alone
+  // (issue #856). "Leader" here is not consensus: every node computes
+  // `lowest alive id` from its OWN SWIM view, so during churn two nodes can
+  // briefly both believe they lead. Keying by node alone also meant a node
+  // that died, REJOINED, and died again could never be recovered a second
+  // time — its id was already claimed forever. The epoch advances on every
+  // membership change, so a later death is a distinct claim while a duplicate
+  // or stale coordinator inside the same epoch is still refused exactly once.
   static std::mutex mtx;
-  static std::unordered_set<clio::run::u64> initiated;
+  static std::set<std::pair<clio::run::u64, clio::run::u64>> initiated;
+  const clio::run::u64 epoch = CLIO_IPC->GetMembershipEpoch();
   std::lock_guard<std::mutex> lk(mtx);
-  return initiated.insert(dead_node_id).second;
+  return initiated.insert({epoch, dead_node_id}).second;
 }
 
 clio::run::TaskResume Runtime::TriggerRecovery(clio::run::u64 dead_node_id) {
