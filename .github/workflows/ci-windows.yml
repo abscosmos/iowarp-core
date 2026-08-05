@@ -18,24 +18,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ---- Matrix tier selection (issue #921) -----------------------------------
+  # A pull request builds ONE MSVC runner and ONE icx runner; the full sweep
+  # (2022 / 2025 / 11-arm for MSVC, 2022 / 2025 / 2025-vs2026 for icx, plus the
+  # Boost.Context variant) runs on push to main/dev. Seven Windows jobs on every
+  # PR commit was the single largest block of CI, and the arches fail together
+  # on real breakage -- the extra six mostly added flake exposure and queue
+  # time. The sweep still gates what lands, at the merge point.
+  #
+  # windows-2025 x64 is the PR runner for both toolchains: the current image,
+  # and the one both cte_bdev_fragmentation (icx) and cr_detached_spawn hit.
+  matrix-tier:
+    runs-on: ubuntu-latest
+    outputs:
+      msvc: ${{ steps.pick.outputs.msvc }}
+      icx: ${{ steps.pick.outputs.icx }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo 'msvc={"include":[{"os":"windows-2025","triplet":"x64-windows","arch":"x64"}]}' >> "$GITHUB_OUTPUT"
+            echo 'icx=["windows-2025"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'msvc={"include":[{"os":"windows-2022","triplet":"x64-windows","arch":"x64"},{"os":"windows-2025","triplet":"x64-windows","arch":"x64"},{"os":"windows-11-arm","triplet":"arm64-windows","arch":"ARM64"}]}' >> "$GITHUB_OUTPUT"
+            echo 'icx=["windows-2022","windows-2025","windows-2025-vs2026"]' >> "$GITHUB_OUTPUT"
+          fi
+
   # ---- MSVC build + ctest (Visual Studio generator) -------------------------
   build-test:
     name: build-test (${{ matrix.os }})
+    needs: matrix-tier
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: windows-2022
-            triplet: x64-windows
-            arch: x64
-          - os: windows-2025
-            triplet: x64-windows
-            arch: x64
-          - os: windows-11-arm
-            triplet: arm64-windows
-            arch: ARM64
+      matrix: ${{ fromJSON(needs.matrix-tier.outputs.msvc) }}
     env:
       VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
       CAE_LABEL_TEST_SKIP: "1"
@@ -215,12 +233,13 @@ jobs:
   # ---- Intel oneAPI (icx-cl) compiler variant (#555) ------------------------
   icx:
     name: icx (${{ matrix.os }})
+    needs: matrix-tier
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, windows-2025, windows-2025-vs2026]
+        os: ${{ fromJSON(needs.matrix-tier.outputs.icx) }}
     env:
       WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe
       WINDOWS_CPP_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common
@@ -410,6 +429,10 @@ jobs:
   # ---- Boost.Context stackful coroutine backend (#620) ----------------------
   boost:
     name: boost (${{ matrix.os }})
+    # Push-only (issue #921): the Boost.Context coroutine backend is a build
+    # variant, not an arch, and it has never been the first job to catch a
+    # regression MSVC did not. It gates main/dev, not every PR commit.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
