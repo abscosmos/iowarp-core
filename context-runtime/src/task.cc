@@ -74,9 +74,25 @@ clio::run::detail::FiberHandle Task::MakeTaskFiber(
   // whose signature takes a non-const shared_ptr<Task>&.
   self->FiberStateRef().done = false;
   self->FiberStateRef().worker_ = CLIO_CUR_WORKER;
+#if defined(CLIO_ASAN_FIBERS)
+  // Record this fiber's stack extent for the ASan switch annotations (issue
+  // #856). Boost's stack_context::sp is the HIGH end of the region, so the
+  // low address ASan wants is sp - size.
+  {
+    BoostStackPoolAllocator probe;
+    boost::context::stack_context sctx = probe.allocate();
+    self->FiberStateRef().fiber_size_ = sctx.size;
+    self->FiberStateRef().fiber_bottom_ =
+        static_cast<const char *>(sctx.sp) - sctx.size;
+    probe.deallocate(sctx);  // the fiber below allocates its own from the pool
+  }
+#endif
   self->FiberStateRef().task_ = boost::context::fiber{
       std::allocator_arg, BoostStackPoolAllocator{},
       [self](boost::context::fiber &&caller) mutable -> boost::context::fiber {
+        // We are now running ON the fiber stack.
+        clio::run::detail::fiber_asan_post_switch_to_fiber(
+            &self->FiberStateRef());
         self->FiberStateRef().caller_ = std::move(caller);
         // Must not let an exception escape the fiber entry (Boost.Context calls
         // std::terminate if one does).
@@ -88,6 +104,10 @@ clio::run::detail::FiberHandle Task::MakeTaskFiber(
         } catch (...) {
         }
         self->FiberStateRef().done = true;
+        // Final switch off this fiber: tell ASan the stack is going away so it
+        // does not keep shadow state for a stack the pool is about to reuse.
+        clio::run::detail::fiber_asan_pre_switch_to_caller(
+            &self->FiberStateRef());
         return std::move(self->FiberStateRef().caller_);
       }};
   return clio::run::detail::FiberHandle(&self->FiberStateRef());

@@ -1131,6 +1131,12 @@ if(NOT CLIO_CORE_MSVC_LIKE)
         message(STATUS "AddressSanitizer + LeakSanitizer (ASan/LSan) enabled for iowarp-core")
         add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
         add_link_options(-fsanitize=address)
+        # issue #856: annotate Boost.Context stack switches. Without these ASan
+        # keeps shadow state for the stack it believes is current, so the first
+        # fault on a fiber stack aborts with "DEADLYSIGNAL / nested bug in the
+        # same thread" and reports NOTHING — which makes ASan useless across
+        # most of the runtime, where tasks run on fibers.
+        add_compile_definitions(CLIO_ASAN_FIBERS)
     endif()
 
     # UndefinedBehaviorSanitizer configuration

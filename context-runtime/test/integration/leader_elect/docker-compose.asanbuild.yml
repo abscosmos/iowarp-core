@@ -1,0 +1,23 @@
+# LOCAL-ONLY overlay: run the ASan-instrumented build (build-asan) with the
+# Boost.Context fiber annotations active (issue #856). Without the annotations
+# ASan dies with "DEADLYSIGNAL / nested bug in the same thread" the first time a
+# fiber stack faults, and reports nothing.
+x-asanenv: &asanenv
+  ASAN_OPTIONS: "detect_leaks=0:abort_on_error=0:malloc_context_size=30:handle_segv=1:print_stacktrace=1"
+services:
+  iowarp-node1:
+    volumes:
+      - ${HOST_WORKSPACE}/build-asan:/workspace/build
+    environment: *asanenv
+  iowarp-node2:
+    volumes:
+      - ${HOST_WORKSPACE}/build-asan:/workspace/build
+    environment: *asanenv
+  iowarp-node3:
+    volumes:
+      - ${HOST_WORKSPACE}/build-asan:/workspace/build
+    environment: *asanenv
+  iowarp-node4:
+    volumes:
+      - ${HOST_WORKSPACE}/build-asan:/workspace/build
+    environment: *asanenv
