@@ -222,6 +222,11 @@ jobs:
           fi
       - name: Upload test logs
         if: always()
+        # Never let the artifact service sink an otherwise-green job (#921).
+        # These logs are diagnostics; the verdict already came from "Run tests".
+        # Seen on PR #920: build-test (windows-11-arm) passed every one of its
+        # tests, then failed the job on an upload-artifact BlobNotFound.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: windows-test-logs-${{ matrix.os }}
@@ -418,6 +423,11 @@ jobs:
           fi
       - name: Upload test logs
         if: always()
+        # Never let the artifact service sink an otherwise-green job (#921).
+        # These logs are diagnostics; the verdict already came from "Run tests".
+        # Seen on PR #920: build-test (windows-11-arm) passed every one of its
+        # tests, then failed the job on an upload-artifact BlobNotFound.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: win-icx-test-logs-${{ matrix.os }}
