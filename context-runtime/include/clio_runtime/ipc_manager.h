@@ -840,6 +840,23 @@ class IpcManager {
   void SetNodeState(u64 node_id, NodeState new_state);
 
   /**
+   * Record that traffic was just received from this peer (issue #856).
+   *
+   * Called on every inbound task/response. SWIM's probes ride ordinary admin
+   * tasks, so a merely STARVED node can miss its probe window and be declared
+   * dead — which is destructive, since recovery then redistributes a live
+   * node's containers. Bytes arriving from a peer prove it is alive
+   * regardless, and NoteInbound records that evidence.
+   */
+  void NoteInbound(u64 node_id);
+
+  /**
+   * Seconds since traffic was last received from this peer, or a very large
+   * value if we have never heard from it. Used to veto a spurious death.
+   */
+  float SecondsSinceInbound(u64 node_id) const;
+
+  /**
    * Set self-fenced status (partition detection)
    * @param fenced true if this node should fence itself
    */

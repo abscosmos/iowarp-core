@@ -137,6 +137,18 @@ struct Host {
   u64 node_id;             // 64-bit representation of IP address
   NodeState state;         // SWIM failure detection state
   std::chrono::steady_clock::time_point state_changed_at;
+  /**
+   * When we last received ANY traffic from this peer (issue #856).
+   *
+   * SWIM's probe/ack round trip rides ordinary admin tasks, so a node whose
+   * workers are merely STARVED — not gone — can miss its probe window and be
+   * declared dead. That is destructive: recovery then redistributes a live
+   * node's containers, and once enough peers look bad the survivors
+   * self-fence and stop recovering anything at all. A node that is actively
+   * sending us bytes is demonstrably alive no matter what the probe did, so
+   * this timestamp is consulted before promoting kSuspected -> kDead.
+   */
+  std::chrono::steady_clock::time_point last_inbound;
 
   /**
    * Default constructor
@@ -144,7 +156,8 @@ struct Host {
   Host()
       : node_id(0),
         state(NodeState::kAlive),
-        state_changed_at(std::chrono::steady_clock::now()) {}
+        state_changed_at(std::chrono::steady_clock::now()),
+        last_inbound(std::chrono::steady_clock::now()) {}
 
   /**
    * Constructor with IP address and node ID (required)
@@ -156,7 +169,8 @@ struct Host {
       : ip_address(ip),
         node_id(id),
         state(NodeState::kAlive),
-        state_changed_at(std::chrono::steady_clock::now()) {}
+        state_changed_at(std::chrono::steady_clock::now()),
+        last_inbound(std::chrono::steady_clock::now()) {}
 
   bool IsAlive() const { return state == NodeState::kAlive; }
 

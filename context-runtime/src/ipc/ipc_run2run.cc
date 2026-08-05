@@ -471,6 +471,14 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   }
 
   clio::run::u64 sender_node = task_ptr->pool_query_.GetReturnNode();
+  // Bytes from a peer are proof it is alive (issue #856). SWIM's probes ride
+  // ordinary admin tasks, so a merely STARVED node can miss its probe window
+  // and get declared dead — destructively, since recovery then redistributes a
+  // live node's containers. Record the evidence; the suspicion-timeout check
+  // consults it before promoting kSuspected -> kDead.
+  if (sender_node != ipc_manager->GetNodeId()) {
+    ipc_manager->NoteInbound(sender_node);
+  }
   if (sender_node != ipc_manager->GetNodeId() &&
       ipc_manager->GetNodeState(sender_node) == clio::run::NodeState::kDead) {
     HLOG(kInfo, "[RecvIn] Received task from dead node {}, marking alive",
@@ -650,7 +658,29 @@ int IpcManagerRun2Run::RecvOutAggregate(
            origin_task->pool_id_);
       continue;
     }
+    // Contract guard (issue #915). AggregateOut merges a REPLICA's OUT fields
+    // into the origin; it must never touch the origin's IDENTITY. Tasks that
+    // implement it by delegating to Copy() — a whole-task assignment — run
+    // Task::Copy and overwrite task_id_/pool_query_/completer_ with the
+    // replica's while send_map_ and the completion path still reference the
+    // origin, and re-assign IN shm strings across segments. That corrupted the
+    // runtime in production (#856) and ~26 such implementations still exist in
+    // tasks that are currently only routed single-replica. This catches any of
+    // them the instant someone routes that task multi-replica, naming the
+    // method, instead of letting it corrupt memory silently.
+    const clio::run::TaskId id_before = origin_task->task_id_;
     container->AggregateOut(origin_task->method_, origin_task, replica);
+    if (!(origin_task->task_id_ == id_before)) {
+      HLOG(kError,
+           "[AggregateOut CONTRACT VIOLATION] pool={} method={}: the origin's "
+           "task_id_ changed during aggregation ({} -> {}). This task's "
+           "AggregateOut is copying the whole replica (almost certainly "
+           "`Copy(other_base...)`) instead of merging OUT fields only. See "
+           "issue #915. Restoring the origin's identity to avoid corruption.",
+           origin_task->pool_id_, origin_task->method_, id_before,
+           origin_task->task_id_);
+      origin_task->task_id_ = id_before;
+    }
 
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);
 

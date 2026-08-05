@@ -39,6 +39,7 @@
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <zmq.h>
+#include <limits>
 
 #include <algorithm>
 #include <cerrno>
@@ -1731,6 +1732,22 @@ NodeState IpcManager::GetNodeState(u64 node_id) const {
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return NodeState::kDead;
   return it->second.state;
+}
+
+void IpcManager::NoteInbound(u64 node_id) {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return;
+  it->second.last_inbound = std::chrono::steady_clock::now();
+}
+
+float IpcManager::SecondsSinceInbound(u64 node_id) const {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) {
+    return std::numeric_limits<float>::max();
+  }
+  return std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                      it->second.last_inbound)
+      .count();
 }
 
 void IpcManager::SetNodeState(u64 node_id, NodeState new_state) {

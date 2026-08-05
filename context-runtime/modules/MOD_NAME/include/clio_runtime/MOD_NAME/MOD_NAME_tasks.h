@@ -188,7 +188,16 @@ struct CustomTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<CustomTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a WHOLE-TASK
+    // assignment, so it runs Task::Copy — overwriting this task's identity
+    // (task_id_, pool_query_, completer_) with the replica's while the
+    // send map and completion path still reference it — and re-assigns IN
+    // fields, including shm-allocated priv::strings, across segments. That
+    // corrupted the runtime in production. Merge only the OUT fields your
+    // task defines, with semantics that suit them (sum, max, first-non-empty).
+    // This template task has no OUT fields beyond the base return code, so
+    // Task::AggregateOut above is all that is required.
   }
 };
 
@@ -312,7 +321,16 @@ struct CoMutexTestTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<CoMutexTestTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a WHOLE-TASK
+    // assignment, so it runs Task::Copy — overwriting this task's identity
+    // (task_id_, pool_query_, completer_) with the replica's while the
+    // send map and completion path still reference it — and re-assigns IN
+    // fields, including shm-allocated priv::strings, across segments. That
+    // corrupted the runtime in production. Merge only the OUT fields your
+    // task defines, with semantics that suit them (sum, max, first-non-empty).
+    // This template task has no OUT fields beyond the base return code, so
+    // Task::AggregateOut above is all that is required.
   }
 };
 
@@ -377,7 +395,16 @@ struct CoRwLockTestTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<CoRwLockTestTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a WHOLE-TASK
+    // assignment, so it runs Task::Copy — overwriting this task's identity
+    // (task_id_, pool_query_, completer_) with the replica's while the
+    // send map and completion path still reference it — and re-assigns IN
+    // fields, including shm-allocated priv::strings, across segments. That
+    // corrupted the runtime in production. Merge only the OUT fields your
+    // task defines, with semantics that suit them (sum, max, first-non-empty).
+    // This template task has no OUT fields beyond the base return code, so
+    // Task::AggregateOut above is all that is required.
   }
 };
 
@@ -442,7 +469,16 @@ struct WaitTestTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<WaitTestTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a WHOLE-TASK
+    // assignment, so it runs Task::Copy — overwriting this task's identity
+    // (task_id_, pool_query_, completer_) with the replica's while the
+    // send map and completion path still reference it — and re-assigns IN
+    // fields, including shm-allocated priv::strings, across segments. That
+    // corrupted the runtime in production. Merge only the OUT fields your
+    // task defines, with semantics that suit them (sum, max, first-non-empty).
+    // This template task has no OUT fields beyond the base return code, so
+    // Task::AggregateOut above is all that is required.
   }
 };
 
@@ -500,7 +536,16 @@ struct TestLargeOutputTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<TestLargeOutputTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a WHOLE-TASK
+    // assignment, so it runs Task::Copy — overwriting this task's identity
+    // (task_id_, pool_query_, completer_) with the replica's while the
+    // send map and completion path still reference it — and re-assigns IN
+    // fields, including shm-allocated priv::strings, across segments. That
+    // corrupted the runtime in production. Merge only the OUT fields your
+    // task defines, with semantics that suit them (sum, max, first-non-empty).
+    // This template task has no OUT fields beyond the base return code, so
+    // Task::AggregateOut above is all that is required.
   }
 };
 
@@ -569,7 +614,16 @@ struct GpuSubmitTask : public clio::run::Task {
    */
   CTP_CROSS_FUN void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<GpuSubmitTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a WHOLE-TASK
+    // assignment, so it runs Task::Copy — overwriting this task's identity
+    // (task_id_, pool_query_, completer_) with the replica's while the
+    // send map and completion path still reference it — and re-assigns IN
+    // fields, including shm-allocated priv::strings, across segments. That
+    // corrupted the runtime in production. Merge only the OUT fields your
+    // task defines, with semantics that suit them (sum, max, first-non-empty).
+    // This template task has no OUT fields beyond the base return code, so
+    // Task::AggregateOut above is all that is required.
   }
 };
 
@@ -622,7 +676,16 @@ struct SubtaskTestTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<SubtaskTestTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a WHOLE-TASK
+    // assignment, so it runs Task::Copy — overwriting this task's identity
+    // (task_id_, pool_query_, completer_) with the replica's while the
+    // send map and completion path still reference it — and re-assigns IN
+    // fields, including shm-allocated priv::strings, across segments. That
+    // corrupted the runtime in production. Merge only the OUT fields your
+    // task defines, with semantics that suit them (sum, max, first-non-empty).
+    // This template task has no OUT fields beyond the base return code, so
+    // Task::AggregateOut above is all that is required.
   }
 };
 
