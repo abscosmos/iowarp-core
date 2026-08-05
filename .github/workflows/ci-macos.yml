@@ -169,6 +169,9 @@ jobs:
   # ---- Boost.Context stackful coroutine backend (#620) ----------------------
   boost:
     name: boost (${{ matrix.os }})
+    # Push-only (#921): the Boost.Context coroutine backend is a build variant,
+    # not an arch. It gates main/dev rather than every PR commit.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
