@@ -186,37 +186,50 @@ class RuntimeServer {
     }
     if (!segment_up) return false;
 
-    // Spend whatever budget is left waiting for the ROUTER bind line. The
-    // daemon logs it at INFO, so a caller that wants this stage must leave
-    // CTP_LOG_LEVEL at info or lower; if the line never shows up we fall
-    // through to the settle sleep rather than failing a daemon that is fine.
+    // Spend whatever budget is left waiting for the daemon to log that its
+    // admin pool exists. The daemon logs it at INFO, so a caller that wants
+    // this stage must leave CTP_LOG_LEVEL at info or lower; if the line never
+    // shows up we fall through to the settle sleep rather than failing a
+    // daemon that is fine.
+    //
+    // The marker is the ADMIN POOL, not the ROUTER bind. Ordering the daemon's
+    // own startup log, the ROUTER binds second of twenty-one markers -- before
+    // the chimods load, before the workers spawn, and before the admin pool is
+    // created. Treating it as "ready" would hand callers a daemon that cannot
+    // yet route a task, which is strictly worse than the sleep it replaced.
+    // Waiting for the admin pool means the runtime can actually serve work.
     const std::string log_path = ServerLogPath();
-    for (; i < attempts; ++i) {
+    bool marker_seen = false;
+    for (; i < attempts && !marker_seen; ++i) {
       if (!IsRunning()) return false;
-      if (ServerLogHasRouter(log_path)) return true;
+      if (ServerLogHasAdminPool(log_path)) {
+        marker_seen = true;
+        break;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    // Budget exhausted with no marker (log not captured, or logging turned
-    // down). Fall back to the historical settle, but do not call a daemon that
-    // died inside it ready.
+    // Keep the historical settle in BOTH cases -- marker seen or budget spent.
+    // The marker is necessary but not provably sufficient: startup work that
+    // logs nothing (e.g. compose/WAL replay re-creating restartable pools) can
+    // still be in flight. Retaining the settle makes this readiness check
+    // strictly stronger than the sleep-only version it replaces, never weaker.
+    // Do not call a daemon that died inside the settle ready.
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     return IsRunning();
   }
 
   /**
-   * @return true if the daemon's captured log shows its request ROUTER bound.
-   * Matches both transports: "TCP ROUTER transport bound on <addr>:<port>" and
-   * the IPC-mode "client ZMQ ROUTER bound on ipc <path>".
+   * @return true if the daemon's captured log shows the admin pool created --
+   * i.e. the runtime can route a task, not merely accept a connection.
    */
-  static bool ServerLogHasRouter(const std::string &log_path) {
+  static bool ServerLogHasAdminPool(const std::string &log_path) {
     std::ifstream f(log_path, std::ios::binary);
     if (!f) return false;
     std::ostringstream ss;
     ss << f.rdbuf();
-    const std::string log = ss.str();
-    return log.find("ROUTER transport bound on") != std::string::npos ||
-           log.find("ROUTER bound on") != std::string::npos;
+    return ss.str().find("Admin chimod pool created successfully") !=
+           std::string::npos;
   }
 
   /** Stop the daemon (SIGTERM then SIGKILL on POSIX — so ServerFinalize's leak
