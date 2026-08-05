@@ -2028,16 +2028,19 @@ clio::run::TaskResume Runtime::TriggerRecovery(clio::run::u64 dead_node_id) {
   HLOG(kInfo, "Recovery: {} containers to redistribute from node {}",
        assignments.size(), dead_node_id);
   {
-    // Do NOT keep the plan alive across the suspend (issue #856). The crash
-    // backtrace lands in ~vector<RecoveryAssignment>() at this scope's exit:
-    // the vector owns heap strings and lived on the FIBER STACK across the
-    // await, and by the time the fiber resumed those blocks were freed twice
-    // (`free(): invalid pointer` / `double free detected in tcache 2`).
-    // AsyncRecoverContainers serializes the plan into the task before it
-    // returns the future, so nothing needs the vector afterwards — hand off,
-    // release the heap ownership, and only then suspend.
+    // NOTE (issue #856): an earlier theory held that keeping this vector
+    // alive across the suspend caused the crash. That is WRONG — instrumented
+    // runs showed the vector VALID (size/capacity/data/contents all intact)
+    // both before and after the serializing call, and the faulting free()
+    // sometimes succeeds. The heap is being corrupted by something ELSE
+    // during recovery; frees in this function are just the first victim,
+    // which is why the reported symptom moves with build layout
+    // (invalid pointer / double free / tpp.c assertion / silent SIGSEGV).
     auto fut = client_.AsyncRecoverContainers(
         clio::run::PoolQuery::Broadcast(0), assignments, dead_node_id);
+    // Release the plan's heap before suspending. This is good hygiene (the
+    // plan is already serialized into the task by the call above, so nothing
+    // needs it afterwards) but it is NOT the crash fix — see the note above.
     assignments.clear();
     assignments.shrink_to_fit();
     CLIO_CO_AWAIT(fut);
