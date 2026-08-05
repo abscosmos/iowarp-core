@@ -103,6 +103,19 @@ struct clio_file_t {
      stays authoritative; this keeps the CTE cache coherent with it). */
   std::mutex ds_mtx;
   std::unordered_set<clio_dataset_t *> open_datasets;
+  /* Set when H5Fclose has run but datasets in this file are still open, so the
+     clio_file_t must outlive its own close. HDF5 normally guarantees the file
+     outlives objects in it, but EXTERNAL LINK traversal does not: HDF5 opens
+     the target file through this connector, hands back an object from it, and
+     closes that file while the object is still live. Deleting here made every
+     later dataset_close touch freed memory -- confirmed use-after-free, not a
+     theory (ASan: heap-use-after-free in open_datasets.erase, freed by
+     clio_file_close, allocated by clio_file_open during traversal).
+     It reached CI as a macOS-only abort ("mutex lock failed: Invalid
+     argument", from ds_mtx sitting in the freed block) purely because Linux
+     leaves the freed heap mapped and reads garbage without complaint. Same bug
+     on both; only one platform was honest about it. */
+  bool close_deferred = false;
   /* Access telemetry (observe-only); non-null only when CLIO_VOL_TRACE is set.
      Finalized to a summary JSON at file close. */
   clio::trace::FileTrace *trace = nullptr;
@@ -606,6 +619,19 @@ static herr_t clio_file_close(void *obj, hid_t dxpl_id, void **req) {
   herr_t ret = H5VLfile_close(file->obj.under_object, file->obj.under_vol_id,
                                dxpl_id, req);
   clio::trace::close_file(file->trace);  /* writes the summary; no-op if null */
+  file->trace = nullptr;
+
+  /* Hand ownership to the last dataset standing rather than deleting under it.
+     Everything above -- drain, native close, trace summary -- is the file
+     CLOSING and still belongs here; only the deallocation waits. See
+     close_deferred. */
+  {
+    std::lock_guard<std::mutex> lk(file->ds_mtx);
+    if (!file->open_datasets.empty()) {
+      file->close_deferred = true;
+      return ret;
+    }
+  }
   delete file;
   return ret;
 }
@@ -1444,10 +1470,16 @@ static herr_t clio_dataset_close(void *obj, hid_t dxpl_id, void **req) {
   auto *dset = static_cast<clio_dataset_t *>(obj);
 
   /* Unregister from the file's Safe-mode set before draining, so a concurrent
-     flush/close does not touch this dataset while it is being torn down. */
+     flush/close does not touch this dataset while it is being torn down.
+     If this is the last dataset in a file whose close was deferred (external
+     link traversal -- see clio_file_t::close_deferred), this call owns the
+     file and frees it once the rest of the teardown no longer needs it. */
+  clio_file_t *file_to_free = nullptr;
   if (dset->file && dset->cacheable) {
     std::lock_guard<std::mutex> lk(dset->file->ds_mtx);
     dset->file->open_datasets.erase(dset);
+    if (dset->file->close_deferred && dset->file->open_datasets.empty())
+      file_to_free = dset->file;
   }
 
   /* Flush all pending async writes; a failed put leaves a partial image, so
@@ -1460,6 +1492,9 @@ static herr_t clio_dataset_close(void *obj, hid_t dxpl_id, void **req) {
   herr_t ret = H5VLdataset_close(dset->obj.under_object,
                                   dset->obj.under_vol_id, dxpl_id, req);
   delete dset;
+  /* Last, and only after everything above has finished reading through
+     dset->file (drain and invalidate both use its tag and trace). */
+  delete file_to_free;
   return ret;
 }
 
