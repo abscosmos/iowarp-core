@@ -500,7 +500,12 @@ void PoolManager::InitAddressMap(PoolId pool_id, u32 num_containers) {
   HLOG(kDebug, "=== Address Map for Pool {} ===", pool_id);
   HLOG(kDebug, "Creating address map with {} containers", num_containers);
 
-  // Initially ContainerId == NodeId (one container per node)
+  // ContainerId == NodeId. This mapping must be globally consistent — every
+  // node derives routing from it — so it deliberately does NOT consult
+  // liveness (issue #856): a view-dependent map lets two nodes disagree about
+  // where a container lives. A container whose node is dead is handled by
+  // recovery (which redistributes it) and by forgiving its undeliverable
+  // replica at completion, not by quietly moving it here.
   for (u32 container_idx = 0; container_idx < num_containers; ++container_idx) {
     info.address_map_[container_idx] = container_idx;
     HLOG(kDebug, "  Container[{}] -> Node[{}] (pool: {})", container_idx,
@@ -534,6 +539,14 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   // Set num_containers equal to number of nodes in the cluster
   auto* ipc_manager = CLIO_IPC;
   std::vector<Host> all_hosts = ipc_manager->GetAllHosts();
+  // Pool geometry MUST be identical on every node (issue #856). Sizing this to
+  // the live cluster instead was tried and reverted: CreatePool runs on every
+  // node handling the broadcast, so each computed its own count from its own
+  // transient liveness view — a restarted node built the pool with 4
+  // containers while the survivors built it with 3, i.e. a split-brain layout.
+  // The hostfile size is the same everywhere, so it stays the source of truth;
+  // an undeliverable replica for a dead node is forgiven at completion instead
+  // (BaseCreateTask::PostWait).
   const u32 num_containers = static_cast<u32>(all_hosts.size());
 
   HLOG(kInfo,

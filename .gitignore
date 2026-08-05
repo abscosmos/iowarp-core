@@ -152,3 +152,8 @@ build-tsan/
 
 # Local-only compose overrides (per-box mounts/debug shims) must never be committed
 docker-compose.override.yml
+
+# Local-only ASan/backtrace debug shim (issue #856) — built ad hoc inside the
+# test containers, never part of the build.
+abrt_bt.c
+abrt_bt.so

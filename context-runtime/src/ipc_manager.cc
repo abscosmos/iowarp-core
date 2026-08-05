@@ -39,6 +39,7 @@
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <zmq.h>
+#include <limits>
 
 #include <algorithm>
 #include <cerrno>
@@ -1684,6 +1685,11 @@ bool IpcManager::IsAlive(u64 node_id) const {
 }
 
 void IpcManager::SetDead(u64 node_id) {
+  // Every confirmed membership change advances the epoch (issue #856):
+  // recovery claims are scoped by (epoch, dead node), so a node that dies,
+  // rejoins and dies again is recoverable each time, while duplicate
+  // coordinators within one epoch are still refused.
+  membership_epoch_.fetch_add(1, std::memory_order_acq_rel);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kDead) return;  // Already dead
@@ -1710,6 +1716,11 @@ void IpcManager::SetDead(u64 node_id) {
 }
 
 void IpcManager::SetAlive(u64 node_id) {
+  // Every confirmed membership change advances the epoch (issue #856):
+  // recovery claims are scoped by (epoch, dead node), so a node that dies,
+  // rejoins and dies again is recoverable each time, while duplicate
+  // coordinators within one epoch are still refused.
+  membership_epoch_.fetch_add(1, std::memory_order_acq_rel);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kAlive) return;  // Already alive
@@ -1731,6 +1742,22 @@ NodeState IpcManager::GetNodeState(u64 node_id) const {
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return NodeState::kDead;
   return it->second.state;
+}
+
+void IpcManager::NoteInbound(u64 node_id) {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return;
+  it->second.last_inbound = std::chrono::steady_clock::now();
+}
+
+float IpcManager::SecondsSinceInbound(u64 node_id) const {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) {
+    return std::numeric_limits<float>::max();
+  }
+  return std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                      it->second.last_inbound)
+      .count();
 }
 
 void IpcManager::SetNodeState(u64 node_id, NodeState new_state) {
@@ -3119,15 +3146,41 @@ bool IpcManager::WaitForServerAndReconnect(
     return false;
   }
 
-  // Pick random hosts and try each (may retry same host — that's fine)
-  std::mt19937 rng(std::random_device{}());
-  std::uniform_int_distribution<size_t> dist(0, hosts.size() - 1);
+  // Build a DETERMINISTIC candidate order (issue #856), replacing uniform
+  // random sampling over every host in the file:
+  //   1. the presumptive leader (lowest alive node id) — it coordinates
+  //      recovery, so it is the most useful node to be attached to;
+  //   2. the remaining ALIVE hosts;
+  //   3. hosts believed dead, last and only as a fallback — "dead" is a local
+  //      opinion that can be stale (a peer may have rejoined without this
+  //      client hearing about it), so they are tried rather than excluded.
+  // Random sampling could burn every attempt re-dialling the node that just
+  // died, and made post-failover behaviour irreproducible under test.
+  std::vector<std::string> candidates;
+  {
+    const u64 leader = GetLeaderNodeId();
+    std::vector<std::string> alive, dead;
+    for (const auto &h : hosts) {
+      if (h.node_id == GetNodeId()) continue;  // our own dead runtime
+      if (h.node_id == leader && h.IsAlive()) continue;  // added first below
+      (h.IsAlive() ? alive : dead).push_back(h.ip_address);
+    }
+    const Host *lh = GetHost(leader);
+    if (lh != nullptr && lh->IsAlive() && leader != GetNodeId()) {
+      candidates.push_back(lh->ip_address);
+    }
+    candidates.insert(candidates.end(), alive.begin(), alive.end());
+    candidates.insert(candidates.end(), dead.begin(), dead.end());
+    if (candidates.empty()) {  // degenerate: single-host file
+      for (const auto &h : hosts) candidates.push_back(h.ip_address);
+    }
+  }
 
-  HLOG(kInfo, "WaitForServerAndReconnect: Trying {} random hosts",
-       client_try_new_servers_);
+  HLOG(kInfo,
+       "WaitForServerAndReconnect: trying up to {} host(s), leader-first: {}",
+       client_try_new_servers_, candidates.front());
   for (int i = 0; i < client_try_new_servers_; ++i) {
-    size_t idx = dist(rng);
-    const std::string &addr = hosts[idx].ip_address;
+    const std::string &addr = candidates[i % candidates.size()];
     HLOG(kInfo, "WaitForServerAndReconnect: Trying {}/{}: {}",
          i + 1, client_try_new_servers_, addr);
     if (ReconnectToNewHost(addr)) {
@@ -3136,7 +3189,7 @@ bool IpcManager::WaitForServerAndReconnect(
     }
   }
 
-  HLOG(kError, "WaitForServerAndReconnect: All {} random hosts failed",
+  HLOG(kError, "WaitForServerAndReconnect: All {} candidate hosts failed",
        client_try_new_servers_);
   reconnecting_.store(false, std::memory_order_release);
   return false;

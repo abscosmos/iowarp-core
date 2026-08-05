@@ -188,7 +188,15 @@ struct CustomTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<CustomTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a
+    // WHOLE-TASK assignment, so it runs Task::Copy — overwriting this
+    // task's identity (task_id_, pool_query_, completer_) with the
+    // replica's while the send map and completion path still reference
+    // it — and re-assigns IN fields, including shm priv::strings, across
+    // segments. Merge ONLY the OUT fields, with semantics that suit them.
+    auto other = other_base.template Cast<CustomTask>();
+    data_ = other->data_;
   }
 };
 
@@ -312,7 +320,15 @@ struct CoMutexTestTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<CoMutexTestTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a
+    // WHOLE-TASK assignment, so it runs Task::Copy — overwriting this
+    // task's identity (task_id_, pool_query_, completer_) with the
+    // replica's while the send map and completion path still reference
+    // it — and re-assigns IN fields, including shm priv::strings, across
+    // segments. Merge ONLY the OUT fields, with semantics that suit them.
+    // This task defines no OUT fields, so Task::AggregateOut above
+    // (return code + completer) is all that is required.
   }
 };
 
@@ -377,7 +393,15 @@ struct CoRwLockTestTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<CoRwLockTestTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a
+    // WHOLE-TASK assignment, so it runs Task::Copy — overwriting this
+    // task's identity (task_id_, pool_query_, completer_) with the
+    // replica's while the send map and completion path still reference
+    // it — and re-assigns IN fields, including shm priv::strings, across
+    // segments. Merge ONLY the OUT fields, with semantics that suit them.
+    // This task defines no OUT fields, so Task::AggregateOut above
+    // (return code + completer) is all that is required.
   }
 };
 
@@ -442,7 +466,15 @@ struct WaitTestTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<WaitTestTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a
+    // WHOLE-TASK assignment, so it runs Task::Copy — overwriting this
+    // task's identity (task_id_, pool_query_, completer_) with the
+    // replica's while the send map and completion path still reference
+    // it — and re-assigns IN fields, including shm priv::strings, across
+    // segments. Merge ONLY the OUT fields, with semantics that suit them.
+    auto other = other_base.template Cast<WaitTestTask>();
+    current_depth_ = other->current_depth_;
   }
 };
 
@@ -500,7 +532,15 @@ struct TestLargeOutputTask : public clio::run::Task {
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<TestLargeOutputTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a
+    // WHOLE-TASK assignment, so it runs Task::Copy — overwriting this
+    // task's identity (task_id_, pool_query_, completer_) with the
+    // replica's while the send map and completion path still reference
+    // it — and re-assigns IN fields, including shm priv::strings, across
+    // segments. Merge ONLY the OUT fields, with semantics that suit them.
+    auto other = other_base.template Cast<TestLargeOutputTask>();
+    data_ = other->data_;
   }
 };
 
@@ -569,7 +609,16 @@ struct GpuSubmitTask : public clio::run::Task {
    */
   CTP_CROSS_FUN void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<GpuSubmitTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a
+    // WHOLE-TASK assignment, so it runs Task::Copy — overwriting this
+    // task's identity (task_id_, pool_query_, completer_) with the
+    // replica's while the send map and completion path still reference
+    // it — and re-assigns IN fields, including shm priv::strings, across
+    // segments. Merge ONLY the OUT fields, with semantics that suit them.
+    auto other = other_base.template Cast<GpuSubmitTask>();
+    result_value_ = other->result_value_;
+    counter_value_ = other->counter_value_;
   }
 };
 
@@ -622,7 +671,15 @@ struct SubtaskTestTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<SubtaskTestTask>());
+    // AggregateOut merges a REPLICA's OUT fields into this (origin) task.
+    // It must NOT delegate to Copy() (issue #856/#915): Copy() is a
+    // WHOLE-TASK assignment, so it runs Task::Copy — overwriting this
+    // task's identity (task_id_, pool_query_, completer_) with the
+    // replica's while the send map and completion path still reference
+    // it — and re-assigns IN fields, including shm priv::strings, across
+    // segments. Merge ONLY the OUT fields, with semantics that suit them.
+    auto other = other_base.template Cast<SubtaskTestTask>();
+    result_value_ = other->result_value_;
   }
 };
 

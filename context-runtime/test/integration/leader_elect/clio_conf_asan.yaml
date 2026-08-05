@@ -21,15 +21,14 @@ runtime:
 
 # Fast SWIM failure detection for the test (production defaults are 30/15/60s,
 # which would take ~150s to confirm a dead node — longer than the scenario).
-# SWIM timings (issue #856). These were 2s/2s/3s to make the suite fast, but
-# under docker load that false-positives HEALTHY nodes as dead: the logs show
-# replicas "Gone" on two live nodes at once, after which the survivors
-# self-fence and the post-failover create never completes (the suite hangs).
-# Slow detection is no longer a problem for this test — a create now tolerates
-# a replica it cannot deliver to a dead node — so these are relaxed enough to
-# stop firing spuriously while still detecting the killed leader promptly.
 swim:
   enabled: true
-  direct_probe_timeout_sec: 5.0
-  indirect_probe_timeout_sec: 5.0
-  suspicion_timeout_sec: 8.0
+  direct_probe_timeout_sec: 20.0
+  indirect_probe_timeout_sec: 20.0
+  suspicion_timeout_sec: 30.0
+
+# ASan variant of clio_conf.yaml (issue #856): the base config uses very
+# aggressive SWIM timeouts (2s/2s/3s) so the suite runs fast. Under an
+# ASan-instrumented build everything is several times slower, so those
+# timeouts false-positive healthy nodes as dead and the cluster never
+# stabilises enough to create a pool. Scaled 10x here.

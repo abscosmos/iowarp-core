@@ -1,0 +1,18 @@
+# LOCAL-ONLY overlay: LD_PRELOAD the abrt_bt backtrace shim into every node so
+# a `free(): invalid pointer` abort prints a stack (ptrace/gdb/core dumps are
+# unavailable in these containers). Build the .so first with:
+#   docker run --rm -v $HOST_WORKSPACE:/workspace -w /workspace \
+#     iowarp/deps-cpu:latest gcc -shared -fPIC -O0 -g -o /workspace/abrt_bt.so /workspace/abrt_bt.c
+services:
+  iowarp-node1:
+    environment:
+      LD_PRELOAD: /workspace/abrt_bt.so
+  iowarp-node2:
+    environment:
+      LD_PRELOAD: /workspace/abrt_bt.so
+  iowarp-node3:
+    environment:
+      LD_PRELOAD: /workspace/abrt_bt.so
+  iowarp-node4:
+    environment:
+      LD_PRELOAD: /workspace/abrt_bt.so
