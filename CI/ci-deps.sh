@@ -352,6 +352,10 @@ if [ "$ONLY_DEPS" = true ]; then
     # pin and trips conda-build's execute_download_actions IndexError.
     # Retry: render performs a solve and can hit the same transient
     # "database is locked" / conda-forge 502 flakes as the installs above.
+    # Backoff is 30/60/120s (not 10/20/30): on 2026-08-05 a render episode
+    # outlived all three of the shorter waits and failed the macOS legs
+    # (#916), while sibling jobs on the same commit rendered fine minutes
+    # later. The wider window costs nothing on the happy path.
     _render_ok=0
     for _attempt in 1 2 3; do
         if "$CONDA_BIN" render "$RECIPE_DIR" \
@@ -360,8 +364,9 @@ if [ "$ONLY_DEPS" = true ]; then
             _render_ok=1
             break
         fi
-        echo -e "${YELLOW}conda render failed (attempt $_attempt/3), retrying in $((10 * _attempt))s...${NC}"
-        sleep $((10 * _attempt))
+        _render_wait=$((30 * (1 << (_attempt - 1))))
+        echo -e "${YELLOW}conda render failed (attempt $_attempt/3), retrying in ${_render_wait}s...${NC}"
+        sleep "$_render_wait"
     done
     if [ "$_render_ok" -ne 1 ]; then
         echo -e "${RED}conda render failed${NC}"
@@ -444,14 +449,43 @@ echo ""
 # crashes conda-build in execute_download_actions
 # ("IndexError: list index out of range"), even when the value
 # matches the pin. This mirrors the known-good install-conda.yml job.
-if "$CONDA_BIN" build "$RECIPE_DIR" \
-    --output-folder "$OUTPUT_DIR" \
-    -c conda-forge \
-    --no-anaconda-upload; then
-    BUILD_SUCCESS=true
-else
-    BUILD_SUCCESS=false
-fi
+# Retry ONLY conda-build's own internal crashes, never a genuine build
+# failure. On 2026-08-05 four CI Linux jobs died here while eight jobs in
+# the same run (same commit, same conda-build 26.7.0, same minute) passed
+# the identical step, and the same four passed in the sibling run: a
+# transient metadata-expansion crash, e.g.
+#     File ".../conda_build/render.py", line 1034, in expand_outputs
+#     IndexError: list index out of range
+# (#916; the --python note above is an earlier incident in the same
+# family). Compile/test failures must still fail on the first attempt --
+# a blind retry of a 10-30 minute build would burn CI on every real
+# breakage -- so we match the crash signature before retrying.
+_build_log="$(mktemp -t iowarp-conda-build.XXXXXX)"
+BUILD_SUCCESS=false
+for _attempt in 1 2; do
+    # tee keeps the build streaming to the CI log while capturing it for
+    # the signature check. PIPESTATUS[0] is conda's status -- the
+    # pipeline's own status is tee's, which is always 0.
+    set +e
+    "$CONDA_BIN" build "$RECIPE_DIR" \
+        --output-folder "$OUTPUT_DIR" \
+        -c conda-forge \
+        --no-anaconda-upload 2>&1 | tee "$_build_log"
+    _build_rc=${PIPESTATUS[0]}
+    set -e
+
+    if [ "$_build_rc" -eq 0 ]; then
+        BUILD_SUCCESS=true
+        break
+    fi
+    if [ "$_attempt" -ge 2 ] || \
+       ! grep -qE "ERROR REPORT|IndexError: list index out of range" "$_build_log"; then
+        break
+    fi
+    echo -e "${YELLOW}conda-build crashed internally (not a build error); retrying once in 60s...${NC}"
+    sleep 60
+done
+rm -f "$_build_log"
 
 echo ""
 
