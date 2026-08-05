@@ -380,6 +380,20 @@ struct BaseCreateTask : public clio::run::Task {
     if (error_message_.size() == 0 && other->error_message_.size() > 0) {
       error_message_ = other->error_message_;
     }
+    // A replica that could not be delivered because its target node DIED must
+    // not fail the whole create (issue #856). Pool creation is a broadcast:
+    // Task::AggregateOut propagates any non-zero replica RC to the origin, so
+    // one unreachable node turned an otherwise-successful create into an
+    // error — which is exactly what the leader-election suite asserts on right
+    // after it kills a node (and, before dead-node tasks completed at all,
+    // what HUNG instead). The pool genuinely exists once any node created it
+    // and reported its id; the dead node's container is created when it
+    // rejoins or when recovery redistributes it. Only the network-timeout RC
+    // is forgiven — a real create failure still propagates.
+    if (!new_pool_id_.IsNull() &&
+        GetReturnCode() == clio::run::kRun2RunNetworkTimeoutRC) {
+      SetReturnCode(0);
+    }
   }
 
   /**
@@ -387,6 +401,22 @@ struct BaseCreateTask : public clio::run::Task {
    * Sets client_->pool_id_ and client_->return_code_ from task results
    */
   void PostWait() {
+    // Forgive a replica that could not be delivered because its target node
+    // DIED (issue #856). This has to happen HERE, not in AggregateOut: the
+    // dead-replica verdict is applied straight to the origin by
+    // HandleTaskProgressResult, which runs AFTER the surviving replicas have
+    // aggregated. Pool creation is a broadcast over the admin pool, which has
+    // one container per node INCLUDING a node that just died, so a single
+    // undeliverable replica turned an otherwise-successful create into an
+    // error — the leader-election suite's assertion right after it kills a
+    // node (and, before dead-node tasks completed at all, an infinite hang).
+    // The pool genuinely exists once a node created it and reported its id;
+    // the dead node's container follows on rejoin or recovery. Only the
+    // network-timeout RC is forgiven — real create failures still propagate.
+    if (!new_pool_id_.IsNull() &&
+        return_code_ == clio::run::kRun2RunNetworkTimeoutRC) {
+      SetReturnCode(0);
+    }
     if (client_ != nullptr) {
       client_->pool_id_ = new_pool_id_;
       client_->return_code_ = return_code_;
