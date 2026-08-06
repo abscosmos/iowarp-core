@@ -89,6 +89,47 @@ public:
   Runtime() = default;
   ~Runtime() override = default;
 
+
+  /**
+   * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
+   *
+   * compute_ is the feature Container::InferCpuTime multiplies its learned
+   * per-method coefficient by; leaving it 0 — as every chimod but MOD_NAME and
+   * admin did — collapses that model to one constant per method with no
+   * dependence on request size. wall_time_ seeds InferWallClockTime at the
+   * ~500 MB/s house convention. Both coefficients are then learned from real
+   * completions, so these only need the right order of magnitude.
+   */
+  clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override {
+    clio::run::TaskStat stat;
+    if (task == nullptr) {
+      return stat;
+    }
+    switch (task->method_) {
+      case Method::kCompress: {
+        const auto *t = static_cast<const CompressTask *>(task);
+        stat.io_size_ = t->size_;
+        // Compression is genuinely CPU-bound: ~300 MB/s, i.e. ~300 bytes per
+        // microsecond of CPU. That is 30x more CPU per byte than a plain copy,
+        // which is exactly the distinction the cost model needs to see.
+        stat.compute_ = static_cast<size_t>(t->size_ / 300.0f) + 5;
+        stat.wall_time_ = static_cast<float>(t->size_) / 300.0f;
+        return stat;
+      }
+      case Method::kDecompress: {
+        const auto *t = static_cast<const DecompressTask *>(task);
+        stat.io_size_ = t->size_;
+        // Decompression runs ~3x faster than compression.
+        stat.compute_ = static_cast<size_t>(t->size_ / 900.0f) + 5;
+        stat.wall_time_ = static_cast<float>(t->size_) / 900.0f;
+        return stat;
+      }
+      default:
+        return clio::cte::core::CoreInterposer::GetTaskStats(task);
+    }
+  }
+
+
 private:
   // Client for this ChiMod
   Client client_;

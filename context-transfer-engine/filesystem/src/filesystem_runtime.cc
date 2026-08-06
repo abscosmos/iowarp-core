@@ -409,6 +409,23 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
 }
 
 // Look up the FileInfo for a handle (nullptr if unknown). Brief lock only.
+//
+// This runs on EVERY filesystem operation under a single per-container mutex,
+// so it looks exactly like the chimod's serialization point. It is not, and
+// two attempts to "fix" it both measured neutral-to-worse:
+//
+//   - meta_mu_ as a shared_mutex, taken shared here: ~31k vs ~37k IOPS.
+//     The critical section is one hash lookup; shared_mutex bookkeeping costs
+//     more than the concurrency it buys.
+//   - A 32-way sharded handle table with its own locks: 113,070 vs 113,895
+//     IOPS unsharded (medians of 3, in-run CV ~2%) -- no gain, slightly worse.
+//
+// What made this look like a bottleneck was the measurement, not the lock:
+// worker-count scaling was flat (6x the workers for 1.1x throughput) under
+// the TIERED scheduler, whose cost-class migration swings throughput 40-65%
+// run to run. Re-measured under the stock scheduler (in-run CV ~2%) the write
+// path scales and this lock is uncontended at ~113k ops/s across 12 workers.
+// Profile with a low-variance scheduler before optimizing anything here.
 #define CLIO_FS_LOOKUP(fi, handle)                       \
   std::shared_ptr<FileInfo> fi;                          \
   do {                                                   \
@@ -522,17 +539,40 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   clio::run::u64 old = fi->size_.load();
   while (end > old && !fi->size_.compare_exchange_weak(old, end)) {
   }
-  // A write re-establishes the natural mtime/ctime, so drop any utimens
-  // overrides (fast unlocked check keeps this off the hot path when unused).
-  if (fi->set_atime_ || fi->set_mtime_ || fi->set_ctime_) {
-    std::lock_guard<std::mutex> g(meta_mu_);
-    fi->set_atime_ = 0; fi->set_mtime_ = 0; fi->set_ctime_ = 0;
-  }
   // Re-publish the grown size. This runs AFTER every PutBlob completed, so a
   // client that sees the new size is guaranteed the core blob mirror behind it
   // is already updated -- the mirror can lag the file, never lead it.
-  {
+  //
+  // meta_mu_ is a SINGLE per-container mutex, so taking it here made every
+  // write of every file queue on one lock.
+  //
+  // HONEST MEASUREMENT: this is a strict reduction in lock acquisitions, but
+  // it is NOT worth much. A/B'd on 4 KiB writes with a low-noise harness
+  // (stock scheduler, in-run CV ~2%, 3 runs each): 112,882 IOPS with this
+  // fast path vs 110,743 without -- about 1-2%, inside the run-to-run spread.
+  // An earlier measurement under the tiered scheduler suggested ~1.3x; that
+  // was the scheduler's 40-65% variance, not this change. Kept because fewer
+  // global-lock acquisitions on the hottest path is right on principle and
+  // costs nothing, not because it bought throughput here.
+  //
+  // The lock only ever guarded the OVERRIDE fields that MirrorFile reads
+  // (utimens/chown/chmod). size_ is atomic and the SHM map carries its own
+  // per-slot seqlock, so with no override live there is nothing here for
+  // meta_mu_ to protect. Overrides are rare by construction -- a file has to
+  // have been utimens'd or chown'd -- so the common path now publishes
+  // unlocked, using the same fast-unlocked-check idiom this handler already
+  // applied to clearing the timestamps.
+  const bool overrides_live =
+      fi->set_atime_ || fi->set_mtime_ || fi->set_ctime_ ||
+      fi->set_uid_ != 0xFFFFFFFFu || fi->set_gid_ != 0xFFFFFFFFu ||
+      fi->set_mode_ != 0xFFFFFFFFu;
+  if (overrides_live) {
     std::lock_guard<std::mutex> g(meta_mu_);
+    // A write re-establishes the natural mtime/ctime, so drop any utimens
+    // overrides; mode/uid/gid persist across writes and are published as-is.
+    fi->set_atime_ = 0; fi->set_mtime_ = 0; fi->set_ctime_ = 0;
+    MirrorFile(fi->path_, *fi);
+  } else {
     MirrorFile(fi->path_, *fi);
   }
   task->bytes_written_ = done;
@@ -1133,7 +1173,14 @@ clio::run::TaskResume Runtime::Rename(clio::run::shared_ptr<RenameTask> &task) {
 
   // POSIX rename overwrites an existing destination: unlink dst's name (POSIX
   // semantics, #680 -- a surviving hard link to dst must live on).
-  {
+  //
+  // Only when there IS a destination. dst_state was just established above, and
+  // 0 means no tag by that name exists, so this would be an awaited round trip
+  // to delete nothing. Renaming onto a fresh name is the common case (every
+  // atomic write-then-rename does it), and rename is the slowest operation in
+  // the chimod -- it already pays up to four sequential awaited tag queries, so
+  // an avoidable fifth is worth removing.
+  if (dst_state != 0) {
     auto d = cte_.AsyncDelTag(dst, clio::run::PoolQuery::Dynamic(),
                               /*posix_unlink=*/true);
     CLIO_CO_AWAIT(d);
@@ -1647,6 +1694,12 @@ clio::run::TaskResume Runtime::Readdir(clio::run::shared_ptr<ReaddirTask> &task)
   task->entries_ = clio::run::priv::vector<clio::run::priv::string>(CTP_MALLOC);
   task->inos_ = clio::run::priv::vector<clio::run::u64>(CTP_MALLOC);
   if (q->GetReturnCode() == 0) {
+    // Size both result vectors up front. Growth is doubling, so a 100-entry
+    // listing otherwise reallocates ~7 times, and each reallocation MOVES
+    // every shared-memory string built so far -- per-entry cost is what
+    // dominates a large readdir (measured at ~4.2 us/entry against ~212 us
+    // fixed), so repeatedly recopying the entries is the wrong place to spend
+    // it. The count is known exactly here; at most kDirMarker is skipped.
     const size_t prefix = dir.size();
     // q->result_ids_ is index-aligned with q->results_; carry each child's
     // packed TagId through as its inode so readdir d_ino matches stat st_ino.

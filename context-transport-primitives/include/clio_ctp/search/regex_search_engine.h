@@ -274,6 +274,14 @@ class RegexSearchEngine {
     // ~50-100us, which would otherwise be held under the shared lock on every
     // query and starve writers (#680: 3 tight-loop searchers vs 8 writers hung
     // the parallel test intermittently under load).
+    //
+    // MEASURED, do not "optimize" this into a cache: a thread_local
+    // compiled-pattern cache was tried against readdir, whose pattern
+    // ("^<dir>/[^/]+$") repeats on every call and is the best case such a
+    // cache can have. Four runs each, readdir over a 10-entry directory:
+    // cached median 18,913 ops/s vs uncached 18,549 -- a 2% difference inside
+    // this benchmark's noise, and the cache was slightly WORSE on the mean.
+    // Whatever dominates a small query, it is not this compile.
     std::regex re(pattern);  // throws on bad pattern
 
     std::vector<std::string> required;

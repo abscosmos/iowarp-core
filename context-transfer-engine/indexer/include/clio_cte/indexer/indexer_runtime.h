@@ -93,6 +93,39 @@ class Runtime : public clio::cte::core::CoreInterposer {
   Runtime() = default;
   ~Runtime() override = default;
 
+
+  /**
+   * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
+   *
+   * compute_ is the feature Container::InferCpuTime multiplies its learned
+   * per-method coefficient by; leaving it 0 — as every chimod but MOD_NAME and
+   * admin did — collapses that model to one constant per method with no
+   * dependence on request size. wall_time_ seeds InferWallClockTime at the
+   * ~500 MB/s house convention. Both coefficients are then learned from real
+   * completions, so these only need the right order of magnitude.
+   */
+  clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override {
+    clio::run::TaskStat stat;
+    if (task == nullptr) {
+      return stat;
+    }
+    switch (task->method_) {
+      case Method::kIndexSweep:
+        // Walks newly-written blobs and updates the index: CPU-bound text work.
+        stat.compute_ = 150;
+        stat.wall_time_ = 200.0f;
+        return stat;
+      case Method::kReindexScan:
+        // Full rebuild pass — the most expensive thing this chimod does.
+        stat.compute_ = 1000;
+        stat.wall_time_ = 1500.0f;
+        return stat;
+      default:
+        return clio::cte::core::CoreInterposer::GetTaskStats(task);
+    }
+  }
+
+
   // ---- Method handlers ----
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);

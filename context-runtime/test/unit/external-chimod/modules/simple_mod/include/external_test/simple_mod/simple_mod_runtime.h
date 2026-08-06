@@ -57,6 +57,23 @@ public:
   // CreateParams type used by CLIO_TASK_CC macro for lib_name access
   using CreateParams = external_test::simple_mod::CreateParams;
 
+  /**
+   * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
+   * This module's verbs are trivial bookkeeping, but reporting a small
+   * non-zero compute_ keeps it out of the "unknown, assume free" bucket:
+   * compute_ is the feature Container::InferCpuTime scales, and a chimod that
+   * leaves it 0 makes every one of its methods predict the same constant.
+   */
+  clio::run::TaskStat GetTaskStats(
+      const clio::run::Task *task) const override {
+    clio::run::TaskStat stat;
+    if (task != nullptr) {
+      stat.compute_ = 5;
+      stat.wall_time_ = 8.0f;
+    }
+    return stat;
+  }
+
 private:
   // Container-specific state
   clio::run::u32 create_count_ = 0;

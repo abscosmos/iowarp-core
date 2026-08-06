@@ -183,6 +183,10 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
       clio::run::TaskStat stat;
       stat.io_size_ = wt->length_;
       size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
+      // compute_ is the feature InferCpuTime scales — without it the CPU model
+      // is one constant per method and cannot tell 4 KiB from 1 MiB. The CPU
+      // half of a device write is the staging copy, ~10 KB per microsecond.
+      stat.compute_ = static_cast<size_t>(aligned / 10000.0f) + 2;
       stat.wall_time_ = static_cast<float>(aligned) / 500.0f;
       return stat;
     }
@@ -191,7 +195,16 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
       clio::run::TaskStat stat;
       stat.io_size_ = rt->length_;
       size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
+      stat.compute_ = static_cast<size_t>(aligned / 10000.0f) + 2;
       stat.wall_time_ = static_cast<float>(aligned) / 500.0f;
+      return stat;
+    }
+    case Method::kAllocateBlocks:
+    case Method::kFreeBlocks: {
+      // Pure allocator bookkeeping: no payload, a handful of microseconds.
+      clio::run::TaskStat stat;
+      stat.compute_ = 5;
+      stat.wall_time_ = 8.0f;
       return stat;
     }
     default: return clio::run::TaskStat();

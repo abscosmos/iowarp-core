@@ -226,7 +226,23 @@ bool FsBdevTransport::InitializeWorkerIOContexts() {
   clio::run::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
 
-  io_contexts_.resize(num_workers);
+  // Reserve slots for workers that do not exist yet. The worker pool GROWS at
+  // runtime: WorkOrchestrator::SpawnAdditionalWorker() hands out ids past the
+  // startup count (the #781/#785 lane-rescue path, and any scheduler that
+  // sizes pools on demand). This vector used to be sized once at pool
+  // creation, so GetWorkerIOContext(id) returned nullptr for every such worker
+  // and its I/O silently failed — writes logged "WriteToFile called with
+  // invalid I/O context" and reads returned 0 bytes, which the CTE read path
+  // treats as a hole rather than an error. Sizing to the same elastic headroom
+  // the lane table reserves keeps a context available for any id the
+  // orchestrator can produce.
+  //
+  // Only the startup contexts are opened eagerly; the reserved tail is opened
+  // lazily by GetWorkerIOContext the first time a spawned worker uses it, so
+  // this costs a vector of empty structs, not file descriptors.
+  const size_t reserved =
+      num_workers + clio::run::WorkOrchestrator::ElasticHeadroom();
+  io_contexts_.resize(reserved);
   bool success = true;
   for (size_t i = 0; i < num_workers; ++i) {
     if (!io_contexts_[i].Init(file_path_, io_depth_, static_cast<clio::run::u32>(i))) {
