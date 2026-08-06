@@ -354,11 +354,16 @@ int main(int argc, char **argv) {
   BenchConfig cfg;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
-    if (a == "--duration" && i + 1 < argc) cfg.duration_s = std::stod(argv[++i]);
-    else if (a == "--warmup" && i + 1 < argc) cfg.warmup_s = std::stod(argv[++i]);
-    else if (a == "--threads" && i + 1 < argc) cfg.threads = std::stoull(argv[++i]);
-    else if (a == "--max-data" && i + 1 < argc) cfg.max_data = ParseSize(argv[++i]);
-    else if (a == "--small-io" && i + 1 < argc) cfg.small_io = ParseSize(argv[++i]);
+    if (a == "--duration" && i + 1 < argc)
+      cfg.duration_s = std::stod(argv[++i]);
+    else if (a == "--warmup" && i + 1 < argc)
+      cfg.warmup_s = std::stod(argv[++i]);
+    else if (a == "--threads" && i + 1 < argc)
+      cfg.threads = std::stoull(argv[++i]);
+    else if (a == "--max-data" && i + 1 < argc)
+      cfg.max_data = ParseSize(argv[++i]);
+    else if (a == "--small-io" && i + 1 < argc)
+      cfg.small_io = ParseSize(argv[++i]);
     else if (a == "--root" && i + 1 < argc) cfg.root = argv[++i];
     else if (a == "--label" && i + 1 < argc) cfg.label = argv[++i];
     else if (a == "--csv" && i + 1 < argc) cfg.csv_path = argv[++i];

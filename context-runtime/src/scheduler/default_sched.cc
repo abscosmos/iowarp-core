@@ -580,7 +580,8 @@ void DefaultScheduler::RebalanceClasses(double now_us) {
       for (size_t i = 0; i < class_elastic_[c].size();) {
         Worker *w = class_elastic_[c][i];
         const bool busy =
-            (w != nullptr) && (w->RealtimeLoad(now_us) > 0.0 || w->IsExecuting());
+            (w != nullptr) &&
+            (w->RealtimeLoad(now_us) > 0.0 || w->IsExecuting());
         if (busy) {
           class_elastic_busy_us_[c][i] = now_us;
           ++i;

@@ -221,14 +221,19 @@ void PrintUsage(const char *argv0) {
   HIPRINT("Usage: {} [options]", argv0);
   HIPRINT("Options:");
   HIPRINT("  --duration <sec>     Measured window (default: 30)");
-  HIPRINT("  --warmup <sec>       Discarded warmup before measuring (default: 2)");
+  HIPRINT("  --warmup <sec>       Discarded warmup before measuring "
+          "(default: 2)");
   HIPRINT("  --threads <N>        Client threads (default: 8)");
-  HIPRINT("  --max-data <size>    Cap on dataset bytes, k/m/g suffix (default: 2g)");
-  HIPRINT("  --mix <spec>         <op>=<pct>[,<op>=<pct>...] (default: even split)");
+  HIPRINT("  --max-data <size>    Cap on dataset bytes, k/m/g suffix "
+          "(default: 2g)");
+  HIPRINT("  --mix <spec>         <op>=<pct>[,<op>=<pct>...] "
+          "(default: even split)");
   HIPRINT("  --root <path>        Filesystem root for the dataset");
-  HIPRINT("  --label <name>       Label recorded in the CSV (default: combined)");
+  HIPRINT("  --label <name>       Label recorded in the CSV "
+          "(default: combined)");
   HIPRINT("  --csv <path>         Append per-operation results to this CSV");
-  HIPRINT("  --filler <N>         Extra untouched files, to grow the tag index");
+  HIPRINT("  --filler <N>         Extra untouched files, to grow the tag "
+          "index");
   HIPRINT("  --small-io <size>    Size of the small-I/O ops (default: 4k)");
   HIPRINT("  --verbose, -v        Per-thread detail");
   HIPRINT("  --help, -h           Show this help");
