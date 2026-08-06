@@ -9,11 +9,64 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
+#include <unordered_map>
+#include <vector>
 #include <mutex>
 #include <clio_cte/filesystem/filesystem_tasks.h>
 #include <clio_cte/filesystem/shm_fs_cache.h>
 
 namespace clio::cte::filesystem {
+
+// ---- clio:: path marker (opt-in interception) -----------------------------
+//
+// Interception is opt-in by a "clio::" path component; the marker is stripped
+// before the path is used as a CTE tag name. This lived in the POSIX adapter,
+// which meant every other interceptor (STDIO, MPI-IO, libfuse, the HDF5 VFD)
+// had to link that adapter to ask "is this path mine?" -- a question about the
+// filesystem, not about POSIX.
+
+static constexpr char kClioPrefix[] = "clio::";
+static constexpr size_t kClioPrefixLen = sizeof(kClioPrefix) - 1;  // 6
+
+/** Byte offset where "clio::" appears as a path-component prefix, or npos. */
+inline size_t FindClioPrefix(const std::string &path) {
+  if (path.size() >= kClioPrefixLen &&
+      path.compare(0, kClioPrefixLen, kClioPrefix) == 0) {
+    return 0;
+  }
+  for (size_t cur = 0; cur < path.size(); ++cur) {
+    if (path[cur] != '/') continue;
+    if (cur + 1 + kClioPrefixLen <= path.size() &&
+        path.compare(cur + 1, kClioPrefixLen, kClioPrefix) == 0) {
+      return cur + 1;
+    }
+  }
+  return std::string::npos;
+}
+
+inline bool HasClioPrefix(const std::string &path) {
+  return FindClioPrefix(path) != std::string::npos;
+}
+
+/** Remove the first "clio::" marker, yielding the bare backend path. */
+inline std::string StripClioPrefix(const std::string &path) {
+  size_t pos = FindClioPrefix(path);
+  if (pos == std::string::npos) {
+    return path;
+  }
+  return path.substr(0, pos) + path.substr(pos + kClioPrefixLen);
+}
+
+/** CTE-issued descriptors start here so they never collide with kernel fds. */
+static constexpr int kCfsFdBase = 8192;
+/** Preferred block size reported by stat (matches the chimod page size). */
+static constexpr size_t kCfsBlkSize = 1024 * 1024;
+/** Synthetic device id -- same for every clio:: file. */
+static constexpr dev_t kClioStDev = static_cast<dev_t>(0xC110);
 
 /**
  * Filesystem client — the single API every interceptor (POSIX, STDIO,
@@ -26,6 +79,44 @@ class Client : public clio::cte::core::Client {
  public:
   Client() = default;
   explicit Client(const clio::run::PoolId &fs_pool_id) { Init(fs_pool_id); }
+
+#if CTP_IS_HOST
+  // Copyable by hand, because the descriptor table below carries a std::mutex
+  // and the compiler-generated copies would be deleted. The base client is
+  // copyable by contract (its deferred-write registry is process-wide for
+  // exactly that reason), and callers do copy it, so losing that here would be
+  // a silent API break.
+  //
+  // The lock is on the SOURCE: we are reading its table. Our own mutex is
+  // freshly constructed -- a lock is not state worth copying, and copying one
+  // would be undefined anyway.
+  Client(const Client &other) : clio::cte::core::Client(other) {
+    std::lock_guard<std::mutex> g(other.fd_mu_);
+    shm_fs_root_ = other.shm_fs_root_;
+    fds_ = other.fds_;
+    next_fd_ = other.next_fd_;
+  }
+
+  Client &operator=(const Client &other) {
+    if (this == &other) {
+      return *this;
+    }
+    clio::cte::core::Client::operator=(other);
+    // Both tables are touched, so both locks are taken -- ordered by address
+    // so two threads assigning A=B and B=A cannot deadlock.
+    std::mutex *first = &fd_mu_;
+    std::mutex *second = &other.fd_mu_;
+    if (first > second) {
+      std::swap(first, second);
+    }
+    std::lock_guard<std::mutex> g1(*first);
+    std::lock_guard<std::mutex> g2(*second);
+    shm_fs_root_ = other.shm_fs_root_;
+    fds_ = other.fds_;
+    next_fd_ = other.next_fd_;
+    return *this;
+  }
+#endif
 
 #if CTP_IS_HOST
   // =========================================================================
@@ -699,6 +790,156 @@ class Client : public clio::cte::core::Client {
    *         file/remote/GPU tier, or placement moving mid-copy. The caller
    *         must then use the RPC path, which is always correct.
    */
+  // =========================================================================
+  // POSIX descriptor layer.
+  //
+  // Formerly adapter/cfs/CfsIo. It is here because a descriptor table, an
+  // O_APPEND seek rule and a synthesized struct stat are FILESYSTEM state, not
+  // POSIX-interceptor state: the STDIO, MPI-IO and HDF5-VFD interceptors all
+  // need the same table, and while it lived in the POSIX adapter they had to
+  // link that adapter to get at it. An interceptor should translate its own
+  // API into these calls and hold nothing.
+  //
+  // The table is process-wide and static rather than a member because
+  // clio::cte::core::Client is copyable by contract (see the deferred-write
+  // registry, which is static for the same reason); a mutex member would
+  // silently break that.
+  // =========================================================================
+
+  struct OpenFile {
+    clio::run::u64 handle = 0;  ///< chimod handle
+    std::string path;           ///< bare (stripped) path == CTE tag name
+    clio::run::u64 off = 0;     ///< current seek offset
+    int flags = 0;              ///< open() flags
+  };
+
+  /** A path is intercepted iff it carries the clio:: marker. */
+  static bool IsPathTracked(const std::string &path) {
+    return HasClioPrefix(path);
+  }
+
+  /** O_SYNC/O_DSYNC keep the blocking behaviour: the caller asked for
+   *  durability over latency, and honouring that is the point of the flag. */
+  static bool IsSyncFd(int flags) {
+#ifdef O_DSYNC
+    if (flags & O_DSYNC) return true;
+#endif
+    return (flags & O_SYNC) != 0;
+  }
+
+  /** Whether fd was issued by us (and is still open). */
+  bool IsFdTracked(int fd) {
+    if (fd < kCfsFdBase) {
+      return false;
+    }
+    std::lock_guard<std::mutex> g(fd_mu_);
+    return fds_.find(fd) != fds_.end();
+  }
+
+  /** The chimod handle behind an fd, or 0 if untracked. */
+  clio::run::u64 HandleOf(int fd) {
+    std::lock_guard<std::mutex> g(fd_mu_);
+    auto it = fds_.find(fd);
+    return it == fds_.end() ? 0 : it->second.handle;
+  }
+
+  /** Copy out a descriptor's state, or set EBADF and return false. */
+  bool LookupFd(int fd, OpenFile *out) {
+    std::lock_guard<std::mutex> g(fd_mu_);
+    auto it = fds_.find(fd);
+    if (it == fds_.end()) {
+      errno = EBADF;
+      return false;
+    }
+    *out = it->second;
+    return true;
+  }
+
+  /** Advance a descriptor's seek offset after a successful read/write. */
+  void AdvanceFd(int fd, clio::run::u64 n) {
+    std::lock_guard<std::mutex> g(fd_mu_);
+    auto it = fds_.find(fd);
+    if (it != fds_.end()) {
+      it->second.off += n;
+    }
+  }
+
+  /** Bind the filesystem pool on first tracked use. */
+  static bool EnsureInit();
+
+  int OpenFd(const std::string &raw_path, int flags, int mode);
+  ssize_t ReadFd(int fd, void *buf, size_t count);
+  ssize_t WriteFd(int fd, const void *buf, size_t count);
+  ssize_t PreadFd(int fd, void *buf, size_t count, off_t offset);
+  ssize_t PwriteFd(int fd, const void *buf, size_t count, off_t offset);
+  off_t SeekFd(int fd, off_t offset, int whence);
+  off_t TellFd(int fd);
+  off_t SizeFd(int fd);
+  int CloseFd(int fd);
+  /** fsync(2): drain this file's deferred writes, reporting a latched
+   *  failure exactly once. */
+  int SyncFd(int fd);
+  int FtruncateFd(int fd, off_t length);
+  int TruncatePath(const std::string &raw_path, off_t length);
+  int RemovePath(const std::string &raw_path);
+  int RenamePath(const std::string &raw_src, const std::string &raw_dst);
+  int ReaddirPath(const std::string &raw_path, std::vector<std::string> *out);
+
+  /** Stable 64-bit synthetic inode from the bare path. */
+  static uint64_t SyntheticInode(const std::string &path) {
+    size_t h = std::hash<std::string>{}(path);
+    return static_cast<uint64_t>(h) ^ (static_cast<uint64_t>(h) << 32);
+  }
+
+  template <typename StatT>
+  static void FillStat(StatT *buf, const std::string &path,
+                       clio::run::u64 size) {
+    std::memset(buf, 0, sizeof(StatT));
+    buf->st_dev = kClioStDev;
+    buf->st_ino = SyntheticInode(path);
+    buf->st_mode = S_IFREG | 0644;
+    buf->st_nlink = 1;
+    buf->st_uid = CTP_SYSTEM_INFO->uid_;
+    buf->st_gid = CTP_SYSTEM_INFO->gid_;
+    buf->st_size = static_cast<off_t>(size);
+    buf->st_blksize = static_cast<blksize_t>(kCfsBlkSize);
+    // POSIX st_blocks counts 512-byte units; round up so non-empty != 0.
+    buf->st_blocks = static_cast<blkcnt_t>((size + 511) / 512);
+  }
+
+  /** fstat(2): fill *buf from the fd's chimod metadata. */
+  template <typename StatT>
+  int StatFd(int fd, StatT *buf) {
+    OpenFile of;
+    if (!LookupFd(fd, &of)) {
+      return -1;
+    }
+    // GetSize drains this file's deferred writes: stat(2) must report the
+    // size a completed write(2) established (issue #817).
+    clio::run::u64 size = 0;
+    if (!GetSize(of.path, &size)) {
+      errno = EBADF;
+      return -1;
+    }
+    FillStat(buf, of.path, size);
+    return 0;
+  }
+
+  /** stat(2): fill *buf for a clio:: path; ENOENT if it does not exist. */
+  template <typename StatT>
+  int StatPath(const std::string &raw_path, StatT *buf) {
+    std::string path = StripClioPrefix(raw_path);
+    clio::run::u64 size = 0;
+    bool exists = false;
+    if (!GetAttr(path, &exists, &size) || !exists) {
+      std::memset(buf, 0, sizeof(StatT));
+      errno = ENOENT;
+      return -1;
+    }
+    FillStat(buf, path, size);
+    return 0;
+  }
+
   ssize_t TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
                      size_t count) {
     // Attach lazily, and RETRY when not yet attached, rather than latching
@@ -832,6 +1073,14 @@ class Client : public clio::cte::core::Client {
   // when caching is unavailable. Not owned: the runtime owns the segment and
   // may drop the cache at any time, which is why every read is validated.
   ShmFsCacheRoot *shm_fs_root_ = nullptr;
+
+  // ---- POSIX descriptor table ----
+  // Guarded by fd_mu_. Held only around map lookups and insertions -- never
+  // across a task Wait, so a slow chimod call cannot block an unrelated
+  // open(2) or close(2).
+  mutable std::mutex fd_mu_;
+  std::unordered_map<int, OpenFile> fds_;
+  int next_fd_ = kCfsFdBase;
 #endif
 };
 

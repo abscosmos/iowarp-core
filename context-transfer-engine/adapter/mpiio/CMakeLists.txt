@@ -52,7 +52,7 @@ add_library(clio_cte_mpiio SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/mpiio_api.cc)
 target_link_libraries(clio_cte_mpiio
         MPI::MPI_CXX
-        clio_cte_cfs_adapter      # cfs-backed I/O core (context-filesystem chimod)
+        clio_cte_filesystem_client  # descriptor layer + chimod client
         clio_cte_core_client
         ctp::cxx
         ctp::interceptor

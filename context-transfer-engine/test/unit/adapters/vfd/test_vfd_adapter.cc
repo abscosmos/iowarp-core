@@ -42,7 +42,7 @@
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/bdev/bdev_client.h"
 #include "clio_cte/core/core_client.h"
-#include "adapter/cfs/cfs_io.h"
+#include <clio_cte/filesystem/filesystem_client.h>
 #include "adapter/vfd/H5FDclio.h"
 
 namespace {
@@ -720,7 +720,7 @@ int main() {
     struct stat nst;
     CHECK(::stat(kNativeDel, &nst) == 0, "14: native file exists before delete");
     struct stat cst;
-    CHECK(CLIO_CTE_CFS->StatPath(kClioDel, &cst) == 0,
+    CHECK(CLIO_CFS_CLIENT->StatPath(kClioDel, &cst) == 0,
           "14: CTE cache tag exists before delete");
 
     // Delete through the VFD (drives H5FD__clio_del via H5Fdelete).
@@ -739,7 +739,7 @@ int main() {
     CHECK(reopened < 0, "14: deleted file no longer opens");
 
     // Postcondition (CLIO side): the CTE cache tag is gone, not orphaned.
-    CHECK(CLIO_CTE_CFS->StatPath(kClioDel, &cst) != 0,
+    CHECK(CLIO_CFS_CLIENT->StatPath(kClioDel, &cst) != 0,
           "14: CTE cache tag removed after H5Fdelete (not orphaned)");
     std::printf("[vfd-suite] ok 14: del removes both native file and CTE tag\n");
   }

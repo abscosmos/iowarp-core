@@ -78,7 +78,7 @@
 
 #include "clio_cte/core/core_client.h"
 #include "clio_cte/filesystem/filesystem_client.h"
-#include "../adapter/cfs/cfs_io.h"
+#include <clio_cte/filesystem/filesystem_client.h>
 #include "clio_runtime/clio_runtime.h"
 
 namespace {
@@ -420,7 +420,7 @@ bool PopulateDir(clio::cte::filesystem::Client *fs, const std::string &dir,
 
 /** The adapter intercepts a path only if it carries the clio:: marker. */
 inline std::string Clio(const std::string &p) {
-  return std::string(clio::cae::kClioPrefix) + p;
+  return std::string(clio::cte::filesystem::kClioPrefix) + p;
 }
 
 /** Sub-intervals the measurement window is split into for stability
@@ -461,7 +461,7 @@ void Worker(const BenchConfig &cfg, ThreadContext &ctx,
             std::chrono::steady_clock::time_point measure_start,
             std::chrono::steady_clock::time_point deadline,
             std::atomic<bool> &abort_flag) {
-  auto *cfs = CLIO_CTE_CFS;
+  auto *cfs = CLIO_CFS_CLIENT;
   std::mt19937_64 rng(0x9E3779B97F4A7C15ULL ^ (ctx.tid * 1000003ULL));
   std::uniform_real_distribution<double> pick(0.0, 1.0);
 
@@ -501,7 +501,7 @@ void Worker(const BenchConfig &cfg, ThreadContext &ctx,
     switch (op) {
       case kWrite4K:
       case kWrite1M: {
-        ssize_t n = cfs->Pwrite(ctx.fd, ctx.buf.data(),
+        ssize_t n = cfs->PwriteFd(ctx.fd, ctx.buf.data(),
                                 static_cast<size_t>(io_size),
                                 static_cast<off_t>(offset));
         ok = (n == static_cast<ssize_t>(io_size));
@@ -510,7 +510,7 @@ void Worker(const BenchConfig &cfg, ThreadContext &ctx,
       }
       case kRead4K:
       case kRead1M: {
-        ssize_t n = cfs->Pread(ctx.fd, ctx.buf.data(),
+        ssize_t n = cfs->PreadFd(ctx.fd, ctx.buf.data(),
                                static_cast<size_t>(io_size),
                                static_cast<off_t>(offset));
         ok = (n >= 0);
@@ -523,11 +523,11 @@ void Worker(const BenchConfig &cfg, ThreadContext &ctx,
         break;
       }
       case kReaddirSmall: {
-        ok = (cfs->Readdir(small_dir, &ctx.dirents) == 0);
+        ok = (cfs->ReaddirPath(small_dir, &ctx.dirents) == 0);
         break;
       }
       case kReaddirLarge: {
-        ok = (cfs->Readdir(large_dir, &ctx.dirents) == 0);
+        ok = (cfs->ReaddirPath(large_dir, &ctx.dirents) == 0);
         break;
       }
       case kRename: {
@@ -701,7 +701,7 @@ int main(int argc, char **argv) {
     ctxs[t].file_size = per_thread;
     ctxs[t].buf.assign(kMaxIoSize, 0x5A);
     ctxs[t].buckets.assign(kNumBuckets, 0);
-    ctxs[t].fd = CLIO_CTE_CFS->Open(Clio(DataFilePath(cfg, t)), O_RDWR, 0644);
+    ctxs[t].fd = CLIO_CFS_CLIENT->OpenFd(Clio(DataFilePath(cfg, t)), O_RDWR, 0644);
     if (ctxs[t].fd < 0) {
       HLOG(kError, "ERROR: thread {} could not open its data file", t);
       return 1;
@@ -737,7 +737,7 @@ int main(int argc, char **argv) {
   for (size_t t = 0; t < cfg.threads; ++t) {
     // close(2) drains this file's deferred writes — the cost of the write
     // tail belongs to the run, not to whatever runs next.
-    CLIO_CTE_CFS->Close(ctxs[t].fd);
+    CLIO_CFS_CLIENT->CloseFd(ctxs[t].fd);
   }
 
   //=========================================================================

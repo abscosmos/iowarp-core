@@ -21,7 +21,7 @@ set_target_properties(clio_vfd PROPERTIES
 
 target_include_directories(clio_vfd SYSTEM PUBLIC ${HDF5_INCLUDE_DIRS})
 target_link_libraries(clio_vfd
-  clio_cte_cfs_adapter      # cfs-backed I/O core (context-filesystem chimod)
+  clio_cte_filesystem_client  # descriptor layer + chimod client
   clio_cte_core_client
   ctp::cxx
   ctp::interceptor

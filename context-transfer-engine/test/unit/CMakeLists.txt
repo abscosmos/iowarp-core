@@ -1571,7 +1571,7 @@ set_tests_properties(
 # clio-fs zero-IPC read path (issue #817): correctness + latency
 #
 # UNIX-only, like the cfs adapter it drives: cfs_io.h is built on unistd.h /
-# sys/stat.h / off_t and has no Windows port, so clio_cte_cfs_adapter does not
+# sys/stat.h / off_t and has no Windows port, so the filesystem client does not
 # exist there.
 # ------------------------------------------------------------------------------
 if(UNIX)
@@ -1592,7 +1592,7 @@ target_compile_definitions(test_cfs_shm_read PRIVATE
     CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
 
 target_link_libraries(test_cfs_shm_read
-    clio_cte_cfs_adapter
+    clio_cte_filesystem_client  # descriptor layer + chimod client
     clio_cte_filesystem_client
     clio_cte_core_client
     # The client library's Config helpers are defined in the RUNTIME library,

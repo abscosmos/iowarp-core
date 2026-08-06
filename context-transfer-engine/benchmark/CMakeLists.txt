@@ -42,10 +42,9 @@ add_executable(clio_cte_reliability_bench
   clio_cte_reliability_bench.cc
 )
 target_link_libraries(clio_cte_reliability_bench
-  # The benchmark drives CfsIo -- the POSIX adapter a real application
-  # reaches by interception -- not the chimod client directly. It is a
+  # Drives the descriptor layer (open/read/write/stat/readdir/rename) that a
+  # real application reaches by interception, not raw task submission. It is a
   # filesystem benchmark, so it pays what a filesystem caller pays.
-  clio_cte_cfs_adapter
   clio_cte_filesystem_client
   clio::cte::core_client
   clio::run::cxx
