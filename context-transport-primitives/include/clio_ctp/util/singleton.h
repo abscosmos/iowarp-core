@@ -273,7 +273,22 @@ static inline T *GetGlobalPtrVar(::std::atomic<T *> &instance) {
   }
   // Lost the publish race: another thread installed its instance first.
   // `observed` now holds the winner, which is the one everyone must share.
+  //
+  // The delete is well-defined even for a polymorphic T with a non-virtual
+  // destructor: `fresh` came from `new T()` two lines up, so the static and
+  // dynamic types are identical and no base-pointer slicing is possible.
+  // -Wdelete-non-virtual-dtor cannot see that and fires in every TU that
+  // instantiates this template (ConfigManager, IpcManager, ... are all
+  // polymorphic), so silence it narrowly here rather than leaving warnings
+  // scattered across the build.
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wdelete-non-virtual-dtor"
+#endif
   delete fresh;
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic pop
+#endif
   return observed;
 }
 
