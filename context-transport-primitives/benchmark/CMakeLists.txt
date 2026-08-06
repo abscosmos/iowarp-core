@@ -23,6 +23,17 @@ target_link_libraries(lock_latency_benchmark
         Threads::Threads)
 
 #------------------------------------------------------------------------------
+# Build Regex Search Benchmark (#919)
+#------------------------------------------------------------------------------
+
+add_executable(regex_search_benchmark
+        regex_search_benchmark.cc)
+add_dependencies(regex_search_benchmark clio_ctp_host)
+target_link_libraries(regex_search_benchmark
+        clio_ctp_host
+        Threads::Threads)
+
+#------------------------------------------------------------------------------
 # Build ZMQ IPC Latency Benchmark
 #------------------------------------------------------------------------------
 
