@@ -180,6 +180,7 @@ def report(data):
            f"{'p99us comb':>13}{'p99us iso':>13}{'p99 ratio':>12}")
     print(hdr)
     print("-" * 104)
+    rows = 0
     for op in OPS:
         if op not in IO_OPS:
             continue
@@ -187,10 +188,14 @@ def report(data):
         i = data.get(f"isolated_{op}", {}).get(op)
         if not c or not i:
             continue
+        rows += 1
         print(f"{op:<14}{fmt(c['mb_per_sec']):>12}{fmt(i['mb_per_sec']):>12}"
               f"{fmt(c['ops_per_sec']):>12}{fmt(i['ops_per_sec']):>12}"
               f"{fmt(c['p99_us']):>13}{fmt(i['p99_us']):>13}"
               f"{ratio(c['p99_us'], i['p99_us']):>12}")
+    if not rows:
+        print("  (no comparison: this CSV has no combined+isolated pair -- "
+              "run without --only, or point --csv at a full suite)")
 
     print()
     print("=" * 104)
@@ -201,6 +206,7 @@ def report(data):
            f"{'p99 ratio':>12}{'ops/s comb':>13}")
     print(hdr)
     print("-" * 104)
+    rows = 0
     for op in OPS:
         if op in IO_OPS:
             continue
@@ -208,11 +214,15 @@ def report(data):
         i = data.get(f"isolated_{op}", {}).get(op)
         if not c or not i:
             continue
+        rows += 1
         print(f"{op:<14}{fmt(c['avg_us']):>14}{fmt(i['avg_us']):>14}"
               f"{ratio(c['avg_us'], i['avg_us']):>12}"
               f"{fmt(c['p99_us']):>14}{fmt(i['p99_us']):>14}"
               f"{ratio(c['p99_us'], i['p99_us']):>12}"
               f"{fmt(c['ops_per_sec']):>13}")
+    if not rows:
+        print("  (no comparison: this CSV has no combined+isolated pair -- "
+              "run without --only, or point --csv at a full suite)")
 
     # Spread across repeats. Printed unconditionally when repeats exist: a
     # median with a 2x range behind it is not a measurement, and the only way
