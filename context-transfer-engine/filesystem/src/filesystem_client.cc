@@ -69,6 +69,9 @@ bool CLIO_CFS_CLIENT_INIT(const std::string &config_path,
   return true;
 }
 
+#if !defined(_WIN32)
+// Descriptor layer -- POSIX only, see filesystem_client.h.
+
 /**
  * Bind the filesystem pool on first tracked use.
  *
@@ -354,5 +357,7 @@ int Client::CloseFd(int fd) {
   }
   return (t->GetReturnCode() == 0) ? 0 : -1;
 }
+
+#endif  // !_WIN32
 
 }  // namespace clio::cte::filesystem

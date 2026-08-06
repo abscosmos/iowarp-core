@@ -9,9 +9,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#if !defined(_WIN32)
+// The descriptor layer below is POSIX-shaped (ssize_t/off_t/O_SYNC/S_IFREG)
+// and has no Windows port -- this is the same constraint that kept the old
+// adapter/cfs out of Windows builds at the CMake level. The rest of this
+// client (tasks, deferred writes, the SHM caches) is portable and still
+// compiles there, so guard the descriptor layer rather than the whole header.
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 #include <cerrno>
 #include <unordered_map>
 #include <vector>
@@ -61,12 +68,14 @@ inline std::string StripClioPrefix(const std::string &path) {
   return path.substr(0, pos) + path.substr(pos + kClioPrefixLen);
 }
 
+#if !defined(_WIN32)
 /** CTE-issued descriptors start here so they never collide with kernel fds. */
 static constexpr int kCfsFdBase = 8192;
 /** Preferred block size reported by stat (matches the chimod page size). */
 static constexpr size_t kCfsBlkSize = 1024 * 1024;
 /** Synthetic device id -- same for every clio:: file. */
 static constexpr dev_t kClioStDev = static_cast<dev_t>(0xC110);
+#endif  // !_WIN32
 
 /**
  * Filesystem client — the single API every interceptor (POSIX, STDIO,
@@ -80,7 +89,7 @@ class Client : public clio::cte::core::Client {
   Client() = default;
   explicit Client(const clio::run::PoolId &fs_pool_id) { Init(fs_pool_id); }
 
-#if CTP_IS_HOST
+#if CTP_IS_HOST && !defined(_WIN32)
   // Copyable by hand, because the descriptor table below carries a std::mutex
   // and the compiler-generated copies would be deleted. The base client is
   // copyable by contract (its deferred-write registry is process-wide for
@@ -432,8 +441,14 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+#if !defined(_WIN32)
   // =========================================================================
   // Byte-oriented filesystem I/O with POSIX semantics (issues #817, #862).
+  //
+  // POSIX-only: these return ssize_t and the descriptor layer below adds
+  // off_t/O_SYNC/S_IFREG. Windows builds get the task API (AsyncRead/
+  // AsyncWrite/...) which is portable; the old adapter/cfs was excluded from
+  // Windows at the CMake level for exactly this reason.
   //
   // THIS is the interface an interceptor calls. An adapter (POSIX, STDIO,
   // MPI-IO, libfuse) should own nothing but its handle table and its seek
@@ -1065,6 +1080,7 @@ class Client : public clio::cte::core::Client {
     }();
     return v;
   }
+#endif  // !_WIN32
 #endif  // CTP_IS_HOST
 
 #if CTP_IS_HOST
@@ -1074,6 +1090,7 @@ class Client : public clio::cte::core::Client {
   // may drop the cache at any time, which is why every read is validated.
   ShmFsCacheRoot *shm_fs_root_ = nullptr;
 
+#if !defined(_WIN32)
   // ---- POSIX descriptor table ----
   // Guarded by fd_mu_. Held only around map lookups and insertions -- never
   // across a task Wait, so a slow chimod call cannot block an unrelated
@@ -1081,6 +1098,7 @@ class Client : public clio::cte::core::Client {
   mutable std::mutex fd_mu_;
   std::unordered_map<int, OpenFile> fds_;
   int next_fd_ = kCfsFdBase;
+#endif  // !_WIN32
 #endif
 };
 

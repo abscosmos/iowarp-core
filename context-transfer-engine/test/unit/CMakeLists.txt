@@ -1570,8 +1570,8 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # clio-fs zero-IPC read path (issue #817): correctness + latency
 #
-# UNIX-only, like the cfs adapter it drives: cfs_io.h is built on unistd.h /
-# sys/stat.h / off_t and has no Windows port, so the filesystem client does not
+# UNIX-only: the descriptor layer it drives is built on unistd.h / sys/stat.h /
+# off_t and has no Windows port, so the filesystem client compiles it out there
 # exist there.
 # ------------------------------------------------------------------------------
 if(UNIX)
