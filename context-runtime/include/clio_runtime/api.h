@@ -51,7 +51,9 @@
 
 /** Same as CTP_DEFINE_GLOBAL_PTR_VAR_{H,CC} but with CLIO_RUN_API decoration
  *  so the symbol is exported from clio_run_cxx.dll and imported elsewhere. */
-#define CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(T, NAME) extern CLIO_RUN_API __TU(T) * NAME;
-#define CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(T, NAME) CLIO_RUN_API __TU(T) *NAME = nullptr;
+#define CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(T, NAME) \
+  extern CLIO_RUN_API ::std::atomic<__TU(T) *> NAME;
+#define CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(T, NAME) \
+  CLIO_RUN_API ::std::atomic<__TU(T) *> NAME{nullptr};
 
 #endif  // CLIO_RUN_API_H_

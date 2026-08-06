@@ -31,7 +31,9 @@
 /** Same as CTP_DEFINE_GLOBAL_PTR_VAR_{H,CC} but with CLIO_CTE_API decoration
  *  so the symbol is exported from clio_cte_core_client.dll and imported
  *  by every dependent module. */
-#define CLIO_CTE_DEFINE_GLOBAL_PTR_VAR_H(T, NAME) extern CLIO_CTE_API __TU(T) * NAME;
-#define CLIO_CTE_DEFINE_GLOBAL_PTR_VAR_CC(T, NAME) CLIO_CTE_API __TU(T) *NAME = nullptr;
+#define CLIO_CTE_DEFINE_GLOBAL_PTR_VAR_H(T, NAME) \
+  extern CLIO_CTE_API ::std::atomic<__TU(T) *> NAME;
+#define CLIO_CTE_DEFINE_GLOBAL_PTR_VAR_CC(T, NAME) \
+  CLIO_CTE_API ::std::atomic<__TU(T) *> NAME{nullptr};
 
 #endif  // CLIO_CTE_API_H_
