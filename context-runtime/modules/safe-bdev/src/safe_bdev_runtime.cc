@@ -66,6 +66,10 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
       clio::run::TaskStat stat;
       stat.io_size_ = wt->length_;
       const size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
+      // compute_ feeds InferCpuTime; a safe-bdev write additionally stages a
+      // per-block copy before forwarding to each member, so it carries roughly
+      // twice the CPU per byte of a plain bdev write.
+      stat.compute_ = static_cast<size_t>(aligned / 5000.0F) + 3;
       stat.wall_time_ = static_cast<float>(aligned) / 500.0F;
       return stat;
     }
@@ -74,7 +78,23 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
       clio::run::TaskStat stat;
       stat.io_size_ = rt->length_;
       const size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
+      stat.compute_ = static_cast<size_t>(aligned / 5000.0F) + 3;
       stat.wall_time_ = static_cast<float>(aligned) / 500.0F;
+      return stat;
+    }
+    case Method::kAllocateBlocks:
+    case Method::kFreeBlocks: {
+      // Slot bookkeeping under alloc_mu_ — small and bounded.
+      clio::run::TaskStat stat;
+      stat.compute_ = 6;
+      stat.wall_time_ = 10.0F;
+      return stat;
+    }
+    case Method::kBuildParity: {
+      // Reed-Solomon encode over a dirty stripe: the CPU-heaviest verb here.
+      clio::run::TaskStat stat;
+      stat.compute_ = 500;
+      stat.wall_time_ = 600.0F;
       return stat;
     }
     default:

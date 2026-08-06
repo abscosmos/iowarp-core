@@ -232,6 +232,14 @@ class WorkOrchestrator {
   // cap is a hard stop rather than a reallocation.
   static constexpr u32 kElasticHeadroom = 64;
 
+ public:
+  /** Upper bound on ids SpawnAdditionalWorker can hand out beyond the startup
+   *  worker count. Anything that indexes per-worker state by worker id must
+   *  reserve this much headroom, or a spawned worker lands outside the array
+   *  (see FsBdevTransport::InitializeWorkerIOContexts). */
+  static constexpr u32 ElasticHeadroom() { return kElasticHeadroom; }
+
+ private:
   // Worker ownership container (owns all worker unique_ptrs)
   std::vector<std::unique_ptr<Worker>> workers_;
 

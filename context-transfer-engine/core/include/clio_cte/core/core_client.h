@@ -42,8 +42,10 @@
 #include <clio_cte/core/shm_metadata_cache.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -881,15 +883,35 @@ class Client : public clio::run::ContainerClient {
     struct KeyPending {
       clio::run::u32 count_ = 0;
       std::vector<PendingExtent> extents_;  // submission order (seq ascending)
+      // High-water end offset over every write pending for this key, tracked
+      // even for writes whose payload is not readable (so it is never an
+      // under-estimate). Lets a size query decide whether anything in flight
+      // could EXTEND the object, which is the only way a pending write can
+      // change its size.
+      clio::run::u64 max_end_ = 0;
     };
     struct Shard {
       std::mutex mtx_;
       std::unordered_map<clio::run::u64, KeyPending> per_key_;
+      // Sticky per-key failure, outliving the pending entry (which is erased
+      // the moment its last put retires). POSIX write-behind requires it: a
+      // deferred write that fails must be reported to the fsync/close of THE
+      // FILE THAT FAILED, not to whichever caller happens to drain next, and
+      // the global errors_ counter cannot attribute that.
+      std::unordered_map<clio::run::u64, int> key_errors_;
     };
     Shard shards_[kShards];
-    std::mutex mtx_;  // guards fifo_ + inflight_bytes_
+    std::mutex mtx_;  // guards fifo_
     std::deque<DeferredPut> fifo_;
-    clio::run::u64 inflight_bytes_ = 0;
+    // Atomic so the window check on the submit path can early-out WITHOUT
+    // taking mtx_. That check is on every deferred write and passes almost
+    // every time (the window is 64 MiB; a write is kilobytes), so locking for
+    // it made a single global mutex the busiest thing in the client: 4 KiB
+    // writes went NEGATIVE with concurrency -- 82k IOPS on one thread, 35k on
+    // eight. Mutations still happen under mtx_ alongside the fifo_ they
+    // describe; the lock-free read is only ever used to decide "clearly under
+    // budget, do not wait", and rechecks under the lock before waiting.
+    std::atomic<clio::run::u64> inflight_bytes_{0};
     // Lock-free emptiness signal: readers on the hot path check this before
     // touching any lock — a pure-read phase pays one relaxed load per get.
     std::atomic<clio::run::u64> pending_count_{0};
@@ -937,13 +959,21 @@ class Client : public clio::run::ContainerClient {
       std::lock_guard<std::mutex> lk(sh.mtx_);
       KeyPending &kp = sh.per_key_[key];
       kp.count_++;
+      if (offset + size > kp.max_end_) {
+        kp.max_end_ = offset + size;
+      }
       if (data != nullptr) {
         kp.extents_.push_back(PendingExtent{seq, data, offset, size});
       }
     }
-    void KeyRelease(clio::run::u64 key, clio::run::u64 seq) {
+    void KeyRelease(clio::run::u64 key, clio::run::u64 seq, int err = 0) {
       Shard &sh = ShardFor(key);
       std::lock_guard<std::mutex> lk(sh.mtx_);
+      if (err != 0) {
+        // First failure wins: the earliest error is the one that explains
+        // the rest, and a later success must not clear it.
+        sh.key_errors_.emplace(key, err);
+      }
       auto it = sh.per_key_.find(key);
       if (it == sh.per_key_.end()) return;
       // Remove the retiring put's extent BEFORE its buffer is freed; later
@@ -959,12 +989,57 @@ class Client : public clio::run::ContainerClient {
         sh.per_key_.erase(it);
       }
     }
+    /** Highest end offset any write pending for `key` will reach, or 0 when
+     *  nothing is pending. Deliberately a high-water mark that does not fall
+     *  as individual writes retire: over-estimating costs an unnecessary
+     *  drain, under-estimating would report a stale size. */
+    clio::run::u64 MaxPendingEnd(clio::run::u64 key) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      auto it = sh.per_key_.find(key);
+      return it == sh.per_key_.end() ? 0 : it->second.max_end_;
+    }
+
+    /** Consume the sticky failure recorded for `key`, if any. Consuming is
+     *  the point: fsync(2) reports a write-behind failure ONCE, and a second
+     *  fsync on a file whose later writes all succeeded must return 0. */
+    int TakeKeyError(clio::run::u64 key) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      auto it = sh.key_errors_.find(key);
+      if (it == sh.key_errors_.end()) return 0;
+      int err = it->second;
+      sh.key_errors_.erase(it);
+      return err;
+    }
+
+    /** The sticky failure for `key` WITHOUT consuming it — for callers that
+     *  drain only to see a coherent size (stat, lseek) and must not eat the
+     *  report owed to fsync/close. */
+    int PeekKeyError(clio::run::u64 key) {
+      Shard &sh = ShardFor(key);
+      std::lock_guard<std::mutex> lk(sh.mtx_);
+      auto it = sh.key_errors_.find(key);
+      return it == sh.key_errors_.end() ? 0 : it->second;
+    }
+
     /** Compose [offset, offset+size) from the SET of pending puts for the
-     *  key, newest submission winning per byte. 1 = fully served; 0 = no
-     *  pending put for the key; -1 = pending but the union does not cover
-     *  the whole range — the caller must fall back to awaiting. The copy
-     *  runs under the shard lock, which is what keeps every source buffer
-     *  alive for its duration. */
+     *  key, newest submission winning per byte. The copy runs under the
+     *  shard lock, which is what keeps every source buffer alive for its
+     *  duration.
+     *
+     *    1 = fully served from in-flight bytes (no wait, no IPC)
+     *    0 = nothing pending for this key
+     *   -1 = pending writes PARTIALLY cover the range — the caller must
+     *        await them, because the uncovered bytes in the store are stale
+     *   -2 = pending writes exist but NONE overlaps the range — the caller
+     *        may read the store directly, with NO wait
+     *
+     *  The -1/-2 split matters more than it looks. Keys are whole FILES, so
+     *  collapsing them would make every read of a file that has any write in
+     *  flight wait for that file's entire write queue, including the common
+     *  case of reading bytes nobody is writing. That turns an unrelated
+     *  concurrent writer into a read stall. */
     int TryServe(clio::run::u64 key, clio::run::u64 offset, char *dst,
                  clio::run::u64 size, clio::run::u64 *served_size) {
       Shard &sh = ShardFor(key);
@@ -972,12 +1047,15 @@ class Client : public clio::run::ContainerClient {
       auto it = sh.per_key_.find(key);
       if (it == sh.per_key_.end()) return 0;
       const auto &ex = it->second.extents_;
+      // Pending but no readable bytes (a put whose payload we cannot see):
+      // its range is unknown, so it must be treated as possibly overlapping.
       if (ex.empty()) return -1;
       // Newest-first overlay: fill remaining gaps of the request from each
       // extent until nothing is uncovered. Extent counts are tiny (usually
       // 1), so a simple gap list is enough.
       struct Gap { clio::run::u64 lo, hi; };
       std::vector<Gap> gaps{{offset, offset + size}};
+      bool touched = false;  // did ANY pending extent intersect the request?
       for (size_t i = ex.size(); i-- > 0 && !gaps.empty();) {
         const PendingExtent &e = ex[i];
         clio::run::u64 elo = e.offset_, ehi = e.offset_ + e.size_;
@@ -990,12 +1068,15 @@ class Client : public clio::run::ContainerClient {
             continue;
           }
           std::memcpy(dst + (lo - offset), e.data_ + (lo - elo), hi - lo);
+          touched = true;
           if (g.lo < lo) next.push_back(Gap{g.lo, lo});
           if (hi < g.hi) next.push_back(Gap{hi, g.hi});
         }
         gaps.swap(next);
       }
-      if (!gaps.empty()) return -1;
+      // Untouched means no pending write claims any of these bytes, so the
+      // store already holds their current value: read it, do not wait.
+      if (!gaps.empty()) return touched ? -1 : -2;
       if (served_size != nullptr) *served_size = size;
       return 1;
     }
@@ -1015,6 +1096,131 @@ class Client : public clio::run::ContainerClient {
     return h;
   }
 
+  // ==== Generic deferred-write registry (module-agnostic) ==================
+  //
+  // The machinery above is not specific to blobs: the registry's future is
+  // type-erased (Future<Task>), the per-key table is keyed by a plain u64,
+  // and the byte budget and staging pool care only about sizes. These entry
+  // points expose it to ANY chimod client whose writes are async — the
+  // filesystem client is the first — so a POSIX write-behind window does not
+  // have to be reimplemented, per adapter, on top of a private task queue.
+  //
+  // Sharing ONE registry across modules is deliberate: a process writing
+  // both blobs and files has a single shared-memory budget, and only one
+  // FIFO can enforce it. It also means AwaitPutsUntilSpace may retire another
+  // module's writes, which is correct — they are competing for the same
+  // staging capacity.
+
+  /** Allocation-free 64-bit key for an opaque name (a path, say). Same FNV-1a
+   *  as DeferKeyHash minus the tag, so callers with no TagId can key the same
+   *  registry. Collisions cost a spurious same-key await, never correctness. */
+  static clio::run::u64 DeferKeyHashName(const std::string &name) {
+    clio::run::u64 h = 1469598103934665603ull;
+    for (unsigned char c : name) {
+      h = (h ^ c) * 1099511628211ull;
+    }
+    return h;
+  }
+
+  /**
+   * Register an ALREADY-SUBMITTED async write as deferred: the registry owns
+   * the future from here, retires it during any drain, and returns `staging`
+   * to the recycled pool when it does.
+   *
+   * `extent_data` (when non-null) must point at bytes that stay valid until
+   * the future retires — normally `staging.ptr_` itself. Supplying it is what
+   * lets a later read of the same key be SERVED from the in-flight write
+   * instead of waiting for it (DeferTryServe), which is the whole reason
+   * read-your-own-writes costs nothing here.
+   *
+   * @param key    DeferKeyHash / DeferKeyHashName of the object written
+   * @param staging pool-managed buffer to recycle at reap (may be null)
+   */
+  template <typename TaskT>
+  static void DeferRegisterWrite(clio::run::Future<TaskT> fut,
+                                 clio::run::u64 key, clio::run::u64 offset,
+                                 clio::run::u64 size, const char *extent_data,
+                                 ctp::ipc::FullPtr<char> staging =
+                                     ctp::ipc::FullPtr<char>::GetNull(),
+                                 clio::run::u64 staging_size = 0) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    clio::run::u64 seq = reg.seq_gen_.fetch_add(1) + 1;
+    reg.KeyAdd(key, seq, extent_data, offset, size);
+    DeferredPut rec;
+    rec.fut_ = fut.template Cast<clio::run::Task>();
+    rec.ents_.push_back(DeferredPut::Ent{key, seq, size});
+    rec.staging_ = staging;
+    rec.staging_size_ = staging_size;
+    {
+      std::lock_guard<std::mutex> lk(reg.mtx_);
+      reg.fifo_.push_back(std::move(rec));
+      reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
+      reg.inflight_bytes_.fetch_add(size, std::memory_order_relaxed);
+    }
+  }
+
+  /** Serve [offset, offset+size) from the in-flight writes for `key`, newest
+   *  winning per byte. 1 = fully served (no wait, no IPC); 0 = nothing
+   *  pending; -1 = PARTIALLY covered (await, then read); -2 = writes pending
+   *  for the key but none overlaps this range (read directly, no wait). */
+  static int DeferTryServe(clio::run::u64 key, clio::run::u64 offset,
+                           char *dst, clio::run::u64 size) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
+      return 0;
+    }
+    return reg.TryServe(key, offset, dst, size, nullptr);
+  }
+
+  /** Await every deferred write registered under `key`. */
+  static void DeferAwaitKey(clio::run::u64 key) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
+      return;
+    }
+    while (true) {
+      if (!reg.IsKeyPending(key)) {
+        return;
+      }
+      if (!DeferAwaitOldest()) {
+        // Nothing claimable, but the key is still accounted: another thread
+        // is mid-Wait on its write. Spin-yield until that wait retires it.
+        std::this_thread::yield();
+      }
+    }
+  }
+
+  /** True iff a deferred write for `key` is still in flight. */
+  static bool DeferKeyPending(clio::run::u64 key) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
+      return false;
+    }
+    return reg.IsKeyPending(key);
+  }
+
+  /** Highest end offset any write pending for `key` will reach (0 = none).
+   *  A caller holding a published size S can skip draining when this is <= S:
+   *  no pending write reaches past the current end, so none can change it. */
+  static clio::run::u64 DeferMaxPendingEnd(clio::run::u64 key) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
+      return 0;
+    }
+    return reg.MaxPendingEnd(key);
+  }
+
+  /** Consume `key`'s sticky write-behind failure (0 if none) — fsync/close. */
+  static int DeferTakeKeyError(clio::run::u64 key) {
+    return DeferRegistry::Get().TakeKeyError(key);
+  }
+
+  /** `key`'s sticky failure WITHOUT consuming it — stat/lseek, which drain
+   *  only for a coherent size and do not own the report. */
+  static int DeferPeekKeyError(clio::run::u64 key) {
+    return DeferRegistry::Get().PeekKeyError(key);
+  }
+
   /** Await the single oldest deferred put. @return false if none was
    *  available to claim (the fifo may be empty while other threads are still
    *  mid-Wait on claimed entries — per_key_/pending_count_/inflight_bytes_
@@ -1030,19 +1236,30 @@ class Client : public clio::run::ContainerClient {
    *  fresh one. Pool hits skip both the allocator walk and first-touch
    *  faults (issue #892). */
   static ctp::ipc::FullPtr<char> PoolAllocStaging(clio::run::u64 size) {
-    DeferRegistry &reg = DeferRegistry::Get();
-    {
-      std::lock_guard<std::mutex> lk(reg.pool_mtx_);
-      for (size_t i = 0; i < reg.pool_.size(); ++i) {
-        if (reg.pool_[i].second == size) {
-          ctp::ipc::FullPtr<char> buf = reg.pool_[i].first;
-          reg.pool_[i] = reg.pool_.back();
-          reg.pool_.pop_back();
-          return buf;
-        }
-      }
+    ctp::ipc::FullPtr<char> buf = PoolTryAlloc(size);
+    if (!buf.IsNull()) {
+      return buf;
     }
     return CLIO_IPC->AllocateBuffer(size);
+  }
+
+  /** Pop a recycled buffer of EXACTLY `size`, or NULL — no allocator
+   *  fallback. Lets a caller distinguish a pool HIT (free, and the common
+   *  case in a burst) from a MISS, so the expensive upkeep that refills the
+   *  pool can be done only when it is actually needed rather than on every
+   *  submit. Touches only pool_mtx_, never the registry's global mutex. */
+  static ctp::ipc::FullPtr<char> PoolTryAlloc(clio::run::u64 size) {
+    DeferRegistry &reg = DeferRegistry::Get();
+    std::lock_guard<std::mutex> lk(reg.pool_mtx_);
+    for (size_t i = 0; i < reg.pool_.size(); ++i) {
+      if (reg.pool_[i].second == size) {
+        ctp::ipc::FullPtr<char> b = reg.pool_[i].first;
+        reg.pool_[i] = reg.pool_.back();
+        reg.pool_.pop_back();
+        return b;
+      }
+    }
+    return ctp::ipc::FullPtr<char>::GetNull();
   }
 
   /** Return a staging buffer to the pool (or free it when the pool is
@@ -1097,22 +1314,30 @@ class Client : public clio::run::ContainerClient {
     }
     entry.fut_.Wait();
     auto *t = entry.fut_.get();
+    int err = 0;
     if (t == nullptr || t->GetReturnCode() != 0) {
       reg.errors_.fetch_add(1);
+      err = EIO;
     }
-    // Recycle the pool-managed staging buffer (issue #892).
-    PoolFreeStaging(entry.staging_, entry.staging_size_);
     clio::run::u64 bytes = 0;
     for (const auto &e : entry.ents_) bytes += e.size_;
     {
       std::lock_guard<std::mutex> lk(reg.mtx_);
       reg.pending_count_.fetch_sub(entry.ents_.size(),
                                    std::memory_order_relaxed);
-      reg.inflight_bytes_ -= bytes;
+      reg.inflight_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
     }
     for (const auto &e : entry.ents_) {
-      reg.KeyRelease(e.key_, e.seq_);
+      reg.KeyRelease(e.key_, e.seq_, err);
     }
+    // Recycle the pool-managed staging buffer (issue #892) — STRICTLY after
+    // KeyRelease. The pending extents point INTO this buffer and TryServe
+    // copies from them under the shard lock; returning it to the pool while
+    // an extent still listed it would hand a reader bytes that a subsequent
+    // writer is concurrently memcpy-ing into. KeyRelease unlists the extent
+    // under that same lock, so once it returns no reader can reach these
+    // bytes.
+    PoolFreeStaging(entry.staging_, entry.staging_size_);
     return true;
   }
 
@@ -1123,12 +1348,38 @@ class Client : public clio::run::ContainerClient {
    * at submit time so a long burst continuously recycles its staging instead
    * of allocating fresh (fault-cold) buffers for every put.
    */
-  static void DeferReapCompleted() {
+  static void DeferReapCompleted() { DeferReapCompletedImpl(false); }
+
+  /**
+   * DeferReapCompleted, but SKIPS rather than waits when another thread holds
+   * the registry lock.
+   *
+   * Reaping is pure upkeep -- it recycles staging for whoever comes next and
+   * is never required for correctness -- so blocking on it is the wrong
+   * trade at any contention. Measured on 4 KiB writes (medians of 3): the
+   * unconditional blocking reap gives 79k IOPS on one thread but collapses to
+   * 36k on eight, because every submitter queues on one mutex to do optional
+   * work. Skipping when contended keeps the single-thread number (the lock is
+   * free, so the reap happens) AND the concurrent one (whoever holds it is
+   * already reaping; a second thread waiting adds nothing).
+   */
+  static void DeferReapCompletedIfUncontended() {
+    DeferReapCompletedImpl(true);
+  }
+
+  static void DeferReapCompletedImpl(bool skip_if_contended) {
     DeferRegistry &reg = DeferRegistry::Get();
     while (true) {
       DeferredPut entry;
       {
-        std::lock_guard<std::mutex> lk(reg.mtx_);
+        std::unique_lock<std::mutex> lk(reg.mtx_, std::defer_lock);
+        if (skip_if_contended) {
+          if (!lk.try_lock()) {
+            return;
+          }
+        } else {
+          lk.lock();
+        }
         if (reg.fifo_.empty()) {
           return;
         }
@@ -1141,21 +1392,24 @@ class Client : public clio::run::ContainerClient {
       }
       entry.fut_.Wait();  // already complete — returns immediately
       auto *t = entry.fut_.get();
+      int err = 0;
       if (t == nullptr || t->GetReturnCode() != 0) {
         reg.errors_.fetch_add(1);
+        err = EIO;
       }
-      PoolFreeStaging(entry.staging_, entry.staging_size_);
       clio::run::u64 bytes = 0;
       for (const auto &e : entry.ents_) bytes += e.size_;
       {
         std::lock_guard<std::mutex> lk(reg.mtx_);
         reg.pending_count_.fetch_sub(entry.ents_.size(),
                                      std::memory_order_relaxed);
-        reg.inflight_bytes_ -= bytes;
+        reg.inflight_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
       }
       for (const auto &e : entry.ents_) {
-        reg.KeyRelease(e.key_, e.seq_);
+        reg.KeyRelease(e.key_, e.seq_, err);
       }
+      // After KeyRelease — see DeferAwaitOldest for why the order matters.
+      PoolFreeStaging(entry.staging_, entry.staging_size_);
     }
   }
 
@@ -1249,7 +1503,7 @@ class Client : public clio::run::ContainerClient {
     {
       std::lock_guard<std::mutex> lk(reg.mtx_);
       reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
-      reg.inflight_bytes_ += size;
+      reg.inflight_bytes_.fetch_add(size, std::memory_order_relaxed);
     }
     return 0;
   }
@@ -1327,7 +1581,7 @@ class Client : public clio::run::ContainerClient {
     {
       std::lock_guard<std::mutex> lk(reg.mtx_);
       reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
-      reg.inflight_bytes_ += total;
+      reg.inflight_bytes_.fetch_add(total, std::memory_order_relaxed);
     }
     return 0;
   }
@@ -1385,7 +1639,7 @@ class Client : public clio::run::ContainerClient {
       std::lock_guard<std::mutex> lk(reg.mtx_);
       reg.fifo_.push_back(std::move(rec));
       reg.pending_count_.fetch_add(1, std::memory_order_relaxed);
-      reg.inflight_bytes_ += size;
+      reg.inflight_bytes_.fetch_add(size, std::memory_order_relaxed);
     }
     return 0;
   }
@@ -1500,17 +1754,7 @@ class Client : public clio::run::ContainerClient {
     if (reg.pending_count_.load(std::memory_order_relaxed) == 0) {
       return;  // nothing deferred anywhere -> no key can be pending
     }
-    clio::run::u64 key = DeferKeyHash(tag_id, blob_name);
-    while (true) {
-      if (!reg.IsKeyPending(key)) {
-        return;
-      }
-      if (!DeferAwaitOldest()) {
-        // Nothing claimable, but the key is still accounted: another thread
-        // is mid-Wait on its put. Spin-yield until that wait retires it.
-        std::this_thread::yield();
-      }
-    }
+    DeferAwaitKey(DeferKeyHash(tag_id, blob_name));
   }
 
   /**
@@ -1546,7 +1790,10 @@ class Client : public clio::run::ContainerClient {
           task->SetComplete();
           return fut;
         }
-        if (served < 0) {
+        if (served == -1) {
+          // Partial coverage only: the bytes outside the pending put are
+          // stale in the store until it lands. -2 (no overlap at all) needs
+          // no wait and falls straight through to the normal read.
           AwaitPendingPuts(tag_id, blob_name);
         }
       }
@@ -1607,16 +1854,33 @@ class Client : public clio::run::ContainerClient {
 
   /**
    * Await oldest deferred puts until at most `max_inflight_bytes` of payload
-   * remain in flight. 0 = full drain. @return in-flight bytes on return.
+   * AND at most `max_inflight_count` operations remain in flight. 0 bytes =
+   * full drain. @return in-flight bytes on return.
+   *
+   * The COUNT bound is not redundant with the byte bound, and omitting it is
+   * a performance bug rather than a missing nicety: a byte-only window admits
+   * a number of concurrent operations that scales INVERSELY with I/O size.
+   * At 64 MiB that is 64 in-flight 1 MiB writes but 16,384 in-flight 4 KiB
+   * writes, and those pile onto a handful of page-sized blobs whose per-blob
+   * write token then serializes them. Measured on 4 KiB writes (8 threads):
+   * 16,384 in flight = 54.7k IOPS, 1,024 = 74.5k, 256 = 86.6k. The deepest
+   * queue was the slowest, by 1.59x.
    */
-  static clio::run::u64 AwaitPutsUntilSpace(clio::run::u64 max_inflight_bytes) {
+  static clio::run::u64 AwaitPutsUntilSpace(
+      clio::run::u64 max_inflight_bytes,
+      clio::run::u64 max_inflight_count =
+          std::numeric_limits<clio::run::u64>::max()) {
     DeferRegistry &reg = DeferRegistry::Get();
     while (true) {
-      {
-        std::lock_guard<std::mutex> lk(reg.mtx_);
-        if (reg.inflight_bytes_ <= max_inflight_bytes) {
-          return reg.inflight_bytes_;
-        }
+      // Lock-free fast path: under budget is the overwhelmingly common answer
+      // and needs no lock to establish. Only a write that is actually over the
+      // window pays for synchronization.
+      clio::run::u64 cur =
+          reg.inflight_bytes_.load(std::memory_order_relaxed);
+      if (cur <= max_inflight_bytes &&
+          reg.pending_count_.load(std::memory_order_relaxed) <=
+              max_inflight_count) {
+        return cur;
       }
       if (!DeferAwaitOldest()) {
         // In-flight bytes are retired only when their Wait completes; if

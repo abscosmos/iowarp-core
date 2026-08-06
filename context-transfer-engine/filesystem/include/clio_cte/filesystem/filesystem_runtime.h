@@ -32,6 +32,102 @@ class Runtime : public clio::run::Container {
   Runtime() = default;
   ~Runtime() override = default;
 
+  /**
+   * Per-task cost estimate for the scheduler.
+   *
+   * Three fields, three consumers:
+   *   io_size_    bytes the task moves — used for large-I/O routing.
+   *   compute_    estimated CPU microseconds. This is the ONLY feature
+   *               Container::InferCpuTime multiplies its learned per-method
+   *               coefficient by, so leaving it 0 collapses that model to a
+   *               constant with no dependence on request size — which is what
+   *               it did here before this override existed (clio-fs had no
+   *               GetTaskStats at all, so every task reported all zeros).
+   *   wall_time_  estimated wall microseconds, seeded at the ~500 MB/s the
+   *               other chimods use; InferWallClockTime learns the coefficient.
+   *
+   * The seeds below come from measured single-thread costs on this filesystem
+   * (clio_cte_reliability_bench, 1 client thread): stat ~31us, readdir ~255us
+   * for 10 entries and ~592us for 100, rename ~568us. They only need to be the
+   * right ORDER of magnitude — ReinforceCpuModel/ReinforceWallModel converge
+   * the coefficient from the first few completions.
+   */
+  clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override {
+    clio::run::TaskStat stat;
+    if (task == nullptr) {
+      return stat;
+    }
+    // Payload copy runs at roughly 10 GB/s, i.e. ~10 KB per CPU microsecond.
+    constexpr float kBytesPerComputeUs = 10000.0f;
+    constexpr float kBytesPerWallUs = 500.0f;  // ~500 MB/s, house convention
+    switch (task->method_) {
+      case Method::kRead: {
+        const auto *t = static_cast<const ReadTask *>(task);
+        stat.io_size_ = t->size_;
+        stat.compute_ =
+            static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
+        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
+        return stat;
+      }
+      case Method::kWrite: {
+        const auto *t = static_cast<const WriteTask *>(task);
+        stat.io_size_ = t->size_;
+        stat.compute_ =
+            static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
+        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
+        return stat;
+      }
+      case Method::kAppend: {
+        const auto *t = static_cast<const AppendTask *>(task);
+        stat.io_size_ = t->size_;
+        stat.compute_ =
+            static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
+        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
+        return stat;
+      }
+      case Method::kReaddir:
+        // A listing is a trigram regex query over the tag index plus one
+        // result marshalled per entry — CPU-bound, and by far the most
+        // expensive metadata call. The entry count is not known until the
+        // query returns, so this seeds the fixed part.
+        stat.compute_ = 200;
+        stat.wall_time_ = 250.0f;
+        return stat;
+      case Method::kRename:
+        // Two index searches (self + descendants) plus the re-key.
+        stat.compute_ = 400;
+        stat.wall_time_ = 500.0f;
+        return stat;
+      case Method::kStatSize:
+      case Method::kGetattr:
+        // Resolved through the O(1) name hash when the path is cached.
+        stat.compute_ = 20;
+        stat.wall_time_ = 30.0f;
+        return stat;
+      case Method::kOpen:
+      case Method::kClose:
+      case Method::kMkdir:
+      case Method::kRmdir:
+      case Method::kUnlink:
+      case Method::kTruncate:
+      case Method::kLink:
+      case Method::kSymlink:
+      case Method::kReadlink:
+      case Method::kUtimens:
+      case Method::kChown:
+      case Method::kSetxattr:
+      case Method::kGetxattr:
+      case Method::kListxattr:
+      case Method::kRemovexattr:
+        // Single metadata mutation/lookup against the tag map.
+        stat.compute_ = 15;
+        stat.wall_time_ = 25.0f;
+        return stat;
+      default:
+        return stat;
+    }
+  }
+
   // ---- Method handlers ----
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
@@ -129,7 +225,7 @@ class Runtime : public clio::run::Container {
     clio::run::u32 set_mode_{0xFFFFFFFFu};
   };
   std::mutex meta_mu_;
-  std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> handles_;  // handle -> file
+  std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> handles_;
   std::unordered_map<std::string, std::shared_ptr<FileInfo>> by_path_;
   std::atomic<clio::run::u64> next_handle_{1};
 

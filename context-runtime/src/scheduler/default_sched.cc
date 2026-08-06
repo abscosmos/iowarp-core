@@ -123,6 +123,43 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
     }
   }
 
+  // Partition the compute workers into the three cost-class pools. Round-robin
+  // so the classes interleave across lanes rather than taking contiguous
+  // blocks — with few workers that keeps each class on a different lane. When
+  // there are fewer compute workers than classes, classes share workers (the
+  // pools overlap); elasticity then grows the busy class on demand rather than
+  // leaving it wedged behind a shared worker.
+  {
+    std::lock_guard<std::mutex> g(class_mu_);
+    for (int c = 0; c < kNumCostClasses; ++c) {
+      class_workers_[c].clear();
+      class_elastic_[c].clear();
+      class_elastic_busy_us_[c].clear();
+    }
+    if (!io_workers_.empty()) {
+      for (size_t i = 0; i < io_workers_.size(); ++i) {
+        class_workers_[i % kNumCostClasses].push_back(io_workers_[i]);
+      }
+      // Any class left empty (fewer I/O workers than classes) borrows the
+      // whole pool so it is never unroutable.
+      for (int c = 0; c < kNumCostClasses; ++c) {
+        if (class_workers_[c].empty()) {
+          class_workers_[c] = io_workers_;
+        }
+      }
+    } else if (scheduler_worker_ != nullptr) {
+      for (int c = 0; c < kNumCostClasses; ++c) {
+        class_workers_[c].push_back(scheduler_worker_);
+      }
+    }
+    HLOG(kInfo,
+         "DefaultScheduler: cost classes quick(<={}us)={} medium(<={}us)={} "
+         "heavy={} workers; grow when all >{}us, retire idle >{}s",
+         kQuickClassUs, class_workers_[kQuickClass].size(), kMediumClassUs,
+         class_workers_[kMediumClass].size(),
+         class_workers_[kHeavyClass].size(), kSpawnLoadUs, kIdleRetireSec);
+  }
+
   // Register both net workers' lanes with the IPC manager so
   // EnqueueNetTask wakes the correct one based on the priority enqueued.
   IpcManager *ipc = CLIO_IPC;
@@ -258,21 +295,49 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
   }
 
   if (selected == nullptr) {
-    // Build the compute candidate pool. Prefer the dedicated I/O workers so the
-    // scheduler worker (lane 0) stays a pure INGRESS DISPATCHER — a heavy task
-    // executing there would stall the dispatch of every incoming task. Only fall
-    // back to the scheduler worker when there are no I/O workers.
-    Worker *cand[64];
-    u32 n = 0;
-    for (Worker *w : io_workers_) {
-      if (w != nullptr && n < 64) cand[n++] = w;
+    // Cost-class routing: predict this task's execution time, pick its class,
+    // and place it on the least-loaded worker of that class only. Keeping the
+    // classes disjoint is the whole point — a quick task can no longer be
+    // queued behind a heavy one, because heavy tasks are not eligible for the
+    // quick pool's workers at all.
+    double now_us = NowUs();
+    double predicted_us = 0.0;   // CPU estimate: what we RESERVE on the worker
+    double predicted_wall = 0.0; // wall estimate: what we CLASSIFY on
+    if (task_ptr != nullptr && container != nullptr) {
+      clio::run::TaskStat stat = container->GetTaskStats(task_ptr);
+      predicted_us = container->InferCpuTime(task_ptr->method_, stat);
+      predicted_wall = container->InferWallClockTime(task_ptr->method_, stat);
     }
-    if (n == 0 && scheduler_worker_ != nullptr) cand[n++] = scheduler_worker_;
-    if (n > 0) {
-      double now_us = NowUs();
-      // Scan from a rotating offset so that when loads tie (e.g. all idle at 0)
-      // selection round-robins instead of always funnelling to the first worker.
-      u32 start = next_io_idx_.fetch_add(1, std::memory_order_relaxed) % n;
+    // Classify on WALL time, not CPU time. These tasks are coroutines that
+    // co_await on I/O: a 1 MiB read and a 4 KiB read burn nearly identical CPU
+    // (~10us) because the payload movement happens off this task's CPU budget,
+    // so a CPU-based class boundary cannot separate them and put 1 MiB reads
+    // in the quick pool. Wall time is also the quantity that actually
+    // determines how long a task occupies a worker, which is what queueing
+    // behind it depends on. The CPU estimate is still what gets RESERVED
+    // below, since that models the worker's real compute backlog.
+    const CostClass cls = ClassFor(predicted_wall);
+    bool all_busy = false;
+    selected = PickInClass(cls, now_us, &all_busy);
+    if (selected != nullptr) {
+      class_routed_[cls].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (all_busy) {
+      // Every worker in the class is carrying more than kSpawnLoadUs. Ask the
+      // monitor thread for another one; spawning here would charge the
+      // submitting client for thread creation.
+      class_needs_worker_[cls].store(true, std::memory_order_relaxed);
+    }
+    // Fall back to the full compute pool if the class is somehow empty.
+    if (selected == nullptr) {
+      Worker *cand[64];
+      u32 n = 0;
+      for (Worker *w : io_workers_) {
+        if (w != nullptr && n < 64) cand[n++] = w;
+      }
+      if (n == 0 && scheduler_worker_ != nullptr) cand[n++] = scheduler_worker_;
+      u32 start = n ? next_io_idx_.fetch_add(1, std::memory_order_relaxed) % n
+                    : 0;
       double best_load = 0.0;
       for (u32 k = 0; k < n; ++k) {
         Worker *w = cand[(start + k) % n];
@@ -282,6 +347,8 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
           best_load = rl;
         }
       }
+    }
+    if (selected != nullptr) {
       // issue #781: reserve the incoming task's PREDICTED cost on the chosen
       // worker so the NEXT mapping sees it as queued load — the quick-behind-
       // heavy fix. The prediction comes from the learned per-method model via
@@ -289,11 +356,10 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
       // counter); it converges to ~the real cost after a few runs. Released in
       // Worker::ExecTask when the task actually starts.
       if (selected != nullptr && task_ptr != nullptr && container != nullptr) {
-        // Read the compute counter FRESH here: RunContext::predicted_stat_ is
-        // only populated at EXECUTION time (BeginTask on the destination worker),
-        // so it is still empty during routing. GetTaskStats is cheap + const.
-        clio::run::TaskStat stat = container->GetTaskStats(task_ptr);
-        double predicted = container->InferCpuTime(task_ptr->method_, stat);
+        // predicted_us was already read fresh above to pick the cost class —
+        // reuse it rather than paying for a second GetTaskStats/InferCpuTime
+        // on the mapping path.
+        const double predicted = predicted_us;
         if (predicted > 0.0) {
           // Set PredictedLoad too so ExecTask/EndTask account the SAME value
           // (its own PredictedStat() lookup would still read 0 during the window
@@ -410,6 +476,139 @@ bool DefaultScheduler::IsWedgedShape(u64 outstanding, u32 live,
   return false;
 }
 
+Worker *DefaultScheduler::PickInClass(CostClass cls, double now_us,
+                                      bool *all_busy) const {
+  Worker *best = nullptr;
+  double best_load = 0.0;
+  bool saturated = true;
+  {
+    std::lock_guard<std::mutex> g(class_mu_);
+    const std::vector<Worker *> &pool = class_workers_[cls];
+    if (pool.empty()) {
+      if (all_busy) *all_busy = false;
+      return nullptr;
+    }
+    // Rotating start so ties (all idle at load 0) spread instead of always
+    // landing on pool[0].
+    const size_t n = pool.size();
+    const size_t start =
+        next_io_idx_.fetch_add(1, std::memory_order_relaxed) % n;
+    for (size_t k = 0; k < n; ++k) {
+      Worker *w = pool[(start + k) % n];
+      if (w == nullptr) {
+        continue;
+      }
+      const double rl = w->RealtimeLoad(now_us);
+      if (rl <= kSpawnLoadUs) {
+        saturated = false;
+      }
+      if (best == nullptr || rl < best_load) {
+        best = w;
+        best_load = rl;
+      }
+    }
+  }
+  if (all_busy) {
+    *all_busy = (best != nullptr) && saturated;
+  }
+  // Work conservation: if this class is saturated but ANOTHER class has an
+  // idle worker, borrow it rather than queueing. Strict partitioning protects
+  // small-task latency, but it also strands capacity — with a skewed mix the
+  // busy class queues while other classes' workers sit at zero load, which
+  // cost ~2.4x aggregate throughput and left reads (which, unlike writes, wait
+  // for completion rather than being acked early) with ~90ms tails. Borrowing
+  // only when the owner class is saturated AND the lender is genuinely idle
+  // keeps the isolation in the common case.
+  if (best != nullptr && saturated) {
+    std::lock_guard<std::mutex> g(class_mu_);
+    for (int other = 0; other < kNumCostClasses; ++other) {
+      if (other == static_cast<int>(cls)) {
+        continue;
+      }
+      for (Worker *w : class_workers_[other]) {
+        if (w != nullptr && w->RealtimeLoad(now_us) <= kQuickClassUs) {
+          return w;
+        }
+      }
+    }
+  }
+  return best;
+}
+
+void DefaultScheduler::RebalanceClasses(double now_us) {
+  if (work_orch_ == nullptr) {
+    return;
+  }
+  for (int c = 0; c < kNumCostClasses; ++c) {
+    // ---- Grow: a mapper saw every worker in this class above kSpawnLoadUs.
+    // Require the signal on consecutive ticks and respect the per-class
+    // ceiling; a single busy instant is normal, and unbounded growth
+    // oversubscribes the cores (see kMinSaturatedTicks / MaxClassWorkers).
+    const bool saturated =
+        class_needs_worker_[c].exchange(false, std::memory_order_relaxed);
+    class_saturated_ticks_[c] = saturated ? class_saturated_ticks_[c] + 1 : 0;
+    size_t class_size;
+    {
+      std::lock_guard<std::mutex> g(class_mu_);
+      class_size = class_workers_[c].size();
+    }
+    if (class_saturated_ticks_[c] >= kMinSaturatedTicks &&
+        class_size < MaxClassWorkers()) {
+      class_saturated_ticks_[c] = 0;
+      // Reuse a parked elastic worker before creating a thread.
+      Worker *w = work_orch_->FindIdleElasticWorker();
+      if (w == nullptr) {
+        w = work_orch_->SpawnAdditionalWorker();
+      }
+      if (w != nullptr) {
+        std::lock_guard<std::mutex> g(class_mu_);
+        class_workers_[c].push_back(w);
+        class_elastic_[c].push_back(w);
+        class_elastic_busy_us_[c].push_back(now_us);
+        class_spawns_[c].fetch_add(1, std::memory_order_relaxed);
+        HLOG(kInfo,
+             "[sched] {} class saturated (> {}us on every worker) -> added "
+             "worker {} ({} workers in class)",
+             ClassName(c), kSpawnLoadUs, w->GetId(), class_workers_[c].size());
+      }
+    }
+
+    // ---- Shrink: retire class-elastic workers idle past kIdleRetireSec.
+    std::vector<Worker *> retire;
+    {
+      std::lock_guard<std::mutex> g(class_mu_);
+      for (size_t i = 0; i < class_elastic_[c].size();) {
+        Worker *w = class_elastic_[c][i];
+        const bool busy =
+            (w != nullptr) && (w->RealtimeLoad(now_us) > 0.0 || w->IsExecuting());
+        if (busy) {
+          class_elastic_busy_us_[c][i] = now_us;
+          ++i;
+          continue;
+        }
+        const double idle_sec = (now_us - class_elastic_busy_us_[c][i]) / 1e6;
+        if (idle_sec < kIdleRetireSec) {
+          ++i;
+          continue;
+        }
+        // Drop from the routable pool FIRST so no mapper can pick it while it
+        // is being parked and joined.
+        auto &pool = class_workers_[c];
+        pool.erase(std::remove(pool.begin(), pool.end(), w), pool.end());
+        retire.push_back(w);
+        class_elastic_[c].erase(class_elastic_[c].begin() + i);
+        class_elastic_busy_us_[c].erase(class_elastic_busy_us_[c].begin() + i);
+      }
+    }
+    for (Worker *w : retire) {
+      class_retires_[c].fetch_add(1, std::memory_order_relaxed);
+      HLOG(kInfo, "[sched] retiring idle {} class worker {} (idle > {}s)",
+           ClassName(c), w->GetId(), kIdleRetireSec);
+      work_orch_->RetireWorker(w);
+    }
+  }
+}
+
 void DefaultScheduler::LoadBalance() {
   // Runs on the WorkOrchestrator monitor thread every ~500ms (NOT a worker).
   // This pass implements the OBSERVABILITY half of the safety net: detect a
@@ -438,7 +637,30 @@ void DefaultScheduler::LoadBalance() {
          stalls_detected_.load());
     HLOG(kWarning, "[#785] lane rescues performed: {}",
          rescues_performed_.load());
+    size_t nq, nm, nh;
+    {
+      std::lock_guard<std::mutex> g(class_mu_);
+      nq = class_workers_[kQuickClass].size();
+      nm = class_workers_[kMediumClass].size();
+      nh = class_workers_[kHeavyClass].size();
+    }
+    HLOG(kWarning,
+         "[sched] cost classes: quick {} workers ({} routed, +{}/-{}) | "
+         "medium {} workers ({} routed, +{}/-{}) | heavy {} workers "
+         "({} routed, +{}/-{})",
+         nq, class_routed_[kQuickClass].load(),
+         class_spawns_[kQuickClass].load(), class_retires_[kQuickClass].load(),
+         nm, class_routed_[kMediumClass].load(),
+         class_spawns_[kMediumClass].load(),
+         class_retires_[kMediumClass].load(), nh,
+         class_routed_[kHeavyClass].load(), class_spawns_[kHeavyClass].load(),
+         class_retires_[kHeavyClass].load());
   }
+
+  // Grow/shrink the cost-class pools before the stall pass below, so a class
+  // that just saturated gets its extra worker on this tick rather than the
+  // next one.
+  RebalanceClasses(now_us);
 
   // migratable == may we move this worker's lane/event queue elsewhere?
   //   NO for net_send/net_recv: they own ZMQ sockets, and "ZeroMQ sockets are

@@ -5757,24 +5757,62 @@ clio::run::u64 Runtime::GetWorkRemaining() const {
 
 clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
   if (!task) return clio::run::TaskStat();
+  // compute_ is the ONLY feature Container::InferCpuTime scales its learned
+  // per-method coefficient by. It used to be left at 0 here, which collapsed
+  // the CPU model to one constant per method — a 4 KiB PutBlob and a 1 MiB
+  // PutBlob predicted identically. Payload handling is a copy at roughly
+  // 10 KB per CPU microsecond; wall time keeps the ~500 MB/s seed.
+  constexpr float kBytesPerComputeUs = 10000.0f;
+  constexpr float kBytesPerWallUs = 500.0f;
   switch (task->method_) {
     case Method::kPutBlob: {
       auto *t = static_cast<const PutBlobTask *>(task);
       clio::run::TaskStat stat;
       stat.io_size_ = t->size_;
+      stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
       // Rough wall-time estimate at ~500 MB/s for routing decisions only.
       // The learned model in InferWallClockTime adjusts the coefficient
       // over time; this is just the initial seed.
-      stat.wall_time_ =
-          static_cast<float>(t->size_) / 500.0f;
+      stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
       return stat;
     }
     case Method::kGetBlob: {
       auto *t = static_cast<const GetBlobTask *>(task);
       clio::run::TaskStat stat;
       stat.io_size_ = t->size_;
-      stat.wall_time_ =
-          static_cast<float>(t->size_) / 500.0f;
+      stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
+      stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
+      return stat;
+    }
+    case Method::kTagQuery: {
+      // A trigram-prefiltered regex search plus a std::regex compile per call
+      // (~150-200us measured). By far the most CPU-hungry metadata verb the
+      // core serves — clio-fs readdir and rename are both built on it.
+      clio::run::TaskStat stat;
+      stat.compute_ = 200;
+      stat.wall_time_ = 250.0f;
+      return stat;
+    }
+    case Method::kRenameTag: {
+      // Two TagQuery-class searches (self + descendants) plus the re-key.
+      clio::run::TaskStat stat;
+      stat.compute_ = 400;
+      stat.wall_time_ = 500.0f;
+      return stat;
+    }
+    case Method::kGetBlobSize:
+    case Method::kGetOrCreateTag:
+    case Method::kGetTagSize:
+    case Method::kGetTagName:
+    case Method::kGetBlobScore:
+    case Method::kGetBlobInfo:
+    case Method::kDelBlob:
+    case Method::kDelTag:
+    case Method::kTruncateBlob: {
+      // Single metadata lookup/mutation against the tag and blob maps.
+      clio::run::TaskStat stat;
+      stat.compute_ = 10;
+      stat.wall_time_ = 15.0f;
       return stat;
     }
     default:
