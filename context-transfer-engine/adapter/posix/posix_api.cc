@@ -4,7 +4,7 @@
  *
  * POSIX interceptor. Tracked paths (those carrying the "clio::" marker) and
  * the descriptors opened from them are routed to the context-filesystem
- * chimod via the shared CfsIo core (CLIO_CFS_CLIENT); everything else falls
+ * chimod via the filesystem client (CLIO_CFS_CLIENT); everything else falls
  * through to the real libc API.
  */
 

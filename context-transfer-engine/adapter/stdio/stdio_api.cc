@@ -3,10 +3,10 @@
  * All rights reserved. BSD 3-Clause license.
  *
  * STDIO interceptor. Tracked paths (those carrying the "clio::" marker) are
- * routed to the context-filesystem chimod via the shared CfsIo core. A clio::
+ * routed to the context-filesystem chimod via the filesystem client. A clio::
  * stream is represented by an opaque heap token reinterpreted as FILE* (the
  * app only ever hands it back to the intercepted calls); the token maps to a
- * CfsIo descriptor. Everything else falls through to the real libc API.
+ * client descriptor. Everything else falls through to the real libc API.
  */
 
 bool stdio_intercepted = true;
@@ -32,7 +32,7 @@ struct CfsStream {
   int fd = -1;
 };
 
-/** Maps clio:: FILE* tokens to their CfsIo descriptors. */
+/** Maps clio:: FILE* tokens to their filesystem-client descriptors. */
 class StdioShim {
  public:
   /** Translate an fopen() mode string to open(2) flags. */
@@ -50,7 +50,7 @@ class StdioShim {
     }
   }
 
-  /** Wrap an already-open CfsIo descriptor in a FILE* token. */
+  /** Wrap an already-open client descriptor in a FILE* token. */
   FILE *Wrap(int fd) {
     auto *s = new CfsStream();
     s->fd = fd;

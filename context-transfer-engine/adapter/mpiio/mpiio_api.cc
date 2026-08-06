@@ -3,8 +3,8 @@
  * All rights reserved. BSD 3-Clause license.
  *
  * MPI-IO interceptor. Tracked paths (those carrying the "clio::" marker) are
- * routed to the context-filesystem chimod via the shared CfsIo core; a clio::
- * MPI_File is an opaque heap token mapped to a CfsIo descriptor. Everything
+ * routed to the context-filesystem chimod via the filesystem client; a clio::
+ * MPI_File is an opaque heap token mapped to a client descriptor. Everything
  * else falls through to the real MPI-IO API.
  *
  * Single-rank (MPI_COMM_SELF) byte semantics: collective (_all), shared and
@@ -33,7 +33,7 @@ struct MpiToken {
   int fd = -1;
 };
 
-/** Maps clio:: MPI_File tokens to their CfsIo descriptors. */
+/** Maps clio:: MPI_File tokens to their filesystem-client descriptors. */
 class MpiioShim {
  public:
   static int AmodeToFlags(int amode) {

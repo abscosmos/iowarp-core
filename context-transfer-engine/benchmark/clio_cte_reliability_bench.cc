@@ -155,9 +155,10 @@ struct BenchConfig {
   // can be moved across DefaultScheduler::kLargeIOThreshold (4096): at or
   // above it a request is routed as large I/O, below it it is not.
   clio::run::u64 small_io = 4096;
-  // NOTE ON WHAT THIS MEASURES. Every operation goes through CfsIo -- the
-  // POSIX adapter a real application reaches by interception -- and nothing
-  // here calls the chimod client directly. That is the point: this is a
+  // NOTE ON WHAT THIS MEASURES. Every operation goes through the descriptor
+  // layer a real application reaches by interception -- open/read/write/
+  // stat/readdir/rename -- and nothing here submits tasks directly. That is
+  // the point: this is a
   // FILESYSTEM benchmark, so it has to pay what a filesystem caller pays,
   // including the adapter's descriptor lookup and the deferred-write path
   // (write(2) hands the bytes off and returns; fsync/close drains). Driving

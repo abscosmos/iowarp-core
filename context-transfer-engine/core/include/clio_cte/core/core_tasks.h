@@ -3402,9 +3402,9 @@ struct GetTagSizeTask : public clio::run::Task {
    * the aggregate, which poisoned the result: on a multi-node cluster the
    * reader's own container often holds none of a just-written file's blobs, so
    * its rc=1 replica made the aggregate rc=1 even though another container
-   * returned the real size. CfsIo::Open only trusts the size when rc==0, so it
-   * discarded the correct size and every cross-node read of that file returned
-   * 0 bytes (issue #714, Bug 2).
+   * returned the real size. Client::OpenFd only trusts the size when rc==0,
+   * so it discarded the correct size and every cross-node read of that file
+   * returned 0 bytes (issue #714, Bug 2).
    *
    * Correct semantics — "found if ANY": the aggregate succeeds (rc=0) if at
    * least one replica found the tag, summing the found replicas' shares; it
