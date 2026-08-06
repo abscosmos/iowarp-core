@@ -1847,8 +1847,16 @@ struct HeartbeatTask : public clio::run::Task {
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    // Must NOT delegate to Copy(): Copy runs Task::Copy, which overwrites the
+    // ORIGIN's task_id_/pool_query_/completer_ with the replica's (issue #915).
+    // Corrupting the origin of a SWIM heartbeat is worse than corrupting an
+    // ordinary task -- this is the machinery that decides which nodes are
+    // alive, so a mangled origin feeds bad liveness into leader election
+    // (issue #929, seen firing as the AggregateOut contract-violation guard
+    // during leader_elect).
+    // HeartbeatTask has no OUT fields of its own -- SerializeOut is just
+    // Task::SerializeOut -- so the base aggregation is the whole merge.
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<HeartbeatTask>());
   }
 };
 
@@ -1906,8 +1914,19 @@ struct QueryTaskProgressTask : public clio::run::Task {
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    // Must NOT delegate to Copy(): Task::Copy would overwrite the ORIGIN's
+    // identity fields (issue #915) and copy the IN fields query_net_key_ /
+    // query_replica_id_ back from the replica.
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<QueryTaskProgressTask>());
+    auto other = other_base.template Cast<QueryTaskProgressTask>();
+    // status_ is 0 = kGone, 1 = kRunning, and the origin starts at 0.
+    // "Still running" wins: this answer decides whether a stuck replica gets
+    // failed, and wrongly concluding kGone completes a task that is still
+    // executing. Sticky-kRunning is also order-independent, unlike Copy's
+    // last-replica-wins.
+    if (other->status_ != 0) {
+      status_ = other->status_;
+    }
   }
 };
 
@@ -1946,8 +1965,10 @@ struct HeartbeatProbeTask : public clio::run::Task {
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    // See HeartbeatTask::AggregateOut -- delegating to Copy() would overwrite
+    // the ORIGIN's identity fields via Task::Copy (issue #915). This task has
+    // no OUT fields of its own, so base aggregation is the whole merge.
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<HeartbeatProbeTask>());
   }
 };
 
@@ -1996,8 +2017,20 @@ struct ProbeRequestTask : public clio::run::Task {
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    // Must NOT delegate to Copy(): it would overwrite the ORIGIN's identity
+    // fields via Task::Copy (issue #915), and it would also copy the IN field
+    // target_node_id_ back from the replica.
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ProbeRequestTask>());
+    auto other = other_base.template Cast<ProbeRequestTask>();
+    // SWIM indirect probe: several helpers are asked to reach the same target,
+    // and the target is alive if ANY of them got through. probe_result_ is
+    // 0 = alive, -1 = unreachable, and the origin starts at -1, so success is
+    // sticky and the merge is order-independent. Taking the last replica's
+    // answer instead (what Copy did) would let one helper's failed probe
+    // erase another's success and declare a live node dead.
+    if (other->probe_result_ == 0) {
+      probe_result_ = 0;
+    }
   }
 };
 

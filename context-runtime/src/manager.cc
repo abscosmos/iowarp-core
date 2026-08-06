@@ -49,9 +49,12 @@
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::RuntimeManager, g_runtime_manager);
 
 static void RuntimeManagerCleanupAtExit() {
-  if (g_runtime_manager) {
-    delete g_runtime_manager;
-    g_runtime_manager = nullptr;
+  // exchange, not load-then-store: this runs from atexit while other threads
+  // may still be resolving CLIO_RUNTIME_MANAGER, and claiming the pointer in
+  // one step means it can never be deleted twice.
+  if (auto *manager = g_runtime_manager.exchange(nullptr,
+                                                 std::memory_order_acq_rel)) {
+    delete manager;
   }
 }
 
@@ -169,17 +172,32 @@ bool RuntimeManager::ClientInit() {
   // The admin container is already created by the runtime, so we just
   // construct the admin client directly with the admin pool ID
   HLOG(kDebug, "Initializing CLIO_ADMIN singleton");
-  // IMPORTANT: Check g_admin directly, NOT CLIO_ADMIN macro
-  // CLIO_ADMIN uses GetGlobalPtrVar which auto-creates with default constructor!
-  if (g_admin == nullptr) {
+  // IMPORTANT: Publish g_admin directly, NOT via the CLIO_ADMIN macro.
+  // CLIO_ADMIN goes through GetGlobalPtrVar, which default-constructs; the
+  // admin client must be built with kAdminPoolId instead.
+  //
+  // The CAS matters as much as the pool id: a plain "if null then assign" is
+  // the same check-then-set that let two PoolManagers exist at once (#929).
+  // Losing that race here would leave two admin clients, with the published
+  // one not necessarily the one this thread went on to use.
+  clio::run::admin::Client *existing_admin = g_admin.load(std::memory_order_acquire);
+  if (existing_admin == nullptr) {
     HLOG(kInfo, "ClientInit: Creating admin client with kAdminPoolId={}",
          clio::run::kAdminPoolId);
-    g_admin = new clio::run::admin::Client(clio::run::kAdminPoolId);
-    HLOG(kInfo, "ClientInit: Admin client created, pool_id_={}",
-         g_admin->pool_id_);
+    auto *fresh_admin = new clio::run::admin::Client(clio::run::kAdminPoolId);
+    if (g_admin.compare_exchange_strong(existing_admin, fresh_admin,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+      HLOG(kInfo, "ClientInit: Admin client created, pool_id_={}",
+           fresh_admin->pool_id_);
+    } else {
+      delete fresh_admin;
+      HLOG(kInfo, "ClientInit: lost the admin publish race, pool_id_={}",
+           existing_admin->pool_id_);
+    }
   } else {
     HLOG(kInfo, "ClientInit: g_admin already exists, pool_id_={}",
-         g_admin->pool_id_);
+         existing_admin->pool_id_);
   }
 
   is_client_initialized_ = true;

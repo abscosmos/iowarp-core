@@ -50,6 +50,30 @@ install(TARGETS
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
 
+add_executable(test_singleton_exec
+        ${TEST_MAIN}/main.cc
+        test_init.cc
+        test_singleton.cc)
+add_dependencies(test_singleton_exec clio_ctp_host)
+target_link_libraries(test_singleton_exec
+        clio_ctp_host
+        Catch2::Catch2)
+
+add_test(NAME ctp_singleton COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_singleton_exec)
+
+# Same precompiled-Catch2 sigaction false positives as the other cases here.
+set_tests_properties(
+  ctp_singleton
+  PROPERTIES LABELS "msan_skip"
+)
+
+install(TARGETS
+        test_singleton_exec
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin)
+
 add_executable(test_system_info_exec
         ${TEST_MAIN}/main.cc
         test_init.cc
