@@ -452,7 +452,30 @@ private:
   // Recovery state
   std::vector<clio::run::RecoveryAssignment> ComputeRecoveryPlan(clio::run::u64 dead_node_id);
   clio::run::TaskResume TriggerRecovery(clio::run::u64 dead_node_id);
-  std::unordered_set<clio::run::u64> recovery_initiated_;
+  /**
+   * Claim a dead node's recovery for this PROCESS, exactly once.
+   *
+   * Deliberately NOT per-container state (issue #856). Two reasons:
+   *
+   *  1. Correctness: a node can host more than one admin container — after a
+   *     prior recovery the survivor owns its own plus the dead node's ("
+   *     container N for pool admin already present locally"). Per-instance
+   *     dedup then lets each instance trigger recovery for the same dead
+   *     node, duplicating the redistribution.
+   *  2. Lifetime: recovery re-creates and re-registers admin containers while
+   *     HeartbeatProbe fibers are running on them, so per-instance members
+   *     are exactly the memory that gets pulled out from under the probe.
+   *
+   * Process-wide storage with its own mutex sidesteps both. HeartbeatProbe is
+   * periodic and runs on DIFFERENT worker threads across periods, each on its
+   * own fiber, so the claim must be synchronized: an unsynchronized
+   * std::unordered_set rehash frees the old bucket array underneath the other
+   * thread (`free(): invalid pointer`).
+   *
+   * @return true if THIS call claimed the node (caller proceeds with
+   *         recovery); false if some earlier call already did.
+   */
+  static bool ClaimRecovery(clio::run::u64 dead_node_id);
 };
 
 } // namespace clio::run::admin

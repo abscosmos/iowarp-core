@@ -1,0 +1,25 @@
+# LOCAL-ONLY overlay: glibc malloc hardening to catch the recovery-path wild
+# write closer to its source (issue #856).
+#   MALLOC_CHECK_=3   abort at the point corruption is DETECTED
+#   MALLOC_PERTURB_   poison freed/allocated bytes so use-after-free faults at
+#                     the offending access instead of some later free()
+x-mcheck: &mcheck
+  MALLOC_CHECK_: "3"
+  MALLOC_PERTURB_: "165"
+services:
+  iowarp-node1:
+    environment:
+      <<: *mcheck
+      LD_PRELOAD: /workspace/abrt_bt.so
+  iowarp-node2:
+    environment:
+      <<: *mcheck
+      LD_PRELOAD: /workspace/abrt_bt.so
+  iowarp-node3:
+    environment:
+      <<: *mcheck
+      LD_PRELOAD: /workspace/abrt_bt.so
+  iowarp-node4:
+    environment:
+      <<: *mcheck
+      LD_PRELOAD: /workspace/abrt_bt.so

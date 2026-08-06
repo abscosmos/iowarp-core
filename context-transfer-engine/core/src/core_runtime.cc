@@ -5382,6 +5382,11 @@ void Runtime::RestoreMetadataFromLog() {
         BlobBlock block(bdev_client, target_query, offset, size);
         blob_info.blocks_.push_back(block);
       }
+      // blocks_ was rebuilt directly: resync the O(1) size cache, or every
+      // restored blob reports GetTotalSize()==0 (a Debug build asserts) and
+      // post-restart reads/rebuilds see empty blobs. The WAL-replay path
+      // below already did this; the snapshot path forgot.
+      blob_info.RecomputeTotalSize();
 
       tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
       MirrorBlobToShm(composite_key, blob_info);
@@ -5579,6 +5584,16 @@ void Runtime::ReplayTransactionLogs() {
             // them. Which shard a blob's records land in is per-worker, so
             // the loss was nondeterministic (caught by the persist test).
             blob_info.replicas_ = existing->replicas_;
+            // Carry the BLOCKS too (issue #905) — third instance of the
+            // same hazard: the snapshot restored this blob's block layout,
+            // and replaying the create record would zero it, so every
+            // restart reported size 0 and lost the persistent primary
+            // bytes' placement (caught by the indexer rebuild test). A
+            // later kExtendBlob record, when present, still replaces the
+            // layout wholesale; a replayed kDelBlob removed the entry, so
+            // a genuine delete+recreate never reaches this carry-over.
+            blob_info.blocks_ = existing->blocks_;
+            blob_info.RecomputeTotalSize();
           }
         }
         tag_blob_name_to_info_.insert_or_assign(composite_key, std::make_shared<BlobInfo>(blob_info));
@@ -5742,24 +5757,62 @@ clio::run::u64 Runtime::GetWorkRemaining() const {
 
 clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
   if (!task) return clio::run::TaskStat();
+  // compute_ is the ONLY feature Container::InferCpuTime scales its learned
+  // per-method coefficient by. It used to be left at 0 here, which collapsed
+  // the CPU model to one constant per method — a 4 KiB PutBlob and a 1 MiB
+  // PutBlob predicted identically. Payload handling is a copy at roughly
+  // 10 KB per CPU microsecond; wall time keeps the ~500 MB/s seed.
+  constexpr float kBytesPerComputeUs = 10000.0f;
+  constexpr float kBytesPerWallUs = 500.0f;
   switch (task->method_) {
     case Method::kPutBlob: {
       auto *t = static_cast<const PutBlobTask *>(task);
       clio::run::TaskStat stat;
       stat.io_size_ = t->size_;
+      stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
       // Rough wall-time estimate at ~500 MB/s for routing decisions only.
       // The learned model in InferWallClockTime adjusts the coefficient
       // over time; this is just the initial seed.
-      stat.wall_time_ =
-          static_cast<float>(t->size_) / 500.0f;
+      stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
       return stat;
     }
     case Method::kGetBlob: {
       auto *t = static_cast<const GetBlobTask *>(task);
       clio::run::TaskStat stat;
       stat.io_size_ = t->size_;
-      stat.wall_time_ =
-          static_cast<float>(t->size_) / 500.0f;
+      stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
+      stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
+      return stat;
+    }
+    case Method::kTagQuery: {
+      // A trigram-prefiltered regex search plus a std::regex compile per call
+      // (~150-200us measured). By far the most CPU-hungry metadata verb the
+      // core serves — clio-fs readdir and rename are both built on it.
+      clio::run::TaskStat stat;
+      stat.compute_ = 200;
+      stat.wall_time_ = 250.0f;
+      return stat;
+    }
+    case Method::kRenameTag: {
+      // Two TagQuery-class searches (self + descendants) plus the re-key.
+      clio::run::TaskStat stat;
+      stat.compute_ = 400;
+      stat.wall_time_ = 500.0f;
+      return stat;
+    }
+    case Method::kGetBlobSize:
+    case Method::kGetOrCreateTag:
+    case Method::kGetTagSize:
+    case Method::kGetTagName:
+    case Method::kGetBlobScore:
+    case Method::kGetBlobInfo:
+    case Method::kDelBlob:
+    case Method::kDelTag:
+    case Method::kTruncateBlob: {
+      // Single metadata lookup/mutation against the tag and blob maps.
+      clio::run::TaskStat stat;
+      stat.compute_ = 10;
+      stat.wall_time_ = 15.0f;
       return stat;
     }
     default:
@@ -6085,10 +6138,29 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   // Snapshot available targets for the DPE. target_list_ is the contiguous
   // mirror of registered_targets_ — copying it under the read lock is O(N_live)
   // with no map iteration over empty slots.
+  //
+  // remaining_space_ is the one field the data path mutates: PutBlob debits and
+  // Free credits the CANONICAL map entry only, lock-free, while the mirror is
+  // refreshed lazily by the periodic StatTargets sweep
+  // (performance.stat_targets_period_ms, 5 s by default). Feeding the DPE the
+  // mirror's copy therefore places against free space that can be a full tick
+  // out of date — and the failure is not symmetric: a tick that lands while a
+  // tier is full pins the mirror at ~0, so every subsequent put is rejected for
+  // "no target has space" even after the blobs holding that space are deleted.
+  // Re-read the canonical value here so placement always sees real free space
+  // (same reason GetCapacity iterates registered_targets_ directly).
   std::vector<TargetInfo> available_targets;
   {
     clio::run::ScopedCoRwReadLock read_lock(target_lock_);
     available_targets = target_list_;
+    for (auto &t : available_targets) {
+      TargetInfo *canonical = registered_targets_.find(t.bdev_client_.pool_id_);
+      if (canonical != nullptr) {
+        t.remaining_space_ =
+            ctp::ipc::atomic_ref<clio::run::u64>(canonical->remaining_space_)
+                .load(std::memory_order_relaxed);
+      }
+    }
   }
   if (available_targets.empty()) {
     error_code = 1;
@@ -7315,214 +7387,10 @@ clio::run::TaskResume Runtime::BlobQuery(clio::run::shared_ptr<BlobQueryTask> &t
 }
 
 // ==============================================================================
-// SemanticSearch — BM25 over blob contents
+// SemanticSearch moved to the indexer chimod (issue #905): the core no
+// longer reads blob bytes at query time — the indexer maintains the term
+// index incrementally and serves Method::kSemanticSearch itself.
 // ==============================================================================
-
-namespace {
-
-// Tokenize raw bytes as lowercase alphanumeric runs of length >= 2.
-// Anything else (whitespace, punctuation, non-ASCII) splits a token.
-// Deliberately simple; good enough for English-ish text from labels.
-std::vector<std::string> SemSearchTokenize(const char *data, size_t size) {
-  std::vector<std::string> tokens;
-  std::string cur;
-  cur.reserve(16);
-  for (size_t i = 0; i < size; ++i) {
-    unsigned char c = static_cast<unsigned char>(data[i]);
-    if (std::isalnum(c)) {
-      cur.push_back(static_cast<char>(std::tolower(c)));
-    } else {
-      if (cur.size() >= 2) tokens.push_back(std::move(cur));
-      cur.clear();
-    }
-  }
-  if (cur.size() >= 2) tokens.push_back(std::move(cur));
-  return tokens;
-}
-
-struct SemSearchDoc {
-  TagId tag_id;
-  std::string tag_name;
-  std::string blob_name;
-  std::unordered_map<std::string, int> tf;
-  size_t length;
-};
-
-}  // namespace
-
-clio::run::TaskResume Runtime::SemanticSearch(
-    clio::run::shared_ptr<SemanticSearchTask> &task) {
-  CLIO_TASK_BODY_BEGIN
-  task->results_.clear();
-  task->return_code_ = 0;
-
-  std::string tag_regex_str = task->tag_regex_.str();
-  std::string blob_regex_str = task->blob_regex_.str();
-  std::string query_text = task->query_text_.str();
-  clio::run::u32 k = task->k_;
-
-  std::regex tag_pattern;
-  std::regex blob_pattern;
-  try {
-    tag_pattern = std::regex(tag_regex_str);
-    blob_pattern = std::regex(blob_regex_str);
-  } catch (const std::regex_error &e) {
-    HLOG(kError, "SemanticSearch: bad regex (tag='{}' blob='{}'): {}",
-         tag_regex_str, blob_regex_str, e.what());
-    task->return_code_ = 1;
-    CLIO_CO_RETURN;
-  }
-
-  // Step 1: pick matching (tag_name, tag_id) pairs from tag metadata
-  // (same iteration as BlobQuery).
-  std::vector<std::pair<std::string, TagId>> matching_tags;
-  tag_name_to_id_.for_each(
-      [&](const std::string &stored, const TagId &tag_id) {
-        std::string full = ResolveTagName(stored);
-        if (std::regex_match(full, tag_pattern)) {
-          matching_tags.emplace_back(full, tag_id);
-        }
-      });
-
-  // Step 2: walk the tag-blob metadata and collect (tag_id, tag_name,
-  // blob_name) triples whose blob_name matches blob_regex_. We collect names
-  // first and read bytes afterward — keeping the metadata iteration short
-  // means the for_each lambda doesn't block on bdev I/O.
-  struct Candidate { TagId tag_id; std::string tag_name; std::string blob_name; };
-  std::vector<Candidate> candidates;
-  for (const auto &tn : matching_tags) {
-    const std::string &tag_name = tn.first;
-    const TagId &tag_id = tn.second;
-    std::string prefix = std::to_string(tag_id.major_) + "." +
-                         std::to_string(tag_id.minor_) + ".";
-    tag_blob_name_to_info_.for_each(
-        [&prefix, &blob_pattern, &tag_id, &tag_name, &candidates](
-            const std::string &composite_key, const std::shared_ptr<BlobInfo> &blob_info_sp) { const BlobInfo &blob_info = *blob_info_sp; (void)blob_info;
-          (void)blob_info;
-          if (composite_key.rfind(prefix, 0) != 0) return;
-          std::string blob_name = composite_key.substr(prefix.length());
-          if (std::regex_match(blob_name, blob_pattern)) {
-            candidates.push_back({tag_id, tag_name, blob_name});
-          }
-        });
-  }
-  if (candidates.empty()) {
-    HLOG(kDebug,
-         "SemanticSearch: no candidates for tag='{}' blob='{}'",
-         tag_regex_str, blob_regex_str);
-    CLIO_CO_RETURN;
-  }
-
-  // Step 3: read each candidate's bytes, tokenize, and accumulate
-  // BM25 corpus statistics (tf per doc, doc length, df, avgdl).
-  auto *ipc_manager = CLIO_IPC;
-  std::vector<SemSearchDoc> docs;
-  docs.reserve(candidates.size());
-  for (auto &cand : candidates) {
-    std::shared_ptr<BlobInfo> info = CheckBlobExists(cand.blob_name, cand.tag_id);
-    if (info == nullptr) continue;
-    clio::run::u64 total = info->GetTotalSize();
-    if (total == 0) continue;
-
-    ctp::ipc::FullPtr<char> buf = ipc_manager->AllocateBuffer(total);
-    if (buf.IsNull()) {
-      HLOG(kWarning,
-           "SemanticSearch: AllocateBuffer({}) failed for blob '{}'; "
-           "skipping",
-           total, cand.blob_name);
-      continue;
-    }
-    ctp::ipc::ShmPtr<> shm(buf.shm_);
-    clio::run::u32 read_rc = 0;
-    {
-      // issue #753 (reader half): pin + snapshot, same discipline as
-      // GetBlobImpl — the pin keeps extent-freeing mutators from reclaiming
-      // the extents mid-read, the snapshot keeps a concurrent Put's blocks_
-      // push_back from dangling the vector we iterate.
-      while (!info->TryPinRead()) {
-        CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
-      }
-      BlobReadPinGuard read_pin_guard(info.get());
-      clio::run::priv::vector<BlobBlock> blocks_snapshot(info->blocks_);
-      CLIO_CO_AWAIT(ReadData(blocks_snapshot, shm, total, 0, read_rc));
-    }
-    if (read_rc != 0) {
-      HLOG(kWarning,
-           "SemanticSearch: ReadData failed for blob '{}' (rc={}); "
-           "skipping",
-           cand.blob_name, read_rc);
-      ipc_manager->FreeBuffer(buf);
-      continue;
-    }
-
-    auto tokens = SemSearchTokenize(buf.ptr_, total);
-    ipc_manager->FreeBuffer(buf);
-
-    SemSearchDoc doc;
-    doc.tag_id = cand.tag_id;
-    doc.tag_name = std::move(cand.tag_name);
-    doc.blob_name = std::move(cand.blob_name);
-    doc.length = tokens.size();
-    for (auto &t : tokens) ++doc.tf[t];
-    docs.push_back(std::move(doc));
-  }
-  if (docs.empty()) {
-    CLIO_CO_RETURN;
-  }
-
-  // Step 4: BM25. Corpus stats are computed over the working set
-  // (the matched slice), not over all CTE blobs — this is "rank
-  // within this regex" semantics. k1=1.5 / b=0.75 are the standard
-  // Okapi defaults.
-  constexpr double kK1 = 1.5;
-  constexpr double kB = 0.75;
-  std::unordered_map<std::string, int> df;
-  double total_len = 0.0;
-  for (auto &d : docs) {
-    total_len += static_cast<double>(d.length);
-    for (auto &kv : d.tf) df[kv.first]++;
-  }
-  double avgdl = (docs.empty() ? 1.0 : total_len / docs.size());
-  if (avgdl <= 0.0) avgdl = 1.0;
-  const size_t N = docs.size();
-
-  auto qtokens = SemSearchTokenize(query_text.data(), query_text.size());
-  std::unordered_set<std::string> uniq_q(qtokens.begin(), qtokens.end());
-
-  std::vector<SemanticSearchResult> scored;
-  scored.reserve(docs.size());
-  for (auto &d : docs) {
-    double score = 0.0;
-    for (auto &q : uniq_q) {
-      auto df_it = df.find(q);
-      if (df_it == df.end()) continue;
-      auto tf_it = d.tf.find(q);
-      if (tf_it == d.tf.end()) continue;
-      double df_q = static_cast<double>(df_it->second);
-      double idf = std::log((static_cast<double>(N) - df_q + 0.5) /
-                                (df_q + 0.5) +
-                            1.0);
-      double tf_q = static_cast<double>(tf_it->second);
-      double norm =
-          1.0 - kB + kB * (static_cast<double>(d.length) / avgdl);
-      score += idf * (tf_q * (kK1 + 1.0)) / (tf_q + kK1 * norm);
-    }
-    scored.emplace_back(d.tag_id, d.tag_name, d.blob_name, score);
-  }
-
-  std::sort(scored.begin(), scored.end(),
-            [](const SemanticSearchResult &a,
-               const SemanticSearchResult &b) { return a.score_ > b.score_; });
-  if (k > 0 && scored.size() > k) scored.resize(k);
-  task->results_ = std::move(scored);
-  HLOG(kDebug,
-       "SemanticSearch: tag='{}' blob='{}' query='{}' -> {} results "
-       "(from {} candidates)",
-       tag_regex_str, blob_regex_str, query_text, task->results_.size(),
-       candidates.size());
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
 
 // ==============================================================================
 // TemporalSearch — timestamp-window scan over blob metadata

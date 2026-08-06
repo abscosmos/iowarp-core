@@ -57,7 +57,7 @@
 /* HDF5 header for dynamic plugin loading */
 #include "H5FDclio.h" /* Clio file driver     */
 #include "H5PLextern.h"
-#include "adapter/cfs/cfs_io.h"
+#include <clio_cte/filesystem/filesystem_client.h>
 #include "clio_cte/core/core_client.h"
 #include <clio_ctp/util/logging.h>
 
@@ -446,7 +446,7 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   // The AUTHORITATIVE store is a real on-disk native HDF5 file at the stripped
   // path (clio::/tmp/foo.h5 -> /tmp/foo.h5), so standard tools (h5dump/h5ls)
   // read it live.
-  std::string native_path = clio::cae::StripClioPrefix(name);
+  std::string native_path = clio::cte::filesystem::StripClioPrefix(name);
   int posix_fd =
       open(native_path.c_str(), o_flags, H5FD_CLIO_POSIX_CREATE_MODE_RW);
   if (posix_fd < 0) {
@@ -465,7 +465,7 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
   // (which avoids the current write-amplification of the populate-only tier).
   int fd = -1;
   if (fa.cache_enabled) {
-    fd = CLIO_CTE_CFS->Open(name, o_flags, H5FD_CLIO_POSIX_CREATE_MODE_RW);
+    fd = CLIO_CFS_CLIENT->OpenFd(name, o_flags, H5FD_CLIO_POSIX_CREATE_MODE_RW);
     HLOG(kDebug, "");
   }
 
@@ -479,7 +479,7 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     H5FD_CLIO_ERROR("calloc() of VFD file struct failed");
     close(posix_fd);
     if (fd >= 0) {
-      CLIO_CTE_CFS->Close(fd);
+      CLIO_CFS_CLIENT->CloseFd(fd);
     }
     return nullptr;
   }
@@ -492,7 +492,7 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     H5FD_CLIO_ERROR("fstat() of authoritative native file failed");
     close(posix_fd);
     if (fd >= 0) {
-      CLIO_CTE_CFS->Close(fd);
+      CLIO_CFS_CLIENT->CloseFd(fd);
     }
     free(file);
     return nullptr;
@@ -505,7 +505,7 @@ static H5FD_t *H5FD__clio_open(const char *name, unsigned flags,
     H5FD_CLIO_ERROR("strdup() of file name failed");
     close(posix_fd);
     if (fd >= 0) {
-      CLIO_CTE_CFS->Close(fd);
+      CLIO_CFS_CLIENT->CloseFd(fd);
     }
     free(file);
     return nullptr;
@@ -556,7 +556,7 @@ static herr_t H5FD__clio_close(H5FD_t *_file) {
   }
   // Release the CTE cache handle, if this session had one.
   if (file->fd >= 0) {
-    CLIO_CTE_CFS->Close(file->fd);
+    CLIO_CFS_CLIENT->CloseFd(file->fd);
     HLOG(kDebug, "");
   }
   if (file->filename_) {
@@ -795,7 +795,7 @@ static herr_t H5FD__clio_do_write(H5FD_clio_t *file, haddr_t addr, size_t size,
   // does not hold, which the future read tier must not mistake for resident
   // data. Count it and log once per failure so residency work has a signal.
   if (file->fd >= 0) {
-    if (CLIO_CTE_CFS->Pwrite(file->fd, buf, size, static_cast<off_t>(addr)) < 0) {
+    if (CLIO_CFS_CLIENT->PwriteFd(file->fd, buf, size, static_cast<off_t>(addr)) < 0) {
       H5FDclio_cache_write_failures_g++;
       HLOG(kWarning,
            "CTE cache populate failed at addr={} size={} (native file is "
@@ -995,7 +995,7 @@ static herr_t H5FD__clio_truncate(H5FD_t *_file, hid_t dxpl_id, bool closing) {
     // tier, see the write callback). Counted on failure for the same reason:
     // a tier that did not shrink still holds bytes past the new EOF.
     if (file->fd >= 0) {
-      if (CLIO_CTE_CFS->FtruncateFd(file->fd, (off_t)file->eoa) < 0) {
+      if (CLIO_CFS_CLIENT->FtruncateFd(file->fd, (off_t)file->eoa) < 0) {
         H5FDclio_cache_truncate_failures_g++;
         HLOG(kWarning,
              "CTE cache truncate to {} failed (native file is unaffected and "
@@ -1176,12 +1176,12 @@ static herr_t H5FD__clio_del(const char *name, hid_t fapl) {
   // file alone is still correct -- the delete must not fail just because CLIO
   // is down (same reasoning as open()).
   if (H5FD__clio_cache_available()) {
-    CLIO_CTE_CFS->RemovePath(name);
+    CLIO_CFS_CLIENT->RemovePath(name);
   }
 
   // Remove the authoritative native file at the stripped path. Fail-closed on
   // error (sec2 parity) so a failed delete is reported, not masked.
-  std::string native_path = clio::cae::StripClioPrefix(name);
+  std::string native_path = clio::cte::filesystem::StripClioPrefix(name);
   if (unlink(native_path.c_str()) < 0) {
     H5FD_CLIO_ERROR("unlink() of authoritative native file failed");
     return FAIL;

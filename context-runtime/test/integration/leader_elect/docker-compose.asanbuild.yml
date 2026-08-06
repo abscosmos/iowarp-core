@@ -1,0 +1,28 @@
+# LOCAL-ONLY overlay: run the ASan-instrumented build (build-asan) with the
+# Boost.Context fiber annotations active (issue #856). Without the annotations
+# ASan dies with "DEADLYSIGNAL / nested bug in the same thread" the first time a
+# fiber stack faults, and reports nothing.
+x-asanenv: &asanenv
+  ASAN_OPTIONS: "detect_leaks=0:abort_on_error=0:malloc_context_size=30:handle_segv=1:print_stacktrace=1"
+  # Scaled SWIM timeouts: the base config's 2s/2s/3s false-positive healthy
+  # nodes as dead once ASan slows everything down, so the cluster never
+  # stabilises enough to run the scenario.
+  CLIO_SERVER_CONF: /workspace/context-runtime/test/integration/leader_elect/clio_conf_asan.yaml
+  CLIO_CLIENT_RETRY_TIMEOUT: "30"
+services:
+  iowarp-node1:
+    volumes:
+      - ${HOST_WORKSPACE}/build-asan:/workspace/build
+    environment: *asanenv
+  iowarp-node2:
+    volumes:
+      - ${HOST_WORKSPACE}/build-asan:/workspace/build
+    environment: *asanenv
+  iowarp-node3:
+    volumes:
+      - ${HOST_WORKSPACE}/build-asan:/workspace/build
+    environment: *asanenv
+  iowarp-node4:
+    volumes:
+      - ${HOST_WORKSPACE}/build-asan:/workspace/build
+    environment: *asanenv

@@ -252,8 +252,16 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       break;
     }
     case Method::kSemanticSearch: {
+      // Moved to the indexer chimod (issue #905): the core no longer owns
+      // the search index. An explicit error beats the default's silent
+      // empty result — reaching here means the deployment composed no
+      // clio_cte_indexer above this pool.
       auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      CLIO_CO_AWAIT(SemanticSearch(typed_task));
+      HLOG(kError,
+           "SemanticSearch reached the CTE core: compose the clio_cte_indexer "
+           "chimod above this pool (issue #905)");
+      typed_task->results_.clear();
+      typed_task->return_code_ = 2;
       break;
     }
     case Method::kTemporalSearch: {

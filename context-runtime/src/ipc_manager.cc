@@ -39,6 +39,7 @@
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <zmq.h>
+#include <limits>
 
 #include <algorithm>
 #include <cerrno>
@@ -1684,6 +1685,11 @@ bool IpcManager::IsAlive(u64 node_id) const {
 }
 
 void IpcManager::SetDead(u64 node_id) {
+  // Every confirmed membership change advances the epoch (issue #856):
+  // recovery claims are scoped by (epoch, dead node), so a node that dies,
+  // rejoins and dies again is recoverable each time, while duplicate
+  // coordinators within one epoch are still refused.
+  membership_epoch_.fetch_add(1, std::memory_order_acq_rel);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kDead) return;  // Already dead
@@ -1710,6 +1716,11 @@ void IpcManager::SetDead(u64 node_id) {
 }
 
 void IpcManager::SetAlive(u64 node_id) {
+  // Every confirmed membership change advances the epoch (issue #856):
+  // recovery claims are scoped by (epoch, dead node), so a node that dies,
+  // rejoins and dies again is recoverable each time, while duplicate
+  // coordinators within one epoch are still refused.
+  membership_epoch_.fetch_add(1, std::memory_order_acq_rel);
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return;
   if (it->second.state == NodeState::kAlive) return;  // Already alive
@@ -1731,6 +1742,22 @@ NodeState IpcManager::GetNodeState(u64 node_id) const {
   auto it = hostfile_map_.find(node_id);
   if (it == hostfile_map_.end()) return NodeState::kDead;
   return it->second.state;
+}
+
+void IpcManager::NoteInbound(u64 node_id) {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return;
+  it->second.last_inbound = std::chrono::steady_clock::now();
+}
+
+float IpcManager::SecondsSinceInbound(u64 node_id) const {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) {
+    return std::numeric_limits<float>::max();
+  }
+  return std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                      it->second.last_inbound)
+      .count();
 }
 
 void IpcManager::SetNodeState(u64 node_id, NodeState new_state) {
@@ -3119,15 +3146,41 @@ bool IpcManager::WaitForServerAndReconnect(
     return false;
   }
 
-  // Pick random hosts and try each (may retry same host — that's fine)
-  std::mt19937 rng(std::random_device{}());
-  std::uniform_int_distribution<size_t> dist(0, hosts.size() - 1);
+  // Build a DETERMINISTIC candidate order (issue #856), replacing uniform
+  // random sampling over every host in the file:
+  //   1. the presumptive leader (lowest alive node id) — it coordinates
+  //      recovery, so it is the most useful node to be attached to;
+  //   2. the remaining ALIVE hosts;
+  //   3. hosts believed dead, last and only as a fallback — "dead" is a local
+  //      opinion that can be stale (a peer may have rejoined without this
+  //      client hearing about it), so they are tried rather than excluded.
+  // Random sampling could burn every attempt re-dialling the node that just
+  // died, and made post-failover behaviour irreproducible under test.
+  std::vector<std::string> candidates;
+  {
+    const u64 leader = GetLeaderNodeId();
+    std::vector<std::string> alive, dead;
+    for (const auto &h : hosts) {
+      if (h.node_id == GetNodeId()) continue;  // our own dead runtime
+      if (h.node_id == leader && h.IsAlive()) continue;  // added first below
+      (h.IsAlive() ? alive : dead).push_back(h.ip_address);
+    }
+    const Host *lh = GetHost(leader);
+    if (lh != nullptr && lh->IsAlive() && leader != GetNodeId()) {
+      candidates.push_back(lh->ip_address);
+    }
+    candidates.insert(candidates.end(), alive.begin(), alive.end());
+    candidates.insert(candidates.end(), dead.begin(), dead.end());
+    if (candidates.empty()) {  // degenerate: single-host file
+      for (const auto &h : hosts) candidates.push_back(h.ip_address);
+    }
+  }
 
-  HLOG(kInfo, "WaitForServerAndReconnect: Trying {} random hosts",
-       client_try_new_servers_);
+  HLOG(kInfo,
+       "WaitForServerAndReconnect: trying up to {} host(s), leader-first: {}",
+       client_try_new_servers_, candidates.front());
   for (int i = 0; i < client_try_new_servers_; ++i) {
-    size_t idx = dist(rng);
-    const std::string &addr = hosts[idx].ip_address;
+    const std::string &addr = candidates[i % candidates.size()];
     HLOG(kInfo, "WaitForServerAndReconnect: Trying {}/{}: {}",
          i + 1, client_try_new_servers_, addr);
     if (ReconnectToNewHost(addr)) {
@@ -3136,7 +3189,7 @@ bool IpcManager::WaitForServerAndReconnect(
     }
   }
 
-  HLOG(kError, "WaitForServerAndReconnect: All {} random hosts failed",
+  HLOG(kError, "WaitForServerAndReconnect: All {} candidate hosts failed",
        client_try_new_servers_);
   reconnecting_.store(false, std::memory_order_release);
   return false;
@@ -3899,9 +3952,10 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
         const auto inline_retry_budget = (task_ptr->pool_id_ == kAdminPoolId)
                                              ? std::chrono::seconds(30)
                                              : kInlineRetryBudget;
-        const auto deadline =
-            std::chrono::steady_clock::now() + inline_retry_budget;
-        while (!task_ptr->IsPeriodic() &&
+        const auto retry_start = std::chrono::steady_clock::now();
+        const auto deadline = retry_start + inline_retry_budget;
+        const bool is_periodic = task_ptr->IsPeriodic();
+        while (!is_periodic &&
                (result == RouteResult::Retry || result == RouteResult::Dne) &&
                std::chrono::steady_clock::now() < deadline) {
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -3918,12 +3972,30 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
           // entry once the popping iteration's owning reference died: the icx
           // windows-2025 cte_tag_large SEGFAULT. Terminal failure is the
           // correct end state.)
-          HLOG(kError,
-               "RouteTask: inline retry exhausted ({} ms) on non-worker "
-               "thread; failing task pool={} method={}",
-               std::chrono::duration_cast<std::chrono::milliseconds>(
-                   inline_retry_budget).count(),
-               task_ptr->pool_id_, task_ptr->method_);
+          // Report what actually happened, not the budget. A PERIODIC task
+          // skips the loop entirely (see above) and is failed instantly and
+          // by design -- printing the budget for it made five harmless drops
+          // read as five 30-second stalls, and that misreading has cost real
+          // diagnosis time twice (issue #923). Log elapsed time and say which
+          // of the two cases this is.
+          const auto elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - retry_start).count();
+          if (is_periodic) {
+            HLOG(kError,
+                 "RouteTask: periodic task not routable at spawn time; failing "
+                 "it immediately by design (no retry attempted) -- pool={} "
+                 "method={}",
+                 task_ptr->pool_id_, task_ptr->method_);
+          } else {
+            HLOG(kError,
+                 "RouteTask: inline retry exhausted after {} ms (budget {} ms) "
+                 "on non-worker thread; failing task pool={} method={}",
+                 elapsed_ms,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     inline_retry_budget).count(),
+                 task_ptr->pool_id_, task_ptr->method_);
+          }
           task_ptr->SetReturnCode(static_cast<u32>(-1));
           task_ptr->SetComplete();
         }
@@ -4068,8 +4140,26 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
     // lines, and a green coverage run logs ~19k of these (issue #849). The
     // callers in RouteTask log the kError summary on first failure and on
     // retry exhaustion.
-    HLOG(kDebug, "RouteLocal: Container not found for pool={} container_id={} method={}",
-         task_ptr->pool_id_, container_id, task_ptr->method_);
+    // Include the pool manager's own state. GetContainer can only return an
+    // invalid handle three ways: the manager is not initialized, the pool has
+    // no metadata entry, or the entry exists but has no usable container --
+    // and those want opposite fixes (issue #923). Printing initialized/pool
+    // count here says which, without needing to reproduce.
+    // The instance ADDRESS is the discriminator. CLIO_POOL_MANAGER resolves
+    // through GetGlobalPtrVar, which lazily `new`s a blank PoolManager when the
+    // global pointer is null -- so "initialized=0, pools=0" can mean either a
+    // second, duplicated instance (one per module) or a genuine
+    // access-before-init window on the one instance. Those want different
+    // fixes. Compare this against the address ServerInit logs: two addresses
+    // is duplication, one address is ordering. (issue #923)
+    auto *pm_diag = pool_manager;
+    HLOG(kDebug,
+         "RouteLocal: Container not found for pool={} container_id={} "
+         "method={} (pool_manager={} initialized={}, pools known={})",
+         task_ptr->pool_id_, container_id, task_ptr->method_,
+         static_cast<const void *>(pm_diag),
+         pm_diag != nullptr && pm_diag->IsInitialized(),
+         pm_diag != nullptr ? pm_diag->GetPoolCount() : 0);
     return RouteResult::Dne;
   }
   if (exec_dc.IsPlugged()) {

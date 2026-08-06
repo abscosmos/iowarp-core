@@ -126,6 +126,12 @@ add_executable(test_bdev_fragmentation
     test_bdev_fragmentation.cc
 )
 
+# Freed space must reach the DPE without waiting for a StatTargets tick (#919).
+# Drives the stale-mirror window that made cte_bdev_fragmentation flaky.
+add_executable(test_bdev_free_visibility
+    test_bdev_free_visibility.cc
+)
+
 # Batching benchmark (#820): many small writes at ONE blob, A/B'd on the same
 # binary via CLIO_TASK_BATCHING.
 add_executable(bench_same_blob_batching
@@ -445,6 +451,18 @@ target_link_libraries(test_vectored_blob_io
 
 # Link test_bdev_fragmentation (#820) - same deps.
 target_link_libraries(test_bdev_fragmentation
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# Link test_bdev_free_visibility (#919) - same deps.
+target_link_libraries(test_bdev_free_visibility
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime
@@ -851,6 +869,15 @@ set_tests_properties(cte_bdev_fragmentation PROPERTIES
     LABELS "regression;bdev;cte;820"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
 
+# issue #919: placement must see space freed since the last StatTargets tick.
+# Four fill/stat/delete/put cycles; a stray periodic tick can rescue one, not all.
+add_test(NAME cte_bdev_free_visibility
+    COMMAND test_bdev_free_visibility)
+set_tests_properties(cte_bdev_free_visibility PROPERTIES
+    TIMEOUT 600
+    LABELS "regression;bdev;cte;919"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+
 # Add reorganize blob tests
 # NOTE: These tests are chained (Put -> Move -> Integrity -> Promote -> Cleanup)
 # and share global state via g_fixture, so they must run together in a single
@@ -1035,6 +1062,41 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 endif()  # TARGET clio_cte_cache_client
+
+#------------------------------------------------------------------------------
+# Indexer chimod behavioral coverage (issue #905): scope, async drain +
+# search barrier, maintenance verbs, kReindexScan, first-insertion backfill.
+#------------------------------------------------------------------------------
+if(TARGET clio_cte_indexer_client)
+add_executable(test_indexer_ops test_indexer_ops.cc)
+target_include_directories(test_indexer_ops PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/indexer/include
+)
+target_link_libraries(test_indexer_ops
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_indexer_runtime
+    clio_cte_indexer_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_indexer_ops
+    COMMAND test_indexer_ops)
+
+set_tests_properties(
+    cte_indexer_ops
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;indexer;cte;semantic-search;coverage"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # TARGET clio_cte_indexer_client
 
 # Full 4-layer stack (issue #886 cache/replication split): cache(563) ->
 # compressor(562) -> replication(561) -> core(512). A compressed blob KEEPS
@@ -1508,8 +1570,8 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # clio-fs zero-IPC read path (issue #817): correctness + latency
 #
-# UNIX-only, like the cfs adapter it drives: cfs_io.h is built on unistd.h /
-# sys/stat.h / off_t and has no Windows port, so clio_cte_cfs_adapter does not
+# UNIX-only: the descriptor layer it drives is built on unistd.h / sys/stat.h /
+# off_t and has no Windows port, so the filesystem client compiles it out there
 # exist there.
 # ------------------------------------------------------------------------------
 if(UNIX)
@@ -1530,7 +1592,7 @@ target_compile_definitions(test_cfs_shm_read PRIVATE
     CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
 
 target_link_libraries(test_cfs_shm_read
-    clio_cte_cfs_adapter
+    clio_cte_filesystem_client  # descriptor layer + chimod client
     clio_cte_filesystem_client
     clio_cte_core_client
     # The client library's Config helpers are defined in the RUNTIME library,

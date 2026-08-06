@@ -34,6 +34,44 @@ install(TARGETS clio_cte_semantic_bench
   RUNTIME DESTINATION bin
 )
 
+# Mixed metadata + I/O reliability benchmark. Drives the eight clio-fs
+# operations (4 KiB / 1 MiB read+write, stat-size, small/large readdir, rename)
+# under a configurable percentage mix so the combined profile can be compared
+# against each operation in isolation.
+add_executable(clio_cte_reliability_bench
+  clio_cte_reliability_bench.cc
+)
+target_link_libraries(clio_cte_reliability_bench
+  # Drives the descriptor layer (open/read/write/stat/readdir/rename) that a
+  # real application reaches by interception, not raw task submission. It is a
+  # filesystem benchmark, so it pays what a filesystem caller pays.
+  clio_cte_filesystem_client
+  clio::cte::core_client
+  clio::run::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+target_compile_features(clio_cte_reliability_bench PRIVATE cxx_std_17)
+install(TARGETS clio_cte_reliability_bench
+  RUNTIME DESTINATION bin
+)
+
+# POSIX baseline for the reliability benchmark: the same eight-operation mixed
+# workload driven through plain pwrite/pread/stat/opendir/rename against an
+# ordinary directory (point --root at NFS, or at local storage). Links nothing
+# from clio on purpose — it is the "what if we just used the filesystem"
+# control, and it takes the same flags and emits the same CSV so one driver can
+# run both.
+add_executable(posix_fs_bench
+  posix_fs_bench.cc
+)
+target_link_libraries(posix_fs_bench
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+target_compile_features(posix_fs_bench PRIVATE cxx_std_17)
+install(TARGETS posix_fs_bench
+  RUNTIME DESTINATION bin
+)
+
 # Create clio_cte_score_bench executable (MPI-based score/demotion benchmark)
 # Only build if MPI is enabled
 if(CLIO_CORE_ENABLE_MPI)
@@ -91,7 +129,13 @@ endif()
 # its own symbols at System.loadLibrary time.
 find_path(CLIO_JNI_INCLUDE_DIR jni.h
   HINTS $ENV{JAVA_HOME}/include /usr/lib/jvm/default-java/include)
-if(CLIO_JNI_INCLUDE_DIR)
+# NOT WIN32: InitOnce() installs a no-op SIGUSR1 sigaction to survive the
+# Linux SHM transport's tgkill wakeups — POSIX-signal machinery with no
+# Windows counterpart (and no Windows SHM-wake path to survive). Windows
+# runners ship a JDK, so without this gate every Windows build that finds
+# jni.h dies compiling sigaction/SIGUSR1 (first seen when the packaging
+# workflows ran against dev content in #899).
+if(CLIO_JNI_INCLUDE_DIR AND NOT WIN32)
   message(STATUS "YCSB JNI binding enabled (jni.h at ${CLIO_JNI_INCLUDE_DIR})")
   add_library(clio_ycsb_jni SHARED
     ycsb/clio_ycsb_jni.cc

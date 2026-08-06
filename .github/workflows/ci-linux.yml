@@ -16,7 +16,12 @@ on:
 
 concurrency:
   group: ci-linux-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel superseded runs on PR branches only. On a SHARED branch (main/dev)
+  # github.ref is identical for every merge, so `true` here made each merge
+  # cancel the PREVIOUS merge's validation mid-flight -- which is exactly the
+  # "lots of skipped tests after merging" symptom, and it silently drops the
+  # coverage that decides what is on dev. A merge's run must always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ---- Phased build + ctest + coverage --------------------------------------
@@ -26,101 +31,82 @@ jobs:
   # report. The multi-node cluster phase (deps-cpu container + docker-compose
   # node containers, with gcov pulled out of the nodes) is folded in next; until
   # then it still runs, without coverage, in cluster-tests.yml.
+  # ---- Matrix tier selection (issue #921) -----------------------------------
+  # A pull request runs the `unit amd64` phase only; the full phase sweep runs
+  # on push to main/dev. Every PR commit fanning out to six phases plus four
+  # variant jobs made Linux the slowest gate and multiplied flake exposure
+  # without multiplying signal -- the non-unit phases each scope themselves to
+  # one subtree and rarely fail alone. They still gate what lands, at the merge
+  # point rather than on every push to a branch.
+  #
+  # `unit amd64` is the PR phase because it is the only one that runs the core
+  # suite (everything except adapter/integration/docker/cae/cee), so a
+  # regression in the runtime, transport, or CTE shows up there first.
+  #
+  # The phase list lives here as JSON rather than as a `strategy.matrix.include`
+  # block because a job-level `if:` cannot see the `matrix` context -- filtering
+  # has to happen before the matrix expands. Field notes, previously inline on
+  # each entry:
+  #
+  #   unit       Everything except adapter/integration/docker/cae/cee (empty
+  #              labels => the script's default exclude set). ENABLE_LLAMA
+  #              without LLAMA_SERVER builds just the llm-hooks kvcache/lmcache
+  #              libraries and their store tests (CTE-only, no llama.cpp
+  #              external) -- otherwise that code has zero CI coverage.
+  #   fuse       Native libfuse3; system fuse3.pc lives in the pkgconfig path
+  #              below, since the conda build otherwise only sees the conda
+  #              env's path and reports FUSE3 missing. Live-mount suites are
+  #              excluded (a real FUSE mount needs /dev/fuse + privileges) and
+  #              run in ci-adapters' mount-smoke step. `extract` covers BOTH
+  #              the adapter tree and the filesystem (CFS) tree: the adapter
+  #              sits on the CFS client+runtime and the fuse|adapter tests
+  #              exercise it, so extracting adapter/* alone silently dropped
+  #              context-transfer-engine/filesystem/** and made it read 0% on
+  #              Codecov. cdash_scope keeps the CDash headline scoped to the
+  #              adapter (== the codecov "fuse" component) instead of a
+  #              whole-repo number diluted by code the fuse-only selection does
+  #              not exercise.
+  #   cae/cee    Context Assimilation / Exploration Engine.
+  #   prediction Stands up the real Python model server and drives a LightGBM
+  #              inference through the C++ prediction path and the bdev
+  #              Monitor("stats") entry point. Needs the Git-LFS models and the
+  #              server's Python deps, both installed in the job below.
+  matrix-tier:
+    runs-on: ubuntu-latest
+    outputs:
+      phases: ${{ steps.pick.outputs.phases }}
+      full: ${{ steps.pick.outputs.full }}
+    steps:
+      - id: pick
+        shell: bash
+        run: |
+          cat > /tmp/phases.json <<'JSON'
+          [
+            {"phase":"unit","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.unit","flag":"unit","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_LLAMA=ON","labels":"","extract":""},
+            {"phase":"unit","arch":"arm64","os":"ubuntu-24.04-arm","site":"ubu-24.arm64.unit","flag":"unit","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_LLAMA=ON","labels":"","extract":""},
+            {"phase":"fuse","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.fuse","flag":"fuse","apt":"libfuse3-dev fuse3","pkgconfig":"/usr/lib/x86_64-linux-gnu/pkgconfig","cmake_args":"-DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON -DCLIO_CTE_ENABLE_FILESYSTEM=ON","labels":"fuse|adapter","exclude_labels":"docker|copy_workspace|integration","extract":"*/context-transfer-engine/adapter/* */context-transfer-engine/filesystem/*","cdash_scope":"context-transfer-engine/adapter"},
+            {"phase":"cae","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cae","flag":"cae","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CAE=ON","labels":"cae","extract":"*/context-assimilation-engine/*"},
+            {"phase":"cee","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cee","flag":"cee","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CEE=ON","labels":"cee","extract":"*/context-exploration-engine/*"},
+            {"phase":"prediction","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.prediction","flag":"prediction","apt":"python3-venv","cmake_args":"","labels":"prediction_e2e","extract":"*/hw_failure_monitor/* */context-transport-primitives/src/system_info.cc */context-runtime/modules/bdev/*"}
+          ]
+          JSON
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "full=false" >> "$GITHUB_OUTPUT"
+            sel=$(jq -c '{include: [.[] | select(.phase == "unit" and .arch == "amd64")]}' /tmp/phases.json)
+          else
+            echo "full=true" >> "$GITHUB_OUTPUT"
+            sel=$(jq -c '{include: .}' /tmp/phases.json)
+          fi
+          echo "phases=$sel" >> "$GITHUB_OUTPUT"
+
   build-test:
     name: build-test (${{ matrix.phase }} ${{ matrix.arch }})
+    needs: matrix-tier
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # Core unit tests: everything except adapter/integration/docker/cae/cee
-          # (PHASE_CTEST_INCLUDE_LABELS empty => script's default exclude set).
-          - phase: unit
-            arch: amd64
-            os: ubuntu-24.04
-            site: ubu-24.amd64.unit
-            flag: unit
-            apt: ""
-            # ENABLE_LLAMA without LLAMA_SERVER = just the llm-hooks kvcache +
-            # lmcache libraries and the lmcache store tests (CTE-only, no
-            # llama.cpp external) — otherwise that code has zero CI coverage.
-            cmake_args: "-DCLIO_CORE_ENABLE_LLAMA=ON"
-            labels: ""
-            extract: ""
-          - phase: unit
-            arch: arm64
-            os: ubuntu-24.04-arm
-            site: ubu-24.arm64.unit
-            flag: unit
-            apt: ""
-            cmake_args: "-DCLIO_CORE_ENABLE_LLAMA=ON"
-            labels: ""
-            extract: ""
-          # FUSE adapter: native libfuse3, run FUSE/adapter tests, scope coverage
-          # to the adapter tree.
-          - phase: fuse
-            arch: amd64
-            os: ubuntu-24.04
-            site: ubu-24.amd64.fuse
-            flag: fuse
-            apt: "libfuse3-dev fuse3"
-            # System libfuse3's fuse3.pc lives here; the conda build otherwise
-            # only sees the conda env's pkg-config path and reports FUSE3 missing.
-            pkgconfig: "/usr/lib/x86_64-linux-gnu/pkgconfig"
-            cmake_args: "-DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON -DCLIO_CTE_ENABLE_FILESYSTEM=ON"
-            labels: "fuse|adapter"
-            # Skip the live-mount suites (real FUSE mount needs /dev/fuse +
-            # privileges); those run in ci-adapters' mount-smoke step for now.
-            exclude_labels: "docker|copy_workspace|integration"
-            # Scope to BOTH the adapter tree and the filesystem (CFS) tree: the
-            # FUSE adapter (fuse_cte.cc / cfs_io.h) sits on top of the CFS
-            # filesystem client+runtime and the fuse|adapter unit tests exercise
-            # it, so its coverage must be uploaded too. Extracting adapter/*
-            # alone silently dropped context-transfer-engine/filesystem/**,
-            # making filesystem_client/runtime/tasks read 0% on Codecov even
-            # though the fuse phase runs them.
-            extract: "*/context-transfer-engine/adapter/* */context-transfer-engine/filesystem/*"
-            # CDash coverage headline is scoped to the FUSE adapter (== the
-            # codecov "fuse" component), so the phase build reports the adapter
-            # at ~97% instead of a whole-repo number diluted by the runtime/CTE
-            # core that the fuse-only test selection doesn't exercise. The
-            # filesystem tree still reaches Codecov via the broader `extract`.
-            cdash_scope: "context-transfer-engine/adapter"
-          # Context Assimilation Engine
-          - phase: cae
-            arch: amd64
-            os: ubuntu-24.04
-            site: ubu-24.amd64.cae
-            flag: cae
-            apt: ""
-            cmake_args: "-DCLIO_CORE_ENABLE_CAE=ON"
-            labels: "cae"
-            extract: "*/context-assimilation-engine/*"
-          # Context Exploration Engine
-          - phase: cee
-            arch: amd64
-            os: ubuntu-24.04
-            site: ubu-24.amd64.cee
-            flag: cee
-            apt: ""
-            cmake_args: "-DCLIO_CORE_ENABLE_CEE=ON"
-            labels: "cee"
-            extract: "*/context-exploration-engine/*"
-          # Drive-failure prediction: stands up the real Python model server and
-          # drives a LightGBM inference through the C++ prediction path and the
-          # bdev Monitor("stats") entry point. Runs the prediction_e2e-labelled
-          # tests (direct C++ E2E + full bdev->model integration). Needs the
-          # Git-LFS models and the server's Python deps, both installed below.
-          - phase: prediction
-            arch: amd64
-            os: ubuntu-24.04
-            site: ubu-24.amd64.prediction
-            flag: prediction
-            apt: "python3-venv"
-            cmake_args: ""
-            labels: "prediction_e2e"
-            extract: "*/prediction_server/* */context-transport-primitives/src/system_info.cc */context-runtime/modules/bdev/*"
+      matrix: ${{ fromJSON(needs.matrix-tier.outputs.phases) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -136,8 +122,8 @@ jobs:
       # server's Python deps; provide both so they actually run.
       - name: Pull prediction models (Git LFS)
         if: matrix.phase == 'prediction'
-        run: git lfs pull --include="prediction_server/models/*.pkl"
-      - name: Install prediction server deps
+        run: git lfs pull --include="context-runtime/modules/bdev/hw_failure_monitor/models/*.pkl"
+      - name: Install hw_failure_monitor server deps
         if: matrix.phase == 'prediction'
         run: |
           # Isolated venv (mirrors local validation) so the E2E driver's
@@ -148,7 +134,7 @@ jobs:
           # PREDICT_PYTHON; the driver scripts prefer it over python3.
           python3 -m venv "$HOME/predenv"
           "$HOME/predenv/bin/pip" install --quiet --upgrade pip
-          "$HOME/predenv/bin/pip" install --quiet -r prediction_server/requirements.txt
+          "$HOME/predenv/bin/pip" install --quiet -r context-runtime/modules/bdev/hw_failure_monitor/requirements.txt
           echo "PREDICT_PYTHON=$HOME/predenv/bin/python" >> "$GITHUB_ENV"
       - name: Calculate coverage (${{ matrix.phase }})
         env:
@@ -186,6 +172,9 @@ jobs:
   # model.
   boost-docker:
     name: boost (docker deps-cpu)
+    # Push-only (#921): a coroutine-backend build variant, not an arch. It
+    # gates main/dev rather than every PR commit.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -235,6 +224,8 @@ jobs:
 
   boost-native:
     name: boost (${{ matrix.os }})
+    # Push-only (#921): same reasoning as boost-docker, times two arches.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -269,12 +260,16 @@ jobs:
   # ---- Sanitizers: asan / ubsan / msan --------------------------------------
   sanitizers:
     name: sanitizer (${{ matrix.sanitizer }})
+    needs: matrix-tier
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        sanitizer: [asan, ubsan, msan]
+        # asan on every PR -- it is the highest-yield of the three and catches
+        # the memory errors most likely to reach review. ubsan and msan join on
+        # push to main/dev (#921).
+        sanitizer: ${{ needs.matrix-tier.outputs.full == 'true' && fromJSON('["asan","ubsan","msan"]') || fromJSON('["asan"]') }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5

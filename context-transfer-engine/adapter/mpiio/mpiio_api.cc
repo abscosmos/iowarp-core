@@ -3,8 +3,8 @@
  * All rights reserved. BSD 3-Clause license.
  *
  * MPI-IO interceptor. Tracked paths (those carrying the "clio::" marker) are
- * routed to the context-filesystem chimod via the shared CfsIo core; a clio::
- * MPI_File is an opaque heap token mapped to a CfsIo descriptor. Everything
+ * routed to the context-filesystem chimod via the filesystem client; a clio::
+ * MPI_File is an opaque heap token mapped to a client descriptor. Everything
  * else falls through to the real MPI-IO API.
  *
  * Single-rank (MPI_COMM_SELF) byte semantics: collective (_all), shared and
@@ -25,7 +25,7 @@ bool mpiio_intercepted = true;
 
 #include "clio_ctp/util/logging.h"
 #include "clio_ctp/util/singleton.h"
-#include "adapter/cfs/cfs_io.h"
+#include <clio_cte/filesystem/filesystem_client.h>
 
 namespace {
 
@@ -33,7 +33,7 @@ struct MpiToken {
   int fd = -1;
 };
 
-/** Maps clio:: MPI_File tokens to their CfsIo descriptors. */
+/** Maps clio:: MPI_File tokens to their filesystem-client descriptors. */
 class MpiioShim {
  public:
   static int AmodeToFlags(int amode) {
@@ -102,22 +102,22 @@ size_t Bytes(int count, MPI_Datatype datatype) {
 
 /** Sequential read at the file pointer. */
 int DoRead(int fd, void *buf, int count, MPI_Datatype datatype) {
-  CLIO_CTE_CFS->Read(fd, buf, Bytes(count, datatype));
+  CLIO_CFS_CLIENT->ReadFd(fd, buf, Bytes(count, datatype));
   return MPI_SUCCESS;
 }
 int DoReadAt(int fd, MPI_Offset off, void *buf, int count,
              MPI_Datatype datatype) {
-  CLIO_CTE_CFS->Pread(fd, buf, Bytes(count, datatype),
+  CLIO_CFS_CLIENT->PreadFd(fd, buf, Bytes(count, datatype),
                       static_cast<off_t>(off));
   return MPI_SUCCESS;
 }
 int DoWrite(int fd, const void *buf, int count, MPI_Datatype datatype) {
-  CLIO_CTE_CFS->Write(fd, buf, Bytes(count, datatype));
+  CLIO_CFS_CLIENT->WriteFd(fd, buf, Bytes(count, datatype));
   return MPI_SUCCESS;
 }
 int DoWriteAt(int fd, MPI_Offset off, const void *buf, int count,
               MPI_Datatype datatype) {
-  CLIO_CTE_CFS->Pwrite(fd, buf, Bytes(count, datatype),
+  CLIO_CFS_CLIENT->PwriteFd(fd, buf, Bytes(count, datatype),
                        static_cast<off_t>(off));
   return MPI_SUCCESS;
 }
@@ -156,9 +156,9 @@ int CLIO_CTE_DECL(MPI_Waitall)(int count, MPI_Request *req,
 int CLIO_CTE_DECL(MPI_File_open)(MPI_Comm comm, const char *filename, int amode,
                                  MPI_Info info, MPI_File *fh) {
   auto real_api = CLIO_CTE_MPIIO_API;
-  if (clio::cae::CfsIo::IsPathTracked(filename)) {
+  if (clio::cte::filesystem::Client::IsPathTracked(filename)) {
     HLOG(kDebug, "Intercept MPI_File_open {} amode {}", filename, amode);
-    int fd = CLIO_CTE_CFS->Open(filename, MpiioShim::AmodeToFlags(amode), 0644);
+    int fd = CLIO_CFS_CLIENT->OpenFd(filename, MpiioShim::AmodeToFlags(amode), 0644);
     if (fd < 0) {
       return MPI_ERR_NO_SUCH_FILE;
     }
@@ -173,7 +173,7 @@ int CLIO_CTE_DECL(MPI_File_close)(MPI_File *fh) {
   int fd = Shim().Release(*fh);
   if (fd >= 0) {
     HLOG(kDebug, "Intercept MPI_File_close");
-    CLIO_CTE_CFS->Close(fd);
+    CLIO_CFS_CLIENT->CloseFd(fd);
     *fh = MPI_FILE_NULL;
     return MPI_SUCCESS;
   }
@@ -187,7 +187,7 @@ int CLIO_CTE_DECL(MPI_File_seek)(MPI_File fh, MPI_Offset offset, int whence) {
     int w = (whence == MPI_SEEK_SET)   ? SEEK_SET
             : (whence == MPI_SEEK_CUR) ? SEEK_CUR
                                        : SEEK_END;
-    return (CLIO_CTE_CFS->Seek(fd, static_cast<off_t>(offset), w) >= 0)
+    return (CLIO_CFS_CLIENT->SeekFd(fd, static_cast<off_t>(offset), w) >= 0)
                ? MPI_SUCCESS
                : MPI_ERR_IO;
   }
@@ -206,7 +206,7 @@ int CLIO_CTE_DECL(MPI_File_get_position)(MPI_File fh, MPI_Offset *offset) {
   auto real_api = CLIO_CTE_MPIIO_API;
   int fd = Shim().FdOf(fh);
   if (fd >= 0) {
-    *offset = static_cast<MPI_Offset>(CLIO_CTE_CFS->Tell(fd));
+    *offset = static_cast<MPI_Offset>(CLIO_CFS_CLIENT->TellFd(fd));
     return MPI_SUCCESS;
   }
   return real_api->MPI_File_get_position(fh, offset);

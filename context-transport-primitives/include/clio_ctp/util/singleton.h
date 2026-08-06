@@ -34,6 +34,7 @@
 #ifndef CTP_SHM_SINGLETON_H
 #define CTP_SHM_SINGLETON_H
 
+#include <atomic>
 #include <memory>
 
 #include "clio_ctp/constants/macros.h"
@@ -223,15 +224,72 @@ CTP_CROSS_FUN static inline T *GetGlobalCrossVar(T &instance) {
  * imported from another DLL; CMake's WINDOWS_EXPORT_ALL_SYMBOLS handles
  * function symbols but not data).
  */
-#define CTP_DEFINE_GLOBAL_PTR_VAR_H(T, NAME) extern __TU(T) * NAME;
-#define CTP_DEFINE_GLOBAL_PTR_VAR_CC(T, NAME) __TU(T) *NAME = nullptr;
+#define CTP_DEFINE_GLOBAL_PTR_VAR_H(T, NAME) \
+  extern ::std::atomic<__TU(T) *> NAME;
+#define CTP_DEFINE_GLOBAL_PTR_VAR_CC(T, NAME) \
+  ::std::atomic<__TU(T) *> NAME{nullptr};
 #define CTP_GET_GLOBAL_PTR_VAR(T, NAME) ctp::GetGlobalPtrVar<__TU(T)>(NAME)
+/**
+ * Publish-once lazy accessor for a process-global singleton pointer.
+ *
+ * This used to be an unsynchronized check-then-set:
+ *
+ *   if (instance == nullptr) { instance = new T(); }
+ *
+ * Two threads could both observe null, each construct a T, and the last
+ * writer would win the variable -- silently orphaning the other instance.
+ * For CLIO_POOL_MANAGER that was not merely wasteful but fatal: ServerInit()
+ * would run on the orphan, every later lookup would return the blank
+ * survivor, and since a blank manager can never become initialized the
+ * route-retry loop would spin its whole 30s deadline and fail the task with
+ * (u32)-1. That is the shared root cause of issues #923 (Linux leak-check),
+ * #928 (macOS adapters) and the windows-11-arm safe_bdev failure in #929 --
+ * the "two instance addresses" signature those issues were filed on.
+ *
+ * The CAS below makes construction publish-once: whoever installs the
+ * pointer first wins, the loser destroys its speculative instance and
+ * adopts the winner's. Correctness does not depend on a shared lock, which
+ * matters because this function is inlined into every module -- a
+ * function-local static mutex would be per-DLL on Windows and so would not
+ * actually serialize the threads racing on this one shared variable.
+ *
+ * The variable is std::atomic<T*> rather than a raw T*: acquire/release on
+ * the pointer is what orders the constructor's writes against another
+ * thread's first dereference, and unlike std::atomic_ref it is available on
+ * every toolchain this project builds with (atomic_ref needs libc++ 19,
+ * newer than the AppleClang used on the macOS runners).
+ */
 template <typename T>
-static inline T *GetGlobalPtrVar(T *&instance) {
-  if (instance == nullptr) {
-    instance = new T();
+static inline T *GetGlobalPtrVar(::std::atomic<T *> &instance) {
+  T *observed = instance.load(::std::memory_order_acquire);
+  if (observed != nullptr) {
+    return observed;
   }
-  return instance;
+  T *fresh = new T();
+  if (instance.compare_exchange_strong(observed, fresh,
+                                       ::std::memory_order_acq_rel,
+                                       ::std::memory_order_acquire)) {
+    return fresh;
+  }
+  // Lost the publish race: another thread installed its instance first.
+  // `observed` now holds the winner, which is the one everyone must share.
+  //
+  // The delete is well-defined even for a polymorphic T with a non-virtual
+  // destructor: `fresh` came from `new T()` two lines up, so the static and
+  // dynamic types are identical and no base-pointer slicing is possible.
+  // -Wdelete-non-virtual-dtor cannot see that and fires in every TU that
+  // instantiates this template (ConfigManager, IpcManager, ... are all
+  // polymorphic), so silence it narrowly here rather than leaving warnings
+  // scattered across the build.
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wdelete-non-virtual-dtor"
+#endif
+  delete fresh;
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic pop
+#endif
+  return observed;
 }
 
 /**

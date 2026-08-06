@@ -3158,7 +3158,19 @@ struct RenameTagTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<RenameTagTask>());
+    // OUT fields ONLY (issue #856). RenameTag is BROADCAST (every container
+    // holding part of the tag must rename), so this runs per surviving
+    // replica. Delegating to Copy() ran Task::Copy — overwriting the
+    // ORIGIN's task_id_/pool_query_/completer_ with the replica's while
+    // send_map_ and completion bookkeeping still referenced the origin —
+    // and re-assigned the IN priv::strings old_name_/new_name_ across
+    // shared-memory segments (free() through the wrong allocator). tag_id_
+    // is the only INOUT the replicas resolve; take the first non-null so a
+    // container that did not host the tag cannot erase it.
+    auto other = other_base.template Cast<RenameTagTask>();
+    if (tag_id_.IsNull()) {
+      tag_id_ = other->tag_id_;
+    }
   }
 };
 
@@ -3390,9 +3402,9 @@ struct GetTagSizeTask : public clio::run::Task {
    * the aggregate, which poisoned the result: on a multi-node cluster the
    * reader's own container often holds none of a just-written file's blobs, so
    * its rc=1 replica made the aggregate rc=1 even though another container
-   * returned the real size. CfsIo::Open only trusts the size when rc==0, so it
-   * discarded the correct size and every cross-node read of that file returned
-   * 0 bytes (issue #714, Bug 2).
+   * returned the real size. Client::OpenFd only trusts the size when rc==0,
+   * so it discarded the correct size and every cross-node read of that file
+   * returned 0 bytes (issue #714, Bug 2).
    *
    * Correct semantics — "found if ANY": the aggregate succeeds (rc=0) if at
    * least one replica found the tag, summing the found replicas' shares; it

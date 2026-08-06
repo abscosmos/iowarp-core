@@ -349,6 +349,43 @@ TEST_CASE("Autogen - Admin AggregateOut", "[autogen][admin][aggregate]") {
     replica_task.reset();
   }
 
+  // issue #856: AggregateOut merges a REPLICA's OUT fields into the origin. It
+  // must NOT whole-task-copy: Task::Copy overwrites the ORIGIN's identity
+  // (task_id_, pool_query_, completer_) with the replica's while send_map_ and
+  // the completion path still reference it, and re-assigns IN priv::strings
+  // across shared-memory segments. These assert the contract directly.
+  SECTION("AggregateOut preserves origin identity (RecoverContainers)") {
+    std::vector<clio::run::RecoveryAssignment> plan;
+    std::string data;
+    auto origin_task =
+        ipc_manager->NewTask<clio::run::admin::RecoverContainersTask>(
+            clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+            clio::run::PoolQuery::Broadcast(0), data, /*dead_node_id=*/7);
+    auto replica_task =
+        ipc_manager->NewTask<clio::run::admin::RecoverContainersTask>(
+            clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+            clio::run::PoolQuery::Local(), data, /*dead_node_id=*/9);
+    if (origin_task.IsNull() || replica_task.IsNull()) {
+      INFO("Failed to create tasks - skipping test");
+      if (!origin_task.IsNull()) origin_task.reset();
+      if (!replica_task.IsNull()) replica_task.reset();
+      return;
+    }
+    const clio::run::TaskId origin_id = origin_task->task_id_;
+    origin_task->num_recovered_ = 2;
+    replica_task->num_recovered_ = 3;
+
+    origin_task->AggregateOut(replica_task.template Cast<clio::run::Task>());
+
+    // Identity survives (the whole-task copy destroyed exactly this).
+    REQUIRE(origin_task->task_id_ == origin_id);
+    // Recovery is partitioned per node, so counts SUM rather than being
+    // clobbered by whichever replica answered last.
+    REQUIRE(origin_task->num_recovered_ == 5);
+    origin_task.reset();
+    replica_task.reset();
+  }
+
   SECTION("AggregateOut for MonitorTask") {
     auto origin_task = ipc_manager->NewTask<clio::run::admin::MonitorTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(), std::string("status"));

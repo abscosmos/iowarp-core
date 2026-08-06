@@ -30,7 +30,7 @@
 #include <thread>
 #include <vector>
 
-#include "../../adapter/cfs/cfs_io.h"
+#include <clio_cte/filesystem/filesystem_client.h>
 #include "clio_cte/core/core_client.h"
 #include "clio_cte/filesystem/filesystem_client.h"
 #include "clio_runtime/bdev/bdev_client.h"
@@ -163,7 +163,7 @@ bool InitRuntime() {
 }
 
 /** Read `count` bytes at `off` through the chimod RPC, bypassing the cache.
- *  This is the exact work CfsIo::DoRead does when the fast path declines, and
+ *  This is the exact work Client::Read does when the fast path declines, and
  *  is the honest baseline to time the fast path against. */
 ssize_t RpcRead(clio::run::u64 handle, clio::run::u64 off, void *buf,
                 size_t count) {
@@ -189,7 +189,7 @@ ssize_t RpcRead(clio::run::u64 handle, clio::run::u64 off, void *buf,
 TEST_CASE("clio-fs SHM read: correctness and latency", "[cfs][shm][noleak]") {
   REQUIRE(InitRuntime());
 
-  auto *cfs_io = CLIO_CTE_CFS;
+  auto *cfs_io = CLIO_CFS_CLIENT;
   REQUIRE(cfs_io != nullptr);
 
   // ---- write a file through the adapter ----------------------------------
@@ -200,9 +200,9 @@ TEST_CASE("clio-fs SHM read: correctness and latency", "[cfs][shm][noleak]") {
   }
 
   cfs_io->RemovePath(kClioPath);  // start from a known state
-  int fd = cfs_io->Open(kClioPath, O_CREAT | O_RDWR | O_TRUNC, 0644);
+  int fd = cfs_io->OpenFd(kClioPath, O_CREAT | O_RDWR | O_TRUNC, 0644);
   REQUIRE(fd >= 0);
-  REQUIRE(cfs_io->Write(fd, src.data(), kFileSize) ==
+  REQUIRE(cfs_io->WriteFd(fd, src.data(), kFileSize) ==
           static_cast<ssize_t>(kFileSize));
 
   // ---- is the shared-memory substrate present at all? --------------------
@@ -249,7 +249,7 @@ TEST_CASE("clio-fs SHM read: correctness and latency", "[cfs][shm][noleak]") {
   // Inspecting the mirror directly is not a read(2), so nothing has drained a
   // queued write for us. fsync first, or this races the write path when async
   // writes are enabled.
-  REQUIRE(cfs_io->Sync(fd) == 0);
+  REQUIRE(cfs_io->SyncFd(fd) == 0);
 
   clio::cte::filesystem::ShmFileRecord rec;
   REQUIRE(fs_client->TryGetFileRecordShm(kBackendPath, &rec));
@@ -285,7 +285,7 @@ TEST_CASE("clio-fs SHM read: correctness and latency", "[cfs][shm][noleak]") {
   };
   for (const Case &c : cases) {
     std::vector<char> fast(c.len, 0), rpc(c.len, 0);
-    ssize_t nf = cfs_io->Pread(fd, fast.data(), c.len,
+    ssize_t nf = cfs_io->PreadFd(fd, fast.data(), c.len,
                                static_cast<off_t>(c.off));
     ssize_t nr = RpcRead(cfs_io->HandleOf(fd), c.off, rpc.data(), c.len);
     REQUIRE(nf >= 0);
@@ -323,14 +323,14 @@ TEST_CASE("clio-fs SHM read: correctness and latency", "[cfs][shm][noleak]") {
 
     std::vector<char> after(4096, 0x5A);
     // Inside the surviving prefix: still correct, still served.
-    REQUIRE(cfs_io->Pread(fd, after.data(), 4096, 4096) == 4096);
+    REQUIRE(cfs_io->PreadFd(fd, after.data(), 4096, 4096) == 4096);
     REQUIRE(std::memcmp(after.data(), src.data() + 4096, 4096) == 0);
     // Past the new EOF: nothing, not stale bytes.
-    REQUIRE(cfs_io->Pread(fd, after.data(), 4096,
+    REQUIRE(cfs_io->PreadFd(fd, after.data(), 4096,
                           static_cast<off_t>(kShrunk)) == 0);
 
     // Restore the file for the latency measurement below.
-    REQUIRE(cfs_io->Pwrite(fd, src.data(), kFileSize, 0) ==
+    REQUIRE(cfs_io->PwriteFd(fd, src.data(), kFileSize, 0) ==
             static_cast<ssize_t>(kFileSize));
   }
 
@@ -340,12 +340,12 @@ TEST_CASE("clio-fs SHM read: correctness and latency", "[cfs][shm][noleak]") {
   std::vector<char> buf(kIoSize);
 
   // Warm: first touch attaches the RAM bdev segment in this process.
-  REQUIRE(cfs_io->Pread(fd, buf.data(), kIoSize, 0) ==
+  REQUIRE(cfs_io->PreadFd(fd, buf.data(), kIoSize, 0) ==
           static_cast<ssize_t>(kIoSize));
 
   double t0 = NowUs();
   for (int i = 0; i < kIters; ++i) {
-    ssize_t n = cfs_io->Pread(fd, buf.data(), kIoSize, 0);
+    ssize_t n = cfs_io->PreadFd(fd, buf.data(), kIoSize, 0);
     if (n != static_cast<ssize_t>(kIoSize)) {
       REQUIRE(false);
     }
@@ -394,13 +394,13 @@ TEST_CASE("clio-fs SHM read: correctness and latency", "[cfs][shm][noleak]") {
   REQUIRE(shm_us < 5.0);
   REQUIRE(rpc_us / shm_us > 20.0);
 
-  cfs_io->Close(fd);
+  cfs_io->CloseFd(fd);
   cfs_io->RemovePath(kClioPath);
 }
 
 TEST_CASE("clio-fs async writes: RYOW, fsync, throughput", "[cfs][shm][noleak]") {
   REQUIRE(InitRuntime());
-  auto *cfs_io = CLIO_CTE_CFS;
+  auto *cfs_io = CLIO_CFS_CLIENT;
   REQUIRE(cfs_io != nullptr);
 
   const std::string wpath = "clio::/tmp/clio_cfs_async_write_test.dat";
@@ -423,30 +423,30 @@ TEST_CASE("clio-fs async writes: RYOW, fsync, throughput", "[cfs][shm][noleak]")
   // blobs when the read is issued. If the read did not wait for it, it would
   // either see a stale EOF (short read) or pre-write bytes.
   {
-    int fd = cfs_io->Open(wpath, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    int fd = cfs_io->OpenFd(wpath, O_CREAT | O_RDWR | O_TRUNC, 0644);
     REQUIRE(fd >= 0);
-    REQUIRE(cfs_io->Pwrite(fd, chunk.data(), kChunk, 0) ==
+    REQUIRE(cfs_io->PwriteFd(fd, chunk.data(), kChunk, 0) ==
             static_cast<ssize_t>(kChunk));
 
     std::vector<char> back(kChunk, 0);
-    REQUIRE(cfs_io->Pread(fd, back.data(), kChunk, 0) ==
+    REQUIRE(cfs_io->PreadFd(fd, back.data(), kChunk, 0) ==
             static_cast<ssize_t>(kChunk));
     REQUIRE(std::memcmp(back.data(), chunk.data(), kChunk) == 0);
 
     // ...and a read of a DIFFERENT region must still be correct.
-    REQUIRE(cfs_io->Pwrite(fd, chunk.data(), kChunk,
+    REQUIRE(cfs_io->PwriteFd(fd, chunk.data(), kChunk,
                            static_cast<off_t>(kChunk)) ==
             static_cast<ssize_t>(kChunk));
     std::vector<char> back2(1024, 0);
-    REQUIRE(cfs_io->Pread(fd, back2.data(), 1024,
+    REQUIRE(cfs_io->PreadFd(fd, back2.data(), 1024,
                           static_cast<off_t>(kChunk + 512)) == 1024);
     REQUIRE(std::memcmp(back2.data(), chunk.data() + 512, 1024) == 0);
 
     // stat must report the size the completed write(2) calls established,
     // even though those writes may still be in flight.
     REQUIRE(cfs_io->SizeFd(fd) == static_cast<off_t>(2 * kChunk));
-    REQUIRE(cfs_io->Sync(fd) == 0);
-    REQUIRE(cfs_io->Close(fd) == 0);
+    REQUIRE(cfs_io->SyncFd(fd) == 0);
+    REQUIRE(cfs_io->CloseFd(fd) == 0);
   }
 
   // NOTE: there is deliberately no assertion that a BURST of overlapping
@@ -469,16 +469,16 @@ TEST_CASE("clio-fs async writes: RYOW, fsync, throughput", "[cfs][shm][noleak]")
   // not the thing under test. (That confound is why an earlier version of this
   // benchmark reported a 3x difference between two identical code paths.)
   auto write_pass = [&](int flags, bool timed) {
-    int fd = cfs_io->Open(wpath, O_CREAT | O_WRONLY | flags, 0644);
+    int fd = cfs_io->OpenFd(wpath, O_CREAT | O_WRONLY | flags, 0644);
     REQUIRE(fd >= 0);
     double t0 = NowUs();
     for (int i = 0; i < kChunks; ++i) {
-      REQUIRE(cfs_io->Write(fd, chunk.data(), kChunk) ==
+      REQUIRE(cfs_io->WriteFd(fd, chunk.data(), kChunk) ==
               static_cast<ssize_t>(kChunk));
     }
-    REQUIRE(cfs_io->Sync(fd) == 0);  // fsync is part of the cost, not a dodge
+    REQUIRE(cfs_io->SyncFd(fd) == 0);  // fsync is part of the cost, not a dodge
     double us = NowUs() - t0;
-    REQUIRE(cfs_io->Close(fd) == 0);
+    REQUIRE(cfs_io->CloseFd(fd) == 0);
     return timed ? us : 0.0;
   };
 
@@ -494,7 +494,7 @@ TEST_CASE("clio-fs async writes: RYOW, fsync, throughput", "[cfs][shm][noleak]")
 
   // No throughput assertion, in either direction. The queued path is OFF by
   // default because it measured ~2.3x SLOWER than blocking writes (see
-  // CfsIo::AsyncWritesEnabled for the numbers and the cause), so asserting a
+  // Client::AsyncWritesEnabled for the numbers and the cause), so asserting a
   // win would be asserting something known to be false today, and asserting a
   // loss would bake in the very thing #784 is expected to fix. The number is
   // printed so a future run can see it move.
@@ -506,19 +506,19 @@ TEST_CASE("clio-fs async writes: RYOW, fsync, throughput", "[cfs][shm][noleak]")
 
   // ---- the bytes survive a close/reopen ----------------------------------
   {
-    int fd = cfs_io->Open(wpath, O_RDONLY, 0644);
+    int fd = cfs_io->OpenFd(wpath, O_RDONLY, 0644);
     REQUIRE(fd >= 0);
     REQUIRE(cfs_io->SizeFd(fd) ==
             static_cast<off_t>(static_cast<size_t>(kChunks) * kChunk));
     std::vector<char> back(kChunk, 0);
     for (int i : {0, kChunks / 2, kChunks - 1}) {
-      REQUIRE(cfs_io->Pread(fd, back.data(), kChunk,
+      REQUIRE(cfs_io->PreadFd(fd, back.data(), kChunk,
                             static_cast<off_t>(static_cast<size_t>(i) *
                                                kChunk)) ==
               static_cast<ssize_t>(kChunk));
       REQUIRE(std::memcmp(back.data(), chunk.data(), kChunk) == 0);
     }
-    REQUIRE(cfs_io->Close(fd) == 0);
+    REQUIRE(cfs_io->CloseFd(fd) == 0);
   }
 
   cfs_io->RemovePath(wpath);
@@ -528,7 +528,7 @@ TEST_CASE("clio-fs async writes: RYOW, fsync, throughput", "[cfs][shm][noleak]")
 TEST_CASE("clio-fs SHM path under concurrent readers and writers",
           "[cfs][shm][noleak]") {
   REQUIRE(InitRuntime());
-  auto *cfs_io = CLIO_CTE_CFS;
+  auto *cfs_io = CLIO_CFS_CLIENT;
   REQUIRE(cfs_io != nullptr);
   if (CLIO_CPU_IPC == nullptr ||
       CLIO_CPU_IPC->GetMetadataAllocator() == nullptr) {
@@ -550,11 +550,11 @@ TEST_CASE("clio-fs SHM path under concurrent readers and writers",
   }
 
   cfs_io->RemovePath(cpath);
-  int wfd = cfs_io->Open(cpath, O_CREAT | O_RDWR | O_TRUNC, 0644);
+  int wfd = cfs_io->OpenFd(cpath, O_CREAT | O_RDWR | O_TRUNC, 0644);
   REQUIRE(wfd >= 0);
-  REQUIRE(cfs_io->Write(wfd, src.data(), kSize) ==
+  REQUIRE(cfs_io->WriteFd(wfd, src.data(), kSize) ==
           static_cast<ssize_t>(kSize));
-  REQUIRE(cfs_io->Sync(wfd) == 0);
+  REQUIRE(cfs_io->SyncFd(wfd) == 0);
 
   const int kThreads = 8;
   const int kItersPerThread = 400;
@@ -565,7 +565,7 @@ TEST_CASE("clio-fs SHM path under concurrent readers and writers",
     threads.emplace_back([&, t]() {
       // Each thread opens its OWN descriptor, so they contend on the fd table,
       // the write windows and the shared client caches simultaneously.
-      int fd = cfs_io->Open(cpath, O_RDWR, 0644);
+      int fd = cfs_io->OpenFd(cpath, O_RDWR, 0644);
       if (fd < 0) {
         ++errors;
         return;
@@ -574,7 +574,7 @@ TEST_CASE("clio-fs SHM path under concurrent readers and writers",
       for (int i = 0; i < kItersPerThread; ++i) {
         clio::run::u64 off =
             (static_cast<clio::run::u64>(i) * 4096 * (t + 1)) % (kSize - 4096);
-        ssize_t n = cfs_io->Pread(fd, buf.data(), 4096,
+        ssize_t n = cfs_io->PreadFd(fd, buf.data(), 4096,
                                   static_cast<off_t>(off));
         if (n != 4096) {
           ++errors;
@@ -588,15 +588,15 @@ TEST_CASE("clio-fs SHM path under concurrent readers and writers",
         // writers keep the mirror, the write windows and the placement
         // generation moving underneath the readers.
         if ((i & 7) == 0) {
-          if (cfs_io->Pwrite(fd, buf.data(), 4096,
+          if (cfs_io->PwriteFd(fd, buf.data(), 4096,
                              static_cast<off_t>(off)) != 4096) {
             ++errors;
             break;
           }
         }
       }
-      cfs_io->Sync(fd);
-      cfs_io->Close(fd);
+      cfs_io->SyncFd(fd);
+      cfs_io->CloseFd(fd);
     });
   }
   for (auto &th : threads) {
@@ -609,7 +609,7 @@ TEST_CASE("clio-fs SHM path under concurrent readers and writers",
   REQUIRE(mismatches.load() == 0);
   REQUIRE(errors.load() == 0);
 
-  cfs_io->Close(wfd);
+  cfs_io->CloseFd(wfd);
   cfs_io->RemovePath(cpath);
 }
 
@@ -629,12 +629,12 @@ TEST_CASE("clio-fs SHM path under concurrent readers and writers",
 TEST_CASE("clio-fs writes always succeed, errors land on fsync/close",
           "[cfs][shm][noleak]") {
   REQUIRE(InitRuntime());
-  auto *cfs_io = CLIO_CTE_CFS;
+  auto *cfs_io = CLIO_CFS_CLIENT;
   REQUIRE(cfs_io != nullptr);
 
   const std::string path = "clio::/tmp/clio_cfs_write_always_ok.dat";
   cfs_io->RemovePath(path);
-  int fd = cfs_io->Open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  int fd = cfs_io->OpenFd(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
   REQUIRE(fd >= 0);
 
   // 4 KiB is the granularity a POSIX application actually writes at, and the
@@ -650,7 +650,7 @@ TEST_CASE("clio-fs writes always succeed, errors land on fsync/close",
   int failed_writes = 0;
   int fsync_failed_after = -1;
   for (int i = 0; i < kMaxWrites; ++i) {
-    ssize_t n = cfs_io->Write(fd, buf.data(), kBuf);
+    ssize_t n = cfs_io->WriteFd(fd, buf.data(), kBuf);
     if (n != static_cast<ssize_t>(kBuf)) {
       ++failed_writes;
       break;
@@ -661,7 +661,7 @@ TEST_CASE("clio-fs writes always succeed, errors land on fsync/close",
       // error -- if it did, the fsync below would report success over a file
       // whose bytes never landed.
       REQUIRE(cfs_io->SizeFd(fd) >= 0);
-      if (cfs_io->Sync(fd) != 0) {
+      if (cfs_io->SyncFd(fd) != 0) {
         REQUIRE(errno == EIO);
         fsync_failed_after = writes;
         break;
@@ -673,7 +673,7 @@ TEST_CASE("clio-fs writes always succeed, errors land on fsync/close",
   REQUIRE(failed_writes == 0);
   REQUIRE(writes > 0);
 
-  int close_rc = cfs_io->Close(fd);
+  int close_rc = cfs_io->CloseFd(fd);
   if (fsync_failed_after >= 0) {
     std::printf("[#817] %d x 4 KiB writes all returned success; the tier "
                 "refused at ~%.1f MiB and fsync reported it (close=%d)\n",

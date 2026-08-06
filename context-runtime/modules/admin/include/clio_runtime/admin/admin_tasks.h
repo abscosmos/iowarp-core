@@ -363,7 +363,37 @@ struct BaseCreateTask : public clio::run::Task {
   /** AggregateOut replica results into this task */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<BaseCreateTask>());
+    // OUT fields ONLY (issue #856). Pool creation is BROADCAST, so this runs
+    // once per surviving node with a foreign replica. Delegating to Copy()
+    // ran Task::Copy — overwriting the ORIGIN's task_id_, pool_query_ and
+    // completer_ with the replica's while send_map_/completion bookkeeping
+    // still referenced the origin — and re-assigned IN priv::strings across
+    // shared-memory segments (free() through the wrong allocator). See the
+    // RecoverContainersTask note: that is the `free(): invalid pointer`
+    // abort behind the leader-election recovery crash.
+    auto other = other_base.template Cast<BaseCreateTask>();
+    // Every replica creates the same pool and reports the same id; take the
+    // first non-null so a later empty answer cannot erase it.
+    if (new_pool_id_.IsNull()) {
+      new_pool_id_ = other->new_pool_id_;
+    }
+    if (error_message_.size() == 0 && other->error_message_.size() > 0) {
+      error_message_ = other->error_message_;
+    }
+    // A replica that could not be delivered because its target node DIED must
+    // not fail the whole create (issue #856). Pool creation is a broadcast:
+    // Task::AggregateOut propagates any non-zero replica RC to the origin, so
+    // one unreachable node turned an otherwise-successful create into an
+    // error — which is exactly what the leader-election suite asserts on right
+    // after it kills a node (and, before dead-node tasks completed at all,
+    // what HUNG instead). The pool genuinely exists once any node created it
+    // and reported its id; the dead node's container is created when it
+    // rejoins or when recovery redistributes it. Only the network-timeout RC
+    // is forgiven — a real create failure still propagates.
+    if (!new_pool_id_.IsNull() &&
+        GetReturnCode() == clio::run::kRun2RunNetworkTimeoutRC) {
+      SetReturnCode(0);
+    }
   }
 
   /**
@@ -371,6 +401,22 @@ struct BaseCreateTask : public clio::run::Task {
    * Sets client_->pool_id_ and client_->return_code_ from task results
    */
   void PostWait() {
+    // Forgive a replica that could not be delivered because its target node
+    // DIED (issue #856). This has to happen HERE, not in AggregateOut: the
+    // dead-replica verdict is applied straight to the origin by
+    // HandleTaskProgressResult, which runs AFTER the surviving replicas have
+    // aggregated. Pool creation is a broadcast over the admin pool, which has
+    // one container per node INCLUDING a node that just died, so a single
+    // undeliverable replica turned an otherwise-successful create into an
+    // error — the leader-election suite's assertion right after it kills a
+    // node (and, before dead-node tasks completed at all, an infinite hang).
+    // The pool genuinely exists once a node created it and reported its id;
+    // the dead node's container follows on rejoin or recovery. Only the
+    // network-timeout RC is forgiven — real create failures still propagate.
+    if (!new_pool_id_.IsNull() &&
+        return_code_ == clio::run::kRun2RunNetworkTimeoutRC) {
+      SetReturnCode(0);
+    }
     if (client_ != nullptr) {
       client_->pool_id_ = new_pool_id_;
       client_->return_code_ = return_code_;
@@ -1698,7 +1744,14 @@ struct ChangeAddressTableTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ChangeAddressTableTask>());
+    // OUT fields ONLY (issue #856) — this task is BROADCAST during container
+    // migration, so Copy()'s whole-task assignment would overwrite the
+    // origin's identity and re-assign IN fields / priv::strings across
+    // segments. See the RecoverContainersTask note.
+    auto other = other_base.template Cast<ChangeAddressTableTask>();
+    if (error_message_.size() == 0 && other->error_message_.size() > 0) {
+      error_message_ = other->error_message_;
+    }
   }
 };
 
@@ -1794,8 +1847,16 @@ struct HeartbeatTask : public clio::run::Task {
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    // Must NOT delegate to Copy(): Copy runs Task::Copy, which overwrites the
+    // ORIGIN's task_id_/pool_query_/completer_ with the replica's (issue #915).
+    // Corrupting the origin of a SWIM heartbeat is worse than corrupting an
+    // ordinary task -- this is the machinery that decides which nodes are
+    // alive, so a mangled origin feeds bad liveness into leader election
+    // (issue #929, seen firing as the AggregateOut contract-violation guard
+    // during leader_elect).
+    // HeartbeatTask has no OUT fields of its own -- SerializeOut is just
+    // Task::SerializeOut -- so the base aggregation is the whole merge.
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<HeartbeatTask>());
   }
 };
 
@@ -1853,8 +1914,19 @@ struct QueryTaskProgressTask : public clio::run::Task {
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    // Must NOT delegate to Copy(): Task::Copy would overwrite the ORIGIN's
+    // identity fields (issue #915) and copy the IN fields query_net_key_ /
+    // query_replica_id_ back from the replica.
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<QueryTaskProgressTask>());
+    auto other = other_base.template Cast<QueryTaskProgressTask>();
+    // status_ is 0 = kGone, 1 = kRunning, and the origin starts at 0.
+    // "Still running" wins: this answer decides whether a stuck replica gets
+    // failed, and wrongly concluding kGone completes a task that is still
+    // executing. Sticky-kRunning is also order-independent, unlike Copy's
+    // last-replica-wins.
+    if (other->status_ != 0) {
+      status_ = other->status_;
+    }
   }
 };
 
@@ -1893,8 +1965,10 @@ struct HeartbeatProbeTask : public clio::run::Task {
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    // See HeartbeatTask::AggregateOut -- delegating to Copy() would overwrite
+    // the ORIGIN's identity fields via Task::Copy (issue #915). This task has
+    // no OUT fields of its own, so base aggregation is the whole merge.
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<HeartbeatProbeTask>());
   }
 };
 
@@ -1943,8 +2017,20 @@ struct ProbeRequestTask : public clio::run::Task {
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    // Must NOT delegate to Copy(): it would overwrite the ORIGIN's identity
+    // fields via Task::Copy (issue #915), and it would also copy the IN field
+    // target_node_id_ back from the replica.
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<ProbeRequestTask>());
+    auto other = other_base.template Cast<ProbeRequestTask>();
+    // SWIM indirect probe: several helpers are asked to reach the same target,
+    // and the target is alive if ANY of them got through. probe_result_ is
+    // 0 = alive, -1 = unreachable, and the origin starts at -1, so success is
+    // sticky and the merge is order-independent. Taking the last replica's
+    // answer instead (what Copy did) would let one helper's failed probe
+    // erase another's success and declare a live node dead.
+    if (other->probe_result_ == 0) {
+      probe_result_ = 0;
+    }
   }
 };
 
@@ -2007,7 +2093,24 @@ struct RecoverContainersTask : public clio::run::Task {
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    Copy(other_base.template Cast<RecoverContainersTask>());
+    // OUT fields ONLY (issue #856). This used to delegate to Copy(), which
+    // is a whole-task assignment: it dragged in Task::Copy — overwriting the
+    // ORIGIN's task_id_, pool_query_ and completer_ with the REPLICA's
+    // (destroying the origin's identity mid-aggregation, while send_map_ /
+    // completion bookkeeping still referenced it) — and re-assigned the IN
+    // priv::string assignments_data_ from the replica's shared-memory
+    // segment, freeing the origin's buffer through the wrong allocator.
+    // That is the `free(): invalid pointer` abort that killed the recovery
+    // leader, then the next leader, until the survivors self-fenced and
+    // recovery never ran (the leader-election CI hang).
+    auto other = other_base.template Cast<RecoverContainersTask>();
+    // Recovery is partitioned across nodes: each dest node reports what IT
+    // created, so the collective total is the SUM (the old whole-task copy
+    // clobbered it with the last replica's count instead).
+    num_recovered_ += other->num_recovered_;
+    if (error_message_.size() == 0 && other->error_message_.size() > 0) {
+      error_message_ = other->error_message_;
+    }
   }
 };
 

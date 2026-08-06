@@ -4,6 +4,12 @@ This document describes the local LMCache storage plugin backed by the CLIO
 Context Transfer Engine (CTE), including the write, read, and lookup paths that
 matter for benchmark performance.
 
+The plugin source lives at
+`context-transfer-engine/llm-hooks/lmcache/plugin/lmcache/v1/storage_backend/plugins/clio_cte_backend.py`.
+The `plugin/` directory mirrors the LMCache package layout so that prepending it
+to `PYTHONPATH` overlays the plugin into an installed `lmcache` package (e.g.
+`PYTHONPATH=<repo>/context-transfer-engine/llm-hooks/lmcache/plugin:...`).
+
 The plugin implements LMCache's generic `MemoryObj` storage interface. In the
 normal worker configuration, the local CPU allocator returns
 `TensorMemoryObj` instances whose writable payload view is `byte_array`.

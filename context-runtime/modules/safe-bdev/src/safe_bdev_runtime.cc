@@ -66,6 +66,10 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
       clio::run::TaskStat stat;
       stat.io_size_ = wt->length_;
       const size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
+      // compute_ feeds InferCpuTime; a safe-bdev write additionally stages a
+      // per-block copy before forwarding to each member, so it carries roughly
+      // twice the CPU per byte of a plain bdev write.
+      stat.compute_ = static_cast<size_t>(aligned / 5000.0F) + 3;
       stat.wall_time_ = static_cast<float>(aligned) / 500.0F;
       return stat;
     }
@@ -74,7 +78,23 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
       clio::run::TaskStat stat;
       stat.io_size_ = rt->length_;
       const size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
+      stat.compute_ = static_cast<size_t>(aligned / 5000.0F) + 3;
       stat.wall_time_ = static_cast<float>(aligned) / 500.0F;
+      return stat;
+    }
+    case Method::kAllocateBlocks:
+    case Method::kFreeBlocks: {
+      // Slot bookkeeping under alloc_mu_ — small and bounded.
+      clio::run::TaskStat stat;
+      stat.compute_ = 6;
+      stat.wall_time_ = 10.0F;
+      return stat;
+    }
+    case Method::kBuildParity: {
+      // Reed-Solomon encode over a dirty stripe: the CPU-heaviest verb here.
+      clio::run::TaskStat stat;
+      stat.compute_ = 500;
+      stat.wall_time_ = 600.0F;
       return stat;
     }
     default:
@@ -766,6 +786,10 @@ clio::run::TaskResume Runtime::AllocateBlocks(
     CLIO_CO_RETURN;
   }
 
+  // Guards data_alloc_/rr_cursor_/alloc_log_ against the other workers that can
+  // be executing this container concurrently. No co_await below, so a plain
+  // mutex is safe here.
+  std::lock_guard<std::mutex> alloc_g(alloc_mu_);
   const size_t nmembers = data_members_.size();
   clio::run::u64 remaining = size;
   while (remaining > 0) {
@@ -821,6 +845,9 @@ clio::run::TaskResume Runtime::FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> 
   // Decode each block to (member d, slot s) and release the slot on that member.
   // The slot leaves the stripe -> if the stripe still has members, mark it dirty
   // so BuildParity re-derives the narrower parity; if it is now empty, forget it.
+  // Same allocator lock as AllocateBlocks (see alloc_mu_); StripeMembers and
+  // ForgetSlotIfEmpty read data_alloc_ under it and must not re-acquire it.
+  std::lock_guard<std::mutex> alloc_g(alloc_mu_);
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const clio::run::bdev::Block &b = task->blocks_[i];
     clio::run::u32 d = 0;
@@ -1043,9 +1070,13 @@ clio::run::TaskResume Runtime::GetStats(clio::run::shared_ptr<GetStatsTask> &tas
   // Full aggregate capacity: every active data member contributes its own
   // remaining slots (bump headroom + reusable frees). No stranding.
   clio::run::u64 remaining = 0;
-  for (size_t d = 0; d < data_alloc_.size(); ++d) {
-    if (data_members_[d].state_ == ec::EcState::kActive) {
-      remaining += data_alloc_[d].RemainingSlots() * kChunkLen;
+  {
+    // data_alloc_ is mutated by concurrent AllocateBlocks/FreeBlocks.
+    std::lock_guard<std::mutex> alloc_g(alloc_mu_);
+    for (size_t d = 0; d < data_alloc_.size(); ++d) {
+      if (data_members_[d].state_ == ec::EcState::kActive) {
+        remaining += data_alloc_[d].RemainingSlots() * kChunkLen;
+      }
     }
   }
   task->remaining_size_ = remaining;

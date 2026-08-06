@@ -57,6 +57,67 @@ class Runtime : public clio::run::Container {
   Runtime() = default;
   ~Runtime() override = default;
 
+  /**
+   * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
+   *
+   * compute_ is the feature Container::InferCpuTime scales its learned
+   * per-method coefficient by. CAE had no override at all, so every one of its
+   * tasks reported all-zero stats and the CPU model degenerated to a single
+   * constant per method — a 4 KiB PutBlob and a 1 MiB PutBlob were
+   * indistinguishable to the scheduler. wall_time_ seeds InferWallClockTime
+   * at the ~500 MB/s convention shared with CTE and bdev; both coefficients
+   * are learned from real completions afterwards.
+   */
+  clio::run::TaskStat GetTaskStats(
+      const clio::run::Task *task) const override {
+    clio::run::TaskStat stat;
+    if (task == nullptr) {
+      return stat;
+    }
+    constexpr float kBytesPerComputeUs = 10000.0f;
+    constexpr float kBytesPerWallUs = 500.0f;
+    switch (task->method_) {
+      case Method::kPutBlob: {
+        // CAE reuses CTE's blob task types (core_tasks.h aliases them).
+        const auto *t = static_cast<const PutBlobTask *>(task);
+        stat.io_size_ = t->size_;
+        stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
+        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
+        return stat;
+      }
+      case Method::kGetBlob: {
+        const auto *t = static_cast<const GetBlobTask *>(task);
+        stat.io_size_ = t->size_;
+        stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
+        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
+        return stat;
+      }
+      case Method::kParseOmni:
+        // Parsing an OMNI record is CPU-bound text work whose size is not
+        // known from the task alone; seed it as clearly non-trivial.
+        stat.compute_ = 300;
+        stat.wall_time_ = 400.0f;
+        return stat;
+      case Method::kExportData:
+        // Writes a dataset out to a file — dominated by the write, not CPU.
+        stat.compute_ = 50;
+        stat.wall_time_ = 5000.0f;
+        return stat;
+      case Method::kSemanticSearch:
+        // Embedding comparison across the indexed set: the most CPU-hungry
+        // verb this chimod serves.
+        stat.compute_ = 1000;
+        stat.wall_time_ = 1200.0f;
+        return stat;
+      case Method::kGetOrCreateTag:
+        stat.compute_ = 10;
+        stat.wall_time_ = 15.0f;
+        return stat;
+      default:
+        return stat;
+    }
+  }
+
   // Virtual methods implemented in autogen/core_lib_exec.cc
   clio::run::TaskResume Run(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task_ptr) override;
   clio::run::u64 GetWorkRemaining() const override;

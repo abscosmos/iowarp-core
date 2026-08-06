@@ -11,7 +11,7 @@ add_executable(clio_cte_stdio_unit_tests
 
 target_link_libraries(clio_cte_stdio_unit_tests
     clio_cte_stdio
-    clio_cte_cfs_adapter      # cfs-backed I/O core (context-filesystem chimod)
+    clio_cte_filesystem_client  # descriptor layer + chimod client
     clio_cte_filesystem_client
     clio_cte_core_client
     ctp::cxx

@@ -62,6 +62,53 @@ class CoreInterposer : public clio::run::Container {
 
  public:
   /**
+   * Cost estimate for the blob verbs every interposer forwards.
+   *
+   * Each interposer chain (cache, compressor, replication, indexer) sits in
+   * front of the same core blob path, so the size-driven estimate belongs
+   * here once rather than in each of them; a derived chimod overrides this
+   * only for its OWN module verbs and delegates the rest back.
+   *
+   * compute_ is what Container::InferCpuTime scales its learned coefficient
+   * by — with it left at 0 the CPU model degenerates to a per-method constant
+   * that cannot tell a 4 KiB blob from a 1 MiB one. Payload handling is a
+   * copy at roughly 10 KB per CPU microsecond; wall time seeds at the
+   * ~500 MB/s convention the bdev and core modules already use.
+   */
+  clio::run::TaskStat GetTaskStats(
+      const clio::run::Task *task) const override {
+    clio::run::TaskStat stat;
+    if (task == nullptr) {
+      return stat;
+    }
+    constexpr float kBytesPerComputeUs = 10000.0f;
+    constexpr float kBytesPerWallUs = 500.0f;
+    switch (task->method_) {
+      case Method::kPutBlob: {
+        const auto *t = static_cast<const PutBlobTask *>(task);
+        stat.io_size_ = t->size_;
+        stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
+        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
+        return stat;
+      }
+      case Method::kGetBlob: {
+        const auto *t = static_cast<const GetBlobTask *>(task);
+        stat.io_size_ = t->size_;
+        stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
+        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
+        return stat;
+      }
+      case Method::kGetBlobSize:
+        // Metadata lookup only — no payload touched.
+        stat.compute_ = 5;
+        stat.wall_time_ = 10.0f;
+        return stat;
+      default:
+        return stat;
+    }
+  }
+
+  /**
    * Route interposed tasks EXACTLY as the core routes its own (issue #886
    * multi-node): the core's ScheduleTask hash-routes blob verbs to their
    * owner container (HashBlobToContainer) and tag creation by tag-name

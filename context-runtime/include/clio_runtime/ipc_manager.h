@@ -840,6 +840,38 @@ class IpcManager {
   void SetNodeState(u64 node_id, NodeState new_state);
 
   /**
+   * Record that traffic was just received from this peer (issue #856).
+   *
+   * Called on every inbound task/response. SWIM's probes ride ordinary admin
+   * tasks, so a merely STARVED node can miss its probe window and be declared
+   * dead — which is destructive, since recovery then redistributes a live
+   * node's containers. Bytes arriving from a peer prove it is alive
+   * regardless, and NoteInbound records that evidence.
+   */
+  void NoteInbound(u64 node_id);
+
+  /**
+   * Seconds since traffic was last received from this peer, or a very large
+   * value if we have never heard from it. Used to veto a spurious death.
+   */
+  float SecondsSinceInbound(u64 node_id) const;
+
+  /**
+   * Monotonic counter of CONFIRMED membership changes seen by this node
+   * (issue #856): bumped whenever a peer is marked dead or alive.
+   *
+   * "Leader" in this runtime is not consensus — every node computes
+   * `lowest alive id` from its own SWIM view — so during churn two nodes can
+   * briefly both believe they lead, and a node may die, rejoin, and die
+   * again. Recovery claims are therefore scoped by (epoch, dead node) rather
+   * than by node alone: a duplicate coordinator inside one epoch is refused,
+   * while a genuinely later death is a distinct, recoverable event.
+   */
+  u64 GetMembershipEpoch() const {
+    return membership_epoch_.load(std::memory_order_acquire);
+  }
+
+  /**
    * Set self-fenced status (partition detection)
    * @param fenced true if this node should fence itself
    */
@@ -1705,6 +1737,8 @@ class IpcManager {
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host
+  /** Confirmed membership changes; see GetMembershipEpoch (issue #856). */
+  std::atomic<u64> membership_epoch_{0};
   mutable std::vector<Host>
       hosts_cache_;  // Cached vector of hosts for GetAllHosts
   mutable bool hosts_cache_valid_ = false;  // Flag to track cache validity

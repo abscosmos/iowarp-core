@@ -1,0 +1,25 @@
+# LOCAL-ONLY overlay: run the runtimes under the ASan ALLOCATOR via LD_PRELOAD
+# (no rebuild needed). Even with uninstrumented binaries this gives redzones,
+# a free quarantine, and allocation/free stack traces — enough to name a
+# double-free or use-after-free that plain glibc only reports as
+# "free(): invalid pointer" / "double free detected in tcache".
+#   verify_asan_link_order=0  : required because ASan is preloaded, not linked
+#   detect_leaks=0            : we are hunting corruption, not leaks
+#   abort_on_error=1          : stop at the first report
+services:
+  iowarp-node1:
+    environment:
+      LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libasan.so.8
+      ASAN_OPTIONS: verify_asan_link_order=0:detect_leaks=0:abort_on_error=1:malloc_context_size=30:log_path=/tmp/asan
+  iowarp-node2:
+    environment:
+      LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libasan.so.8
+      ASAN_OPTIONS: verify_asan_link_order=0:detect_leaks=0:abort_on_error=1:malloc_context_size=30:log_path=/tmp/asan
+  iowarp-node3:
+    environment:
+      LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libasan.so.8
+      ASAN_OPTIONS: verify_asan_link_order=0:detect_leaks=0:abort_on_error=1:malloc_context_size=30:log_path=/tmp/asan
+  iowarp-node4:
+    environment:
+      LD_PRELOAD: /usr/lib/x86_64-linux-gnu/libasan.so.8
+      ASAN_OPTIONS: verify_asan_link_order=0:detect_leaks=0:abort_on_error=1:malloc_context_size=30:log_path=/tmp/asan

@@ -289,7 +289,7 @@ if [ "$DO_CTEST" = true ]; then
                 [ "${keep_it}" = 0 ] && _excludes="${_excludes}    \".*/${rel}/.*\"\n"
             done < <(
                 { find "${REPO_ROOT}" -mindepth 1 -maxdepth 1 -type d \
-                       \( -name 'context-*' -o -name 'prediction_server' \);
+                       -name 'context-*';
                   find "${REPO_ROOT}/context-transfer-engine" -mindepth 1 -maxdepth 1 \
                        -type d 2>/dev/null; } | sort -u
             )

@@ -1,5 +1,12 @@
 name: cpplint
-on: [push, pull_request]
+# Scoped to main/dev (#921). The bare `on: [push, pull_request]` fired twice for
+# every PR -- once for the branch push, once for the PR -- and also on pushes to
+# branches with no PR open, where nobody reads the result.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
 jobs:
   cpplint:
     runs-on: ubuntu-latest
