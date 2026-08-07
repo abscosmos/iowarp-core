@@ -477,6 +477,14 @@ jobs:
     - name: Install WinFsp (FUSE adapter SDK)
       run: choco install winfsp -y --no-progress
 
+    # cpack -G NSIS below shells out to makensis. Nothing installed it, so the
+    # job failed with "Cannot find NSIS compiler makensis ... Cannot initialize
+    # the generator NSIS" -- after a successful compile AND a successful ZIP
+    # package, so it reads as a packaging-config problem rather than a missing
+    # tool. The runner image does not ship NSIS.
+    - name: Install NSIS (installer generator for cpack -G NSIS)
+      run: choco install nsis -y --no-progress
+
     - name: Configure with CMake
       run: |
         # Cache + replication pins: same rationale as build-deb (#899).
