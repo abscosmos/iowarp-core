@@ -163,8 +163,8 @@ no separate `compose` step is required:
 
 ```bash
 clio_run start &
-mkdir -p /mnt/clio
-CLIO_WITH_RUNTIME=0 clio_cte_fuse /mnt/clio -f
+mkdir -p ~/clio-mnt
+CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
 ```
 
 `CLIO_WITH_RUNTIME=0` attaches to the runtime you just started rather than
@@ -178,14 +178,14 @@ is handed to `fuse_main`, so standard libfuse options apply (`-o allow_other`,
 The mount then behaves like any other filesystem:
 
 ```bash
-cp big_input.h5 /mnt/clio/
-python analysis.py /mnt/clio/big_input.h5
+cp big_input.h5 ~/clio-mnt/
+python analysis.py ~/clio-mnt/big_input.h5
 ```
 
 **3. Unmount:**
 
 ```bash
-fusermount3 -u /mnt/clio      # or: fusermount -u /mnt/clio
+fusermount3 -u ~/clio-mnt      # or: fusermount -u ~/clio-mnt
 ```
 
 To size the storage tiers explicitly instead of taking the defaults, compose a
