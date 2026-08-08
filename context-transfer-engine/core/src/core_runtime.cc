@@ -6815,8 +6815,11 @@ clio::run::TaskResume Runtime::AllocateFromTarget(
   // the task path already exercises. Remote/non-local targets and containers
   // that decline (or ENOSPC) fall through to the task path unchanged.
   if (target_info.target_query_.IsLocalMode()) {
-    auto inline_dc =
-        CLIO_POOL_MANAGER->GetStaticContainer(target_info.bdev_client_.pool_id_);
+    // The REAL bdev container: InlineOp reaches into the live block allocator,
+    // which only the container that ran Create owns. The pool's static
+    // container carries the task-stat model and nothing else (issue #956).
+    auto inline_dc = CLIO_POOL_MANAGER->GetRealOrStaticContainer(
+        target_info.bdev_client_.pool_id_);
     auto inline_c = inline_dc.get();  // ContainerHold keeps the container pinned
     if (inline_c) {
       clio::run::u64 inline_size = size;
