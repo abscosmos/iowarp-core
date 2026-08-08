@@ -409,6 +409,18 @@ jobs:
             elif command -v dnf &>/dev/null; then
               dnf install -y -q fuse3 fuse3-libs >/dev/null 2>&1
             fi
+            # Assert the BINARY is in the wheel before exercising it. The
+            # `clio_cte_fuse` console script is a [project.scripts] entry
+            # point, so it exists even when the binary behind it does not --
+            # it then exits nonzero-but-not-signalled, which the heuristic
+            # below tolerates. That blind spot is why every wheel shipped
+            # without the FUSE adapter and only the Windows job (which does
+            # Test-Path on the .exe) ever noticed.
+            BIN_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_bin_dir())")
+            if [ ! -x "$BIN_DIR/clio_cte_fuse" ]; then
+              echo "FAIL: clio_cte_fuse missing from wheel bin dir ($BIN_DIR)"
+              exit 1
+            fi
             clio_cte_fuse --help || rc=$?
             rc=${rc:-0}
             if [ "$rc" -ge 128 ]; then
