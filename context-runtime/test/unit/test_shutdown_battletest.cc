@@ -75,6 +75,14 @@
 #include "clio_runtime/bdev/bdev_client.h"
 #include "clio_runtime/bdev/bdev_tasks.h"
 
+// glibc declares `environ` in <unistd.h>; macOS declares it in no header and
+// forbids referencing it directly outside main(), so route through the
+// sanctioned _NSGetEnviron() accessor there (used by posix_spawn below).
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#endif
+
 namespace {
 
 constexpr unsigned kBtPort = 10600;
