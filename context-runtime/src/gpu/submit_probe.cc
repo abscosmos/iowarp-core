@@ -7,8 +7,8 @@
 
 #include "clio_runtime/gpu/submit_probe.h"
 
+#include <chrono>
 #include <cstdio>
-#include <ctime>
 
 namespace clio::run::gpu {
 
@@ -18,10 +18,12 @@ SubmitProbe &SubmitProbe::Get() {
 }
 
 unsigned long long SubmitProbe::NowNs() {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return static_cast<unsigned long long>(ts.tv_sec) * 1000000000ull +
-         static_cast<unsigned long long>(ts.tv_nsec);
+  // On Linux, libstdc++'s steady_clock is clock_gettime(CLOCK_MONOTONIC, ...)
+  // under the hood -- same syscall, same resolution. This also gets us
+  // QueryPerformanceCounter on Windows, where CLOCK_MONOTONIC doesn't exist.
+  auto now = std::chrono::steady_clock::now().time_since_epoch();
+  return static_cast<unsigned long long>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 }
 
 void SubmitProbe::Enable(unsigned cap) {
