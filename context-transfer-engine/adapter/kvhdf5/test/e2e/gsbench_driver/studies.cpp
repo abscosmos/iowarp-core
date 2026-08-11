@@ -217,6 +217,16 @@ std::vector<WorkConfig> BuildStudyW(const std::vector<std::string>& tiers,
     return out;
 }
 
+// Study P sweeps GSBENCH_POOL per work-unit. That is safe only because each WorkConfig here
+// lists a single arm (w.arms = {"pooled"}) AND no other arm reads GSBENCH_POOL.
+//
+// FOOTGUN for whoever adds a bounded-async sweep: GSBENCH_HDF5_ASYNC_POOL does NOT have that
+// second property. async_VOL and async_VOL_reuse are the same TEST_CASE reading that same var,
+// and WorkConfig::env is applied to every arm in w.arms (ComputeChildEnv appends it after the
+// per-arm registry env, so it WINS). A unit with w.arms = {"async_VOL", "async_VOL_reuse"} and
+// GSBENCH_HDF5_ASYNC_POOL in w.env would silently pool the unbounded baseline. Keep such a
+// sweep to w.arms = {"async_VOL_reuse"} and put the unbounded baseline in its own unit (the
+// async_ref_<tier> pattern below), or teach the runner to filter that key per-arm.
 std::vector<WorkConfig> BuildStudyP(const std::vector<std::string>& tiers,
                                      const std::string& scratch) {
     std::vector<WorkConfig> out;

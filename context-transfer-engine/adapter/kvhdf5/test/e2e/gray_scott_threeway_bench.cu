@@ -2265,6 +2265,62 @@ double RunPersistentArm(const Cfg& cfg, const char* prefix, uint64_t* checksum,
     return ms;
 }
 
+// COMPUTE-ONLY isolation of the persistent kernel (fig_write_decomp2.tex's compute-floor
+// probe). GsPersistentComputeOnlyKernel (defined above, "never launched") is argument-for-
+// argument compatible with GsPersistentKernel but has every CLIO/I/O call stripped, so it
+// can be launched directly with null/zero I/O args -- no CLIO server, no dataset, no tag
+// table needed. Same grid-sizing/prewarm/timing shape as RunPersistentArm, minus everything
+// that isn't the resident cooperative compute loop. Gives a DIRECT measured compute floor
+// for the gpuh5/gpuh5_sync bars, instead of the small-scale ratio probe in
+// sweep_stacked128.sh Part A (which only bounds the gap at 1.1%/9.2%, N=4096/5792).
+double RunPersistentFloorArm(const Cfg& cfg) {
+    Grids g = MakeGrids(cfg.N);
+
+    const void* kfn = reinterpret_cast<const void*>(GsPersistentComputeOnlyKernel);
+    int dev = 0; cudaGetDevice(&dev);
+    int num_sm = 0;
+    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev);
+    const int block = 256;
+    int blocks_per_sm = 0;
+    REQUIRE(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, kfn, block, 0) == cudaSuccess);
+    REQUIRE(blocks_per_sm > 0);
+    const int grid = num_sm * blocks_per_sm;
+    std::fprintf(stderr, "GSBENCH_PERSISTENT_FLOOR grid=%d (%d SMs x %d blocks/SM) block=%d\n",
+                 grid, num_sm, blocks_per_sm, block);
+
+    // Prewarm is a CORRECTNESS requirement for cooperative launches (cold-launch deadlock),
+    // same as RunPersistentArm.
+    if (cfg.prewarm) {
+        cudaFuncAttributes fa;
+        cudaFuncGetAttributes(&fa, kfn);
+    }
+
+    unsigned N = cfg.N, snaps = cfg.snaps, steps_per = cfg.steps_per;
+    // Every I/O arg is unused inside GsPersistentComputeOnlyKernel (see its definition) --
+    // null/zero is safe and skips CLIO/dataset/tag-table setup entirely.
+    const kvhdf5::GpuDatasetHandle* d_handles = nullptr;
+    unsigned ngroups_arg = 0;
+    const clio::cte::core::TagId* d_tag_table = nullptr;
+    const uint32_t* d_mask = nullptr;
+    void* args[] = {&g.u_curr, &g.v_curr, &g.u_next, &g.v_next,
+                    &d_handles, &ngroups_arg,
+                    &d_tag_table, &d_mask, const_cast<GsParams*>(&kGs),
+                    &N, &snaps, &steps_per};
+
+    ctp::GpuApi::Synchronize();   // settle the seed before timing
+    auto t0 = std::chrono::steady_clock::now();
+    cudaError_t lerr = cudaLaunchCooperativeKernel(
+        const_cast<void*>(kfn), dim3(grid), dim3(block), args, 0, 0);
+    REQUIRE(lerr == cudaSuccess);
+    ctp::GpuApi::Synchronize();
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    FreeGrids(g);
+    return ms;
+}
+
 // Host-driven CLIO arm: the SAME host flow as the raw arm (synchronous D2H into a host
 // buffer, then a host-side write call), but the sink is a CLIO PutBlob instead of a
 // file write+fsync. It does NOT use the GPU-producer model — no device-side task
@@ -3599,6 +3655,26 @@ TEST_CASE("GSBENCH clio persistent_sync",
     double ms = RunPersistentArm(cfg, "results/gsbench/persistent_sync", &checksum,
                                  /*async_submit=*/false);
     PrintResult("gpuh5_sync", cfg, ms, checksum);
+    REQUIRE(ms > 0.0);
+}
+
+// persistent_floor: COMPUTE-ONLY isolation of GsPersistentKernel via
+// GsPersistentComputeOnlyKernel -- see RunPersistentFloorArm. Direct measured compute floor
+// for the gpuh5/gpuh5_sync bars in fig_write_decomp2.tex, replacing that figure's single
+// GsStepKernel-only floor for those two bars specifically. MB/MBps/io_buf_mb in the printed
+// GSBENCH_RESULT line are not meaningful here (no I/O happens); read ms from the
+// GSBENCH_PERSISTENT_FLOOR line instead.
+TEST_CASE("GSBENCH clio persistent floor (compute-only)",
+          "[.][integration][gpu][gsbench][gsbench_persistent_floor]") {
+    Cfg cfg;
+    static BenchEnv env(cfg);
+    double ms = RunPersistentFloorArm(cfg);
+    const double total_steps = double(cfg.snaps) * double(cfg.steps_per);
+    std::fprintf(stderr,
+        "GSBENCH_PERSISTENT_FLOOR arm=gpuh5_floor N=%u snaps=%u steps_per=%u total_steps=%.0f "
+        "compute_ms=%.3f ms_per_step=%.6f\n",
+        cfg.N, cfg.snaps, cfg.steps_per, total_steps, ms, ms / total_steps);
+    PrintResult("gpuh5_floor", cfg, ms, /*checksum=*/0);
     REQUIRE(ms > 0.0);
 }
 
