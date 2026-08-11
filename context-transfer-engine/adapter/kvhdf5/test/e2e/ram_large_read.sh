@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -u
-BIN=/workspace/build-bench/bin/kvhdf5_e2e_tests
-BINDIR=/workspace/build-bench/bin
-LOG=/workspace/build-bench/gpuh5_ram_LARGE_read.log
+BIN="${RLR_BUILD_DIR:-/workspace/build}/bin/kvhdf5_e2e_tests"
+BINDIR="${RLR_BUILD_DIR:-/workspace/build}/bin"
+LOG="${RLR_BUILD_DIR:-/workspace/build}/gpuh5_ram_LARGE_read.log"
 : > "$LOG"
 cd "$BINDIR"
 common(){ echo GSBENCH_N=16384 GSBENCH_CHUNKS=$CH GSBENCH_SUBMIT_BLOCKS=$CH GSBENCH_SNAPS=8 \
   GSBENCH_STEPS_PER=8 GSBENCH_RAW_ODIRECT=0 GSBENCH_BDEV=ram GSBENCH_DISK_DIR=/dev/shm/gsbench_raw \
   GSBENCH_HDF5_DIR=/dev/shm/gsbench_hdf5 \
-  GSBENCH_BDEV_PATH=/workspace/build-bench/gsbench_scratch/clio_bdev.dat \
+  GSBENCH_BDEV_PATH="${RLR_BUILD_DIR:-/workspace/build}/gsbench_scratch/clio_bdev.dat" \
   GSBENCH_BDEV_CAP_MB=12000 GSBENCH_READ=1 GSBENCH_READ_ASYNC=1; }
 run_arm(){ local name="$1" sel="$2"; shift 2
   rm -f /dev/shm/chi_* 2>/dev/null
@@ -19,7 +19,7 @@ run_async(){ rm -f /dev/shm/chi_* 2>/dev/null
   rm -rf /dev/shm/gsbench_raw /dev/shm/gsbench_hdf5 2>/dev/null
   echo "=== arm=async_VOL chunks=$CH rep=$REP ===" >> "$LOG"
   env $(common) GSBENCH_HDF5_ASYNC_FWAIT=0 \
-    LD_LIBRARY_PATH=/opt/vol-async-nomemcpy/lib:/opt/hdf5ts/lib:/opt/argobots/lib:/workspace/build-bench/bin \
+    LD_LIBRARY_PATH="/opt/vol-async-nomemcpy/lib:/opt/hdf5ts/lib:/opt/argobots/lib:${BINDIR}" \
     HDF5_PLUGIN_PATH=/opt/vol-async-nomemcpy/lib HDF5_VOL_CONNECTOR="async under_vol=0;under_info={}" \
     "$BIN" "[gsbench_hdf5_async]" >> "$LOG" 2>&1; }
 for CH in 1 4 16 64 256; do

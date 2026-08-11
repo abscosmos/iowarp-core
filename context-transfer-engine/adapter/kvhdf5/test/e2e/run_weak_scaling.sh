@@ -21,7 +21,7 @@
 #   docker exec iowarp-kvhdf5-gpu bash /workspace/context-transfer-engine/adapter/kvhdf5/test/e2e/run_weak_scaling.sh
 set -u -o pipefail
 
-BUILD_DIR="${WS_BUILD_DIR:-/workspace/build-bench}"
+BUILD_DIR="${WS_BUILD_DIR:-/workspace/build}"
 BIN="${BUILD_DIR}/bin/kvhdf5_e2e_tests"
 OUT_DIR="${WS_OUT_DIR:-/workspace/context-transfer-engine/adapter/kvhdf5/test/e2e/results}"
 LOG="${OUT_DIR}/weak_scaling_raw.log"
