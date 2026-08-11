@@ -496,6 +496,42 @@ set_target_properties(${IPC_TRANSPORT_MODES_TEST_TARGET} PROPERTIES
 )
 endif()
 
+# Create Shutdown Battletest executable (issue #710).
+# POSIX-only: drives the daemon with signals (SIGSTOP/SIGKILL), posix_spawn
+# and waitpid. Emulates the #526 start->load->stop churn and asserts zero
+# stale artifacts after every cycle.
+set(SHUTDOWN_BATTLETEST_TARGET clio_run_shutdown_battletest)
+if(NOT WIN32)
+add_executable(${SHUTDOWN_BATTLETEST_TARGET} test_shutdown_battletest.cc)
+
+target_include_directories(${SHUTDOWN_BATTLETEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h / runtime_server.h
+  ${CLIO_RUN_ROOT}/modules/bdev/include
+  ${CLIO_RUN_ROOT}/modules/admin/include
+)
+
+target_link_libraries(${SHUTDOWN_BATTLETEST_TARGET}
+  clio_run_cxx               # Main CLIO Runtime library
+  clio_bdev_client        # Bdev module client (load-client mode)
+  clio_admin_client       # Admin module client
+  ctp::cxx                  # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+)
+
+# RuntimeServer launches clio_run; the harness also shells out to it for
+# stop/status.
+add_dependencies(${SHUTDOWN_BATTLETEST_TARGET} clio_run)
+target_compile_definitions(${SHUTDOWN_BATTLETEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
+set_target_properties(${SHUTDOWN_BATTLETEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+endif()
+
 # Create Client Retry test executable.
 # POSIX-only: uses <sys/wait.h> / fork() for parent-child retry orchestration.
 if(NOT WIN32)
@@ -1030,6 +1066,38 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   endif()  # NOT WIN32 (ipc_transport_modes tests)
 
+  # Shutdown Battletest (issue #710) — POSIX-only. Each scenario runs in its
+  # own process on a dedicated port (10600) and RUN_SERIAL so no other
+  # runtime-spawning test races it. Cycle count: CLIO_SHUTDOWN_BT_ITERS
+  # (default 24, mirroring the #526 pipeline's 24 runs).
+  if(NOT WIN32)
+  set(_bt_env "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10600")
+  foreach(_bt_case
+      "churn|Graceful Churn|1800"
+      "load|Churn Under Load|1800"
+      "force|Force Under Load|1800"
+      "watchdog|Watchdog Bound|600"
+      "wedged|Wedged Runtime|600"
+      "crash|Crash Recovery|600"
+      "transports|Transport Churn|1800")
+    string(REPLACE "|" ";" _bt_parts "${_bt_case}")
+    list(GET _bt_parts 0 _bt_tag)
+    list(GET _bt_parts 1 _bt_name)
+    list(GET _bt_parts 2 _bt_timeout)
+    add_test(
+      NAME cr_shutdown_bt_${_bt_tag}
+      COMMAND ${SHUTDOWN_BATTLETEST_TARGET} "ShutdownBattletest - ${_bt_name}"
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_shutdown_bt_${_bt_tag} PROPERTIES
+      ENVIRONMENT "${_bt_env}"
+      TIMEOUT ${_bt_timeout}
+      RUN_SERIAL TRUE
+      LABELS "shutdown_battletest"
+    )
+  endforeach()
+  endif()  # NOT WIN32 (shutdown battletest)
+
   # Queue-depth flurry test (issue #822): tiny queue_depth + task flurry must
   # not hang (the TIMEOUT is the hang detector).
   if(NOT WIN32)
@@ -1265,6 +1333,7 @@ if(NOT WIN32)
     ${EXTERNAL_CLIENT_TEST_TARGET}
     ${CLIENT_RETRY_TEST_TARGET}
     ${IPC_TRANSPORT_MODES_TEST_TARGET}
+    ${SHUTDOWN_BATTLETEST_TARGET}
   )
 endif()
 if(CLIO_CORE_ENABLE_CAE)
