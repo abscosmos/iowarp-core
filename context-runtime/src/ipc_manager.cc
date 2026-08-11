@@ -65,6 +65,7 @@
 #include "clio_runtime/container.h"
 #include "clio_runtime/local_task_archives.h"
 #include "clio_runtime/pool_manager.h"
+#include "clio_runtime/runtime_pid_record.h"
 #include "clio_runtime/scheduler/scheduler_factory.h"
 #include "clio_runtime/task_archives.h"
 
@@ -467,6 +468,17 @@ bool IpcManager::ServerInit() {
   // Initialize memory segments for server
   if (!ServerInitShm()) {
     return false;
+  }
+
+  // Publish this runtime's pid as soon as its segments exist, and withdraw it
+  // in UnlinkOwnArtifacts when they go: the record's lifetime brackets the
+  // segments' exactly like the /proc/<pid>/fd symlink Linux memfds carry. It
+  // is what `clio_run stop`/`status` fall back to on platforms whose segments
+  // are plain files naming no owner (macOS/BSD) — including against a runtime
+  // that wedges partway through this ServerInit.
+  if (ConfigManager *config = CLIO_CONFIG_MANAGER) {
+    WriteRuntimePidRecord(config->GetPort(),
+                          static_cast<int>(ctp::SystemInfo::GetPid()));
   }
 
   // Initialize priority queues
@@ -2896,6 +2908,25 @@ size_t IpcManager::ClearUserIpcs() {
       }
     }
 
+    // The runtime pid record (chi_runtime_pid_<user>_<port>) is a plain file,
+    // so the symlink test above cannot see its owner — it names the owner in
+    // its contents instead. Keep it while that runtime is alive: it is the
+    // only handle `clio_run stop` has on a co-resident runtime whose segments
+    // are not /proc symlinks (macOS/BSD).
+    if (name.rfind(kRuntimePidRecordPrefix, 0) == 0) {
+      std::ifstream pid_file(full_path);
+      std::string pid_line;
+      if (pid_file.is_open() && std::getline(pid_file, pid_line)) {
+        int owner_pid = std::atoi(pid_line.c_str());
+        if (owner_pid > 0 && owner_pid != current_pid &&
+            ctp::SystemInfo::IsProcessAlive(owner_pid)) {
+          HLOG(kDebug, "ClearUserIpcs: keeping {} (runtime pid {} alive)", name,
+               owner_pid);
+          continue;
+        }
+      }
+    }
+
     if (ctp::SystemInfo::RemoveFile(full_path)) {
       HLOG(kDebug, "ClearUserIpcs: Removed memfd symlink: {}", name);
       removed_count++;
@@ -2985,6 +3016,9 @@ size_t IpcManager::UnlinkOwnArtifacts() {
         removed_count++;
       }
     }
+    // The pid record published in ServerInit: this runtime no longer owns the
+    // port, so nothing must be able to escalate a kill against it.
+    RemoveRuntimePidRecord(port);
   }
 
   if (removed_count > 0) {

@@ -135,6 +135,18 @@ size_t SweepDeadRuntimeArtifacts(int pid, clio::run::u32 port) {
           matches = owner > 0 && owner != own_pid &&
                     !ctp::SystemInfo::IsProcessAlive(owner);
         }
+      } else if (pid > 0) {
+        // No symlink to read: on platforms without memfd (macOS/BSD) the
+        // entries are plain files, so fall back to the pid-keyed names the
+        // runtime gives its on-demand and per-thread segments — the same
+        // fallback IpcManager::UnlinkOwnPidEntries uses on its own entries.
+        for (const auto& prefix : {"clio_" + std::to_string(pid) + "_",
+                                   "clio-" + std::to_string(pid) + "-"}) {
+          if (name.rfind(prefix, 0) == 0) {
+            matches = true;
+            break;
+          }
+        }
       }
     }
     if (matches && ctp::SystemInfo::RemoveFile(full_path)) {

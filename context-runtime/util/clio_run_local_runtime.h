@@ -47,9 +47,18 @@
 #include <string>
 #include <vector>
 
+#ifdef __APPLE__
+// macOS has no /proc: process introspection goes through libproc
+// (proc_pidpath) and the KERN_PROC sysctl (process state / zombie check).
+#include <libproc.h>
+#include <sys/proc.h>
+#include <sys/sysctl.h>
+#endif
+
 #include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/util/config_parse.h"
 #include "clio_runtime/config_manager.h"
+#include "clio_runtime/runtime_pid_record.h"
 #include "clio_runtime/types.h"
 
 namespace clio::run::cli {
@@ -87,11 +96,13 @@ inline std::string MainSegmentPath(u32 port) {
 }
 
 /**
- * Discover the local runtime's pid from its main segment symlink, whose
- * target is /proc/<pid>/fd/<n> (the memfd the runtime created). POSIX-only;
+ * Discover the local runtime's pid: on Linux from its main segment symlink,
+ * whose target is /proc/<pid>/fd/<n> (the memfd the runtime created), and
+ * otherwise from the pid record the runtime writes alongside its segments
+ * (see clio_runtime/runtime_pid_record.h). POSIX-only;
  * returns -1 on Windows.
  * @param port the runtime port (segment names are port-keyed)
- * @return the owning pid (may be dead), or -1 if no segment entry exists
+ * @return the owning pid (may be dead), or -1 if the runtime left no trace
  */
 inline int DiscoverRuntimePid(u32 port) {
 #ifdef _WIN32
@@ -100,16 +111,17 @@ inline int DiscoverRuntimePid(u32 port) {
 #else
   std::error_code ec;
   auto target = std::filesystem::read_symlink(MainSegmentPath(port), ec);
-  if (ec) {
-    return -1;
+  if (!ec) {
+    const std::string t = target.string();
+    constexpr const char *kProc = "/proc/";
+    if (t.rfind(kProc, 0) == 0) {
+      int pid = std::atoi(t.c_str() + std::string(kProc).size());
+      if (pid > 0) {
+        return pid;
+      }
+    }
   }
-  const std::string t = target.string();
-  constexpr const char *kProc = "/proc/";
-  if (t.rfind(kProc, 0) != 0) {
-    return -1;
-  }
-  int pid = std::atoi(t.c_str() + std::string(kProc).size());
-  return pid > 0 ? pid : -1;
+  return ReadRuntimePidRecord(port);
 #endif
 }
 
@@ -118,12 +130,25 @@ inline int DiscoverRuntimePid(u32 port) {
  * kill(pid, 0) treats zombies as alive, but a zombie cannot run, service
  * tasks, or hold sockets — for stop purposes it is dead. The stop CLI is a
  * sibling of the runtime (the parent is Jarvis / a test harness / a shell),
- * so it can never reap the zombie itself. Linux-only; false elsewhere.
+ * so it can never reap the zombie itself.
+ *
+ * This matters most on the kill-escalation path: after SIGKILL the runtime
+ * lingers as a zombie until its parent (the harness / Jarvis) reaps it, and
+ * a stop that cannot see through that reports "survived SIGKILL".
  * @param pid candidate pid
- * @return true if /proc/<pid>/stat reports state 'Z'
+ * @return true if the process is a zombie
  */
 inline bool PidIsZombie(int pid) {
-#ifdef __linux__
+#if defined(__APPLE__)
+  // No /proc: ask the kernel for the process's state directly.
+  struct kinfo_proc info;
+  size_t len = sizeof(info);
+  int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, pid};
+  if (sysctl(mib, 4, &info, &len, nullptr, 0) != 0 || len == 0) {
+    return false;
+  }
+  return info.kp_proc.p_stat == SZOMB;
+#elif defined(__linux__)
   std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
   if (!stat_file.is_open()) {
     return false;
@@ -157,12 +182,21 @@ inline bool PidIsRunning(int pid) {
  * Check that a pid currently belongs to a clio_run process (guards kill
  * escalation against pid recycling). POSIX-only; false on Windows.
  * @param pid candidate runtime pid
- * @return true if /proc/<pid>/exe resolves to a clio_run binary
+ * @return true if the process's executable is a clio_run binary
  */
 inline bool PidIsClioRun(int pid) {
-#ifdef _WIN32
+#if defined(_WIN32)
   (void)pid;
   return false;
+#elif defined(__APPLE__)
+  // No /proc/<pid>/exe: libproc reports the executable path, and does so for
+  // same-user processes without any special entitlement.
+  char exe_path[PROC_PIDPATHINFO_MAXSIZE];
+  if (proc_pidpath(pid, exe_path, sizeof(exe_path)) <= 0) {
+    return false;
+  }
+  return std::filesystem::path(exe_path).filename().string().rfind(
+             "clio_run", 0) == 0;
 #else
   std::error_code ec;
   auto exe = std::filesystem::read_symlink(
