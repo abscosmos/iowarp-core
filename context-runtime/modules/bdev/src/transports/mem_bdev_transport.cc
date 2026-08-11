@@ -194,6 +194,15 @@ void MemBdevTransport::InitShmBacking(const clio::run::PoolId &pool_id) {
 }
 
 void MemBdevTransport::PreallocateRamPages() {
+  // SHM-backed devices need no per-page private-heap allocation at all:
+  // EnsureRamPage resolves every offset directly into shm_base_ and never
+  // touches ram_pages_ for them (see its shm_backed_ branch). Committing and
+  // zeroing private-heap pages here would just be memory and time nobody
+  // reads back through -- and at kRamPageSize == 1 GiB, doing that per pool
+  // for every small kRam device a test suite creates is enough to exhaust a
+  // CI runner outright.
+  if (shm_backed_) return;
+
   size_t num_pages =
       static_cast<size_t>((ram_capacity_ + kRamPageSize - 1) / kRamPageSize);
   std::lock_guard<std::mutex> lock(ram_pages_mu_);
