@@ -27,7 +27,20 @@ std::vector<Arm> BuildRegistry() {
         // hdf5_async: needs the async-VOL LD_LIBRARY_PATH/HDF5_PLUGIN_PATH/HDF5_VOL_CONNECTOR
         // env, applied specially by the runner (see runner.cpp ApplyArmEnv), plus
         // GSBENCH_HDF5_ASYNC_FWAIT=0 to avoid the H5VL_async_file_wait busy-spin livelock.
-        {"async_VOL",     "[gsbench_hdf5_async]", {{"GSBENCH_HDF5_ASYNC_FWAIT", "0"}}, true, false},
+        // POOL=0 (unbounded: one buffer per snapshot) is also the .cu default, but it is pinned
+        // here explicitly so this baseline reads 0 even if something upstream sets the var.
+        {"async_VOL",     "[gsbench_hdf5_async]", {{"GSBENCH_HDF5_ASYNC_FWAIT", "0"},
+                                                     {"GSBENCH_HDF5_ASYNC_POOL", "0"}}, true, false},
+
+        // async_VOL_reuse: same TEST_CASE and VOL toolchain as async_VOL, bounded to M reused
+        // pinned buffers instead of one per snapshot. M defaults to 2 to mirror GPUH5's own 2
+        // reused buffer groups, making it the direct bounded-memory comparison; override with
+        // --hdf5-async-pool (which reaches this arm ONLY -- see reads_hdf5_async_pool).
+        // FWAIT=1 here, unlike async_VOL: bounding the pool turns one end-of-run drain into a
+        // drain per reuse, and FWAIT=0's ~2s hard-coded mutex backoff per wait -- harmless once,
+        // at the end -- would otherwise be paid on every single buffer reuse.
+        {"async_VOL_reuse", "[gsbench_hdf5_async]", {{"GSBENCH_HDF5_ASYNC_FWAIT", "1"},
+                                                       {"GSBENCH_HDF5_ASYNC_POOL", "2"}}, true, false, true},
 
         {"hostclio",      "[gsbench_hostclio]",   {}, false, false},
 
@@ -67,6 +80,14 @@ std::vector<Arm> BuildRegistry() {
         // pinned=1 regardless of GSBENCH_DATA_PINNED.
         {"gpuh5",            "[gsbench_persistent]",      {}, false, false},
         {"gpuh5_sync",       "[gsbench_persistent_sync]", {}, false, false},
+
+        // gpuh5_floor: COMPUTE-ONLY isolation of GsPersistentKernel (GsPersistentComputeOnlyKernel,
+        // every CLIO/I/O call stripped) -- a direct measured compute floor for the gpuh5/
+        // gpuh5_sync bars in fig_write_decomp2.tex, replacing that figure's single
+        // GsStepKernel-only floor (from [gsbench_reuse]) for those two bars specifically. Read
+        // ms from the GSBENCH_PERSISTENT_FLOOR line, not the GSBENCH_RESULT MB/MBps fields
+        // (meaningless here -- no I/O happens).
+        {"gpuh5_floor",      "[gsbench_persistent_floor]", {}, false, false},
     };
 }
 

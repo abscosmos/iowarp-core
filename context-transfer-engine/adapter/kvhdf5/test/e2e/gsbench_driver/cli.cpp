@@ -95,6 +95,12 @@ bool ParseArgs(int argc, char** argv, DriverConfig& cfg, std::string& err) {
             auto v = need_value(i, a); if (!v) return false;
             if (!ParseUnsigned(*v, cfg.pool)) { err = "--pool: bad value"; return false; }
             ++i;
+        } else if (a == "--hdf5-async-pool") {
+            auto v = need_value(i, a); if (!v) return false;
+            if (!ParseUnsigned(*v, cfg.hdf5_async_pool)) {
+                err = "--hdf5-async-pool: bad value " + *v; return false;
+            }
+            ++i;
         } else if (a == "--bdev") {
             auto v = need_value(i, a); if (!v) return false; cfg.bdev = *v; ++i;
         } else if (a == "--bdev-cap-mb") {
@@ -142,6 +148,10 @@ SINGLE-CONFIG MODE (default): run the given arms once at one config, print a tab
   --tier ram|file         storage tier convenience (default: file)
   --n --chunks --snaps --steps --submit-blocks --pool
                            GSBENCH_N/CHUNKS/SNAPS/STEPS_PER/SUBMIT_BLOCKS/POOL
+  --hdf5-async-pool M     reused pinned buffers for the async_VOL_reuse arm
+                           (GSBENCH_HDF5_ASYNC_POOL; default 2 when omitted). Applied to
+                           async_VOL_reuse ONLY -- async_VOL stays unbounded (0) even when
+                           both arms run in the same invocation.
   --bdev --bdev-cap-mb --bdev-path --disk-dir --hdf5-dir
                            override tier-derived storage env directly
 

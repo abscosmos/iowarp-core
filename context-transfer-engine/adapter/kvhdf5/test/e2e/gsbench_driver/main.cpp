@@ -70,6 +70,21 @@ void PrintDryRunUnit(const std::string& tag, const std::vector<EnvOverride>& cfg
     std::printf("\n");
 }
 
+// The single-config env vector is shared by every arm in a --arms run, and ComputeChildEnv
+// appends it AFTER the per-arm registry env (setenv overwrite => last wins), so anything put in
+// it overrides every arm's registry default. That is fine for GSBENCH_POOL (only `pooled` reads
+// it) but NOT for GSBENCH_HDF5_ASYNC_POOL: async_VOL and async_VOL_reuse are the same
+// TEST_CASE reading the same var, so a global --hdf5-async-pool would silently pool the
+// unbounded baseline and invalidate the comparison. Hence this per-arm view: the override is
+// appended only for arms that opt in via Arm::reads_hdf5_async_pool (async_VOL_reuse alone).
+std::vector<EnvOverride> ArmEnv(const Arm& arm, const std::vector<EnvOverride>& shared,
+                                 const DriverConfig& cli) {
+    if (!cli.hdf5_async_pool || !arm.reads_hdf5_async_pool) return shared;
+    std::vector<EnvOverride> e = shared;
+    e.push_back({"GSBENCH_HDF5_ASYNC_POOL", std::to_string(cli.hdf5_async_pool)});
+    return e;
+}
+
 int RunSingleConfig(const DriverConfig& cli, const std::string& bin_path) {
     std::vector<std::string> arm_names = cli.arms.empty() ? DefaultArmNames() : cli.arms;
     for (const auto& a : arm_names) {
@@ -125,7 +140,10 @@ int RunSingleConfig(const DriverConfig& cli, const std::string& bin_path) {
         std::printf("-- single-config dry-run: %zu arm(s) x %u rep(s) --\n", arm_names.size(),
                     cli.reps);
         for (unsigned rep = 1; rep <= cli.reps; ++rep) {
-            for (const auto& a : arm_names) PrintDryRunUnit("[single]", env, rep, a, bin_dir);
+            for (const auto& a : arm_names) {
+                const Arm* arm = FindArm(a);  // validated non-null at the top of this function
+                PrintDryRunUnit("[single]", ArmEnv(*arm, env, cli), rep, a, bin_dir);
+            }
         }
         return 0;
     }
@@ -152,7 +170,7 @@ int RunSingleConfig(const DriverConfig& cli, const std::string& bin_path) {
             const Arm* arm = FindArm(a);
             StateReset(/*hard=*/false, "");
             std::printf(">>> arm: %s\n", a.c_str());
-            ChildEnvPlan plan = ComputeChildEnv(*arm, env, bin_dir);
+            ChildEnvPlan plan = ComputeChildEnv(*arm, ArmEnv(*arm, env, cli), bin_dir);
             ChildOutcome oc = RunOneChild(ropts, *arm, plan, "");
             if (oc.result) {
                 std::printf("    %s\n", oc.result->raw_line.c_str());

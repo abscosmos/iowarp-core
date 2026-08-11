@@ -28,6 +28,10 @@ struct DriverConfig {
     unsigned n = 6400, chunks = 4, snaps = 12, steps_per = 48;
     unsigned submit_blocks = 0;  // 0 = default to chunks, matching the campaign's convention
     unsigned pool = 0;           // GSBENCH_POOL, only consulted for the `pooled` arm
+    // GSBENCH_HDF5_ASYNC_POOL override for async_VOL_reuse. 0 = not given: leave the registry's
+    // per-arm default (2) alone. NOT injected globally -- async_VOL reads the same env var, so
+    // the driver applies this only to arms with Arm::reads_hdf5_async_pool.
+    unsigned hdf5_async_pool = 0;
 
     // explicit overrides of tier-derived storage env (empty = tier default)
     std::string bdev;

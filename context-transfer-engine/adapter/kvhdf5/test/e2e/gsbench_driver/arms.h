@@ -24,6 +24,12 @@ struct Arm {
     std::vector<EnvOverride> env;       // always-applied overrides for this arm
     bool is_hdf5_async = false;         // needs the async-VOL LD_LIBRARY_PATH/plugin/connector env
     bool is_pooled = false;             // needs GSBENCH_POOL set per-config (caller supplies value)
+    // True only for the arm that a --hdf5-async-pool override is allowed to reach. Unlike
+    // GSBENCH_POOL (read by exactly one arm, `pooled`), GSBENCH_HDF5_ASYNC_POOL is read by the
+    // ONE function backing BOTH async_VOL and async_VOL_reuse, so a global override would
+    // silently pool the unbounded baseline whenever the two arms run in the same invocation.
+    // Callers must therefore gate the override on this flag rather than on the env var's name.
+    bool reads_hdf5_async_pool = false;
 };
 
 // The full 11-arm registry (order = declaration order below; stable for iteration).
