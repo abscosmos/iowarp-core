@@ -28,6 +28,7 @@ kvhdf5_add_gpu_test_target(kvhdf5_e2e_tests WITH_KVHDF5_HEADERS
         snapshot_reuse_test.cu
         snapshot_read_test.cu
         oob_guard_test.cu
+        weak_scaling_bench.cu
 )
 
 # The device-side chunk-coordinate guard traps by default in a debug build (its
