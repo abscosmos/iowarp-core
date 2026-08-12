@@ -1063,7 +1063,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_detached_spawn PROPERTIES
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10615"
-    RESOURCE_LOCK "clio_runtime_port"
+    RESOURCE_LOCK "clio_runtime"
     TIMEOUT 120
     LABELS "runtime;transport;detached"
   )
@@ -1468,7 +1468,7 @@ if(CLIO_CORE_ENABLE_MPI)
     )
     set_tests_properties(cr_mpi_bdev_transport_all_modes PROPERTIES
       ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
-      RESOURCE_LOCK "clio_runtime_port"
+      RESOURCE_LOCK "clio_runtime"
       TIMEOUT 300
     )
 
@@ -1483,7 +1483,7 @@ if(CLIO_CORE_ENABLE_MPI)
     )
     set_tests_properties(cr_mpi_bdev_transport_minimal PROPERTIES
       ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
-      RESOURCE_LOCK "clio_runtime_port"
+      RESOURCE_LOCK "clio_runtime"
       TIMEOUT 180
     )
   endif()
